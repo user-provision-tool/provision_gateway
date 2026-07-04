@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+dist/
+node_modules/
+.vite/
+*.log
+gateway_data/

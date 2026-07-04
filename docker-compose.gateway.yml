@@ -1,0 +1,43 @@
+version: "3.8"
+
+services:
+  provision-gateway:
+    build:
+      context: ./provision-gateway
+      dockerfile: Dockerfile
+    container_name: provision-gateway
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${PROVISION_DIR:-/srv/provision}:${PROVISION_DIR:-/srv/provision}
+      - gateway_data:/data
+    environment:
+      - PROVISION_DIR=${PROVISION_DIR:-/srv/provision}
+      - GATEWAY_DATA_DIR=/data
+      - PROVISION_API_URL=http://provision-api:8765
+      - GATEWAY_SECRET_KEY=${GATEWAY_SECRET_KEY:-dev-secret-change-me-in-production-32chars!}
+      - NGINX_HTTP_PORT=${NGINX_HTTP_PORT:-80}
+      - NGINX_HTTPS_PORT=${NGINX_HTTPS_PORT:-443}
+      - DOCKER_OPS_LOG=${PROVISION_DIR:-/srv/provision}/generated/docker_ops.log
+    networks:
+      - provision_default
+    restart: unless-stopped
+
+  provision-dashboard:
+    build:
+      context: ./provision-dashboard
+      dockerfile: Dockerfile
+    container_name: provision-dashboard
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-8771}:80"
+    networks:
+      - provision_default
+    restart: unless-stopped
+
+volumes:
+  gateway_data:
+    name: provision_gateway_data
+
+networks:
+  provision_default:
+    external: true
+    name: users_provision_default

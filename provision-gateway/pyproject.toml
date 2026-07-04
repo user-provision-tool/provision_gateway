@@ -1,0 +1,29 @@
+[project]
+name = "provision-gateway"
+version = "1.0.0"
+description = "Provision Gateway - Web UI and management layer for provision-api"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.13.0",
+    "python-jose[cryptography]>=3.3.0",
+    "passlib[bcrypt]>=1.7.4",
+    "bcrypt>=4.0.0",
+    "httpx>=0.27.0",
+    "docker>=7.0.0",
+    "gitpython>=3.1.0",
+    "cryptography>=42.0.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "aiofiles>=24.0.0",
+]
+
+[tool.setuptools]
+packages = ["app"]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
