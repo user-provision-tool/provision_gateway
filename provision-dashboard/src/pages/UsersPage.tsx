@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Popconfirm, Modal } from 'antd'
-import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, UpOutlined, DownOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, SwapOutlined, UnorderedListOutlined } from '@ant-design/icons'
+import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, SwapOutlined, UnorderedListOutlined } from '@ant-design/icons'
 import { useAuth } from '../hooks/useAuth'
 import client from '../api/client'
 import DeployForm from '../components/services/DeployForm'
@@ -177,12 +177,20 @@ export default function UsersPage() {
                     extra={
                       <Space onClick={e=>e.stopPropagation()}>
                         {isAdmin && <>
-                          <Tooltip title="Start containers"><Button size="small" icon={<UpOutlined/>} onClick={()=>{
-                            client.post(`/users/${svc.user_name}/${svc.service_name}/${svc.label}/up`).then(()=>{message.success('Starting...');loadServices()}).catch(e=>message.error(e.response?.data?.detail||'Failed'))
-                          }}/></Tooltip>
-                          <Tooltip title="Stop containers"><Button size="small" icon={<DownOutlined/>} onClick={()=>{
-                            client.post(`/users/${svc.user_name}/${svc.service_name}/${svc.label}/down`).then(()=>{message.success('Stopping...');loadServices()}).catch(e=>message.error(e.response?.data?.detail||'Failed'))
-                          }}/></Tooltip>
+                          <Tooltip title={Object.keys(svc.healthy_containers||{}).length > 0 ? 'Stop containers' : 'Start containers'}>
+                            <Button size="small" 
+                              icon={Object.keys(svc.healthy_containers||{}).length > 0 ? <PauseOutlined/> : <CaretRightOutlined/>}
+                              type={Object.keys(svc.healthy_containers||{}).length > 0 ? 'default' : 'primary'}
+                              onClick={()=>{
+                                const isRunning = Object.keys(svc.healthy_containers||{}).length > 0
+                                const action = isRunning ? 'down' : 'up'
+                                const label = isRunning ? 'Stopping...' : 'Starting...'
+                                client.post(`/users/${svc.user_name}/${svc.service_name}/${svc.label}/${action}`)
+                                  .then(()=>{message.success(label);loadServices()})
+                                  .catch(e=>message.error(e.response?.data?.detail||'Failed'))
+                              }}
+                            />
+                          </Tooltip>
                           <Button size="small" onClick={async ()=>{
                             try {
                               const r = await client.post(`/users/${svc.user_name}/${svc.service_name}/${svc.label}/rebuild`,{})
@@ -233,48 +241,45 @@ export default function UsersPage() {
                       </div>
                       <div><Text strong>Deployment Files: </Text></div>
                       <div style={{paddingLeft:16}}>
-                        {svc.compose_template_path && <div style={{marginBottom:4}}>
-                          <Tag color="blue">compose</Tag>
-                          <Text code style={{cursor:'pointer',color:'#1677ff'}} onClick={()=>navigate(`/services/${svc.service_name}?file=${svc.compose_template_path?.split('/').pop()}`)}>
-                            {svc.compose_template_path?.split('/').pop()}
-                          </Text>
-                          <Text type="secondary" style={{fontSize:11}}> (template)</Text>
-                        </div>}
-                        {svc.nginx_conf_template_path && <div style={{marginBottom:4}}>
-                          <Tag color="purple">nginx</Tag>
-                          <Text code style={{cursor:'pointer',color:'#1677ff'}} onClick={()=>navigate(`/services/${svc.service_name}?file=${svc.nginx_conf_template_path?.split('/').pop()}`)}>
-                            {svc.nginx_conf_template_path?.split('/').pop()}
-                          </Text>
-                          <Text type="secondary" style={{fontSize:11}}> (template)</Text>
-                        </div>}
-                        <div style={{marginBottom:4}}>
-                          <Tag color="green">env</Tag>
-                          <Text code style={{cursor:'pointer',color:'#1677ff'}} onClick={()=>navigate(`/services/${svc.service_name}?file=.env`)}>
-                            .env
-                          </Text>
-                          <Text type="secondary" style={{fontSize:11}}> (per-user)</Text>
-                        </div>
-                        <div style={{marginBottom:4}}>
-                          <Tag color="orange">compose</Tag>
-                          <Text code style={{cursor:'pointer',color:'#1677ff'}} onClick={()=>navigate(`/services/${svc.service_name}?file=docker-compose.yml`)}>
-                            docker-compose.yml
-                          </Text>
-                          <Text type="secondary" style={{fontSize:11}}> (generated per-user)</Text>
-                        </div>
-                        <div style={{marginBottom:4}}>
-                          <Tag color="purple">nginx</Tag>
-                          <Text code style={{cursor:'pointer',color:'#1677ff'}} onClick={()=>navigate(`/services/${svc.service_name}?file=nginx.conf`)}>
-                            nginx.conf
-                          </Text>
-                          <Text type="secondary" style={{fontSize:11}}> (generated per-user)</Text>
-                        </div>
-                        <div style={{marginBottom:4}}>
-                          <Tag color="red">ssl</Tag>
-                          <Text code style={{color:'#666'}}>
-                            ssl/{svc.service_name}-{svc.user_name}-{svc.label}.crt
-                          </Text>
-                          <Text type="secondary" style={{fontSize:11}}> (managed by provision-nginx)</Text>
-                        </div>
+                        {/* .env file */}
+                        {(() => {
+                          const envFile = `.env.${svc.user_name}.${svc.label}`
+                          return <div style={{marginBottom:4}}>
+                            <Text>.env: </Text>
+                            <Text code>{envFile}</Text>
+                            <Text type="secondary" style={{fontSize:11}}> (in PROVISION/source_projects/{svc.service_name} dir)</Text>
+                          </div>
+                        })()}
+                        {/* generated compose file */}
+                        {(() => {
+                          const composeFile = `docker-compose.user-${svc.user_name}.${svc.label}.yml`
+                          return <div style={{marginBottom:4}}>
+                            <Text>compose: </Text>
+                            <Text code>{composeFile}</Text>
+                            <Text type="secondary" style={{fontSize:11}}> (in PROVISION/source_projects/{svc.service_name} dir)</Text>
+                          </div>
+                        })()}
+                        {/* nginx conf file */}
+                        {(() => {
+                          // Try to derive nginx conf filename from compose_template_path or service_name
+                          const nginxConfPath = svc.nginx_conf_template_path || ''
+                          const nginxBase = nginxConfPath.split('/').pop()?.replace('.j2', '') || svc.service_name
+                          const nginxConfFile = `${nginxBase}.user-${svc.user_name}.${svc.label}.nginx.conf`
+                          return <div style={{marginBottom:4}}>
+                            <Text>nginx conf: </Text>
+                            <Text code>{nginxConfFile}</Text>
+                            <Text type="secondary" style={{fontSize:11}}> (in PROVISION/generated dir)</Text>
+                          </div>
+                        })()}
+                        {/* ssl */}
+                        {svc.url && svc.url.startsWith('https') && (() => {
+                          const domain = new URL(svc.url).hostname.split('.').slice(-2).join('.')
+                          return <div style={{marginBottom:4}}>
+                            <Text>ssl: </Text>
+                            <Text code>fullchain.pem, privkey.pem</Text>
+                            <Text type="secondary" style={{fontSize:11}}> (in PROVISION/ssl/{domain} dir)</Text>
+                          </div>
+                        })()}
                       </div>
                       {(svc as any).volumes && Object.keys((svc as any).volumes).length>0 && <div><Text strong>Volumes: </Text><Space wrap>{Object.entries((svc as any).volumes).map(([k,v]:[string,any])=><Tag key={k}>{k}: {String(v)}</Tag>)}</Space></div>}
                     </Space>

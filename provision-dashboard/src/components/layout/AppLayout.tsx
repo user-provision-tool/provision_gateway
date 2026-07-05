@@ -102,13 +102,15 @@ export default function AppLayout() {
         const { data } = await client.get('/tasks')
         const tasks = data.tasks || data || []
         for (const t of tasks) {
-          if ((t.status === 'completed' || t.status === 'succeeded' || t.status === 'failed') && !notifiedRef.current.has(t.id)) {
-            notifiedRef.current.add(t.id)
+          const taskId = t.id || t.task_id
+          if (!taskId) continue
+          if ((t.status === 'completed' || t.status === 'succeeded' || t.status === 'failed') && !notifiedRef.current.has(taskId)) {
+            notifiedRef.current.add(taskId)
             const emoji = t.status === 'failed' ? '❌' : '✅'
             if ('Notification' in window && Notification.permission === 'granted') {
               try { new Notification(`Task ${t.status}`, { body: `${t.type||'task'} ${t.target||''}`, icon: '/favicon.ico' }) } catch {}
             }
-            message.info({ content: `${emoji} Task ${t.id?.substring(0,8)}... ${t.status}`, duration: 5 })
+            message.info({ content: `${emoji} Task ${taskId.substring(0,8)}... ${t.status}`, duration: 5 })
           }
         }
       } catch { /* silent */ }
