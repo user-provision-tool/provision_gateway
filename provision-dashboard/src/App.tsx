@@ -9,6 +9,7 @@ import UsersPage from './pages/UsersPage'
 import TasksPage from './pages/TasksPage'
 import SettingsPage from './pages/SettingsPage'
 import AuditPage from './pages/AuditPage'
+import UserManagementPage from './pages/UserManagementPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, isLoading } = useAuth()
@@ -58,6 +59,7 @@ export default function App() {
         <Route path="tasks" element={<TasksPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="audit" element={<AuditPage />} />
+        <Route path="users/manage" element={<UserManagementPage />} />
       </Route>
     </Routes>
   )

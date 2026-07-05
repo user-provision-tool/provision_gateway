@@ -74,12 +74,81 @@ def get_container_count() -> tuple[int, int]:
 def get_host_stats() -> dict[str, Any]:
     """Get host-level stats (CPU, memory, disk)."""
     import shutil
+    import os
     disk = shutil.disk_usage("/")
+    
+    # Try to get host CPU/memory via docker info (not container-level)
+    cpu_percent = 0.0
+    mem_percent = 0.0
+    mem_total_mb = 0.0
+    mem_used_mb = 0.0
+    
+    # Try to get host memory from /proc/meminfo (works if /proc is from host)
+    try:
+        meminfo = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) >= 2:
+                    key = parts[0].strip()
+                    val = parts[1].strip().split()[0]
+                    try:
+                        meminfo[key] = int(val)
+                    except ValueError:
+                        pass
+        total_kb = meminfo.get("MemTotal", 0)
+        free_kb = meminfo.get("MemFree", 0)
+        buffers_kb = meminfo.get("Buffers", 0)
+        cached_kb = meminfo.get("Cached", 0)
+        sreclaimable_kb = meminfo.get("SReclaimable", 0)
+        
+        used_kb = total_kb - free_kb - buffers_kb - cached_kb - sreclaimable_kb
+        if used_kb < 0:
+            used_kb = total_kb - free_kb
+        
+        if total_kb > 0:
+            mem_total_mb = round(total_kb / 1024, 1)
+            mem_used_mb = round(used_kb / 1024, 1)
+            mem_percent = round(used_kb / total_kb * 100, 1)
+    except Exception:
+        pass
+    
+    # Try to get host CPU from /proc/stat (two-sample, 100ms apart)
+    try:
+        def _read_cpu():
+            with open("/proc/stat", "r") as f:
+                line = f.readline()
+            parts = line.split()
+            if parts[0] == "cpu" and len(parts) >= 8:
+                return [int(x) for x in parts[1:8]]
+            return None
+        
+        s1 = _read_cpu()
+        if s1:
+            import time
+            time.sleep(0.1)
+            s2 = _read_cpu()
+            if s2:
+                total1 = sum(s1)
+                idle1 = s1[3]  # idle
+                total2 = sum(s2)
+                idle2 = s2[3]
+                total_diff = total2 - total1
+                idle_diff = idle2 - idle1
+                if total_diff > 0:
+                    cpu_percent = round((1 - idle_diff / total_diff) * 100, 1)
+    except Exception:
+        pass
+    
     return {
         "disk_total_gb": round(disk.total / (1024**3), 1),
         "disk_used_gb": round(disk.used / (1024**3), 1),
         "disk_free_gb": round(disk.free / (1024**3), 1),
         "disk_percent": round(disk.used / disk.total * 100, 1),
+        "cpu_percent": cpu_percent,
+        "mem_total_mb": mem_total_mb,
+        "mem_used_mb": mem_used_mb,
+        "mem_percent": mem_percent,
     }
 
 
