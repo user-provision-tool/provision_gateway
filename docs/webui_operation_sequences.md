@@ -132,15 +132,22 @@
 ### 3.5 Per-Service Action Buttons
 Each service card shows these buttons:
 
-#### 3.5.1 Up Button
-- **Trigger**: Click up arrow
-- **Sequence**: POST /api/users/{user}/{service}/{label}/up → docker compose up -d
-- **Status**: ✅ Fixed (compose path resolution + docker compose plugin)
+### 3.5.1 Play/Pause Button (Toggle)
+- **Trigger**: Click Play/Pause toggle button
+- **Sequence**: 
+  - If running (▶): POST /api/users/{user}/{service}/{label}/down → docker compose stop
+  - If stopped (⏸): POST /api/users/{user}/{service}/{label}/up → docker compose up -d
+- **Status**: ✅ Fixed (single toggle button replaces separate Up/Down buttons)
 
-#### 3.5.2 Down Button
-- **Trigger**: Click down arrow
-- **Sequence**: POST /api/users/{user}/{service}/{label}/down → docker compose stop
-- **Status**: ✅ Fixed
+### 3.5.2 Down Button
+- ~~**Trigger**: Click down arrow~~
+- ~~**Sequence**: POST /api/users/{user}/{service}/{label}/down → docker compose stop~~
+- **Status**: ❌ Replaced by Play/Pause toggle (see 3.5.1)
+
+### 3.5.3 Up Button
+- ~~**Trigger**: Click up arrow~~
+- ~~**Sequence**: POST /api/users/{user}/{service}/{label}/up → docker compose up -d~~
+- **Status**: ❌ Replaced by Play/Pause toggle (see 3.5.1)
 
 #### 3.5.3 Rebuild Button
 - **Trigger**: Click "Rebuild"
@@ -306,12 +313,18 @@ Each service card shows these buttons:
 | User Management | 5 operations (register, approve, special users, delete, role change) | All ✅ |
 | Login | 2 operations (login, register) | All ✅ |
 
-### Known Issues:
-1. **Task SSE log reads global file** — The log endpoint reads `DOCKER_OPS_LOG` (global file) and filters by task context (user/service name). Per-task log isolation could be improved if provision-api exposes a per-task log endpoint.
-2. **Git-diff shown as separate view** — Diff is displayed in Monaco DiffEditor component (read-only), not as inline decorations in the main editor. This is an acceptable UX choice.
-3. **Redeploy button** — The Redeploy button triggers rebuild with `no_cache: true`. Full e2e flow verification needed.
-4. **SSL certs display** — SSL certificate file paths (fullchain.pem, privkey.pem) are available in the expanded service card but could be more prominently displayed.
-5. **siyuan-mcp container status** — The siyuan-mcp container for alice shows "0 up, 1 down" (exited). Root cause investigation needed.
+### Known Issues (Post-ITERATION 1):
+1. **Task SSE log reads global file** — The log endpoint reads `DOCKER_OPS_LOG` and filters by task context. Per-task log files would improve isolation (see Task 10 in tasks-20260705-3.md).
+2. **New user registration flow** — Viewer/admin role switching and page access control needs debugging (see Task 9 in tasks-20260705-3.md).
+3. **Task log persistence** — Task logs should be configurable and per-task (see Task 10.2 in tasks-20260705-3.md).
+4. **Redeploy button flow** — Full e2e verification needed.
+
+### Fixed Issues (ITERATION 1 — 2026-07-05):
+1. ✅ **siyuan-mcp always down** — Root cause: container_name template had `{{ container_prefix }}server` but should be `{{ container_prefix }}siyuan-mcp-server`. Fixed template, regenerated compose, restarted container.
+2. ✅ **Separate Up/Down buttons** — Replaced with single Play/Pause toggle button.
+3. ✅ **Task notification error** — "❌ Task undefined... failed" fixed by handling missing task IDs.
+4. ✅ **Templates vs Generated Files** — Properly separated: .env files in Templates, generated compose files in Generated Files.
+5. ✅ **File auto-location** — Files from URL query params now auto-open and auto-expand directory tree.
 
 ### Verified Pages (Browser Check — 2026-07-05):
 - ✅ Login page (`/login`) — Email + password fields, Register link, gradient background
