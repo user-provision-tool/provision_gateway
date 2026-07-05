@@ -54,7 +54,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const response = await authApi.login({ email, password })
     localStorage.setItem('access_token', response.access_token)
     localStorage.setItem('refresh_token', response.refresh_token)
-    setAdmin(response.admin)
+    // Handle both admin and end-user responses
+    const userData = response.admin || response.user
+    if (userData) {
+      userData.user_type = response.user_type || 'admin'
+      // For end-users, use username as email for display purposes
+      if (!userData.email && (userData as any).username) {
+        userData.email = (userData as any).username
+      }
+      setAdmin(userData)
+    } else if (response.user) {
+      setAdmin({ ...response.user, email: response.user.username || '', user_type: response.user_type || 'end_user' })
+    }
     setNeedsSetup(false)
   }, [])
 

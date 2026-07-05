@@ -9,9 +9,11 @@ export interface AdminUser {
   id: number
   email: string
   role: string
-  is_active: boolean
-  created_at: string
-  last_login_at: string | null
+  is_active?: boolean
+  created_at?: string
+  last_login_at?: string | null
+  username?: string
+  user_type?: string
 }
 
 export interface TokenResponse {
@@ -19,7 +21,9 @@ export interface TokenResponse {
   refresh_token: string
   token_type: string
   expires_in: number
-  admin: AdminUser
+  admin?: AdminUser
+  user?: AdminUser
+  user_type?: string
 }
 
 export async function setupAdmin(email: string, password: string) {

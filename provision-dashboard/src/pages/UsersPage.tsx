@@ -42,6 +42,9 @@ export default function UsersPage() {
 
   useEffect(() => { loadServices() }, [])
 
+  const isEndUser = (admin as any)?.user_type === 'end_user'
+  const endUserViewer = isEndUser && admin?.role !== 'admin'
+
   const loadServices = async () => {
     setLoading(true)
     try {
@@ -49,6 +52,8 @@ export default function UsersPage() {
       const users = data.users || data.user_status || []
       const all: ServiceInstance[] = []
       for (const u of users) {
+        // End-user viewers only see their own services
+        if (endUserViewer && admin?.email && u.user_name !== admin.email) continue
         for (const s of (u.healthy_services||[])) all.push({...s, user_name: u.user_name})
         for (const s of (u.unhealthy_services||[])) all.push({...s, user_name: u.user_name})
         for (const s of (u.missing_services||[])) all.push({...s, user_name: u.user_name})

@@ -31,27 +31,29 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 # JWT
 # ---------------------------------------------------------------------------
 
-def create_access_token(admin_id: int, email: str, role: str) -> str:
-    """Create a JWT access token."""
+def create_access_token(user_id: int, email: str, role: str, user_type: str = "admin") -> str:
+    """Create a JWT access token. user_type is 'admin' or 'end_user'."""
     expire = datetime.now(timezone.utc) + timedelta(seconds=settings.JWT_EXPIRE_SEC)
     payload = {
-        "sub": str(admin_id),
+        "sub": str(user_id),
         "email": email,
         "role": role,
         "type": "access",
+        "user_type": user_type,
         "exp": expire,
         "iat": datetime.now(timezone.utc),
     }
     return jwt.encode(payload, settings.GATEWAY_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
-def create_refresh_token(admin_id: int, email: str) -> str:
+def create_refresh_token(user_id: int, email: str, user_type: str = "admin") -> str:
     """Create a JWT refresh token (longer-lived)."""
     expire = datetime.now(timezone.utc) + timedelta(seconds=settings.JWT_REFRESH_EXPIRE_SEC)
     payload = {
-        "sub": str(admin_id),
+        "sub": str(user_id),
         "email": email,
         "type": "refresh",
+        "user_type": user_type,
         "exp": expire,
         "iat": datetime.now(timezone.utc),
     }
@@ -137,3 +139,51 @@ def change_password(
     admin.password_hash = hash_password(new_password)
     db.commit()
     return True
+
+
+# ---------------------------------------------------------------------------
+# End-User authentication
+# ---------------------------------------------------------------------------
+
+from ..models.end_user import EndUser
+
+
+def get_end_user_by_username(db: Session, username: str) -> EndUser | None:
+    """Find an end-user by username."""
+    return db.query(EndUser).filter(EndUser.username == username).first()
+
+
+def get_end_user_by_id(db: Session, user_id: int) -> EndUser | None:
+    """Find an end-user by ID."""
+    return db.query(EndUser).filter(EndUser.id == user_id).first()
+
+
+def authenticate_end_user(db: Session, username: str, password: str) -> EndUser | None:
+    """Authenticate an end-user by username and password. Returns the user or None."""
+    user = get_end_user_by_username(db, username)
+    if not user or not user.is_active:
+        return None
+    if not user.is_approved:
+        return None  # Not yet approved by admin
+    if not verify_password(password, user.password_hash):
+        return None
+    return user
+
+
+def authenticate_user(db: Session, email_or_username: str, password: str) -> tuple[str, dict] | None:
+    """
+    Authenticate a user by checking both admins and end_users tables.
+    Returns (user_type, user_dict) or None.
+    user_type is 'admin' or 'end_user'.
+    """
+    # Try admin first
+    admin = authenticate_admin(db, email_or_username, password)
+    if admin:
+        return ("admin", {"id": admin.id, "email": admin.email, "role": admin.role})
+    
+    # Try end-user
+    end_user = authenticate_end_user(db, email_or_username, password)
+    if end_user:
+        return ("end_user", {"id": end_user.id, "username": end_user.username, "role": end_user.role, "is_approved": end_user.is_approved, "is_active": end_user.is_active})
+    
+    return None
