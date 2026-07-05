@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Typography, Card, Table, Button, Modal, Form, Input,
   Space, message, Tag, Empty, Tabs, Spin, Checkbox
@@ -88,15 +88,39 @@ export default function ServicesPage() {
       render: (t: string) => <Button type="link" onClick={() => navigate(`/services/${t}`)}><FolderOpenOutlined /> {t}</Button> },
     { title: 'Templates', key: 'templates',
       render: (_:any, r:ServiceInfo) => {
+        // First identify generated files
+        const generatedSet = new Set<string>()
+        r.files.forEach((f: string) => {
+          // Only system-generated compose/nginx files are "generated" — not .env files
+          if (f.match(/docker-compose\.user-.*\.yml$/) || f.match(/\.user-.*\.nginx\.conf$/)) {
+            generatedSet.add(f)
+          }
+        });
+        (r.generated_files || []).forEach((f: string) => generatedSet.add(f))
+        
+        // Templates = non-generated files that are templates (.j2, Dockerfile, .env, etc.)
         const temps: string[] = []
-        r.files.forEach((f: string) => { if (f.endsWith('.yml.j2')||f.endsWith('.conf.j2')||f.includes('Dockerfile')) temps.push(f) })
-        return <Space size={4} wrap>{temps.map(f=><Tag key={f} color="green" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>)}</Space>
+        r.files.forEach((f: string) => {
+          if (generatedSet.has(f)) return // skip generated files
+          if (f.endsWith('.yml.j2') || f.endsWith('.conf.j2') || f.includes('Dockerfile') || f.startsWith('.env')) {
+            temps.push(f)
+          }
+        })
+        return <Space size={4} wrap>{temps.length>0 ? temps.map(f=><Tag key={f} color="green" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
       }
     },
     { title: 'Generated Files', key: 'generated',
-      render: (_:any, r:any) => {
-        const gens = r.generated_files || []
-        return gens.length>0 ? <Space size={4} wrap>{gens.map((f:string)=><Tag key={f} color="gold" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>)}</Space> : <Tag>none</Tag>
+      render: (_:any, r:ServiceInfo) => {
+        const gens: string[] = []
+        r.files.forEach((f: string) => {
+          // System-generated per-user files: docker-compose.user-*.yml, *.user-*.nginx.conf
+          if (f.match(/docker-compose\.user-.*\.yml$/) || f.match(/\.user-.*\.nginx\.conf$/)) {
+            gens.push(f)
+          }
+        })
+        const backendGens = r.generated_files || []
+        const allGens = [...new Set([...gens, ...backendGens])]
+        return <Space size={4} wrap>{allGens.length>0 ? allGens.map(f=><Tag key={f} color="gold" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
       }
     },
     { title: 'Actions', key: 'actions',
@@ -172,19 +196,42 @@ export default function ServicesPage() {
 }
 
 function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void }) {
+  const [searchParams] = useSearchParams()
   const [service, setService] = useState<ServiceInfo | null>(null)
   const [fileContent, setFileContent] = useState('')
   const [headContent, setHeadContent] = useState('')
   const [selectedFile, setSelectedFile] = useState('')
   const [editing, setEditing] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [gitModifiedFiles, setGitModifiedFiles] = useState<Set<string>>(new Set())  // tracked + modified
-  const [gitNewFiles, setGitNewFiles] = useState<Set<string>>(new Set())            // untracked (new)
+  const [gitModifiedFiles, setGitModifiedFiles] = useState<Set<string>>(new Set())
+  const [gitNewFiles, setGitNewFiles] = useState<Set<string>>(new Set())
+  const [treeReady, setTreeReady] = useState(false)
 
   useEffect(() => {
-    client.get(`/services/${name}`).then(r=>setService(r.data)).catch(()=>message.error('Failed'))
+    client.get(`/services/${name}`).then(r=>{setService(r.data);setTreeReady(true)}).catch(()=>message.error('Failed'))
     refreshGitStatus()
   }, [name])
+
+  // Auto-load file from URL query param ?file=...
+  const fileParam = searchParams.get('file')
+  useEffect(() => {
+    if (fileParam && service && treeReady) {
+      loadFile(fileParam)
+      // Auto-expand parent directories
+      const parts = fileParam.split('/')
+      const dirsToExpand = new Set<string>()
+      for (let i = 0; i < parts.length - 1; i++) {
+        dirsToExpand.add(parts.slice(0, i + 1).join('/'))
+      }
+      if (dirsToExpand.size > 0) {
+        setExpandedDirs(prev => {
+          const next = new Set(prev)
+          dirsToExpand.forEach(d => next.add(d))
+          return next
+        })
+      }
+    }
+  }, [fileParam, service, treeReady])
 
   const refreshGitStatus = async () => {
     try {
