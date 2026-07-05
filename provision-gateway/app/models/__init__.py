@@ -3,8 +3,11 @@
 from .admin import AdminUser
 from .audit_log import AuditLog
 from .llm_config import LLMConfig
+from .system_config import SystemConfig
 from .service_template import ServiceTemplate
 from .gateway_setting import GatewaySetting
+from .proxy_config import ProxyConfig
+from .end_user import EndUser
 
 __all__ = [
     "AdminUser",
@@ -12,4 +15,6 @@ __all__ = [
     "LLMConfig",
     "ServiceTemplate",
     "GatewaySetting",
+    "ProxyConfig",
+    "EndUser",
 ]

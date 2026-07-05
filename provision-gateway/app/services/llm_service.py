@@ -19,33 +19,67 @@ class LLMService:
     """Manages LLM configuration and generates service config files."""
 
     # ------------------------------------------------------------------
-    # Config management
+    # Config management (multi-config)
     # ------------------------------------------------------------------
 
+    def list_configs(self, db: Session) -> list[dict]:
+        """List all LLM configs."""
+        configs = db.query(LLMConfig).order_by(LLMConfig.id).all()
+        return [c.to_dict() for c in configs]
+
     def get_config(self, db: Session) -> dict:
-        """Get the current LLM configuration."""
+        """Get the currently active LLM config (backward compat)."""
         config = db.query(LLMConfig).filter(LLMConfig.is_active == True).first()
         if not config:
-            return {
-                "mode": "local_agent",
-                "agent_url": None,
-                "agent_model": None,
-                "byok_configured": False,
-                "byok_model": None,
-                "byok_api_key_masked": None,
-                "is_active": False,
-                "system_prompt": None,
-            }
+            return {"mode": "local_agent", "agent_url": None, "agent_model": None,
+                    "byok_configured": False, "byok_model": None,
+                    "byok_api_key_masked": None, "is_active": False, "system_prompt": None}
         return config.to_dict()
 
+    def create_config(self, db: Session, data: dict) -> LLMConfig:
+        """Create a new LLM config."""
+        config = LLMConfig(
+            mode=data.get("mode", "local_agent"),
+            agent_url=data.get("agent_url", ""),
+            agent_model=data.get("agent_model", ""),
+            byok_base_url=data.get("byok_base_url", ""),
+            byok_model=data.get("byok_model", ""),
+            system_prompt=data.get("system_prompt", ""),
+            is_active=False,
+        )
+        if data.get("byok_api_key"):
+            config.byok_api_key_enc = encrypt_api_key(data["byok_api_key"])
+        db.add(config)
+        db.commit()
+        db.refresh(config)
+        return config
+
+    def activate_config(self, db: Session, config_id: int) -> LLMConfig | None:
+        """Activate a config, deactivating all others."""
+        config = db.query(LLMConfig).filter(LLMConfig.id == config_id).first()
+        if not config:
+            return None
+        db.query(LLMConfig).filter(LLMConfig.is_active == True).update({"is_active": False})
+        config.is_active = True
+        db.commit()
+        db.refresh(config)
+        return config
+
+    def delete_config(self, db: Session, config_id: int) -> bool:
+        """Delete an LLM config."""
+        config = db.query(LLMConfig).filter(LLMConfig.id == config_id).first()
+        if not config:
+            return False
+        db.delete(config)
+        db.commit()
+        return True
+
     def save_config(self, db: Session, data: dict) -> LLMConfig:
-        """Save or update LLM configuration."""
+        """Save/update config (backward compat — creates or updates active)."""
         config = db.query(LLMConfig).filter(LLMConfig.is_active == True).first()
-        
         if not config:
             config = LLMConfig()
             db.add(config)
-        
         config.mode = data.get("mode", config.mode or "local_agent")
         config.agent_url = data.get("agent_url", config.agent_url)
         config.agent_model = data.get("agent_model", config.agent_model)
@@ -53,14 +87,8 @@ class LLMService:
         config.byok_model = data.get("byok_model", config.byok_model)
         config.system_prompt = data.get("system_prompt", config.system_prompt)
         config.is_active = True
-        
-        # Encrypt API key if provided (only if non-empty)
         if data.get("byok_api_key"):
             config.byok_api_key_enc = encrypt_api_key(data["byok_api_key"])
-        elif "byok_api_key" in data and data["byok_api_key"] == "":
-            # Empty string = keep existing key
-            pass
-        
         db.commit()
         db.refresh(config)
         return config

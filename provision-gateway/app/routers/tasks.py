@@ -60,14 +60,39 @@ async def stream_task_log(
     follow: bool = Query(True, description="Whether to keep streaming new lines"),
     current_admin: AdminUser = Depends(get_current_admin),
 ):
-    """Stream task build log via Server-Sent Events."""
+    """Stream task build log via Server-Sent Events, filtered by task context."""
     log_file = settings.DOCKER_OPS_LOG
+    
+    # Try to get task context for filtering
+    task_context: str | None = None
+    try:
+        task = await provision_service.get_task(task_id)
+        result = task.get("result") or {}
+        if isinstance(result, dict):
+            user = result.get("user_name", "")
+            svc = result.get("service_name", "")
+            if user or svc:
+                task_context = f"{user}/{svc}" if user and svc else (user or svc)
+        else:
+            ttype = task.get("type", "")
+            task_context = ttype
+    except Exception:
+        pass
+
+    def _line_matches(line: str) -> bool:
+        """Check if a log line is relevant to this task."""
+        if not task_context:
+            return True  # No filter — show all
+        # Check if line contains task context (user/service patterns)
+        return task_context.lower() in line.lower()
 
     async def log_generator():
         if log_file.exists():
             try:
                 lines = log_file.read_text().splitlines()
-                recent = lines[-tail:] if len(lines) > tail else lines
+                # Filter lines relevant to this task, then take tail
+                matched = [l for l in lines if _line_matches(l)]
+                recent = matched[-tail:] if len(matched) > tail else matched
                 for line in recent:
                     yield f"data: {line}\n\n"
             except Exception:
@@ -88,7 +113,7 @@ async def stream_task_log(
                             f.seek(last_size)
                             new_data = f.read()
                             for line in new_data.splitlines():
-                                if line.strip():
+                                if line.strip() and _line_matches(line):
                                     yield f"data: {line}\n\n"
                         last_size = current_size
             except Exception:

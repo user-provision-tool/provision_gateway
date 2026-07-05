@@ -138,3 +138,123 @@ def change_password(
     if not success:
         raise HTTPException(status_code=400, detail="Current password is incorrect")
     return {"message": "Password updated."}
+
+
+# ---------------------------------------------------------------------------
+# End-User Management (admin-only)
+# ---------------------------------------------------------------------------
+
+from ..models.end_user import EndUser
+import bcrypt as _bcrypt
+from datetime import datetime, timezone
+
+
+@router.get("/users")
+def list_end_users(
+    current_admin: AdminUser = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+):
+    """List all registered end-users."""
+    users = db.query(EndUser).order_by(EndUser.created_at.desc()).all()
+    return {"users": [u.to_dict() for u in users]}
+
+
+@router.post("/users/register")
+def register_end_user(
+    req: dict,
+    db: Session = Depends(get_db),
+):
+    """Register a new end-user. Requires admin approval before activation."""
+    username = req.get("username", "").strip()
+    password = req.get("password", "")
+    if not username or not password:
+        raise HTTPException(400, "username and password required")
+    if len(password) < 4:
+        raise HTTPException(400, "password too short (min 4 chars)")
+    
+    existing = db.query(EndUser).filter(EndUser.username == username).first()
+    if existing:
+        raise HTTPException(409, f"User '{username}' already exists")
+    
+    user = EndUser(
+        username=username,
+        password_hash=_bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode(),
+        role=req.get("role", "viewer"),
+        is_approved=False,
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return {"created": True, "user": user.to_dict(), "message": "Registration submitted. Awaiting admin approval."}
+
+
+@router.put("/users/{user_id}/approve")
+def approve_end_user(
+    user_id: int,
+    current_admin: AdminUser = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+):
+    """Admin approves an end-user."""
+    user = db.query(EndUser).filter(EndUser.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+    user.is_approved = True
+    user.approved_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"approved": True, "user": user.to_dict()}
+
+
+@router.put("/users/{user_id}")
+def update_end_user(
+    user_id: int,
+    req: dict,
+    current_admin: AdminUser = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+):
+    """Update end-user settings (role, special users, active status)."""
+    user = db.query(EndUser).filter(EndUser.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+    if "role" in req:
+        user.role = req["role"]
+    if "is_active" in req:
+        user.is_active = bool(req["is_active"])
+    if "allowed_special_users" in req:
+        user.allowed_special_users = ",".join(req["allowed_special_users"]) if isinstance(req["allowed_special_users"], list) else req["allowed_special_users"]
+    db.commit()
+    return {"updated": True, "user": user.to_dict()}
+
+
+@router.delete("/users/{user_id}")
+def delete_end_user(
+    user_id: int,
+    current_admin: AdminUser = Depends(require_admin_role),
+    db: Session = Depends(get_db),
+):
+    """Delete an end-user."""
+    user = db.query(EndUser).filter(EndUser.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+    db.delete(user)
+    db.commit()
+    return {"deleted": True}
+
+
+@router.get("/users/deployable")
+def list_deployable_users(
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """List users available for deployment (approved + active + special users)."""
+    users = db.query(EndUser).filter(
+        EndUser.is_approved == True,
+        EndUser.is_active == True,
+    ).all()
+    result = [u.to_dict() for u in users]
+    # Add special functional users
+    specials = ["shared", "public", "internal"]
+    for s in specials:
+        if not any(u["username"] == s for u in result):
+            result.append({"username": s, "role": "special", "is_approved": True, "is_active": True, "allowed_special_users": []})
+    return {"users": sorted(result, key=lambda x: x["username"])}

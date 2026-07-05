@@ -1,35 +1,48 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Typography, Card, Table, Button, Modal, Form, Input,
-  Space, message, Tag, Empty, Tabs, Spin
+  Space, message, Tag, Empty, Tabs, Spin, Checkbox
 } from 'antd'
 import {
   PlusOutlined, DeleteOutlined, FolderOpenOutlined,
   GithubOutlined, UploadOutlined, FileTextOutlined
 } from '@ant-design/icons'
+import Editor, { DiffEditor } from '@monaco-editor/react'
+import { useAuth } from '../hooks/useAuth'
 import client from '../api/client'
 
-const { Title } = Typography
+const { Title, Text } = Typography
 
 interface ServiceInfo {
   name: string; path: string; files: string[]
   has_compose_template: boolean; has_nginx_template: boolean
   has_dockerfile: boolean; active_users: number
   active_instances: string[]; created_at: string
+  generated_files?: string[]
 }
 
 export default function ServicesPage() {
   const { name } = useParams<{ name?: string }>()
   const navigate = useNavigate()
+  const { admin } = useAuth()
+  const isAdmin = admin?.role === 'admin'
   const [services, setServices] = useState<ServiceInfo[]>([])
   const [loading, setLoading] = useState(true)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [addLoading, setAddLoading] = useState(false)
   const [addMode, setAddMode] = useState<'git' | 'upload' | 'template'>('git')
   const [form] = Form.useForm()
+  const [proxyEnabled, setProxyEnabled] = useState(false)
 
-  useEffect(() => { loadServices() }, [])
+  useEffect(() => { loadServices(); loadProxyStatus() }, [])
+
+  const loadProxyStatus = async () => {
+    try {
+      const { data } = await client.get('/system/proxy')
+      setProxyEnabled(data.has_active === true)
+    } catch { /* proxy not configured */ }
+  }
 
   const loadServices = async () => {
     setLoading(true)
@@ -73,19 +86,31 @@ export default function ServicesPage() {
   const columns = [
     { title: 'Name', dataIndex: 'name', key: 'name',
       render: (t: string) => <Button type="link" onClick={() => navigate(`/services/${t}`)}><FolderOpenOutlined /> {t}</Button> },
-    { title: 'Files', dataIndex: 'files', key: 'files',
-      render: (files: string[]) => <Space size={4} wrap>{files.slice(0,5).map(f=><Tag key={f} color="blue">{f}</Tag>)}{files.length>5&&<Tag>+{files.length-5}</Tag>}</Space> },
     { title: 'Templates', key: 'templates',
-      render: (_:any, r:ServiceInfo) => <Space>{r.has_compose_template&&<Tag color="green">Compose</Tag>}{r.has_nginx_template&&<Tag color="purple">Nginx</Tag>}{r.has_dockerfile&&<Tag color="orange">Dockerfile</Tag>}</Space> },
+      render: (_:any, r:ServiceInfo) => {
+        const temps: string[] = []
+        r.files.forEach((f: string) => { if (f.endsWith('.yml.j2')||f.endsWith('.conf.j2')||f.includes('Dockerfile')) temps.push(f) })
+        return <Space size={4} wrap>{temps.map(f=><Tag key={f} color="green" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>)}</Space>
+      }
+    },
+    { title: 'Generated Files', key: 'generated',
+      render: (_:any, r:any) => {
+        const gens = r.generated_files || []
+        return gens.length>0 ? <Space size={4} wrap>{gens.map((f:string)=><Tag key={f} color="gold" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>)}</Space> : <Tag>none</Tag>
+      }
+    },
     { title: 'Actions', key: 'actions',
-      render: (_:any, r:ServiceInfo) => <Button type="text" danger icon={<DeleteOutlined/>} onClick={()=>handleDelete(r.name)}/> },
+      render: (_:any, r:ServiceInfo) => <Space>
+        <Button size="small" type="primary" onClick={()=>navigate(`/services/${r.name}`)}>Deploy</Button>
+        {isAdmin && <Button size="small" danger icon={<DeleteOutlined/>} onClick={()=>handleDelete(r.name)}/>}
+      </Space> },
   ]
 
   return (
     <div>
       <div style={{display:'flex',justifyContent:'space-between',marginBottom:16}}>
         <Title level={3} style={{margin:0}}>Source Projects</Title>
-        <Button type="primary" icon={<PlusOutlined/>} onClick={()=>setAddModalOpen(true)}>Add Project</Button>
+        {isAdmin && <Button type="primary" icon={<PlusOutlined/>} onClick={()=>setAddModalOpen(true)}>Add Project</Button>}
       </div>
       <Card>
         {loading ? <Spin/> : services.length===0 ? <Empty description="No source projects yet"><Button type="primary" icon={<PlusOutlined/>} onClick={()=>setAddModalOpen(true)}>Add Project</Button></Empty> :
@@ -98,15 +123,48 @@ export default function ServicesPage() {
               <Form.Item name="repo_url" label="Repository URL" rules={[{required:true}]}><Input placeholder="https://github.com/user/repo.git"/></Form.Item>
               <Form.Item name="branch" label="Branch" initialValue="main"><Input placeholder="main"/></Form.Item>
               <Form.Item name="name" label="Service Name" rules={[{required:true}]}><Input placeholder="myapp"/></Form.Item>
+              <Form.Item name="use_proxy" valuePropName="checked">
+                <Checkbox disabled={!proxyEnabled}>
+                  Use global proxy for clone
+                  {!proxyEnabled && <span style={{color:'#999',fontSize:12}}> (enable in Settings)</span>}
+                </Checkbox>
+              </Form.Item>
               <Button type="primary" htmlType="submit" loading={addLoading} block>Clone & Create</Button>
             </Form> },
-          { key:'upload', label:<span><UploadOutlined/> Upload Files</span>, children:
+          { key:'upload', label:<span><UploadOutlined/> Upload Zip</span>, children:
             <Form form={form} layout="vertical" onFinish={handleAdd}>
               <Form.Item name="name" label="Service Name" rules={[{required:true}]}><Input placeholder="myapp"/></Form.Item>
-              <Form.Item name="files" label="Files (JSON)"><Input.TextArea rows={6} placeholder='{"docker-compose.yml":"services:...","nginx.conf":"server {...}"}'/></Form.Item>
-              <Button type="primary" htmlType="submit" loading={addLoading} block>Create Service</Button>
+              <Form.Item name="zip_content" label="Zip (base64)" help="Paste base64-encoded zip"><Input.TextArea rows={3} placeholder="UEsDBBQAAAAI..."/></Form.Item>
+              <Form.Item name="files" label="Or files as JSON"><Input.TextArea rows={2} placeholder='{"file":"content"}'/></Form.Item>
+              <Button type="primary" htmlType="submit" loading={addLoading} block>Create from Upload</Button>
             </Form> },
-          { key:'template', label:<span><FileTextOutlined/> From Template</span>, children:<Empty description="Coming soon."/> },
+          { key:'template', label:<span><FileTextOutlined/> From Template</span>, children:
+            <Form form={form} layout="vertical" onFinish={async (values)=>{
+              setAddLoading(true)
+              try {
+                const { data } = await client.post('/llm/generate', {
+                  prompt: `Create a production-ready ${values.template_type||'web app'} service named "${values.name}". Generate docker-compose.yml, nginx.conf, .env, and Dockerfile.`,
+                  generate_type: 'service_config'
+                })
+                // Save generated files
+                await client.post('/services/save-generated', { name: values.name, files: data.files||data })
+                message.success('Service created from template!')
+                setAddModalOpen(false); form.resetFields(); loadServices()
+              } catch (err: any) { message.error(err.response?.data?.detail || 'Generation failed') }
+              finally { setAddLoading(false) }
+            }}>
+              <Form.Item name="name" label="Service Name" rules={[{required:true}]}><Input placeholder="myapp"/></Form.Item>
+              <Form.Item name="template_type" label="Service Type" initialValue="web app">
+                <Input placeholder="e.g. Python FastAPI + Redis, WordPress, Node.js app"/>
+              </Form.Item>
+              <Form.Item name="use_proxy" valuePropName="checked">
+                <Checkbox disabled={!proxyEnabled}>
+                  Use global proxy (for LLM API)
+                  {!proxyEnabled && <span style={{color:'#999',fontSize:12}}> (enable in Settings)</span>}
+                </Checkbox>
+              </Form.Item>
+              <Button type="primary" htmlType="submit" loading={addLoading} block icon={<FileTextOutlined/>}>Generate from Template</Button>
+            </Form> },
         ]}/>
       </Modal>
     </div>
@@ -116,22 +174,67 @@ export default function ServicesPage() {
 function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void }) {
   const [service, setService] = useState<ServiceInfo | null>(null)
   const [fileContent, setFileContent] = useState('')
+  const [headContent, setHeadContent] = useState('')
   const [selectedFile, setSelectedFile] = useState('')
   const [editing, setEditing] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [gitModifiedFiles, setGitModifiedFiles] = useState<Set<string>>(new Set())  // tracked + modified
+  const [gitNewFiles, setGitNewFiles] = useState<Set<string>>(new Set())            // untracked (new)
 
-  useEffect(() => { client.get(`/services/${name}`).then(r=>setService(r.data)).catch(()=>message.error('Failed')) }, [name])
+  useEffect(() => {
+    client.get(`/services/${name}`).then(r=>setService(r.data)).catch(()=>message.error('Failed'))
+    refreshGitStatus()
+  }, [name])
+
+  const refreshGitStatus = async () => {
+    try {
+      const { data } = await client.get(`/services/${name}/git/status`)
+      const modified = new Set<string>()
+      const untracked = new Set<string>()
+      for (const m of (data.modified || [])) { modified.add(m.file) }
+      for (const u of (data.untracked || [])) { untracked.add(u.file) }
+      setGitModifiedFiles(modified)
+      setGitNewFiles(untracked)
+    } catch { /* git not available */ }
+  }
+
+  const loadHeadContent = async (file: string): Promise<string> => {
+    try {
+      const { data } = await client.get(`/services/${name}/git/head-file`, { params: { file } })
+      return (data.content || '').replace(/\r\n/g, '\n')
+    } catch { return '' }
+  }
 
   const loadFile = async (f: string) => {
-    try { const {data}=await client.get(`/services/${name}/files/${f}`); setFileContent(data.content); setSelectedFile(f); setEditing(false) }
-    catch { message.error('Failed to load') }
+    try {
+      const [{ data: fileData }, headText] = await Promise.all([
+        client.get(`/services/${name}/files/${f}`),
+        loadHeadContent(f),
+      ])
+      setFileContent((fileData.content || '').replace(/\r\n/g, '\n'))
+      setHeadContent(headText)
+      setSelectedFile(f)
+      setEditing(false)
+    } catch { message.error('Failed to load file') }
   }
+
   const saveFile = async () => {
     setSaving(true)
-    try { await client.put(`/services/${name}/files/${selectedFile}`,{content:fileContent}); message.success('Saved'); setEditing(false) }
-    catch { message.error('Failed') }
+    try {
+      await client.put(`/services/${name}/files/${selectedFile}`, { content: fileContent })
+      message.success('Saved')
+      setHeadContent(fileContent)
+      setEditing(false)
+      await refreshGitStatus()
+    } catch { message.error('Failed') }
     finally { setSaving(false) }
   }
+
+  const handleCancel = () => {
+    setEditing(false)
+    loadFile(selectedFile)
+  }
+
   const handleConvert = async () => {
     try {
       await client.post(`/services/${name}/convert`,{
@@ -140,6 +243,116 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
       })
       message.success('Converted'); client.get(`/services/${name}`).then(r=>setService(r.data))
     } catch (err:any) { message.error(err.response?.data?.detail||'Failed') }
+  }
+
+  const headLoaded = selectedFile && headContent !== undefined
+  const hasDiff = headLoaded && fileContent !== headContent
+
+  // ---- Build directory tree from flat file list ----
+  type TreeNode = { name: string; isDir: boolean; children: TreeNode[]; hasModified: boolean; hasNew: boolean; fullPath: string }
+  
+  const fileTree = useMemo(() => {
+    if (!service) return []
+    const filtered = service.files.filter((f: string) => {
+      if (f.startsWith('.git/') || f === '.git' || f === '.gitignore' || f === '.gitattributes') return false
+      if (f.startsWith('node_modules/') || f === 'node_modules') return false
+      if (f.startsWith('dist/') && (f.endsWith('.js') || f.endsWith('.map') || f.endsWith('.ts'))) return false
+      if (f.startsWith('.vite/') || f === '.vite') return false
+      return true
+    })
+    
+    const root: Record<string, TreeNode> = {}
+    
+    for (const f of filtered) {
+      const parts = f.split('/')
+      let current = root
+      
+      for (let i = 0; i < parts.length; i++) {
+        const name = parts[i]
+        const isLast = i === parts.length - 1
+        const fullPath = parts.slice(0, i + 1).join('/')
+        
+        if (!current[name]) {
+          current[name] = { name, isDir: !isLast, children: [], hasModified: false, hasNew: false, fullPath }
+          // Link to parent's children array for rendering
+          if (i === 0) {
+            // top-level entry — will be added to result later
+          }
+        }
+        
+        if (isLast) {
+          current[name].isDir = false
+          current[name].hasModified = gitModifiedFiles.has(f)
+          current[name].hasNew = gitNewFiles.has(f)
+        }
+        
+        current = current[name].children as any
+      }
+    }
+    
+    // Convert root map to sorted array
+    const result: TreeNode[] = Object.values(root)
+    // Compute directory-level status (post-order)
+    const computeDirStatus = (nodes: TreeNode[]) => {
+      for (const node of nodes) {
+        if (node.isDir) {
+          computeDirStatus(node.children)
+          node.hasModified = node.children.some(c => c.hasModified)
+          node.hasNew = node.children.some(c => c.hasNew)
+        }
+      }
+    }
+    computeDirStatus(result)
+    
+    // Sort: dirs first, then files; alphabetical within each group
+    const sortNodes = (nodes: TreeNode[]) => {
+      nodes.sort((a, b) => {
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
+        return a.name.localeCompare(b.name)
+      })
+      for (const n of nodes) { if (n.isDir) sortNodes(n.children) }
+    }
+    sortNodes(result)
+    
+    return result
+  }, [service, gitModifiedFiles, gitNewFiles])
+
+  // ---- Recursive file tree renderer ----
+  const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set(['app'])) // 'app' expanded by default
+  
+  const renderTreeNode = (node: TreeNode, depth: number): React.ReactNode => {
+    const isSelected = selectedFile === node.fullPath
+    const isGenerated = (service?.generated_files || []).includes(node.fullPath)
+    const isNew = node.hasNew && !node.hasModified
+    const isModified = node.hasModified
+    const statusColor = isSelected ? '#e6f4ff' : isGenerated ? '#f6ffed' : isNew ? '#f6ffed' : isModified ? '#fff7e6' : 'transparent'
+    
+    if (node.isDir) {
+      const expanded = expandedDirs.has(node.fullPath)
+      return <div key={node.fullPath}>
+        <div
+          onClick={() => setExpandedDirs(prev => { const next = new Set(prev); if (next.has(node.fullPath)) next.delete(node.fullPath); else next.add(node.fullPath); return next })}
+          style={{padding:'6px 12px',cursor:'pointer',borderRadius:4,background:statusColor,marginBottom:2,fontFamily:'monospace',fontSize:13,display:'flex',alignItems:'center',gap:6,paddingLeft:12+depth*16}}
+        >
+          <span>{expanded ? '📂' : '📁'}</span>
+          <span style={{fontWeight:'bold'}}>{node.name}/</span>
+          {node.hasNew && <Tag color="green" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>N</Tag>}
+          {node.hasModified && <Tag color="orange" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>M</Tag>}
+        </div>
+        {expanded && node.children.map(c => renderTreeNode(c, depth + 1))}
+      </div>
+    }
+    
+    // File node
+    return <div key={node.fullPath} onClick={() => loadFile(node.fullPath)}
+      style={{padding:'6px 12px',cursor:'pointer',borderRadius:4,background:statusColor,marginBottom:2,fontFamily:'monospace',fontSize:13,display:'flex',alignItems:'center',gap:6,paddingLeft:12+depth*16}}
+    >
+      <span>{isGenerated?'✨':isNew?'●':'📄'}</span>
+      <span style={{color:isGenerated?'#52c41a':isNew?'#52c41a':isModified?'#faad14':undefined,fontWeight:isGenerated||isNew?'bold':undefined}}>{node.name}</span>
+      {isGenerated && <Tag color="green" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>gen</Tag>}
+      {isNew && <Tag color="green" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>N</Tag>}
+      {isModified && !isNew && <Tag color="orange" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>M</Tag>}
+    </div>
   }
 
   if (!service) return <Spin/>
@@ -154,17 +367,66 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
       </Card>
       <Card title="Files">
         <div style={{display:'flex',gap:16}}>
-          <div style={{width:250,borderRight:'1px solid #f0f0f0',paddingRight:16}}>
-            {service.files.map((f:string)=><div key={f} onClick={()=>loadFile(f)} style={{padding:'8px 12px',cursor:'pointer',borderRadius:4,background:selectedFile===f?'#e6f4ff':'transparent',marginBottom:4,fontFamily:'monospace',fontSize:13}}>📄 {f}</div>)}
+          <div style={{width:280,borderRight:'1px solid #f0f0f0',paddingRight:16,overflow:'auto',maxHeight:'calc(100vh - 300px)'}}>
+            <div style={{marginBottom:8,display:'flex',gap:8,alignItems:'center'}}>
+              <Tag color="green">N</Tag><Text type="secondary" style={{fontSize:11}}>new</Text>
+              <Tag color="orange">M</Tag><Text type="secondary" style={{fontSize:11}}>modified</Text>
+            </div>
+            {fileTree.map(n => renderTreeNode(n, 0))}
           </div>
           <div style={{flex:1}}>
             {selectedFile ? <div>
-              <div style={{marginBottom:8,display:'flex',justifyContent:'space-between'}}>
-                <strong>{selectedFile}</strong>
-                <Space>{editing?<><Button onClick={()=>{setEditing(false);loadFile(selectedFile)}}>Cancel</Button><Button type="primary" onClick={saveFile} loading={saving}>Save</Button></>:<Button onClick={()=>setEditing(true)}>Edit</Button>}</Space>
+              <div style={{marginBottom:8,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <Space>
+                  <strong>{selectedFile}</strong>
+                  {hasDiff && !editing && <Tag color="orange">Modified</Tag>}
+                </Space>
+                <Space>
+                  {editing ? <>
+                    <Button onClick={handleCancel}>Cancel</Button>
+                    <Button type="primary" onClick={saveFile} loading={saving}>Save</Button>
+                  </> : <Button onClick={()=>setEditing(true)}>Edit</Button>}
+                </Space>
               </div>
-              {editing?<Input.TextArea value={fileContent} onChange={e=>setFileContent(e.target.value)} rows={20} style={{fontFamily:'monospace',fontSize:13}}/>:
-              <pre style={{background:'#f5f5f5',padding:16,borderRadius:8,overflow:'auto',maxHeight:500,fontSize:13,fontFamily:'monospace'}}>{fileContent}</pre>}
+              {editing ? (
+                <Editor
+                  height="500px"
+                  width="100%"
+                  defaultLanguage="yaml"
+                  value={fileContent}
+                  onChange={(v)=>setFileContent((v||'').replace(/\r\n/g, '\n'))}
+                  theme="vs-dark"
+                  options={{ minimap:{enabled:false}, fontSize:13, lineNumbers:'on', glyphMargin:true, automaticLayout:true, scrollBeyondLastLine:false, wordWrap:'on' }}
+                />
+              ) : hasDiff ? (
+                <DiffEditor
+                  height="500px"
+                  width="100%"
+                  language="yaml"
+                  original={headContent}
+                  modified={fileContent}
+                  theme="vs-dark"
+                  options={{
+                    minimap: { enabled: false },
+                    fontSize: 13,
+                    lineNumbers: 'on',
+                    automaticLayout: true,
+                    scrollBeyondLastLine: false,
+                    wordWrap: 'on',
+                    readOnly: true,
+                    renderSideBySide: false,
+                  }}
+                />
+              ) : (
+                <Editor
+                  height="500px"
+                  width="100%"
+                  defaultLanguage="yaml"
+                  value={fileContent}
+                  theme="vs-dark"
+                  options={{ minimap:{enabled:false}, fontSize:13, lineNumbers:'on', readOnly:true, automaticLayout:true, scrollBeyondLastLine:false, wordWrap:'on' }}
+                />
+              )}
             </div> : <Empty description="Select a file"/>}
           </div>
         </div>

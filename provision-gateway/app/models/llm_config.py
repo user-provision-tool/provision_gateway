@@ -19,7 +19,7 @@ class LLMConfig(Base):
     byok_api_key_enc = Column(Text, nullable=True)  # AES-256-GCM encrypted
     byok_base_url = Column(String(500), nullable=True)
     byok_model = Column(String(255), nullable=True)
-    is_active = Column(Boolean, nullable=False, default=True)
+    is_active = Column(Boolean, nullable=False, default=False)  # only one at a time
     system_prompt = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 

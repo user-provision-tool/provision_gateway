@@ -31,6 +31,17 @@ body {
   color: #1677ff;
 }
 
+/* Monaco Editor git-like inline diff decorations */
+.modified-line-highlight {
+  background: rgba(226, 183, 20, 0.15) !important;
+}
+
+.modified-line-glyph {
+  background: #e2b714 !important;
+  width: 3px !important;
+  margin-left: 5px;
+}
+
 .setup-container {
   display: flex;
   justify-content: center;

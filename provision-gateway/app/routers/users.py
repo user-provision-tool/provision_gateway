@@ -50,6 +50,15 @@ async def deploy_user(
     db: Session = Depends(get_db),
 ):
     """Deploy a service to a user (proxied to provision-api POST /users)."""
+    # Inject global proxy into build_args if requested
+    use_global_proxy = req.pop("use_global_proxy", False)
+    if use_global_proxy:
+        from ..services.proxy_service import inject_proxy_build_args, has_active_proxy
+        if not has_active_proxy(db):
+            raise HTTPException(400, "Global proxy is not enabled. Configure it in Settings first.")
+        build_args = req.get("build_args") or {}
+        req["build_args"] = inject_proxy_build_args(db, build_args, True)
+
     try:
         result = await provision_service.register_user(**req)
     except Exception as e:
@@ -132,6 +141,74 @@ async def rebuild_user_service(
     return result
 
 
+@router.post("/{user_name}/{service_name}/{label}/up")
+async def start_user_service(
+    user_name: str, service_name: str, label: str,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Start (docker compose up -d) a user's service."""
+    import subprocess
+    from pathlib import Path
+    from ..config import settings
+
+    generated_dir = settings.PROVISION_DIR / "generated"
+    compose_file = generated_dir / f"{user_name}.{service_name}.{label}.docker-compose.yml"
+    # Also check source_projects directory (where provision-api actually writes files)
+    alt_compose = settings.PROVISION_DIR / "source_projects" / service_name / f"docker-compose.user-{user_name}.{label}.yml"
+    if not compose_file.exists() and alt_compose.exists():
+        compose_file = alt_compose
+
+    if not compose_file.exists():
+        raise HTTPException(404, f"Compose file not found: {compose_file} (also tried: {alt_compose})")
+
+    try:
+        subprocess.run(
+            ["docker", "compose", "-f", str(compose_file), "up", "-d"],
+            capture_output=True, text=True, check=True, timeout=60,
+            cwd=str(compose_file.parent),
+        )
+        audit_service.log_action(db, action="start", admin_id=current_admin.id,
+            target_user=user_name, target_service=service_name, target_label=label, status="success")
+        return {"message": "Service started", "status": "up"}
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(500, f"Docker compose up failed: {e.stderr}")
+
+
+@router.post("/{user_name}/{service_name}/{label}/down")
+async def stop_user_service(
+    user_name: str, service_name: str, label: str,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Stop (docker compose stop) a user's service."""
+    import subprocess
+    from pathlib import Path
+    from ..config import settings
+
+    generated_dir = settings.PROVISION_DIR / "generated"
+    compose_file = generated_dir / f"{user_name}.{service_name}.{label}.docker-compose.yml"
+    # Also check source_projects directory
+    alt_compose = settings.PROVISION_DIR / "source_projects" / service_name / f"docker-compose.user-{user_name}.{label}.yml"
+    if not compose_file.exists() and alt_compose.exists():
+        compose_file = alt_compose
+
+    if not compose_file.exists():
+        raise HTTPException(404, f"Compose file not found: {compose_file} (also tried: {alt_compose})")
+
+    try:
+        subprocess.run(
+            ["docker", "compose", "-f", str(compose_file), "stop"],
+            capture_output=True, text=True, check=True, timeout=60,
+            cwd=str(compose_file.parent),
+        )
+        audit_service.log_action(db, action="stop", admin_id=current_admin.id,
+            target_user=user_name, target_service=service_name, target_label=label, status="success")
+        return {"message": "Service stopped", "status": "down"}
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(500, f"Docker compose stop failed: {e.stderr}")
+
+
 @router.put("/{user_name}/{service_name}/{label}/password")
 async def change_user_password(
     user_name: str, service_name: str, label: str,
@@ -148,7 +225,8 @@ async def change_user_password(
     if not passwd:
         raise HTTPException(400, "passwd is required")
 
-    generated_dir = Path("/srv/provision/generated")
+    from ..config import settings
+    generated_dir = settings.PROVISION_DIR / "generated"
     htpasswd_file = generated_dir / f"{user_name}.{service_name}.{label}.htpasswd"
 
     if not htpasswd_file.exists():
@@ -181,7 +259,7 @@ async def get_service_url(
     from pathlib import Path
     import re
 
-    generated_dir = Path("/srv/provision/generated")
+    generated_dir = settings.PROVISION_DIR / "generated"
     nginx_conf = generated_dir / f"{user_name}.{service_name}.{label}.nginx.conf"
 
     server_name = f"{service_name}-{user_name}-{label}.example.com"
