@@ -48,6 +48,15 @@ export default function AppLayout() {
   const [chatLoading, setChatLoading] = useState(false)
 
   const isAdmin = admin?.role === 'admin'
+  const isEndUser = (admin as any)?.user_type === 'end_user'
+  
+  // Determine visible menu items based on user type and role
+  const visibleMenuItems = (() => {
+    if (isAdmin && !isEndUser) return menuItems // Gateway admin: all items
+    if (isEndUser && admin?.role === 'admin') return menuItems // End-user promoted to admin: all items
+    // End-user viewer: only Services page
+    return menuItems.filter(m => m.key === '/users')
+  })()
 
   const handleMenuClick = ({ key }: { key: string }) => {
     navigate(key)
@@ -154,7 +163,7 @@ export default function AppLayout() {
           selectedKeys={[location.pathname.startsWith('/services') ? '/services' :
                          location.pathname.startsWith('/users/manage') ? '/users/manage' :
                          location.pathname.startsWith('/users') ? '/users' : location.pathname]}
-          items={isAdmin ? menuItems : menuItems.filter(m => ['/dashboard','/users','/tasks','/audit'].includes(m.key))}
+          items={visibleMenuItems}
           onClick={handleMenuClick}
         />
       </Sider>

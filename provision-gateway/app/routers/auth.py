@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..middleware import get_current_admin, require_admin_role
+from ..middleware import get_current_admin, get_current_user, require_admin_role
 from ..models.admin import AdminUser
 from ..schemas.auth import (
     LoginRequest,
@@ -66,21 +66,40 @@ def register_admin(
 
 @router.post("/login")
 def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
-    """Authenticate and return JWT tokens."""
-    admin = auth_service.authenticate_admin(db, req.email, req.password)
-    if admin is None:
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-
-    access_token = auth_service.create_access_token(admin.id, admin.email, admin.role)
-    refresh_token = auth_service.create_refresh_token(admin.id, admin.email)
-
-    return {
+    """Authenticate and return JWT tokens. Supports both admin and end-user accounts."""
+    result = auth_service.authenticate_user(db, req.email, req.password)
+    if result is None:
+        raise HTTPException(status_code=401, detail="Invalid email/username or password")
+    
+    user_type, user_info = result
+    
+    access_token = auth_service.create_access_token(
+        user_info["id"], user_info.get("email", user_info.get("username", "")),
+        user_info["role"], user_type
+    )
+    refresh_token = auth_service.create_refresh_token(
+        user_info["id"], user_info.get("email", user_info.get("username", "")),
+        user_type
+    )
+    
+    response = {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
         "expires_in": settings.JWT_EXPIRE_SEC,
-        "admin": admin.to_dict(),
+        "user_type": user_type,
     }
+    
+    if user_type == "admin":
+        response["admin"] = user_info
+    else:
+        response["user"] = {
+            "id": user_info["id"],
+            "username": user_info["username"],
+            "role": user_info["role"],
+        }
+    
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -98,16 +117,30 @@ def refresh_token(req: RefreshRequest, db: Session = Depends(get_db)):
     if payload.get("type") != "refresh":
         raise HTTPException(status_code=401, detail="Not a refresh token")
 
-    admin_id = int(payload.get("sub", 0))
-    admin = auth_service.get_admin_by_id(db, admin_id)
-    if admin is None or not admin.is_active:
-        raise HTTPException(status_code=401, detail="Admin not found or inactive")
+    user_id = int(payload.get("sub", 0))
+    user_type = payload.get("user_type", "admin")
+    email = payload.get("email", "")
+    role = payload.get("role", "viewer")
+    
+    if user_type == "admin":
+        admin = auth_service.get_admin_by_id(db, user_id)
+        if admin is None or not admin.is_active:
+            raise HTTPException(status_code=401, detail="Admin not found or inactive")
+        role = admin.role
+        email = admin.email
+    else:
+        end_user = auth_service.get_end_user_by_id(db, user_id)
+        if end_user is None or not end_user.is_active or not end_user.is_approved:
+            raise HTTPException(status_code=401, detail="User not found, inactive, or not approved")
+        role = end_user.role
+        email = end_user.username
 
-    access_token = auth_service.create_access_token(admin.id, admin.email, admin.role)
+    access_token = auth_service.create_access_token(user_id, email, role, user_type)
     return {
         "access_token": access_token,
         "token_type": "bearer",
         "expires_in": settings.JWT_EXPIRE_SEC,
+        "user_type": user_type,
     }
 
 
@@ -116,9 +149,9 @@ def refresh_token(req: RefreshRequest, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @router.get("/me")
-def get_me(current_admin: AdminUser = Depends(get_current_admin)):
-    """Return the currently authenticated admin's profile."""
-    return current_admin.to_dict()
+def get_me(current_user: dict = Depends(get_current_user)):
+    """Return the currently authenticated user's profile (admin or end-user)."""
+    return current_user
 
 
 # ---------------------------------------------------------------------------
