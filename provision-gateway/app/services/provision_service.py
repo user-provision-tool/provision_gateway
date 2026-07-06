@@ -74,6 +74,36 @@ class ProvisionService:
             json_data=kwargs,
         )
 
+    async def start_user(self, user_name: str, service_name: str, label: str) -> dict[str, Any]:
+        """Start a user's service containers (proxy to provision-api)."""
+        return await self._request(
+            "POST", f"/users/{user_name}/services/{service_name}/{label}/up"
+        )
+
+    async def stop_user(self, user_name: str, service_name: str, label: str) -> dict[str, Any]:
+        """Stop a user's service containers (proxy to provision-api)."""
+        return await self._request(
+            "POST", f"/users/{user_name}/services/{service_name}/{label}/down"
+        )
+
+    async def change_user_password(
+        self, user_name: str, service_name: str, label: str, passwd: str
+    ) -> dict[str, Any]:
+        """Change a user's service password (proxy to provision-api)."""
+        return await self._request(
+            "PUT",
+            f"/users/{user_name}/services/{service_name}/{label}/password",
+            json_data={"passwd": passwd},
+        )
+
+    async def nginx_reconnect_all(self) -> dict[str, Any]:
+        """Reconnect nginx to all user networks (proxy to provision-api)."""
+        return await self._request("POST", "/nginx/reconnect-all")
+
+    async def nginx_connections(self) -> dict[str, Any]:
+        """Get nginx connection state (proxy to provision-api)."""
+        return await self._request("GET", "/nginx/connections")
+
     # ---- Tasks ----
 
     async def list_tasks(self) -> dict[str, Any]:

@@ -147,32 +147,14 @@ async def start_user_service(
     current_admin: AdminUser = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
-    """Start (docker compose up -d) a user's service."""
-    import subprocess
-    from pathlib import Path
-    from ..config import settings
-
-    generated_dir = settings.PROVISION_DIR / "generated"
-    compose_file = generated_dir / f"{user_name}.{service_name}.{label}.docker-compose.yml"
-    # Also check source_projects directory (where provision-api actually writes files)
-    alt_compose = settings.PROVISION_DIR / "source_projects" / service_name / f"docker-compose.user-{user_name}.{label}.yml"
-    if not compose_file.exists() and alt_compose.exists():
-        compose_file = alt_compose
-
-    if not compose_file.exists():
-        raise HTTPException(404, f"Compose file not found: {compose_file} (also tried: {alt_compose})")
-
+    """Start a user's service (delegated to provision-api)."""
     try:
-        subprocess.run(
-            ["docker", "compose", "-f", str(compose_file), "up", "-d"],
-            capture_output=True, text=True, check=True, timeout=60,
-            cwd=str(compose_file.parent),
-        )
-        audit_service.log_action(db, action="start", admin_id=current_admin.id,
-            target_user=user_name, target_service=service_name, target_label=label, status="success")
-        return {"message": "Service started", "status": "up"}
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(500, f"Docker compose up failed: {e.stderr}")
+        result = await provision_service.start_user(user_name, service_name, label)
+    except Exception as e:
+        raise HTTPException(502, f"provision-api error: {e}")
+    audit_service.log_action(db, action="start", admin_id=current_admin.id,
+        target_user=user_name, target_service=service_name, target_label=label, status="success")
+    return result
 
 
 @router.post("/{user_name}/{service_name}/{label}/down")
@@ -181,32 +163,14 @@ async def stop_user_service(
     current_admin: AdminUser = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
-    """Stop (docker compose stop) a user's service."""
-    import subprocess
-    from pathlib import Path
-    from ..config import settings
-
-    generated_dir = settings.PROVISION_DIR / "generated"
-    compose_file = generated_dir / f"{user_name}.{service_name}.{label}.docker-compose.yml"
-    # Also check source_projects directory
-    alt_compose = settings.PROVISION_DIR / "source_projects" / service_name / f"docker-compose.user-{user_name}.{label}.yml"
-    if not compose_file.exists() and alt_compose.exists():
-        compose_file = alt_compose
-
-    if not compose_file.exists():
-        raise HTTPException(404, f"Compose file not found: {compose_file} (also tried: {alt_compose})")
-
+    """Stop a user's service (delegated to provision-api)."""
     try:
-        subprocess.run(
-            ["docker", "compose", "-f", str(compose_file), "stop"],
-            capture_output=True, text=True, check=True, timeout=60,
-            cwd=str(compose_file.parent),
-        )
-        audit_service.log_action(db, action="stop", admin_id=current_admin.id,
-            target_user=user_name, target_service=service_name, target_label=label, status="success")
-        return {"message": "Service stopped", "status": "down"}
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(500, f"Docker compose stop failed: {e.stderr}")
+        result = await provision_service.stop_user(user_name, service_name, label)
+    except Exception as e:
+        raise HTTPException(502, f"provision-api error: {e}")
+    audit_service.log_action(db, action="stop", admin_id=current_admin.id,
+        target_user=user_name, target_service=service_name, target_label=label, status="success")
+    return result
 
 
 @router.put("/{user_name}/{service_name}/{label}/password")
@@ -216,37 +180,22 @@ async def change_user_password(
     current_admin: AdminUser = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
-    """Change a user's htpasswd password directly."""
-    from pathlib import Path
-    import subprocess
-    import bcrypt as _bcrypt
-
+    """Change a user's htpasswd password (delegated to provision-api)."""
     passwd = req.get("passwd", "")
     if not passwd:
         raise HTTPException(400, "passwd is required")
 
-    from ..config import settings
-    generated_dir = settings.PROVISION_DIR / "generated"
-    htpasswd_file = generated_dir / f"{user_name}.{service_name}.{label}.htpasswd"
-
-    if not htpasswd_file.exists():
-        raise HTTPException(404, f"htpasswd file not found: {htpasswd_file}")
-
-    # Generate bcrypt hash in htpasswd-compatible format ($2b$ rounds)
-    passwd_hash = _bcrypt.hashpw(passwd.encode("utf-8"), _bcrypt.gensalt()).decode("utf-8")
-    htpasswd_file.write_text(f"{user_name}:{passwd_hash}\n")
-
-    subprocess.run(
-        ["docker", "exec", "provision-nginx", "nginx", "-s", "reload"],
-        capture_output=True,
-    )
+    try:
+        result = await provision_service.change_user_password(user_name, service_name, label, passwd)
+    except Exception as e:
+        raise HTTPException(502, f"provision-api error: {e}")
 
     audit_service.log_action(
         db, action="password_change", admin_id=current_admin.id,
         target_user=user_name, target_service=service_name,
         target_label=label, status="success",
     )
-    return {"message": "Password updated. Nginx reloaded."}
+    return result
 
 
 @router.get("/{user_name}/{service_name}/{label}/url")
