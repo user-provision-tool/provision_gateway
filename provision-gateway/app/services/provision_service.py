@@ -104,6 +104,20 @@ class ProvisionService:
         """Get nginx connection state (proxy to provision-api)."""
         return await self._request("GET", "/nginx/connections")
 
+    # ---- Reconciliation (proxied to provision-api) ----
+
+    async def reconcile(self) -> dict[str, Any]:
+        """Run a full reconciliation pass (proxy to provision-api)."""
+        return await self._request("POST", "/reconcile")
+
+    async def reconciliation_status(self) -> dict[str, Any]:
+        """Get last reconciliation status (proxy to provision-api)."""
+        return await self._request("GET", "/reconcile/status")
+
+    async def nginx_state(self) -> dict[str, Any]:
+        """Get the full nginx state JSON (proxy to provision-api)."""
+        return await self._request("GET", "/nginx-state")
+
     # ---- Docker / Host stats ----
 
     async def docker_ps(self) -> list[dict[str, Any]]:

@@ -63,10 +63,5 @@ class Settings:
         # ---- Logging ----
         self.LOG_LEVEL: str = os.environ.get("GATEWAY_LOG_LEVEL", "INFO")
 
-        # ---- State file ----
-        self.NGINX_STATE_FILE: Path = (
-            self.PROVISION_DIR / "provision_nginx_state.json"
-        )
-
 
 settings = Settings()
