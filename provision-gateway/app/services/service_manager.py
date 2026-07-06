@@ -214,20 +214,20 @@ class ServiceManager:
     def convert_compose(
         self, service_name: str, compose_file: str
     ) -> dict[str, str]:
-        """Convert a plain docker-compose file to a Jinja2 template.
+        """Mark a plain docker-compose file for template conversion.
         
-        This can either call provision-api's converter or do it locally.
-        For now, we copy the provision-api converter logic.
+        Conversion is handled by provision-api at deploy time.
+        The gateway just copies the file with a .j2 extension as a marker.
         """
-        from .provision_service import provision_service
-        from ..lib.compose_converter import compose_file_to_template
-
         src = self._source_dir / service_name / compose_file
         if not src.exists():
             raise FileNotFoundError(f"Compose file not found: {src}")
 
         template_out = src.parent / f"{src.stem}.yml.j2"
-        compose_file_to_template(str(src), str(template_out), service_name_hint=service_name)
+        # Copy raw content — provision-api's converter handles real transformation at deploy time
+        content = src.read_text()
+        header = f"# Jinja2 compose template — conversion handled by provision-api at deploy time\n# Service: {service_name}\n\n"
+        template_out.write_text(header + content)
         return {
             "compose_template": str(template_out.name),
             "compose_file": compose_file,
@@ -236,15 +236,19 @@ class ServiceManager:
     def convert_nginx(
         self, service_name: str, nginx_file: str, compose_service_names: list[str] | None = None,
     ) -> dict[str, str]:
-        """Convert a plain nginx conf to a Jinja2 template."""
-        from ..lib.nginx_converter import nginx_file_to_template
-
+        """Mark a plain nginx conf for template conversion.
+        
+        Conversion is handled by provision-api at deploy time.
+        The gateway just copies the file with a .j2 extension as a marker.
+        """
         src = self._source_dir / service_name / nginx_file
         if not src.exists():
             raise FileNotFoundError(f"Nginx file not found: {src}")
 
         template_out = src.parent / f"{src.name}.j2"
-        nginx_file_to_template(str(src), str(template_out), service_name, compose_service_names)
+        content = src.read_text()
+        header = f"# Jinja2 nginx template — conversion handled by provision-api at deploy time\n# Service: {service_name}\n\n"
+        template_out.write_text(header + content)
         return {
             "nginx_template": str(template_out.name),
             "nginx_file": nginx_file,
