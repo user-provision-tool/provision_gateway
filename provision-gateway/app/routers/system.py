@@ -13,7 +13,6 @@ from ..middleware import get_current_admin
 from ..models.admin import AdminUser
 from ..models.system_config import SystemConfig
 from ..services.provision_service import provision_service
-from ..services.reconciliation import reconciliation_service
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -161,11 +160,11 @@ async def trigger_reconciliation(
     current_admin: AdminUser = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
-    """Run a full nginx upstream reconciliation."""
+    """Run a full nginx upstream reconciliation (proxied to provision-api)."""
     from ..services.audit_service import log_action
 
     try:
-        report = await reconciliation_service.run_reconciliation()
+        result = await provision_service.reconcile()
     except Exception as e:
         log_action(
             db, action="reconcile", admin_id=current_admin.id,
@@ -173,50 +172,34 @@ async def trigger_reconciliation(
         )
         raise HTTPException(500, f"Reconciliation failed: {e}")
 
+    report = result.get("report", {})
     log_action(
         db, action="reconcile", admin_id=current_admin.id,
         status="success",
         detail={
-            "total_upstreams": report["total_upstreams"],
-            "reachable": report["reachable"],
-            "unreachable": report["unreachable"],
+            "total_upstreams": report.get("total_upstreams", 0),
+            "reachable": report.get("reachable", 0),
+            "unreachable": report.get("unreachable", 0),
         },
     )
 
-    return {"message": "Reconciliation completed.", "report": report}
+    return result
 
 
 @router.get("/reconcile/status")
 async def reconciliation_status(
     current_admin: AdminUser = Depends(get_current_admin),
 ):
-    """Get the last reconciliation status from the state file."""
-    state = await reconciliation_service.get_state()
-    last_run = state.get("last_updated")
-    upstreams = state.get("upstreams", [])
-
-    reachable = sum(1 for u in upstreams if u.get("reachable") is True)
-    unreachable = sum(1 for u in upstreams if u.get("reachable") is False)
-
-    return {
-        "last_run": last_run,
-        "result": {
-            "total_upstreams": len(upstreams),
-            "reachable": reachable,
-            "unreachable": unreachable,
-            "unreachable_details": [
-                u for u in upstreams if u.get("reachable") is False
-            ],
-        },
-    }
+    """Get the last reconciliation status (proxied to provision-api)."""
+    return await provision_service.reconciliation_status()
 
 
 @router.get("/nginx-state")
 async def get_nginx_state(
     current_admin: AdminUser = Depends(get_current_admin),
 ):
-    """Get the full nginx state JSON."""
-    return await reconciliation_service.get_state()
+    """Get the full nginx state JSON (proxied to provision-api)."""
+    return await provision_service.nginx_state()
 
 
 # ---------------------------------------------------------------------------
