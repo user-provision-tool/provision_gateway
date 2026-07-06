@@ -11,8 +11,7 @@ from ..config import settings
 from ..database import get_db
 from ..middleware import get_current_admin
 from ..models.admin import AdminUser
-from ..models.system_config import SystemConfig  # ensure table creation
-from ..services import docker_service
+from ..models.system_config import SystemConfig
 from ..services.provision_service import provision_service
 from ..services.reconciliation import reconciliation_service
 
@@ -34,27 +33,35 @@ async def system_status(
     except Exception:
         provision_api_status["status"] = "unreachable"
 
-    # Per-component status from Docker
+    # Per-component status from Docker (via provision-api)
     components = {}
     for name in ["provision-api", "provision-nginx", "provision-gateway", "provision-dashboard"]:
-        running = docker_service.container_running(name)
-        exists = docker_service.container_exists(name)
+        try:
+            running = await provision_service.container_running(name)
+            exists = await provision_service.container_exists(name)
+        except Exception:
+            running = False; exists = False
         components[name] = {
             "running": running,
             "exists": exists,
             "status": "running" if running else ("stopped" if exists else "not found"),
         }
 
-    total, running_count = docker_service.get_container_count()
-    host_stats = docker_service.get_host_stats()
+    # Docker info + host stats (via provision-api)
+    try:
+        host_stats = await provision_service.host_stats()
+    except Exception:
+        host_stats = {}
+    try:
+        docker_info_data = await provision_service.docker_info()
+    except Exception:
+        docker_info_data = {}
 
     docker_host = {
-        "containers_total": total,
-        "containers_running": running_count,
+        "containers_total": docker_info_data.get("containers_total", 0),
+        "containers_running": docker_info_data.get("containers_running", 0),
         "cpu_percent": host_stats.get("cpu_percent", 0),
         "mem_percent": host_stats.get("mem_percent", 0),
-        "mem_total_mb": host_stats.get("mem_total_mb", 0),
-        "mem_used_mb": host_stats.get("mem_used_mb", 0),
         "disk_percent": host_stats.get("disk_percent", 0),
     }
 
@@ -112,9 +119,15 @@ async def system_stats(
     detail: bool = Query(False),
     current_admin: AdminUser = Depends(get_current_admin),
 ):
-    """Get detailed system stats including per-container metrics."""
-    containers = docker_service.docker_ps()
-    stats = docker_service.docker_stats_snapshot()
+    """Get detailed system stats including per-container metrics (via provision-api)."""
+    try:
+        containers = await provision_service.docker_ps()
+    except Exception:
+        containers = []
+    try:
+        stats = await provision_service.docker_stats()
+    except Exception:
+        stats = []
 
     stats_map = {s["name"]: s for s in stats}
     merged = []
@@ -134,10 +147,11 @@ async def system_stats(
     result = {"containers": merged}
 
     if detail:
-        host_stats = docker_service.get_host_stats()
-        prov_size = docker_service.get_provision_dir_size()
+        try:
+            host_stats = await provision_service.host_stats()
+        except Exception:
+            host_stats = {}
         result["host"] = host_stats
-        result["provision_dir"] = prov_size
 
     return result
 
