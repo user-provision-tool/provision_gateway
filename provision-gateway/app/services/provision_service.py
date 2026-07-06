@@ -104,6 +104,34 @@ class ProvisionService:
         """Get nginx connection state (proxy to provision-api)."""
         return await self._request("GET", "/nginx/connections")
 
+    # ---- Docker / Host stats ----
+
+    async def docker_ps(self) -> list[dict[str, Any]]:
+        return await self._request("GET", "/docker/ps")
+
+    async def docker_stats(self) -> list[dict[str, Any]]:
+        return await self._request("GET", "/docker/stats")
+
+    async def docker_info(self) -> dict[str, Any]:
+        return await self._request("GET", "/docker/info")
+
+    async def host_stats(self) -> dict[str, Any]:
+        return await self._request("GET", "/host/stats")
+
+    async def container_exists(self, container: str) -> bool:
+        r = await self._request("GET", f"/docker/container/{container}/exists")
+        return r.get("exists", False)
+
+    async def container_running(self, container: str) -> bool:
+        r = await self._request("GET", f"/docker/container/{container}/running")
+        return r.get("running", False)
+
+    async def network_connect(self, network: str, container: str) -> dict[str, Any]:
+        return await self._request("POST", f"/docker/network/{network}/connect/{container}")
+
+    async def nginx_reload(self, container: str = "provision-nginx") -> dict[str, Any]:
+        return await self._request("POST", "/docker/nginx/reload", params={"container": container})
+
     # ---- Tasks ----
 
     async def list_tasks(self) -> dict[str, Any]:

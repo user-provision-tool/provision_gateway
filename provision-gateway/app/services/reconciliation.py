@@ -1,4 +1,7 @@
-"""Reconciliation service — verifies nginx upstreams match running containers."""
+"""Reconciliation service — verifies nginx upstreams match running containers.
+
+All Docker operations are delegated to provision-api via ProvisionService.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import settings
-from .docker_service import container_running, container_exists, network_connect, nginx_reload
+from .provision_service import provision_service
 
 
 class ReconciliationService:
@@ -57,13 +60,15 @@ class ReconciliationService:
                         target_container = url_match.group(1)
                         upstream["target_container"] = target_container
 
-                        if container_running(target_container):
+                        running = await provision_service.container_running(target_container)
+                        exists = await provision_service.container_exists(target_container)
+                        if running:
                             upstream["reachable"] = True
                             reachable += 1
                         else:
                             upstream["reachable"] = False
                             unreachable += 1
-                            reason = "container not running" if container_exists(target_container) else "container not found"
+                            reason = "container not running" if exists else "container not found"
                             upstream["reason"] = reason
                             unreachable_details.append({
                                 "upstream": proxy_pass,
@@ -95,14 +100,21 @@ class ReconciliationService:
                     label = match.group(3)
                     network_name = f"{service_name}-user_{user_name}-{label}"
 
-                    # Try connecting provision-nginx to this network
-                    if network_connect("provision-nginx", network_name):
+                    # Try connecting provision-nginx to this network (via provision-api)
+                    try:
+                        await provision_service.network_connect(network_name, "provision-nginx")
                         networks_reconnected += 1
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
-        # Reload nginx
-        nginx_reloaded = nginx_reload()
+        # Reload nginx (via provision-api)
+        try:
+            await provision_service.nginx_reload()
+            nginx_reloaded = True
+        except Exception:
+            nginx_reloaded = False
 
         # Build report
         report = {
