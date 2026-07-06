@@ -61,7 +61,7 @@ def compose_file_to_template(
     lines.append(_make_header(src_to_key, service_name_hint))
     
     # Write transformed YAML
-    transformed = _transform_services(content, src_to_key, service_name_hint)
+    transformed = _transform_services(content, src_to_key, service_name_hint, services)
     lines.append(transformed)
     
     dst = Path(dst_path)
@@ -112,14 +112,33 @@ def _make_header(src_to_key: dict, hint: str) -> str:
     return "\n".join(lines)
 
 
-def _transform_services(content: str, src_to_key: dict, hint: str) -> str:
+def _transform_services(content: str, src_to_key: dict, hint: str, services: dict | None = None) -> str:
     """Apply Jinja2 template transformations to the compose content."""
     text = content
     
-    # container_name → {{ container_prefix }}<svc>
+    # container_name → {{ container_prefix }}<svc_key>
+    # Use the full service key from the parsed YAML "services:" section.
+    # Build a map of original container_name → correct service key suffix.
+    container_to_svc: dict[str, str] = {}
+    if services:
+        for svc_key, svc_def in services.items():
+            if isinstance(svc_def, dict):
+                orig = svc_def.get("container_name", "")
+                if orig:
+                    container_to_svc[orig] = svc_key
+    
+    def _replace_container(m: re.Match) -> str:
+        original = m.group(2)
+        # Use the full service key if known, otherwise fall back to the old heuristic
+        if original in container_to_svc:
+            svc = container_to_svc[original]
+        else:
+            svc = _extract_svc(original)
+        return f"{m.group(1)}{{{{ container_prefix }}}}{svc}"
+    
     text = re.sub(
         r'(\s+container_name:\s*)(\S+)',
-        lambda m: f"{m.group(1)}{{{{ container_prefix }}}}{_extract_svc(m.group(2))}",
+        _replace_container,
         text,
     )
     
