@@ -1,7 +1,7 @@
 # Provision Gateway — Features Status
 
-> **Version**: 1.0
-> **Date**: 2026-07-05
+> **Version**: 1.1
+> **Date**: 2026-07-08 (updated — post-deduplication refactor)
 > **Purpose**: Quick reference and implementation status tracker for all features.
 
 ---
@@ -32,6 +32,8 @@
 | A8 | End-user role management | ✅ | `PUT /api/auth/users/{id}` |
 | A9 | Special users assignment | ✅ | Per-user `allowed_special_users` |
 | A10 | Deployable users list | ✅ | `GET /api/auth/users/deployable` |
+| A11 | End-user login (JWT with user_type) | ✅ | `POST /api/auth/login` supports both admin and end-user |
+| A12 | Role-based sidebar filtering | ✅ | End-user viewers see only Services page |
 
 ---
 
@@ -39,12 +41,12 @@
 
 | # | Feature | Status | Notes |
 |---|---|---|---|
-| D1 | System health stats | ✅ | Service/User/Task/Container counts |
+| D1 | System health stats | ✅ | Service/User/Task/Container counts (registry-based) |
 | D2 | CPU/RAM/Disk gauges | ✅ | Circular progress with >80% warning |
 | D3 | System components table | ✅ | provision-api, nginx, gateway, dashboard status |
 | D4 | Global proxy status card | ✅ | Enabled/disabled + reachability |
-| D5 | User summary cards | ✅ | Per-user healthy/unhealthy counts |
-| D6 | Reconcile button | ✅ | Triggers nginx upstream reconciliation |
+| D5 | Container stats breakdown | ✅ | Registry-based: healthy/running, unhealthy, restarting, down, missing |
+| D6 | Reconcile button | ✅ | Triggers nginx upstream reconciliation (proxied to provision-api) |
 | D7 | Auto-polling (10s) | ✅ | Live indicator shown |
 | D8 | Task notifications | ✅ | Browser notifications + toasts for completed/failed |
 
@@ -79,8 +81,8 @@
 | P2 | Clone all: User A → User B | ✅ | Auto-remaps volumes and domains |
 | P3 | Rebuild service | ✅ | Async task with no-cache option |
 | P4 | Remove service | ✅ | With confirmation dialog |
-| P5 | Service Up (docker compose up) | ✅ | Direct Docker CLI call |
-| P6 | Service Down (docker compose stop) | ✅ | Direct Docker CLI call |
+| P5 | Service Up (docker compose up) | ✅ | Delegated to provision-api; triggered by Play/Pause toggle |
+| P6 | Service Down (docker compose stop) | ✅ | Delegated to provision-api; triggered by Play/Pause toggle |
 | P7 | Service password management | ✅ | Re-hash, rewrite .htpasswd, nginx reload |
 | P8 | Duplicate service to another user | ✅ | Same config, new user |
 | P9 | Batch operations | 🔴 | Multi-select not yet implemented |
@@ -95,7 +97,8 @@
 | U1 | Service URL display | ✅ | HTTPS/HTTP URLs with clickable links |
 | U2 | Test curl from gateway | ✅ | Shows HTTP status, headers, body preview, time |
 | U3 | Auth test (include credentials) | ✅ | Optional basic auth in test curl |
-| U4 | SSL cert file display | 🟡 | Paths shown, could be more prominent |
+| U4 | SSL cert file display | ✅ | SSL Certs page: list, upload, refresh, delete |
+| U5 | SSL cert selection in deploy form | ✅ | Searchable Select dropdown, auto-fills domain + paths |
 
 ---
 

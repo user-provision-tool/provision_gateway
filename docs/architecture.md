@@ -1,8 +1,8 @@
 # Provision Gateway — Architecture Document
 
-> **Version**: 1.0
-> **Date**: 2026-07-05
-> **Status**: Current (reflects implemented codebase)
+> **Version**: 1.1
+> **Date**: 2026-07-08 (updated)
+> **Status**: Current (reflects implemented codebase, post-deduplication refactor)
 
 ---
 
@@ -78,24 +78,26 @@ Provision Gateway is a **management layer** that wraps the existing `provision-a
 
 | Container | Image | Ports | Network | Purpose |
 |---|---|---|---|---|
-| `provision-gateway` | `python:3.13-slim` + custom | 8770 (internal) | `provision_default` | Backend API + business logic |
-| `provision-dashboard` | `nginx:alpine` + React build | 8771→80 (localhost only) | `provision_default` | Web UI serving + API proxy |
-| `provision-mcp` | `python:3.13-slim` + custom | 8780 (internal) | `provision_default` | MCP server for external AI agents |
-| `provision-api` | External dependency | 8765→8000 | `provision_default` | User provisioning operations |
-| `provision-nginx` | External dependency | 99→80, 1993→443 | `provision_default` + per-user networks | End-user service ingress |
+| `provision-gateway` | `python:3.13-slim` + custom | 8770 (internal) | `users_provision_default` | Backend API + business logic |
+| `provision-dashboard` | `nginx:alpine` + React build | 8771→80 (localhost only) | `users_provision_default` | Web UI serving + API proxy |
+| `provision-mcp` | `python:3.13-slim` + custom | 8780 (internal) | `users_provision_default` | MCP server for external AI agents |
+| `provision-api` | External dependency | 8765→8000 | `users_provision_default` | User provisioning operations |
+| `provision-nginx` | External dependency | 99→80, 1993→443 | `users_provision_default` + per-user networks | End-user service ingress |
 
 ### 2.2 Container Responsibilities
 
 #### provision-gateway (Backend)
 - FastAPI application serving REST API
-- SQLite database for admin users, audit logs, LLM config, proxy config
-- JWT authentication and authorization
-- Docker socket access for container management, stats, reconciliation
+- SQLite database for admin users, end users, audit logs, LLM config, proxy config
+- JWT authentication and authorization (admin + end-user)
+- All Docker operations proxied to provision-api (no direct Docker socket access)
+- All compose/nginx template conversion delegated to provision-api
 - File operations on shared `PROVISION_DIR` volume
 - LLM client for config generation (BYOK + local agent modes)
 - Proxy configuration management
 - Git operations for service source management
-- Async proxy to provision-api
+- Async HTTP proxy to provision-api for all user provisioning operations
+- SSL certificate management (proxied to provision-api)
 
 #### provision-dashboard (Frontend)
 - Nginx serving React SPA (built with Vite)
@@ -117,7 +119,7 @@ Provision Gateway is a **management layer** that wraps the existing `provision-a
 ### 3.1 Docker Networks
 
 ```
-provision_default (shared management network)
+users_provision_default (shared management network)
 ├── provision-gateway       (8770)
 ├── provision-dashboard     (8771 → 80)
 ├── provision-mcp           (8780)
@@ -145,7 +147,6 @@ Per-User Networks (isolated)
 | Dashboard → Gateway | HTTP | JWT Bearer | Internal Docker DNS |
 | MCP → Gateway | HTTP | JWT Bearer | Internal Docker DNS |
 | Gateway → provision-api | HTTP | None | Internal Docker DNS |
-| Gateway → Docker Socket | Unix Socket | None | Read-only mount |
 | End User → provision-nginx | HTTP/HTTPS | HTTP Basic Auth (htpasswd) | Public |
 | End User → Service Container | HTTP | Service-specific | Via provision-nginx proxy |
 
@@ -184,26 +185,21 @@ app/
 │   └── audit.py         # /api/audit/* (query with filters)
 │
 ├── services/            # Business Logic Services
-│   ├── auth_service.py      # bcrypt hash/verify, JWT create/decode
-│   ├── provision_service.py # Async HTTP proxy to provision-api
-│   ├── service_manager.py   # File ops, git clone, template conversion
+│   ├── auth_service.py      # bcrypt hash/verify, JWT create/decode, end-user auth
+│   ├── provision_service.py # Async HTTP proxy to provision-api (all ops)
+│   ├── service_manager.py   # File ops, git clone, template conversion (delegated)
 │   ├── llm_service.py       # LLM client, config generation
-│   ├── docker_service.py    # Docker CLI wrapper (ps, stats, info)
-│   ├── reconciliation.py    # Nginx upstream/network reconciliation
 │   ├── curl_service.py      # URL testing via subprocess curl
 │   ├── audit_service.py     # Audit log writer + querier
 │   └── proxy_service.py     # Proxy config CRUD + env injection
 │
 ├── middleware/           # Middleware
-│   └── auth_middleware.py   # JWT verification dependency
+│   ├── __init__.py          # JWT verification (get_current_admin, get_current_user, require_admin_role)
 │
-├── lib/                 # Template Converters
-│   ├── compose_converter.py # docker-compose.yml → .yml.j2
-│   └── nginx_converter.py   # nginx.conf → .conf.j2
+├── lib/                 # Shared utilities (no converters — delegated to provision-api)
 │
 └── utils/               # Utilities
     ├── crypto.py            # AES-256-GCM encrypt/decrypt
-    ├── nginx_parser.py      # Parse nginx conf → upstreams
     └── file_scanner.py      # Scan repo → RepoContext for LLM
 ```
 
@@ -247,19 +243,20 @@ gateway.db
 ```
 Request → FastAPI Router
     → get_db()           (DB session)
-    → get_current_admin() (JWT verification → lookup admin)
+    → get_current_admin() OR get_current_user() (JWT verification → lookup)
     → require_admin_role()(role check: admin vs viewer)
     → Service Layer      (business logic)
     → Response
 ```
 
+`get_current_user()` supports both admin (gateway admins) and end-user (portal users) tokens. It returns a unified dict with keys: `id`, `email`, `role`, `user_type`. The JWT `user_type` claim (`admin` or `end_user`) determines which table is queried.
+
 ### 4.4 Singleton Services
 
 | Service | Singleton | Purpose |
 |---|---|---|
-| `provision_service` | Yes | HTTP client for provision-api |
+| `provision_service` | Yes | HTTP client for provision-api (all Docker, reconciliation, SSL, user ops) |
 | `service_manager` | Yes | File operations on PROVISION_DIR |
-| `reconciliation_service` | Yes | Nginx state management |
 | `llm_service` | Yes | LLM client and config generation |
 
 ---
@@ -302,9 +299,12 @@ main.tsx (Entry Point)
                     │   └── SpecialUsersPanel
                     ├── /audit → AuditPage
                     │   └── FilterableTable + CSV export
-                    └── /users/manage → UserManagementPage
-                        ├── UserTable (register, approve, delete)
-                        └── SpecialUsersModal (per-user assignment)
+                    ├── /users/manage → UserManagementPage
+                    │   ├── UserTable (register, approve, delete)
+                    │   └── SpecialUsersModal (per-user assignment)
+                    └── /ssl → SSLPage
+                        ├── CertTable (domain, cert, key, expiry, actions)
+                        └── AddCertModal (domain + ssl path upload)
 ```
 
 ### 5.2 State Management

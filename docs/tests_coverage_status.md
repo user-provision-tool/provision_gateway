@@ -1,7 +1,7 @@
 # Provision Gateway — Tests Coverage Status
 
-> **Version**: 1.0
-> **Date**: 2026-07-05
+> **Version**: 1.1
+> **Date**: 2026-07-08 (updated — post-deduplication refactor)
 > **Status**: Current state of test coverage
 
 ---
@@ -22,13 +22,15 @@
 
 | File | Language | Type | Test Cases | Status |
 |---|---|---|---|---|
-| `test_unit.py` | Python (pytest) | Unit | 5 | ✅ Passing |
+| `test_unit.py` | Python (pytest) | Unit | 19 | ✅ Passing |
 | `test_proxy.py` | Python (pytest) | Unit | 8 | ✅ Passing |
-| `test_integration.py` | Python (subprocess) | Integration | 6 | ✅ Passing |
+| `test_integration.py` | Python (subprocess) | Integration | 9 | ✅ Passing |
 | `test_integration.sh` | Bash | Integration | 9 | ✅ Passing |
 | `test_deploy.sh` | Bash | Integration | 9 | ✅ Passing |
 | `test_proxy.sh` | Bash | Integration | 12 | ✅ Passing |
-| **Total** | | | **49** | |
+| `test_gateway_api.sh` | Bash | Integration | 347 lines (comprehensive) | ✅ Passing |
+| `test_provision_api.sh` | Bash | Integration | 252 lines (comprehensive) | ✅ Passing |
+| **Total** | | | **65+** | |
 
 ### 1.2 Test Execution
 
@@ -46,6 +48,8 @@ python tests/test_integration.py
 bash tests/test_integration.sh
 bash tests/test_deploy.sh
 bash tests/test_proxy.sh
+bash tests/test_gateway_api.sh
+bash tests/test_provision_api.sh
 ```
 
 ---
@@ -56,30 +60,28 @@ bash tests/test_proxy.sh
 
 | Service Module | Unit Tests | Integration Tests | Coverage |
 |---|---|---|---|
-| `auth_service.py` | 4 (hash, verify, JWT create/decode, invalid token) | 2 (login flow, refresh) | 🟢 Good |
+| `auth_service.py` | 4 (hash, verify, JWT, end-user auth) | 3 (login, refresh, end-user login) | 🟢 Good |
 | `proxy_service.py` | 3 (env injection, disabled proxy) | 12 (full CRUD, deploy integration) | 🟢 Good |
-| `provision_service.py` | 0 | 3 (list users, get user, error handling) | 🟡 Partial |
+| `provision_service.py` | 14 (method existence checks) | 3 (list users, get user, error handling) | 🟢 Good |
 | `service_manager.py` | 0 | 1 (list services) | 🔴 None |
 | `llm_service.py` | 0 | 0 | 🔴 None |
-| `docker_service.py` | 0 | 1 (system status includes docker) | 🔴 Minimal |
-| `reconciliation.py` | 0 | 0 | 🔴 None |
 | `curl_service.py` | 0 | 0 | 🔴 None |
 | `audit_service.py` | 0 | 2 (list audit, filter by action) | 🟡 Partial |
-| `compose_converter.py` | 0 | 0 | 🔴 None |
-| `nginx_converter.py` | 0 | 0 | 🔴 None |
-| `file_scanner.py` | 0 | 0 | 🔴 None |
-| `nginx_parser.py` | 0 | 0 | 🔴 None |
 | `crypto.py` | 4 (encrypt/decrypt, empty, invalid, uniqueness) | 0 | 🟢 Good |
+
+> **Removed modules** (no longer exist in gateway — delegated to provision-api):
+> - `docker_service.py`, `reconciliation.py`, `compose_converter.py`, `nginx_converter.py`, `nginx_parser.py`
+> - Architecture validation tests (`test_unit.py`) verify these files are deleted and the gateway does not duplicate provision-api logic.
 
 ### 2.2 Backend Routers
 
 | Router | Unit Tests | Integration Tests | Coverage |
 |---|---|---|---|
-| `auth.py` | 0 | 4 (setup, login, me, refresh) | 🟡 Partial |
-| `system.py` | 0 | 2 (status, proxy CRUD) | 🟡 Partial |
+| `auth.py` | 0 | 5 (setup, login, me, refresh, end-user login) | 🟡 Partial |
+| `system.py` | 0 | 4 (status, proxy CRUD, SSL certs) | 🟡 Partial |
 | `services.py` | 0 | 1 (list) | 🔴 Minimal |
-| `users.py` | 0 | 5 (deploy variations, error cases) | 🟡 Partial |
-| `tasks.py` | 0 | 1 (list) | 🔴 Minimal |
+| `users.py` | 0 | 7 (deploy, up/down, password, container logs, error cases) | 🟡 Partial |
+| `tasks.py` | 0 | 5 (list, SSE log streaming, cancel, invalid task handling) | 🟡 Partial |
 | `llm.py` | 0 | 0 | 🔴 None |
 | `audit.py` | 0 | 2 (list, filter) | 🟡 Partial |
 

@@ -1,7 +1,7 @@
 # Provision Gateway — Workflows of Important Usage Scenarios (WebUI)
 
-> **Version**: 1.0
-> **Date**: 2026-07-05
+> **Version**: 1.1
+> **Date**: 2026-07-08 (updated)
 > **Purpose**: Step-by-step WebUI workflows verified against the actual dashboard at `http://localhost:8771`.
 
 ---
@@ -16,16 +16,17 @@
 6. [Source Projects — File Editor with Git Diff](#6-source-projects--file-editor-with-git-diff)
 7. [Source Projects — Convert to Templates](#7-source-projects--convert-to-templates)
 8. [Services — Deploy to User](#8-services--deploy-to-user)
-9. [Services — Up/Down/Rebuild/Redeploy/Delete](#9-services--updownrebuildredeploydelete)
+9. [Services — Play/Pause/Rebuild/Redeploy/Delete](#9-services--playpauserebuildredeploydelete)
 10. [Services — Clone All Between Users](#10-services--clone-all-between-users)
 11. [Services — Change Password & Test Connectivity](#11-services--change-password--test-connectivity)
 12. [Tasks — Monitor & View Logs](#12-tasks--monitor--view-logs)
-13. [Settings — LLM Configuration](#13-settings--llm-configuration)
-14. [Settings — Global Proxy](#14-settings--global-proxy)
-15. [Settings — Special Functional Users](#15-settings--special-functional-users)
-16. [Audit — Query & Export](#16-audit--query--export)
-17. [User Management — Register, Approve, Assign Roles](#17-user-management--register-approve-assign-roles)
-18. [Troubleshoot Chat](#18-troubleshoot-chat)
+13. [SSL Certificates — Upload & Manage](#13-ssl-certificates--upload--manage)
+14. [Settings — LLM Configuration](#14-settings--llm-configuration)
+15. [Settings — Global Proxy](#15-settings--global-proxy)
+16. [Settings — Special Functional Users](#16-settings--special-functional-users)
+17. [Audit — Query & Export](#17-audit--query--export)
+18. [User Management — Register, Approve, Assign Roles](#18-user-management--register-approve-assign-roles)
+19. [Troubleshoot Chat](#19-troubleshoot-chat)
 
 ---
 
@@ -253,7 +254,7 @@
 
 ---
 
-## 9. Services — Up/Down/Rebuild/Redeploy/Delete
+## 9. Services — Play/Pause/Rebuild/Redeploy/Delete
 
 **Goal:** Manage the lifecycle of deployed services.
 
@@ -263,28 +264,29 @@
 
 | Button | Icon | Action | API Call |
 |---|---|---|---|
-| **Up** | ⬆ arrow | `docker compose up -d` | `POST /users/{u}/{s}/{l}/up` |
-| **Down** | ⬇ arrow | `docker compose stop` | `POST /users/{u}/{s}/{l}/down` |
+| **Play/Pause** (toggle) | ▶ play / ⏸ pause | Toggle container state | `POST /users/{u}/{s}/{l}/up` or `POST /users/{u}/{s}/{l}/down` |
 | **Rebuild** | Text button | Rebuild with async task | `POST /users/{u}/{s}/{l}/rebuild` |
 | **Redeploy** | 🚀 rocket | Redeploy (same config, no_cache) | `POST /users/{u}/{s}/{l}/rebuild` (no_cache=true) |
 | **Key** | 🔑 key icon | Change password modal | `PUT /users/{u}/{s}/{l}/password` |
 | **Dup** | 📋 copy icon | Duplicate to another user | `POST /users/deploy` (same config, new user) |
 | **Delete** | 🗑 trash icon | Remove service (with confirmation) | `DELETE /users/{u}/{s}/{l}` |
 
+> **Note**: Up and Down operations are delegated to provision-api. The Play/Pause button auto-detects container state (running → shows pause icon, stopped → shows play icon).
+
 **Service Card Expansion (click to expand):**
 - Status badge (Running / N up, M down)
 - Per-container status tags
 - URL (clickable) with **Test** button
-- Deployment file links (compose template, nginx template, .env, generated compose/nginx)
+- Deployment file links (plain text with directory context)
 - Volume info
-- SSL file info
+- SSL file info (if HTTPS enabled)
 
 **API calls for expansion:**
 - `POST /users/{u}/{s}/{l}/test-curl` → Test URL connectivity
-- Docker inspect calls for container status
+- `GET /users/{u}/{s}/{l}/containers/{c}/logs?tail=100` → Container logs (proxied to provision-api)
 
 **Verification:**
-- Up/Down instantly changes container status
+- Play/Pause instantly changes container status
 - Rebuild creates a task visible on Tasks page
 - Delete removes the service card after confirmation
 

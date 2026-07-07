@@ -1,7 +1,7 @@
 # Provision Gateway — Workflows of Important Usage Scenarios (APIs)
 
-> **Version**: 1.0
-> **Date**: 2026-07-05
+> **Version**: 1.1
+> **Date**: 2026-07-08 (updated)
 > **Purpose**: Step-by-step API workflows for the most important usage scenarios, directly usable with `curl` or any HTTP client.
 
 ---
@@ -10,22 +10,25 @@
 
 1. [First-Time Setup](#1-first-time-setup)
 2. [Admin Authentication Flow](#2-admin-authentication-flow)
-3. [Add Service from Git Repository](#3-add-service-from-git-repository)
-4. [Add Service from File Upload](#4-add-service-from-file-upload)
-5. [Edit Service Files (with Git Diff)](#5-edit-service-files-with-git-diff)
-6. [Convert to Jinja2 Templates](#6-convert-to-jinja2-templates)
-7. [Deploy Service to User](#7-deploy-service-to-user)
-8. [Monitor Deploy Task (with Log Streaming)](#8-monitor-deploy-task-with-log-streaming)
-9. [Clone All Services Between Users](#9-clone-all-services-between-users)
-10. [Manage Service Lifecycle (Up/Down/Rebuild/Delete)](#10-manage-service-lifecycle-updownrebuilddelete)
-11. [Change Service Password](#11-change-service-password)
-12. [Test Service Connectivity (curl)](#12-test-service-connectivity-curl)
-13. [System Monitoring & Reconciliation](#13-system-monitoring--reconciliation)
-14. [Configure Global Proxy](#14-configure-global-proxy)
-15. [Configure LLM (BYOK)](#15-configure-llm-byok)
-16. [Generate Config via LLM](#16-generate-config-via-llm)
-17. [Query Audit Logs](#17-query-audit-logs)
-18. [End-User Management](#18-end-user-management)
+3. [End-User Authentication Flow](#3-end-user-authentication-flow)
+4. [Add Service from Git Repository](#4-add-service-from-git-repository)
+5. [Add Service from File Upload](#5-add-service-from-file-upload)
+6. [Edit Service Files (with Git Diff)](#6-edit-service-files-with-git-diff)
+7. [Convert to Jinja2 Templates](#7-convert-to-jinja2-templates)
+8. [Deploy Service to User](#8-deploy-service-to-user)
+9. [Monitor Deploy Task (with Log Streaming)](#9-monitor-deploy-task-with-log-streaming)
+10. [Clone All Services Between Users](#10-clone-all-services-between-users)
+11. [Manage Service Lifecycle (Up/Down/Rebuild/Delete)](#11-manage-service-lifecycle-updownrebuilddelete)
+12. [Change Service Password](#12-change-service-password)
+13. [Get Container Logs](#13-get-container-logs)
+14. [Test Service Connectivity (curl)](#14-test-service-connectivity-curl)
+15. [System Monitoring & Reconciliation](#15-system-monitoring--reconciliation)
+16. [SSL Certificate Management](#16-ssl-certificate-management)
+17. [Configure Global Proxy](#17-configure-global-proxy)
+18. [Configure LLM (BYOK)](#18-configure-llm-byok)
+19. [Generate Config via LLM](#19-generate-config-via-llm)
+20. [Query Audit Logs](#20-query-audit-logs)
+21. [End-User Management](#21-end-user-management)
 
 ---
 
@@ -99,7 +102,60 @@ curl -s -X PUT http://localhost:8771/api/auth/password \
 
 ---
 
-## 3. Add Service from Git Repository
+## 3. End-User Authentication Flow
+
+**Goal:** Login as an end-user (portal user) and verify role-based access.
+
+```bash
+# --- Register a new end-user (no auth required) ---
+curl -s -X POST http://localhost:8771/api/auth/users/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "alice",
+    "password": "userpass123",
+    "role": "viewer"
+  }'
+
+# Expected: 201 {"id": 1, "username": "alice", "is_approved": false, ...}
+
+# --- Login as unapproved user (should fail) ---
+curl -s -X POST http://localhost:8771/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "alice", "password": "userpass123"}'
+
+# Expected: 401 "User not yet approved"
+
+# --- Admin approves the user ---
+ADMIN_TOKEN="..."
+curl -s -X PUT http://localhost:8771/api/auth/users/1/approve \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# --- Login as approved end-user ---
+END_RESP=$(curl -s -X POST http://localhost:8771/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "alice", "password": "userpass123"}')
+
+END_TOKEN=$(echo $END_RESP | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+# Response includes: "user_type": "end_user", "user": {"id": 1, "username": "alice", "role": "viewer"}
+
+# --- Access with end-user token ---
+curl -s http://localhost:8771/api/auth/me \
+  -H "Authorization: Bearer $END_TOKEN"
+
+# Expected: {"id": 1, "email": "alice", "role": "viewer", "user_type": "end_user"}
+
+# --- Refresh end-user token ---
+curl -s -X POST http://localhost:8771/api/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d "{\"refresh_token\": \"$REFRESH_TOKEN\"}"
+
+# Response includes: "user_type": "end_user"
+```
+
+---
+
+## 4. Add Service from Git Repository
 
 **Goal:** Clone a GitHub repo as a service source project, with optional proxy and LLM auto-generation.
 

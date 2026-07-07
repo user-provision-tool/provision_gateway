@@ -62,16 +62,25 @@ The Provision Gateway is a **management layer** that wraps the provision-api wit
 | Audit log | `provision-gateway` |
 | Service URL display & test-curl | `provision-dashboard` |
 
-### 2.2 What belongs in the user_provision tool (list only — do NOT implement now)
+### 2.2 What belongs in the user_provision tool (list only — IMPLEMENTED ✅)
 
-These are gaps identified in the current provision-api that should be fixed there, not in the gateway:
+These gaps were identified in the current provision-api and have been implemented:
 
-| Feature | Rationale |
-|---|---|
-| **Orphan network cleanup on remove** | When `docker compose down` tears down a user's containers, the network may be left with only `provision-nginx` connected. The provision-api should detect and prune these orphan networks after removal. |
-| **Expose build log streaming endpoint** | Currently `DOCKER_OPS_LOG` is a file. A `GET /tasks/{id}/log?tail=N&follow=true` SSE endpoint would allow the gateway to stream logs live. |
-| **Expose provision-nginx connection state** | A `GET /nginx/connections` endpoint listing which networks provision-nginx is connected to, and which upstreams are defined in conf files. Needed by the gateway for reconciliation. |
-| **Network reconnect on provision-nginx restart** | If provision-nginx is rebuilt/restarted, it loses all `docker network connect` associations. The provision-api should have a `POST /nginx/reconnect-all` endpoint that re-connects provision-nginx to all user networks and reloads. |
+| Feature | Status | Rationale |
+|---|---|---|
+| **Orphan network cleanup on remove** | ✅ Implemented | `docker_ops.orphan_network_cleanup()` called in `provisioner.remove_user()` |
+| **Expose build log streaming endpoint** | ✅ Implemented | `GET /tasks/{id}/log?tail=N&follow=true` → SSE endpoint (per-task log files) |
+| **Expose provision-nginx connection state** | ✅ Implemented | `GET /nginx/connections` → networks, conf files, upstreams |
+| **Network reconnect on provision-nginx restart** | ✅ Implemented | `POST /nginx/reconnect-all` → reconnects nginx to all networks |
+| **Password change endpoint** | ✅ Implemented | `PUT /users/{u}/services/{s}/{l}/password` |
+| **Container logs endpoint** | ✅ Implemented | `GET /users/{u}/{s}/{l}/containers/{c}/logs` |
+| **Docker/host stats endpoints** | ✅ Implemented | `GET /docker/ps`, `/docker/stats`, `/docker/info`, `/host/stats` |
+| **Container existence/running check** | ✅ Implemented | `GET /docker/container/{name}/exists`, `/running` |
+| **Service/container stats (registry-based)** | ✅ Implemented | `GET /container-stats`, `/service-stats` |
+| **SSL certificate management** | ✅ Implemented | `GET/POST/DELETE /ssl-certs`, `POST /ssl-certs/{domain}/refresh` |
+| **Reconciliation endpoint** | ✅ Implemented | `POST /reconcile`, `GET /reconcile/status`, `GET /nginx-state` |
+
+> The gateway no longer duplicates any of the above logic — all operations are delegated to provision-api via HTTP proxy.
 
 ---
 
