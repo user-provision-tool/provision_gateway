@@ -17,14 +17,24 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   const [httpsEnabled, setHttpsEnabled] = useState(false)
   const [sources, setSources] = useState<{ name: string; files: string[]; has_compose_template?: boolean }[]>([])
   const [deployableUsers, setDeployableUsers] = useState<{username:string,label:string}[]>([])
+  const [sslDomains, setSslDomains] = useState<{domain:string, fullchain_path:string, privkey_path:string}[]>([])
+  const [selectedSslDomain, setSelectedSslDomain] = useState<string>('')
 
   useEffect(() => {
     if (open) {
       loadSources()
       loadProxyStatus()
       loadDeployableUsers()
+      loadSslDomains()
     }
   }, [open])
+
+  const loadSslDomains = async () => {
+    try {
+      const { data } = await client.get('/system/ssl-certs')
+      setSslDomains(data.domains || [])
+    } catch { /* ignore */ }
+  }
 
   const loadDeployableUsers = async () => {
     try {
@@ -143,7 +153,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
               ]} />
             </Form.Item>
             <Form.Item name="domain" label="Domain" style={{ flex: 2 }}>
-              <Input placeholder="example.com" />
+              <Input placeholder="example.com" disabled={!!selectedSslDomain} />
             </Form.Item>
             <Form.Item name="passwd" label="Password" style={{ flex: 1 }}>
               <Input.Password placeholder="secret" />
@@ -152,18 +162,37 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
           {/* ---- HTTPS ---- */}
           <Form.Item name="https" label="Enable HTTPS" valuePropName="checked">
-            <Switch onChange={(v) => setHttpsEnabled(v)} />
+            <Switch onChange={(v) => {
+              setHttpsEnabled(v)
+              if (!v) {
+                setSelectedSslDomain('')
+                form.setFieldsValue({ ssl_domain: undefined, fullchain: '', privkey: '' })
+              }
+            }} />
           </Form.Item>
           {httpsEnabled && (
-            <Space.Compact block>
-              <Form.Item name="fullchain" label="Fullchain Path" style={{ flex: 1 }}>
-                <Input placeholder="/etc/letsencrypt/live/example.com/fullchain.pem" />
-              </Form.Item>
-              <Form.Item name="privkey" label="Privkey Path" style={{ flex: 1 }}>
-                <Input placeholder="/etc/letsencrypt/live/example.com/privkey.pem" />
-              </Form.Item>
-            </Space.Compact>
+            <Form.Item name="ssl_domain" label="SSL Certificate" rules={[{ required: true, message: 'Select an SSL certificate' }]}>
+              <Select
+                showSearch
+                placeholder="Select uploaded SSL certificate"
+                filterOption={(input, option) => (option?.label as string||'').toLowerCase().includes(input.toLowerCase())}
+                options={sslDomains.map(d => ({ value: d.domain, label: d.domain }))}
+                onChange={(domain) => {
+                  const cert = sslDomains.find(d => d.domain === domain)
+                  if (cert) {
+                    setSelectedSslDomain(domain)
+                    form.setFieldsValue({
+                      fullchain: cert.fullchain_path,
+                      privkey: cert.privkey_path,
+                      domain: domain,
+                    })
+                  }
+                }}
+              />
+            </Form.Item>
           )}
+          <Form.Item name="fullchain" hidden><Input /></Form.Item>
+          <Form.Item name="privkey" hidden><Input /></Form.Item>
 
           <Divider plain>Volume Mapping (optional)</Divider>
           <Form.List name="volumes">

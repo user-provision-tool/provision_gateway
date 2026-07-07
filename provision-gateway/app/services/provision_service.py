@@ -199,6 +199,29 @@ class ProvisionService:
         """Get service statistics from provision-api (registry only)."""
         return await self._request("GET", "/service-stats")
 
+    # ---- SSL certificates ----
+
+    async def list_ssl_certs(self) -> dict[str, Any]:
+        """List available SSL certificate domains from provision-api."""
+        return await self._request("GET", "/ssl-certs")
+
+    async def upload_ssl_cert(self, domain: str, fullchain: str, privkey: str, ssl_path: str | None = None) -> dict[str, Any]:
+        """Upload SSL certificates for a domain."""
+        payload: dict[str, Any] = {
+            "domain": domain, "fullchain": fullchain, "privkey": privkey,
+        }
+        if ssl_path:
+            payload["ssl_path"] = ssl_path
+        return await self._request("POST", "/ssl-certs", json_data=payload)
+
+    async def refresh_ssl_cert(self, domain: str) -> dict[str, Any]:
+        """Refresh SSL certificates for a domain from its source path."""
+        return await self._request("POST", f"/ssl-certs/{domain}/refresh")
+
+    async def delete_ssl_cert(self, domain: str) -> dict[str, Any]:
+        """Delete SSL certificates for a domain."""
+        return await self._request("DELETE", f"/ssl-certs/{domain}")
+
     # ---- Health ----
 
     async def health(self) -> dict[str, Any]:

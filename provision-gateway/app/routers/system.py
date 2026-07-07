@@ -368,3 +368,72 @@ def set_system_config(
 
 
 from ..models.proxy_config import ProxyConfig as ProxyConfigModel
+
+
+# ---------------------------------------------------------------------------
+# SSL Certificate endpoints (proxied to provision-api)
+# ---------------------------------------------------------------------------
+
+from fastapi import UploadFile, File, Form
+
+@router.get("/ssl-certs")
+async def list_ssl_certs(
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """List available SSL certificate domains (proxied to provision-api)."""
+    return await provision_service.list_ssl_certs()
+
+
+@router.post("/ssl-certs", status_code=201)
+async def upload_ssl_cert(
+    domain: str = Form(...),
+    fullchain: str = Form(""),
+    privkey: str = Form(""),
+    ssl_path: str = Form(""),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Upload SSL certificates for a domain (proxied to provision-api).
+
+    Supports two modes:
+    - Paste mode: provide ``fullchain`` and ``privkey`` PEM content directly.
+    - Path mode: provide ``ssl_path`` to a directory containing fullchain.pem
+      and privkey.pem (e.g. /etc/letsencrypt/live/example.com). The
+      provision-api reads the files from that path.
+    """
+    from ..services.audit_service import log_action
+
+    try:
+        result = await provision_service.upload_ssl_cert(
+            domain=domain,
+            fullchain=fullchain,
+            privkey=privkey,
+            ssl_path=ssl_path or None,
+        )
+    except Exception as e:
+        raise HTTPException(502, f"provision-api error: {e}")
+    log_action(db, action="ssl_upload", admin_id=current_admin.id,
+        detail={"domain": domain, "mode": "path" if ssl_path else "paste"}, status="success")
+    return result
+
+
+@router.post("/ssl-certs/{domain}/refresh")
+async def refresh_ssl_cert(
+    domain: str,
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """Refresh SSL certificates for a domain from its original source path."""
+    try:
+        result = await provision_service.refresh_ssl_cert(domain)
+    except Exception as e:
+        raise HTTPException(502, f"provision-api error: {e}")
+    return result
+
+
+@router.delete("/ssl-certs/{domain}")
+async def delete_ssl_cert(
+    domain: str,
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """Delete SSL certificates for a domain (proxied to provision-api)."""
+    return await provision_service.delete_ssl_cert(domain)
