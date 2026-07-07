@@ -82,14 +82,27 @@ async def system_status(
     services_count = 0
     users_count = 0
     tasks_running = 0
+    service_stats = {}
+    container_stats = {}
+
+    # Service & container stats from provision-api (registry-based, not docker ps)
+    try:
+        cs = await provision_service.get_container_stats()
+        container_stats = cs.get("container_stats", {})
+    except Exception:
+        pass
+
+    try:
+        ss = await provision_service.get_service_stats()
+        service_stats = ss.get("service_stats", {})
+        services_count = service_stats.get("expected", 0)
+    except Exception:
+        pass
+
     try:
         users_result = await provision_service.list_users()
         users_list = users_result.get("user_status", [])
         users_count = len(users_list)
-        for u in users_list:
-            services_count += len(u.get("healthy_services", []))
-            services_count += len(u.get("unhealthy_services", []))
-            services_count += len(u.get("missing_services", []))
     except Exception:
         pass
 
@@ -110,6 +123,8 @@ async def system_status(
         "services_count": services_count,
         "users_count": users_count,
         "tasks_running": tasks_running,
+        "service_stats": service_stats,
+        "container_stats": container_stats,
     }
 
 

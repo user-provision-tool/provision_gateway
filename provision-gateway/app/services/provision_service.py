@@ -189,6 +189,16 @@ class ProvisionService:
             params={"tail": tail},
         )
 
+    # ---- Container & Service stats (registry-based, not docker ps) ----
+
+    async def get_container_stats(self) -> dict[str, Any]:
+        """Get container statistics from provision-api (registry only, not all docker containers)."""
+        return await self._request("GET", "/container-stats")
+
+    async def get_service_stats(self) -> dict[str, Any]:
+        """Get service statistics from provision-api (registry only)."""
+        return await self._request("GET", "/service-stats")
+
     # ---- Health ----
 
     async def health(self) -> dict[str, Any]:

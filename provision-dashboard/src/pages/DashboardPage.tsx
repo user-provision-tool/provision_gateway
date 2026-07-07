@@ -66,6 +66,13 @@ export default function DashboardPage() {
   const ramPct = sysStatus?.docker_host?.mem_percent ?? null
   const diskPct = sysStatus?.docker_host?.disk_percent ?? null
 
+  // Registry-based stats (from provision-api, not docker ps)
+  const cStats = sysStatus?.container_stats || {}
+  const sStats = sysStatus?.service_stats || {}
+  const svcHealthy = sStats.healthy ?? 0
+  const svcUnhealthy = sStats.unhealthy ?? 0
+  const svcExpected = sStats.expected ?? 0
+
   return (
     <div>
       <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16,flexWrap:'wrap',gap:8}}>
@@ -78,10 +85,31 @@ export default function DashboardPage() {
 
       {/* Stat cards */}
       <Row gutter={[16, 16]}>
-        <Col xs={24} sm={12} md={6}><Card><Statistic title="Services" value={sysStatus?.services_count ?? 0}/></Card></Col>
+        <Col xs={24} sm={12} md={6}>
+          <Card size="small">
+            <Statistic title="Services" value={svcExpected}
+              suffix={svcExpected > 0 ? <span style={{fontSize:14}}>
+                <Text type="success">{svcHealthy} healthy</Text>
+                {svcUnhealthy > 0 && <><br/><Text type="danger">{svcUnhealthy} unhealthy</Text></>}
+              </span> : undefined}
+            />
+          </Card>
+        </Col>
         <Col xs={24} sm={12} md={6}><Card><Statistic title="Users" value={sysStatus?.users_count ?? 0}/></Card></Col>
         <Col xs={24} sm={12} md={6}><Card><Statistic title="Running Tasks" value={sysStatus?.tasks_running ?? 0}/></Card></Col>
-        <Col xs={24} sm={12} md={6}><Card><Statistic title="Containers" value={sysStatus?.docker_host?.containers_running||0} suffix={`/ ${sysStatus?.docker_host?.containers_total||0}`}/></Card></Col>
+        <Col xs={24} sm={12} md={6}>
+          <Card size="small">
+            <Statistic title="Containers" value={cStats.total_expected ?? 0}
+              suffix={<span style={{fontSize:12}}>
+                {(cStats.healthy_running ?? 0) > 0 && <Tag color="green">{cStats.healthy_running} up</Tag>}
+                {(cStats.unhealthy_running ?? 0) > 0 && <Tag color="orange">{cStats.unhealthy_running} unhealthy</Tag>}
+                {(cStats.restarting ?? 0) > 0 && <Tag color="purple">{cStats.restarting} restarting</Tag>}
+                {(cStats.down ?? 0) > 0 && <Tag color="red">{cStats.down} down</Tag>}
+                {(cStats.missing ?? 0) > 0 && <Tag color="default">{cStats.missing} missing</Tag>}
+              </span>}
+            />
+          </Card>
+        </Col>
       </Row>
 
       {/* CPU / RAM / Disk gauges */}
