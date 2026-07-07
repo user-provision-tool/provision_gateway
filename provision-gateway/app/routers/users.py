@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -195,6 +195,22 @@ async def change_user_password(
         target_user=user_name, target_service=service_name,
         target_label=label, status="success",
     )
+    return result
+
+
+@router.get("/{user_name}/{service_name}/{label}/containers/{container}/logs")
+async def get_container_logs(
+    user_name: str, service_name: str, label: str, container: str,
+    tail: int = Query(100, ge=1, le=10000, description="Number of log lines to return"),
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """Get container logs for a specific compose service (delegated to provision-api)."""
+    try:
+        result = await provision_service.get_container_logs(
+            user_name, service_name, label, container, tail,
+        )
+    except Exception as e:
+        raise HTTPException(502, f"provision-api error: {e}")
     return result
 
 

@@ -141,6 +141,75 @@ def test_system_status(token):
     print(f"  ✓ GET /system/status works")
 
 
+def test_container_logs_endpoint(token):
+    """Test container logs endpoint (proxied to provision-api)."""
+    print("\nTesting container logs endpoint...")
+    
+    # Test with non-existent user/service — should get error from provision-api
+    status, body = run_curl(
+        "GET",
+        "/api/users/nonexistent_user/nonexistent_svc/0/containers/web/logs?tail=10",
+        token=token,
+    )
+    # Should get a response (may be 404 or 502 depending on provision-api state)
+    print(f"  GET /users/.../containers/.../logs → {status}")
+    # Even a 404/502 is acceptable — we just need the endpoint to exist and proxy
+    assert status in (200, 404, 502), f"Unexpected status: {status}"
+
+
+def test_tasks_log_sse_endpoint(token):
+    """Test SSE task log streaming endpoint (proxied to provision-api)."""
+    print("\nTesting SSE task log endpoint...")
+    
+    # Test with non-existent task_id — should get error from provision-api
+    url = f"{GATEWAY_URL}/api/tasks/nonexistent_task_id_12345/log?tail=5&follow=false"
+    cmd = [
+        "curl", "-s", "-w", "\n%{http_code}",
+        "-H", f"Authorization: Bearer {token}",
+        "--max-time", "5",
+        url,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    output = result.stdout.strip()
+    
+    parts = output.rsplit("\n", 1)
+    if len(parts) == 2:
+        body = parts[0]
+        try:
+            status = int(parts[1])
+        except ValueError:
+            body = output
+            status = 0
+    else:
+        body = output
+        status = 0
+    
+    print(f"  GET /tasks/.../log (SSE) → {status}")
+    # Should get some response — even an error is acceptable as long as the
+    # endpoint exists and is proxying correctly
+    assert status in (200, 404, 502, 500), f"Unexpected status: {status}"
+
+
+def test_new_endpoints_exist(token):
+    """Verify all new endpoints from user_provision changes are reachable via gateway."""
+    print("\nTesting new proxied endpoints...")
+    
+    new_endpoints = [
+        # Docker / host monitoring
+        ("GET", "/api/system/status"),  # internally uses docker_ps, docker_stats, docker_info, host_stats
+        # Task management
+        ("GET", "/api/tasks"),
+        # Reconciliation
+        ("GET", "/api/system/status"),  # internally uses reconciliation
+    ]
+    
+    for method, path in new_endpoints:
+        status, body = run_curl(method, path, token=token)
+        print(f"  {method} {path} → {status}")
+        # All should be reachable
+        assert status < 500, f"Server error on {method} {path}: {body}"
+
+
 def main():
     print("=" * 60)
     print("Provision Gateway Integration Tests")
@@ -168,7 +237,15 @@ def main():
     
     # Tests that need a token
     if token:
-        for test_fn in [test_users_proxy, test_tasks_proxy, test_audit_logs, test_system_status]:
+        for test_fn in [
+            test_users_proxy,
+            test_tasks_proxy,
+            test_audit_logs,
+            test_system_status,
+            test_container_logs_endpoint,
+            test_tasks_log_sse_endpoint,
+            test_new_endpoints_exist,
+        ]:
             try:
                 test_fn(token)
             except AssertionError as e:

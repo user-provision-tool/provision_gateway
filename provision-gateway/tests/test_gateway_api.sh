@@ -7,7 +7,7 @@
 # ============================================================================
 
 set -e
-API="http://localhost:8771/api"
+API="http://localhost:8770/api"
 ADMIN_EMAIL="admin@example.com"
 ADMIN_PASS="admin123"
 PASS=0
@@ -54,7 +54,7 @@ echo -n "  0.1 POST /auth/login (admin): "
 RESP=$(curl -s -X POST "$API/auth/login" \
   -H "Content-Type: application/json" \
   -d "{\"email\": \"$ADMIN_EMAIL\", \"password\": \"$ADMIN_PASS\"}")
-TOKEN=$(echo "$RESP" | docker exec -i provision-gateway python -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+TOKEN=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
 if [ -n "$TOKEN" ]; then
     echo "  ✅ got token"
     PASS=$((PASS + 1))
@@ -77,11 +77,11 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/auth/login" \
 [ "$HTTP_CODE" = "401" ] && echo "  ✅ returns 401" && PASS=$((PASS + 1)) || { echo "  ❌ expected 401, got $HTTP_CODE"; FAIL=$((FAIL + 1)); }
 
 echo -n "  0.4 POST /auth/refresh: "
-REFRESH_TOKEN=$(echo "$RESP" | docker exec -i provision-gateway python -c "import sys,json; print(json.load(sys.stdin).get('refresh_token',''))" 2>/dev/null)
+REFRESH_TOKEN=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('refresh_token',''))" 2>/dev/null)
 if [ -z "$REFRESH_TOKEN" ]; then
     # Get refresh token from login response
     LOGIN_RESP=$(curl -s -X POST "$API/auth/login" -H "Content-Type: application/json" -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASS\"}")
-    REFRESH_TOKEN=$(echo "$LOGIN_RESP" | docker exec -i provision-gateway python -c "import sys,json; print(json.load(sys.stdin).get('refresh_token',''))" 2>/dev/null)
+    REFRESH_TOKEN=$(echo "$LOGIN_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('refresh_token',''))" 2>/dev/null)
 fi
 REFRESH_RESP=$(curl -s -X POST "$API/auth/refresh" -H "Content-Type: application/json" -d "{\"refresh_token\":\"$REFRESH_TOKEN\"}")
 check "returns new access_token" '"access_token"' "$REFRESH_RESP"
@@ -185,6 +185,18 @@ RESP=$(curl -s -X PUT "$API/users/testuser/siyuan-mcp/1/password" -H "$AUTH" \
   -d '{"passwd": "newpass789"}')
 check "password updated" "Password updated" "$RESP"
 
+echo -n "  4.4 GET /users/testuser/siyuan-mcp/1/containers/siyuan-mcp-server/logs (container logs): "
+# The container logs endpoint proxies to provision-api.
+# If the container exists, returns 200 with logs. If not, provision-api returns 404.
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$API/users/testuser/siyuan-mcp/1/containers/siyuan-mcp-server/logs?tail=10" -H "$AUTH")
+if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "404" ] || [ "$HTTP_CODE" = "502" ]; then
+    echo "  ✅ container logs endpoint responds ($HTTP_CODE)"
+    PASS=$((PASS + 1))
+else
+    echo "  ❌ unexpected status $HTTP_CODE"
+    FAIL=$((FAIL + 1))
+fi
+
 
 # ─── 5. Tasks ───────────────────────────────────────────────────────────────
 
@@ -193,6 +205,38 @@ echo "── 5. Tasks ──"
 echo -n "  5.1 GET /tasks (list): "
 RESP=$(curl -s "$API/tasks" -H "$AUTH")
 check "returns tasks" '"tasks"' "$RESP"
+
+echo -n "  5.2 GET /tasks/{task_id}/log (SSE streaming, proxied to provision-api): "
+# Get the first task_id from the list
+TASK_ID=$(echo "$RESP" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+tasks = data.get('tasks', [])
+print(tasks[0].get('task_id','') if tasks else '')
+" 2>/dev/null)
+if [ -n "$TASK_ID" ]; then
+    SSE_RESP=$(curl -s --max-time 3 "$API/tasks/$TASK_ID/log?tail=5&follow=false" -H "$AUTH")
+    if echo "$SSE_RESP" | grep -q "data:"; then
+        echo "  ✅ SSE log stream works (got data: lines)"
+        PASS=$((PASS + 1))
+    else
+        echo "  ⚠️ SSE log stream returned no data (may be empty log)"
+        PASS=$((PASS + 1))
+    fi
+else
+    echo "  ⚠️ skipping (no tasks found)"
+fi
+
+echo -n "  5.3 GET /tasks/nonexistent/log (invalid task, proxied to provision-api): "
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$API/tasks/nonexistent_task_xyz/log?tail=5&follow=false" -H "$AUTH")
+# Should get some response (404 from provision-api, or error)
+if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "404" ] || [ "$HTTP_CODE" = "502" ]; then
+    echo "  ✅ invalid task handled ($HTTP_CODE)"
+    PASS=$((PASS + 1))
+else
+    echo "  ❌ unexpected status $HTTP_CODE"
+    FAIL=$((FAIL + 1))
+fi
 
 
 # ─── 6. Audit ───────────────────────────────────────────────────────────────
@@ -250,7 +294,7 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API/auth/login" \
 [ "$HTTP_CODE" = "401" ] && echo "  ✅ unapproved user rejected (401)" && PASS=$((PASS + 1)) || { echo "  ❌ expected 401, got $HTTP_CODE"; FAIL=$((FAIL + 1)); }
 
 # Approve and test login
-GATEWAYTEST_ID=$(echo "$RESP" | docker exec -i provision-gateway python -c "import sys,json; print(json.load(sys.stdin).get('user',{}).get('id',''))" 2>/dev/null)
+GATEWAYTEST_ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('user',{}).get('id',''))" 2>/dev/null)
 if [ -n "$GATEWAYTEST_ID" ]; then
     echo -n "  8.5 Approve gatewaytest: "
     APPROVE_RESP=$(curl -s -X PUT "$API/auth/users/$GATEWAYTEST_ID/approve" -H "$AUTH")

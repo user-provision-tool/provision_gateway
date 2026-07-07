@@ -157,6 +157,38 @@ class ProvisionService:
     async def cancel_task(self, task_id: str) -> dict[str, Any]:
         return await self._request("DELETE", f"/tasks/{task_id}")
 
+    async def stream_task_log(self, task_id: str, tail: int = 200, follow: bool = True):
+        """Stream task build log from provision-api via SSE.
+        
+        Returns an async generator yielding raw SSE lines from provision-api.
+        """
+        url = f"{self._base_url}/tasks/{task_id}/log"
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("GET", url, params={"tail": tail, "follow": follow}) as resp:
+                if resp.status_code >= 400:
+                    detail = await resp.aread()
+                    raise httpx.HTTPStatusError(
+                        f"provision-api error: {detail.decode()}",
+                        request=resp.request,
+                        response=resp,
+                    )
+                async for line in resp.aiter_lines():
+                    if line:
+                        yield f"{line}\n\n"
+
+    # ---- Container logs ----
+
+    async def get_container_logs(
+        self, user_name: str, service_name: str, label: str,
+        container: str, tail: int = 100,
+    ) -> dict[str, Any]:
+        """Get container logs from provision-api."""
+        return await self._request(
+            "GET",
+            f"/users/{user_name}/services/{service_name}/{label}/containers/{container}/logs",
+            params={"tail": tail},
+        )
+
     # ---- Health ----
 
     async def health(self) -> dict[str, Any]:
