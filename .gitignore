@@ -8,3 +8,5 @@ node_modules/
 .vite/
 *.log
 gateway_data/
+_ignore/
+_tasks/

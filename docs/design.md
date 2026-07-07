@@ -1,10 +1,10 @@
 # Provision Gateway — Product Design Document
 
-> **Version**: 1.1
-> **Date**: 2026-07-05 (updated)
+> **Version**: 1.2
+> **Date**: 2026-07-08 (updated — post-deduplication refactor)
 > **Status**: Implemented — reflects current codebase
 > **Depends on**: [requirements.md](./requirements.md) (CONFIRMED)
-> **See also**: [architecture.md](./architecture.md) | [api_references.md](./api_references.md) | [tests_coverage_status.md](./tests_coverage_status.md)
+> **See also**: [architecture.md](./architecture.md) | [api_references.md](./api_references.md) | [tests_coverage_status.md](./tests_coverage_status.md) | [changes-provision_gateway-20260708.md](./changes-provision_gateway-20260708.md)
 
 ---
 
@@ -109,7 +109,7 @@
 | Gateway backend | Python 3.13 + FastAPI | Consistent with provision-api; shared mental model |
 | Gateway DB ORM | SQLAlchemy + Alembic | Mature, well-supported |
 | Gateway DB | SQLite | Zero-config, no extra container, sufficient for admin data |
-| Auth | python-jose (JWT) + passlib (bcrypt) | Same stack as provision-api's auth module |
+| Auth | python-jose (JWT) + bcrypt | JWT with bcrypt directly (passlib incompatible with bcrypt 5.x) |
 | LLM client | httpx (async) → OpenAI-compatible `/v1/chat/completions` | Generic protocol; works with Ollama, OpenAI, Anthropic via gateways |
 | Encryption (BYOK key) | cryptography (AES-256-GCM) | Industry standard for at-rest key storage |
 | Docker SDK | docker-py | Programmatic Docker API access (health checks, stats, events) |
@@ -143,7 +143,7 @@ services:
     environment:
       - PROVISION_DIR=${PROVISION_DIR}
       - GATEWAY_DATA_DIR=/data
-      - PROVISION_API_URL=http://provision-api:8765
+      - PROVISION_API_URL=http://provision-api:8000
       - GATEWAY_SECRET_KEY=${GATEWAY_SECRET_KEY}             # for JWT + encryption
       - NGINX_HTTP_PORT=${NGINX_HTTP_PORT:-80}
       - NGINX_HTTPS_PORT=${NGINX_HTTPS_PORT:-443}
@@ -229,13 +229,13 @@ services:
     environment:
       - PROVISION_DIR=${PROVISION_DIR}
       - GATEWAY_DATA_DIR=/data
-      - PROVISION_API_URL=http://provision-api:8765
+      - PROVISION_API_URL=http://provision-api:8000
       - GATEWAY_SECRET_KEY=${GATEWAY_SECRET_KEY:?err}
       - NGINX_HTTP_PORT=${NGINX_HTTP_PORT:-80}
       - NGINX_HTTPS_PORT=${NGINX_HTTPS_PORT:-443}
       - DOCKER_OPS_LOG=${PROVISION_DIR}/generated/docker_ops.log
     networks:
-      - provision_default
+      - users_provision_default
     restart: unless-stopped
 
   provision-dashboard:
@@ -246,7 +246,7 @@ services:
     ports:
       - "127.0.0.1:${DASHBOARD_PORT:-8771}:80"
     networks:
-      - provision_default
+      - users_provision_default
     restart: unless-stopped
 
 volumes:
@@ -254,12 +254,12 @@ volumes:
     name: provision_gateway_data
 
 networks:
-  provision_default:
+  users_provision_default:
     external: true
-    name: provision_default
+    name: users_provision_default
 ```
 
-> **Note**: `provision_default` network is created by `docker-compose.provision.yml` (the existing provision-api stack). The gateway compose file uses `external: true` to join that network.
+> **Note**: `users_provision_default` network is created by `docker-compose.provision.yml` (the existing provision-api stack). The gateway compose file uses `external: true` to join that network.
 
 ---
 
@@ -315,24 +315,20 @@ _provision_gateway/
 │   │   │
 │   │   ├── services/                   # Business logic layer
 │   │   │   ├── __init__.py
-│   │   │   ├── auth_service.py         # Admin CRUD, JWT, password hashing
-│   │   │   ├── provision_service.py    # Proxy calls to provision-api
-│   │   │   ├── service_manager.py      # File ops, git clone, template conversion
+│   │   │   ├── auth_service.py         # Admin + End-user auth, JWT, password hashing
+│   │   │   ├── provision_service.py    # All proxy calls to provision-api (Docker, reconciliation, SSL, users)
+│   │   │   ├── service_manager.py      # File ops, git clone, template conversion (delegated)
 │   │   │   ├── llm_service.py          # LLM client, config generation
-│   │   │   ├── docker_service.py       # Docker SDK: ps, stats, events, network
-│   │   │   ├── reconciliation.py       # Nginx network/upstream reconciliation
-│   │   │   ├── monitoring_service.py   # Health checks, host stats polling
 │   │   │   ├── curl_service.py         # Test-curl from within container
-│   │   │   └── audit_service.py        # Audit log writer + querier
+│   │   │   ├── audit_service.py        # Audit log writer + querier
+│   │   │   └── proxy_service.py        # Proxy config CRUD + env injection
 │   │   │
 │   │   ├── middleware/
-│   │   │   ├── __init__.py
-│   │   │   └── auth_middleware.py       # JWT verification dependency
+│   │   │   └── __init__.py             # JWT verification (get_current_admin, get_current_user)
 │   │   │
 │   │   └── utils/
 │   │       ├── __init__.py
 │   │       ├── crypto.py               # AES-256-GCM encrypt/decrypt for BYOK key
-│   │       ├── nginx_parser.py          # Parse nginx conf → extract upstreams
 │   │       └── file_scanner.py          # Scan repo for Dockerfile, compose, etc.
 │   │
 │   └── tests/
@@ -1623,7 +1619,7 @@ These features need to be implemented in `_users_provision/` to fully support th
 | `PROVISION_DIR` | ✓ | — | Same as provision-api; base directory for all provision data |
 | `GATEWAY_DATA_DIR` | — | `$PROVISION_DIR/gateway_data` | Gateway SQLite DB + uploads storage |
 | `GATEWAY_SECRET_KEY` | ✓ | — | 32+ char random string; used for JWT signing + API key encryption |
-| `PROVISION_API_URL` | — | `http://provision-api:8765` | URL of the provision-api container |
+| `PROVISION_API_URL` | — | `http://provision-api:8000` | URL of the provision-api container (container port, not host port) |
 | `NGINX_HTTP_PORT` | — | `80` | provision-nginx HTTP port (for URL display) |
 | `NGINX_HTTPS_PORT` | — | `443` | provision-nginx HTTPS port (for URL display) |
 | `DOCKER_OPS_LOG` | — | `$PROVISION_DIR/generated/docker_ops.log` | Build log file path for streaming |

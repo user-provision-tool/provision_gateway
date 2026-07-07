@@ -1,7 +1,7 @@
 # Provision Gateway — API Reference
 
-> **Version**: 1.0
-> **Date**: 2026-07-05
+> **Version**: 1.1
+> **Date**: 2026-07-08 (updated)
 > **Base URL**: `http://provision-gateway:8770` (internal) / `http://localhost:8771/api` (via dashboard proxy)
 
 ---
@@ -27,7 +27,9 @@
 - All endpoints except `/health`, `/api/auth/setup`, `/api/auth/login`, `/api/auth/refresh`, and `/api/auth/users/register` require `Authorization: Bearer <JWT>` header
 - JWT access tokens expire after 1 hour (configurable via `JWT_EXPIRE_SEC`)
 - Refresh tokens expire after 7 days (`JWT_REFRESH_EXPIRE_SEC`)
+- JWT tokens carry a `user_type` claim: `admin` (gateway admin) or `end_user` (portal user)
 - Non-admin users (role=`viewer`) have read-only access; mutating endpoints require `admin` role
+- The SSE log endpoint (`GET /api/tasks/{id}/log`) also supports `?token=` query parameter for EventSource (which cannot set headers)
 
 ### 1.2 Request/Response
 
@@ -122,7 +124,7 @@ Create additional admin/portal user. Requires `admin` role to create another adm
 
 ### `POST /api/auth/login`
 
-Authenticate and receive tokens.
+Authenticate and receive tokens. Supports both gateway admin accounts (by email) and end-user portal accounts (by username).
 
 **Request:**
 ```json
@@ -132,13 +134,14 @@ Authenticate and receive tokens.
 }
 ```
 
-**Response 200:**
+**Response 200 (admin):**
 ```json
 {
   "access_token": "eyJhbGciOi...",
   "refresh_token": "eyJhbGciOi...",
   "token_type": "bearer",
   "expires_in": 3600,
+  "user_type": "admin",
   "admin": {
     "id": 1,
     "email": "admin@example.com",
@@ -147,8 +150,24 @@ Authenticate and receive tokens.
 }
 ```
 
+**Response 200 (end-user):**
+```json
+{
+  "access_token": "eyJhbGciOi...",
+  "refresh_token": "eyJhbGciOi...",
+  "token_type": "bearer",
+  "expires_in": 3600,
+  "user_type": "end_user",
+  "user": {
+    "id": 5,
+    "username": "alice",
+    "role": "viewer"
+  }
+}
+```
+
 **Errors:**
-- `401` — "Invalid email or password"
+- `401` — "Invalid email/username or password"
 
 ---
 
@@ -167,7 +186,9 @@ Exchange refresh token for a new access token.
 ```json
 {
   "access_token": "eyJhbGciOi...",
-  "expires_in": 3600
+  "token_type": "bearer",
+  "expires_in": 3600,
+  "user_type": "admin"
 }
 ```
 
@@ -175,17 +196,25 @@ Exchange refresh token for a new access token.
 
 ### `GET /api/auth/me`
 
-Get current authenticated admin profile.
+Get current authenticated user profile. Returns a unified dict for both admin and end-user tokens.
 
-**Response 200:**
+**Response 200 (admin):**
 ```json
 {
   "id": 1,
   "email": "admin@example.com",
   "role": "admin",
-  "is_active": true,
-  "created_at": "2026-07-04T00:00:00Z",
-  "last_login_at": "2026-07-05T12:00:00Z"
+  "user_type": "admin"
+}
+```
+
+**Response 200 (end-user):**
+```json
+{
+  "id": 5,
+  "email": "alice",
+  "role": "viewer",
+  "user_type": "end_user"
 }
 ```
 
@@ -337,7 +366,7 @@ List users available for deployment (approved + active end-users, plus special u
 
 ### `GET /api/system/status`
 
-Comprehensive system health overview.
+Comprehensive system health overview. All Docker/container data proxied from provision-api.
 
 **Response 200:**
 ```json
@@ -346,13 +375,15 @@ Comprehensive system health overview.
     "status": "healthy",
     "latency_ms": 2.3
   },
-  "components": [
-    {"name": "provision-api", "status": "running", "image": "provision-api"},
-    {"name": "provision-nginx", "status": "running", "image": "nginx:alpine"},
-    {"name": "provision-gateway", "status": "running", "image": "provision-gateway"},
-    {"name": "provision-dashboard", "status": "running", "image": "provision-dashboard"}
-  ],
-  "host_stats": {
+  "components": {
+    "provision-api": {"running": true, "exists": true, "status": "running"},
+    "provision-nginx": {"running": true, "exists": true, "status": "running"},
+    "provision-gateway": {"running": true, "exists": true, "status": "running"},
+    "provision-dashboard": {"running": true, "exists": true, "status": "running"}
+  },
+  "docker_host": {
+    "containers_total": 45,
+    "containers_running": 42,
     "cpu_percent": 23.5,
     "mem_percent": 67.2,
     "disk_percent": 54.0
@@ -361,25 +392,37 @@ Comprehensive system health overview.
     "enabled": true,
     "reachable": true
   },
-  "counts": {
-    "services": 2,
-    "users": 1,
-    "containers_total": 45,
-    "containers_running": 42
+  "services_count": 2,
+  "users_count": 1,
+  "tasks_running": 0,
+  "service_stats": {
+    "healthy": 2,
+    "unhealthy": 0,
+    "expected": 2
+  },
+  "container_stats": {
+    "total_expected": 7,
+    "healthy_running": 7,
+    "unhealthy_running": 0,
+    "restarting": 0,
+    "down": 0,
+    "missing": 0
   }
 }
 ```
+
+> **Note**: `services_count`, `service_stats`, and `container_stats` are derived from provision-api's user registry (not raw `docker ps`). They reflect only provisioned user services, not all Docker containers on the host.
 
 ---
 
 ### `GET /api/system/stats?detail=true`
 
-Detailed Docker container statistics.
+Detailed Docker container statistics (proxied to provision-api).
 
 **Query Parameters:**
 | Param | Type | Default | Description |
 |---|---|---|---|
-| `detail` | bool | `false` | Include per-container stats + disk usage |
+| `detail` | bool | `false` | Include host-level stats |
 
 **Response 200:**
 ```json
@@ -388,17 +431,13 @@ Detailed Docker container statistics.
     {
       "name": "provision-api",
       "cpu_percent": 1.2,
-      "mem_usage_mb": 89,
+      "mem_usage": "89MiB / 1.5GiB",
       "status": "running"
     }
   ],
   "host": {
     "cpu_percent": 23.5,
     "mem_percent": 67.2
-  },
-  "disk": {
-    "provision_dir_size_gb": 12.5,
-    "provision_dir_free_gb": 87.5
   }
 }
 ```
@@ -407,22 +446,19 @@ Detailed Docker container statistics.
 
 ### `POST /api/system/reconcile`
 
-Trigger nginx upstream/network reconciliation.
+Trigger nginx upstream/network reconciliation (proxied to provision-api).
 
 **Response 200:**
 ```json
 {
-  "total_upstreams": 12,
-  "reachable": 10,
-  "unreachable": 2,
-  "networks_reconnected": 1,
-  "nginx_reloaded": true,
-  "unreachable_details": [
-    {
-      "upstream": "http://gitlab-user_bob-0-web:80",
-      "reason": "container not found"
-    }
-  ]
+  "message": "Reconciliation completed.",
+  "report": {
+    "total_upstreams": 12,
+    "reachable": 10,
+    "unreachable": 2,
+    "networks_reconnected": 1,
+    "nginx_reloaded": true
+  }
 }
 ```
 
@@ -430,7 +466,7 @@ Trigger nginx upstream/network reconciliation.
 
 ### `GET /api/system/reconcile/status`
 
-Get last reconciliation result.
+Get last reconciliation result (proxied to provision-api).
 
 **Response 200:** Same schema as reconcile response, plus `last_run` timestamp.
 
@@ -438,30 +474,15 @@ Get last reconciliation result.
 
 ### `GET /api/system/nginx-state`
 
-Get contents of `provision_nginx_state.json`.
+Get nginx state from provision-api (proxied).
 
 **Response 200:**
 ```json
 {
   "version": 1,
-  "last_updated": "2026-07-05T12:00:00Z",
-  "networks": {
-    "siyuan-user_alice-0": {
-      "containers": [
-        {"name": "siyuan-user_alice-0-main", "status": "running"}
-      ],
-      "nginx_connected": true
-    }
-  },
-  "upstreams": [
-    {
-      "conf_file": "siyuan.user-alice.0.nginx.conf",
-      "server_name": "siyuan-alice-0.snaprovision.com",
-      "proxy_pass": "http://siyuan-user_alice-0-main:6806",
-      "target_container": "siyuan-user_alice-0-main",
-      "target_network": "siyuan-user_alice-0"
-    }
-  ]
+  "last_updated": "2026-07-08T12:00:00Z",
+  "networks": { "..." : "..." },
+  "upstreams": [ "..." ]
 }
 ```
 
@@ -624,6 +645,79 @@ Set a system configuration value.
 {
   "key": "special_users",
   "value": "shared,public,internal"
+}
+```
+
+---
+
+### SSL Certificates
+
+All SSL certificate operations are proxied to provision-api.
+
+#### `GET /api/system/ssl-certs`
+
+List available SSL certificate domains.
+
+**Response 200:**
+```json
+{
+  "domains": [
+    {
+      "domain": "snaprovision.com",
+      "fullchain_path": "/etc/letsencrypt/live/snaprovision.com/fullchain.pem",
+      "privkey_path": "/etc/letsencrypt/live/snaprovision.com/privkey.pem",
+      "created_at": "2026-07-08T00:00:00Z",
+      "expiry_date": "2026-10-06T00:00:00Z",
+      "days_left": 90
+    }
+  ]
+}
+```
+
+#### `POST /api/system/ssl-certs`
+
+Upload SSL certificates for a domain. Supports two modes:
+- **Path mode**: Provide `ssl_path` to a directory containing `fullchain.pem` and `privkey.pem`.
+- **Paste mode**: Provide `fullchain` and `privkey` PEM content directly.
+
+**Request (Form Data):**
+| Field | Type | Description |
+|---|---|---|
+| `domain` | string | Domain name (required) |
+| `ssl_path` | string | Path to Let's Encrypt live directory (path mode) |
+| `fullchain` | string | PEM content of fullchain (paste mode) |
+| `privkey` | string | PEM content of private key (paste mode) |
+
+**Response 201:**
+```json
+{
+  "message": "SSL cert for snaprovision.com saved",
+  "domain": "snaprovision.com",
+  "expiry_date": "2026-10-06T00:00:00Z",
+  "days_left": 90
+}
+```
+
+#### `POST /api/system/ssl-certs/{domain}/refresh`
+
+Re-import SSL certificates from the original source path.
+
+**Response 200:**
+```json
+{
+  "message": "SSL cert refreshed",
+  "expiry_date": "2026-10-06T00:00:00Z"
+}
+```
+
+#### `DELETE /api/system/ssl-certs/{domain}`
+
+Delete SSL certificates for a domain.
+
+**Response 200:**
+```json
+{
+  "message": "SSL cert deleted"
 }
 ```
 
@@ -1116,6 +1210,25 @@ Change the HTTP basic auth password for a user's service.
 ```json
 {
   "message": "Password updated. Nginx reloaded."
+}
+```
+
+---
+
+### `GET /api/users/{user_name}/{service_name}/{label}/containers/{container}/logs?tail=100`
+
+Get container logs for a specific compose service (proxied to provision-api).
+
+**Query Parameters:**
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `tail` | int | 100 | Number of log lines to return (1–10000) |
+
+**Response 200:**
+```json
+{
+  "container": "siyuan-user_alice-0-siyuan",
+  "logs": "2026-07-08T12:00:00Z Starting siyuan...\n2026-07-08T12:00:01Z Boot complete.\n"
 }
 ```
 
