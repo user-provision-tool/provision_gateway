@@ -36,8 +36,8 @@ export default function TasksPage() {
     catch { message.error('Failed to cancel') }
   }
 
-  // SSE log streaming
-  const sseUrl = logTaskId ? `/tasks/${logTaskId}/log` : null
+  // SSE log streaming — uses /api prefix for gateway proxy; token via query param for EventSource
+  const sseUrl = logTaskId ? `/api/tasks/${logTaskId}/log` : null
   const { lines: logLines, isConnected: logConnected, clearLines: clearLog } = useSSE(sseUrl)
 
   const openLogs = (taskId: string) => {

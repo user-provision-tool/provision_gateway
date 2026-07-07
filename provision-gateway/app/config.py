@@ -34,6 +34,8 @@ class Settings:
         self.NGINX_HTTPS_PORT: int = int(os.environ.get("NGINX_HTTPS_PORT", "443"))
 
         # ---- Docker log path ----
+        # Log streaming is now proxied to provision-api's per-task SSE endpoint.
+        # DOCKER_OPS_LOG is kept for backward-compatible reference only.
         self.DOCKER_OPS_LOG: Path = Path(
             os.environ.get(
                 "DOCKER_OPS_LOG",

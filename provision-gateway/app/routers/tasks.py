@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
-
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
 
-from ..config import settings
+from ..database import get_db
 from ..middleware import get_current_admin
 from ..models.admin import AdminUser
+from ..services.auth_service import decode_access_token, get_admin_by_id
 from ..services.provision_service import provision_service
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
@@ -56,71 +56,47 @@ async def cancel_task(
 @router.get("/{task_id}/log")
 async def stream_task_log(
     task_id: str,
+    request: Request,
     tail: int = Query(200, description="Number of recent lines to send first"),
     follow: bool = Query(True, description="Whether to keep streaming new lines"),
-    current_admin: AdminUser = Depends(get_current_admin),
+    token: str = Query("", description="JWT token for EventSource (query param fallback)"),
+    db: Session = Depends(get_db),
 ):
-    """Stream task build log via Server-Sent Events, filtered by task context."""
-    log_file = settings.DOCKER_OPS_LOG
-    
-    # Try to get task context for filtering
-    task_context: str | None = None
-    try:
-        task = await provision_service.get_task(task_id)
-        result = task.get("result") or {}
-        if isinstance(result, dict):
-            user = result.get("user_name", "")
-            svc = result.get("service_name", "")
-            if user or svc:
-                task_context = f"{user}/{svc}" if user and svc else (user or svc)
-        else:
-            ttype = task.get("type", "")
-            task_context = ttype
-    except Exception:
-        pass
+    """Stream task build log via Server-Sent Events (proxied to provision-api).
 
-    def _line_matches(line: str) -> bool:
-        """Check if a log line is relevant to this task."""
-        if not task_context:
-            return True  # No filter — show all
-        # Check if line contains task context (user/service patterns)
-        return task_context.lower() in line.lower()
+    Authentication: accepts JWT via ``Authorization: Bearer`` header,
+    OR via ``?token=`` query parameter (for EventSource which cannot set headers).
+    """
+    # Authenticate: try Authorization header first, then query param token
+    admin = None
+    auth_header = request.headers.get("Authorization", "")
+    actual_token = ""
 
-    async def log_generator():
-        if log_file.exists():
-            try:
-                lines = log_file.read_text().splitlines()
-                # Filter lines relevant to this task, then take tail
-                matched = [l for l in lines if _line_matches(l)]
-                recent = matched[-tail:] if len(matched) > tail else matched
-                for line in recent:
-                    yield f"data: {line}\n\n"
-            except Exception:
-                pass
+    if auth_header.startswith("Bearer "):
+        actual_token = auth_header[7:]
+    elif token:
+        actual_token = token
 
-        if not follow:
-            yield "event: done\ndata: {}\n\n"
-            return
+    if actual_token:
+        try:
+            payload = decode_access_token(actual_token)
+            admin_id = int(payload.get("sub", 0))
+            admin = get_admin_by_id(db, admin_id)
+        except Exception:
+            pass
 
-        last_size = log_file.stat().st_size if log_file.exists() else 0
-        while True:
-            await asyncio.sleep(1)
-            try:
-                if log_file.exists():
-                    current_size = log_file.stat().st_size
-                    if current_size > last_size:
-                        with open(log_file, "r") as f:
-                            f.seek(last_size)
-                            new_data = f.read()
-                            for line in new_data.splitlines():
-                                if line.strip() and _line_matches(line):
-                                    yield f"data: {line}\n\n"
-                        last_size = current_size
-            except Exception:
-                break
+    if admin is None or not admin.is_active:
+        raise HTTPException(status_code=401, detail="Invalid or missing authentication token")
+
+    async def sse_generator():
+        try:
+            async for line in provision_service.stream_task_log(task_id, tail, follow):
+                yield line
+        except Exception as e:
+            yield f"event: error\ndata: {str(e)}\n\n"
 
     return StreamingResponse(
-        log_generator(),
+        sse_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
