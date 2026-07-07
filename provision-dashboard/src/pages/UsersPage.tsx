@@ -151,12 +151,14 @@ export default function UsersPage() {
       ) : (
         Object.entries(grouped).map(([userName, userSvcs], idx) => {
           const allHealthy = userSvcs.every(s => Object.keys(s.unhealthy_containers||{}).length===0 && Object.keys(s.missing_containers||{}).length===0)
+          const healthyCount = userSvcs.filter(s => Object.keys(s.healthy_containers||{}).length > 0 && Object.keys(s.unhealthy_containers||{}).length===0 && Object.keys(s.missing_containers||{}).length===0).length
+          const unhealthyCount = userSvcs.length - healthyCount
           return (
           <div key={userName} style={{marginBottom: idx<Object.keys(grouped).length-1?32:0, paddingBottom: idx<Object.keys(grouped).length-1?16:0, borderBottom: idx<Object.keys(grouped).length-1?'1px solid #f0f0f0':'none'}}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
               <Space>
                 <Title level={4} style={{margin:0}}>{highlight(userName, search)}</Title>
-                <Tag color={allHealthy?'green':'orange'}>{userSvcs.length} service{userSvcs.length>1?'s':''}</Tag>
+                <Tag color={allHealthy?'green':'orange'}>{userSvcs.length} service{userSvcs.length>1?'s':''}{unhealthyCount > 0 ? ` (${healthyCount} healthy, ${unhealthyCount} unhealthy)` : ` (all healthy)`}</Tag>
               </Space>
               <Space>
                 {isAdmin && <>

@@ -11,9 +11,7 @@ export default function DashboardPage() {
   const { admin } = useAuth()
   const [sysStatus, setSysStatus] = useState<any>(null)
   const [proxyStatus, setProxyStatus] = useState<any>(null)
-  const [stats, setStats] = useState<any>(null)
   const [refreshing, setRefreshing] = useState(false)
-  const [userServices, setUserServices] = useState<Record<string,any>>({})
 
   const fetchAll = useCallback(async () => {
     // Use individual try/catch so one failure doesn't block others
@@ -26,27 +24,6 @@ export default function DashboardPage() {
       const proxyRes = await client.get('/system/proxy')
       setProxyStatus(proxyRes.data)
     } catch { /* proxy not configured */ }
-    
-    try {
-      const statsRes = await client.get('/system/stats')
-      setStats(statsRes.data)
-    } catch { /* stats may fail */ }
-    
-    try {
-      const usersRes = await client.get('/users')
-      const users = usersRes.data.users || usersRes.data.user_status || []
-      const summary: Record<string,any> = {}
-      for (const u of users) {
-        const un = u.user_name || 'unknown'
-        const services = [...(u.healthy_services||[]), ...(u.unhealthy_services||[]), ...(u.missing_services||[])]
-        summary[un] = {
-          services: services.length,
-          healthy: (u.healthy_services||[]).length,
-          unhealthy: (u.unhealthy_services||[]).length + (u.missing_services||[]).length,
-        }
-      }
-      setUserServices(summary)
-    } catch { /* users may fail */ }
     
     setRefreshing(true)
     setTimeout(() => setRefreshing(false), 500)
@@ -61,7 +38,6 @@ export default function DashboardPage() {
       render: (s:string) => s==='running' ? <Tag color="green">Running</Tag> : <Tag color="red">{s}</Tag> },
   ]
 
-  const containers = stats?.containers || []
   const cpuPct = sysStatus?.docker_host?.cpu_percent ?? null
   const ramPct = sysStatus?.docker_host?.mem_percent ?? null
   const diskPct = sysStatus?.docker_host?.disk_percent ?? null
@@ -83,29 +59,33 @@ export default function DashboardPage() {
         </Space>
       </div>
 
-      {/* Stat cards */}
+      {/* Stat cards — consistent height, all stats always shown */}
       <Row gutter={[16, 16]}>
         <Col xs={24} sm={12} md={6}>
-          <Card size="small">
+          <Card style={{height:110}}>
             <Statistic title="Services" value={svcExpected}
-              suffix={svcExpected > 0 ? <span style={{fontSize:14}}>
-                <Text type="success">{svcHealthy} healthy</Text>
-                {svcUnhealthy > 0 && <><br/><Text type="danger">{svcUnhealthy} unhealthy</Text></>}
-              </span> : undefined}
+              suffix={svcExpected > 0 ? <span style={{fontSize:13,display:'block',marginTop:4}}>
+                <Tag color="green">{svcHealthy} healthy</Tag>
+                {svcUnhealthy > 0 && <Tag color="orange">{svcUnhealthy} unhealthy</Tag>}
+              </span> : <span style={{fontSize:12,color:'#999',display:'block',marginTop:4}}>No services yet</span>}
             />
           </Card>
         </Col>
-        <Col xs={24} sm={12} md={6}><Card><Statistic title="Users" value={sysStatus?.users_count ?? 0}/></Card></Col>
-        <Col xs={24} sm={12} md={6}><Card><Statistic title="Running Tasks" value={sysStatus?.tasks_running ?? 0}/></Card></Col>
         <Col xs={24} sm={12} md={6}>
-          <Card size="small">
+          <Card style={{height:110}}><Statistic title="Users" value={sysStatus?.users_count ?? 0}/></Card>
+        </Col>
+        <Col xs={24} sm={12} md={6}>
+          <Card style={{height:110}}><Statistic title="Running Tasks" value={sysStatus?.tasks_running ?? 0}/></Card>
+        </Col>
+        <Col xs={24} sm={12} md={6}>
+          <Card style={{height:110}}>
             <Statistic title="Containers" value={cStats.total_expected ?? 0}
-              suffix={<span style={{fontSize:12}}>
-                {(cStats.healthy_running ?? 0) > 0 && <Tag color="green">{cStats.healthy_running} up</Tag>}
-                {(cStats.unhealthy_running ?? 0) > 0 && <Tag color="orange">{cStats.unhealthy_running} unhealthy</Tag>}
-                {(cStats.restarting ?? 0) > 0 && <Tag color="purple">{cStats.restarting} restarting</Tag>}
-                {(cStats.down ?? 0) > 0 && <Tag color="red">{cStats.down} down</Tag>}
-                {(cStats.missing ?? 0) > 0 && <Tag color="default">{cStats.missing} missing</Tag>}
+              suffix={<span style={{fontSize:12,display:'block',marginTop:4}}>
+                <Tag color="green">{(cStats.healthy_running ?? 0)} up</Tag>
+                {(cStats.unhealthy_running ?? 0) > 0 && <Tag color="orange">{(cStats.unhealthy_running??0)} unhlth</Tag>}
+                {(cStats.restarting ?? 0) > 0 && <Tag color="purple">{(cStats.restarting??0)} rst</Tag>}
+                {(cStats.down ?? 0) > 0 && <Tag color="red">{(cStats.down??0)} down</Tag>}
+                {(cStats.missing ?? 0) > 0 && <Tag color="default">{(cStats.missing??0)} miss</Tag>}
               </span>}
             />
           </Card>
@@ -155,25 +135,7 @@ export default function DashboardPage() {
         </Col>
       </Row>
 
-      {/* User summary cards */}
-      {Object.keys(userServices).length > 0 && (
-        <Card title="Users" size="small" style={{marginTop:16}}>
-          <Row gutter={[12,12]}>
-            {Object.entries(userServices as Record<string,any>).map(([user, info]:[string,any]) => (
-              <Col xs={24} sm={12} md={8} lg={6} key={user}>
-                <Card size="small" hoverable>
-                  <Statistic title={user} value={info.services??0} suffix="services"/>
-                  <Space style={{marginTop:4}}>
-                    <Tag color="green">{info.healthy??0} healthy</Tag>
-                    <Tag color="orange">{info.unhealthy??0} unhealthy</Tag>
-                  </Space>
-                </Card>
-              </Col>
-            ))}
-          </Row>
-        </Card>
-      )}
-
+      {/* Welcome */}
       <Card style={{marginTop:16}}>
         <Title level={5}>Welcome, {admin?.email || 'Admin'}!</Title>
         <p>Provision Gateway is running. Use the sidebar to manage services, users, and tasks.</p>

@@ -13,6 +13,7 @@ import {
   MenuUnfoldOutlined,
   KeyOutlined,
   QuestionCircleOutlined,
+  SafetyCertificateOutlined,
 } from '@ant-design/icons'
 import { useAuth } from '../../hooks/useAuth'
 import client from '../../api/client'
@@ -28,6 +29,7 @@ const menuItems = [
   { key: '/settings', icon: <SettingOutlined />, label: 'Settings' },
   { key: '/audit', icon: <AuditOutlined />, label: 'Audit' },
   { key: '/users/manage', icon: <UserOutlined />, label: 'Users' },
+  { key: '/ssl', icon: <SafetyCertificateOutlined />, label: 'SSL Certs' },
 ]
 
 export default function AppLayout() {

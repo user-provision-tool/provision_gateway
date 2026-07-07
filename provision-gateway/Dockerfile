@@ -48,7 +48,8 @@ RUN pip install --no-cache-dir \
     pyyaml>=6.0 \
     pydantic>=2.0.0 \
     pydantic-settings>=2.0.0 \
-    aiofiles>=24.0.0
+    aiofiles>=24.0.0 \
+    python-multipart>=0.0.9
 
 # Clear proxy settings — must NOT persist to runtime (internal Docker DNS would break)
 ENV HTTP_PROXY="" \
