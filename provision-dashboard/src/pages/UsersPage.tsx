@@ -1,7 +1,8 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Popconfirm, Modal } from 'antd'
+import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Popconfirm, Modal, Drawer } from 'antd'
 import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, SwapOutlined, UnorderedListOutlined } from '@ant-design/icons'
+import Editor from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
 import client from '../api/client'
 import DeployForm from '../components/services/DeployForm'
@@ -40,7 +41,125 @@ export default function UsersPage() {
   const [cloneTarget, setCloneTarget] = useState('')
   const [cloneLoading, setCloneLoading] = useState(false)
 
+  // Deployment file editor drawer
+  const [editorOpen, setEditorOpen] = useState(false)
+  const [editorFile, setEditorFile] = useState<{user:string;service:string;label:string;fileType:string;filename:string;path:string}|null>(null)
+  const [editorContent, setEditorContent] = useState('')
+  const [editorOriginal, setEditorOriginal] = useState('')
+  const [editorLoading, setEditorLoading] = useState(false)
+  const [editorSaving, setEditorSaving] = useState(false)
+
+  // Registration times cache: key → unix timestamp
+  const [regTimes, setRegTimes] = useState<Record<string, number|null>>({})
+  // File modification times cache: key → unix timestamp
+  const [fileModTimes, setFileModTimes] = useState<Record<string, number|null>>({})
+  // Track which services need redeploy (files modified after registration)
+  const [needsRedeploy, setNeedsRedeploy] = useState<Record<string, boolean>>({})
+
   useEffect(() => { loadServices() }, [])
+
+  // After services are loaded, check registration times and file mod times
+  useEffect(() => {
+    if (services.length === 0) return
+    // Check registration times for each service
+    const checkTimes = async () => {
+      for (const svc of services) {
+        const key = `${svc.user_name}-${svc.service_name}-${svc.label}`
+        if (regTimes[key] !== undefined) continue // Already fetched
+        try {
+          const { data } = await client.get(`/users/${svc.user_name}/${svc.service_name}/${svc.label}/registration-time`)
+          const rt = data.registration_time || null
+          setRegTimes(prev => ({...prev, [key]: rt}))
+        } catch { /* ignore */ }
+      }
+    }
+    checkTimes()
+  }, [services])
+
+  // Check file modification times for deployment files
+  const checkFileModTimes = useCallback(async (user: string, service: string, label: string) => {
+    const key = `${user}-${service}-${label}`
+    try {
+      const { data } = await client.get(`/users/${user}/${service}/${label}/deployment-files`)
+      let latestMod: number | null = null
+      for (const f of (data.files || [])) {
+        if (f.exists && f.modified_at) {
+          if (latestMod === null || f.modified_at > latestMod) {
+            latestMod = f.modified_at
+          }
+        }
+      }
+      setFileModTimes(prev => ({...prev, [key]: latestMod}))
+      // Check if files were modified after registration
+      const regTime = regTimes[key]
+      if (regTime && latestMod && latestMod > regTime) {
+        setNeedsRedeploy(prev => ({...prev, [key]: true}))
+      } else {
+        setNeedsRedeploy(prev => ({...prev, [key]: false}))
+      }
+    } catch { /* ignore */ }
+  }, [regTimes])
+
+  // When services load, check their file modification times
+  useEffect(() => {
+    for (const svc of services) {
+      const key = `${svc.user_name}-${svc.service_name}-${svc.label}`
+      if (fileModTimes[key] === undefined) {
+        checkFileModTimes(svc.user_name, svc.service_name, svc.label)
+      }
+    }
+  }, [services, checkFileModTimes])
+
+  // Open deployment file editor
+  const openFileEditor = async (user: string, service: string, label: string, fileType: string, filename: string) => {
+    setEditorLoading(true)
+    setEditorFile({ user, service, label, fileType, filename, path: '' })
+    setEditorOpen(true)
+    try {
+      const { data } = await client.get(`/users/${user}/${service}/${label}/deployment-files/${fileType}`)
+      setEditorContent(data.content || '')
+      setEditorOriginal(data.content || '')
+      setEditorFile(prev => prev ? {...prev, path: data.path || ''} : null)
+    } catch (err: any) {
+      if (err.response?.status === 404) {
+        setEditorContent('')
+        setEditorOriginal('')
+        message.info('File does not exist yet. Create it by saving.')
+      } else {
+        message.error('Failed to load file')
+        setEditorOpen(false)
+      }
+    } finally {
+      setEditorLoading(false)
+    }
+  }
+
+  // Save deployment file
+  const saveFile = async () => {
+    if (!editorFile) return
+    setEditorSaving(true)
+    try {
+      await client.put(`/users/${editorFile.user}/${editorFile.service}/${editorFile.label}/deployment-files/${editorFile.fileType}`, { content: editorContent })
+      message.success('File saved')
+      setEditorOriginal(editorContent)
+      // Re-check modification times
+      checkFileModTimes(editorFile.user, editorFile.service, editorFile.label)
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || 'Failed to save')
+    } finally {
+      setEditorSaving(false)
+    }
+  }
+
+  // Get language for Monaco based on file type
+  const getEditorLanguage = (fileType: string) => {
+    switch (fileType) {
+      case 'compose': return 'yaml'
+      case 'nginx': return 'nginx'
+      case 'env': return 'shell'
+      default: return 'plaintext'
+    }
+  }
 
   const isEndUser = (admin as any)?.user_type === 'end_user'
   const endUserViewer = isEndUser && admin?.role !== 'admin'
@@ -207,15 +326,22 @@ export default function UsersPage() {
                               loadServices()
                             } catch(e:any) { message.error(e.response?.data?.detail||'Failed') }
                           }}>Rebuild</Button>
-                          <Button size="small" icon={<RocketOutlined/>} onClick={async ()=>{
+                          <Tooltip title="Redeploy service with no-cache rebuild">
+                            <Button size="small" icon={<RocketOutlined/>} 
+                              className={needsRedeploy[key] ? 'redeploy-blink' : ''}
+                              style={needsRedeploy[key] ? {borderColor:'#faad14',color:'#faad14'} : {}}
+                              onClick={async ()=>{
                             try {
                               const r = await client.post(`/users/${svc.user_name}/${svc.service_name}/${svc.label}/rebuild`,{no_cache:true})
                               const taskId = r.data?.task_id || r.data?.id
                               if (taskId) setActiveTasks(t=>({...t,[key]:taskId}))
                               message.success({content:<span>Redeploying... {taskId && <Button type="link" size="small" icon={<UnorderedListOutlined/>} onClick={()=>navigate('/tasks')}>View Task</Button>}</span>,duration:5})
+                              // Clear the needs-redeploy flag
+                              setNeedsRedeploy(prev => ({...prev, [key]: false}))
                               loadServices()
                             } catch(e:any) { message.error(e.response?.data?.detail||'Failed') }
                           }}>Redeploy</Button>
+                          </Tooltip>
                           <Tooltip title="Change password">
                             <Button size="small" icon={<KeyOutlined/>} onClick={()=>openPwdChange(svc.user_name,svc.service_name,svc.label)}/>
                           </Tooltip>
@@ -253,7 +379,8 @@ export default function UsersPage() {
                           const envFile = `.env.${svc.user_name}.${svc.label}`
                           return <div style={{marginBottom:4}}>
                             <Text>.env: </Text>
-                            <Text code>{envFile}</Text>
+                            <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
+                              onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'env', envFile)}>{envFile}</Text>
                             <Text type="secondary" style={{fontSize:11}}> (in PROVISION/source_projects/{svc.service_name} dir)</Text>
                           </div>
                         })()}
@@ -262,19 +389,20 @@ export default function UsersPage() {
                           const composeFile = `docker-compose.user-${svc.user_name}.${svc.label}.yml`
                           return <div style={{marginBottom:4}}>
                             <Text>compose: </Text>
-                            <Text code>{composeFile}</Text>
+                            <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
+                              onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'compose', composeFile)}>{composeFile}</Text>
                             <Text type="secondary" style={{fontSize:11}}> (in PROVISION/source_projects/{svc.service_name} dir)</Text>
                           </div>
                         })()}
                         {/* nginx conf file */}
                         {(() => {
-                          // Try to derive nginx conf filename from compose_template_path or service_name
                           const nginxConfPath = svc.nginx_conf_template_path || ''
                           const nginxBase = nginxConfPath.split('/').pop()?.replace('.j2', '') || svc.service_name
                           const nginxConfFile = `${nginxBase}.user-${svc.user_name}.${svc.label}.nginx.conf`
                           return <div style={{marginBottom:4}}>
                             <Text>nginx conf: </Text>
-                            <Text code>{nginxConfFile}</Text>
+                            <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
+                              onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'nginx', nginxConfFile)}>{nginxConfFile}</Text>
                             <Text type="secondary" style={{fontSize:11}}> (in PROVISION/generated dir)</Text>
                           </div>
                         })()}
@@ -321,6 +449,53 @@ export default function UsersPage() {
           <Text type="secondary">All services from {cloneSource} will be cloned to the target user.</Text>
         </Space>
       </Modal>
+
+      {/* Deployment File Editor Drawer */}
+      <Drawer
+        title={editorFile ? <Space><Text strong>{editorFile.filename}</Text><Tag>{editorFile.fileType}</Tag><Text type="secondary">for {editorFile.user}/{editorFile.service}/{editorFile.label}</Text></Space> : 'File Editor'}
+        open={editorOpen}
+        onClose={() => {
+          if (editorContent !== editorOriginal) {
+            Modal.confirm({
+              title: 'Unsaved changes',
+              content: 'You have unsaved changes. Discard them?',
+              onOk: () => { setEditorOpen(false); setEditorFile(null); }
+            })
+          } else {
+            setEditorOpen(false)
+            setEditorFile(null)
+          }
+        }}
+        width="80%"
+        extra={
+          <Space>
+            {editorContent !== editorOriginal && <Tag color="orange">Modified</Tag>}
+            <Button onClick={() => setEditorContent(editorOriginal)} disabled={editorContent === editorOriginal}>Reset</Button>
+            <Button type="primary" onClick={saveFile} loading={editorSaving} disabled={editorContent === editorOriginal}>
+              Save & Close
+            </Button>
+          </Space>
+        }
+      >
+        {editorLoading ? <Spin /> : (
+          <div style={{height:'calc(100vh - 180px)'}}>
+            <Editor
+              height="100%"
+              language={getEditorLanguage(editorFile?.fileType || 'plaintext')}
+              theme="vs-dark"
+              value={editorContent}
+              onChange={(val) => setEditorContent(val || '')}
+              options={{
+                minimap: { enabled: false },
+                fontSize: 13,
+                wordWrap: 'on',
+                scrollBeyondLastLine: false,
+                automaticLayout: true,
+              }}
+            />
+          </div>
+        )}
+      </Drawer>
     </div>
   )
 }

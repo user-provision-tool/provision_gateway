@@ -15,7 +15,7 @@ class Settings:
             os.environ.get("PROVISION_DIR", "/srv/provision")
         )
         self.GATEWAY_DATA_DIR = Path(
-            os.environ.get("GATEWAY_DATA_DIR", "/data")
+            os.environ.get("GATEWAY_DATA_DIR", str(self.PROVISION_DIR / "gateway_data"))
         )
         self.GATEWAY_DATA_DIR.mkdir(parents=True, exist_ok=True)
 

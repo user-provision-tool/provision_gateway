@@ -279,15 +279,14 @@ def list_deployable_users(
     current_admin: AdminUser = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
-    """List users available for deployment (approved + active + special users)."""
+    """List users available for deployment (approved + active end-users, plus special users)."""
+    # Get all approved, active end-users
     users = db.query(EndUser).filter(
         EndUser.is_approved == True,
         EndUser.is_active == True,
     ).all()
     result = [u.to_dict() for u in users]
-    # Add special functional users
-    specials = ["shared", "public", "internal"]
-    for s in specials:
-        if not any(u["username"] == s for u in result):
-            result.append({"username": s, "role": "special", "is_approved": True, "is_active": True, "allowed_special_users": []})
+    # Special users are those registered with role="special" in end_users
+    # They're already included in the query above. 
+    # No hardcoded special users — all special users must be registered via the Users page.
     return {"users": sorted(result, key=lambda x: x["username"])}

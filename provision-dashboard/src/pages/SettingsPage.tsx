@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Typography, Card, Form, Input, Select, Button, message, Space, Spin, Alert, Empty, Divider, Tag, Switch, Popconfirm } from 'antd'
-import { SaveOutlined, ApiOutlined, RobotOutlined, KeyOutlined, GlobalOutlined, CheckCircleOutlined, CloseCircleOutlined, LoadingOutlined, DeleteOutlined, UserOutlined } from '@ant-design/icons'
+import { SaveOutlined, ApiOutlined, RobotOutlined, KeyOutlined, GlobalOutlined, CheckCircleOutlined, CloseCircleOutlined, LoadingOutlined, DeleteOutlined } from '@ant-design/icons'
 import { useAuth } from '../hooks/useAuth'
 import client from '../api/client'
 
@@ -13,40 +13,9 @@ export default function SettingsPage() {
   return (
     <div>
       <Title level={3}>Settings</Title>
-      {isAdmin ? <><LlmPanel /><ProxyPanel /><SpecialUsersPanel /></> : <Card><Empty description="Settings management requires admin role."/></Card>}
+      {isAdmin ? <><LlmPanel /><ProxyPanel /></> : <Card><Empty description="Settings management requires admin role."/></Card>}
       <Card title="System Info"><Space direction="vertical"><Text><strong>Gateway:</strong> v1.0.0</Text><Text><strong>Provision API:</strong> provision-api:8000</Text></Space></Card>
     </div>
-  )
-}
-
-// ---- Special Users Panel ----
-function SpecialUsersPanel() {
-  const [value, setValue] = useState('shared,public,internal')
-  const [loading, setLoading] = useState(false)
-
-  useEffect(() => {
-    client.get('/system/config', { params: { key: 'special_users' } })
-      .then(r => { if (r.data.value) setValue(r.data.value) })
-      .catch(() => {})
-  }, [])
-
-  const save = async () => {
-    setLoading(true)
-    try {
-      await client.put('/system/config', { value }, { params: { key: 'special_users' } })
-      message.success('Special users saved')
-    } catch { message.error('Failed') }
-    finally { setLoading(false) }
-  }
-
-  return (
-    <Card title={<Space><UserOutlined/>Special Functional Users</Space>} size="small" style={{marginTop:16}}>
-      <Space direction="vertical" style={{width:'100%'}}>
-        <Text type="secondary">Comma-separated list of special users that can be deployed to without registration (e.g. shared, public, internal).</Text>
-        <Input.TextArea value={value} onChange={e=>setValue(e.target.value)} rows={2} placeholder="shared,public,internal"/>
-        <Button onClick={save} loading={loading} icon={<SaveOutlined/>}>Save</Button>
-      </Space>
-    </Card>
   )
 }
 

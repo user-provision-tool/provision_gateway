@@ -1,7 +1,7 @@
 # Provision Gateway — Product Design Document
 
-> **Version**: 1.2
-> **Date**: 2026-07-08 (updated — post-deduplication refactor)
+> **Version**: 1.3
+> **Date**: 2026-07-20 (updated — post comprehensive gap analysis)
 > **Status**: Implemented — reflects current codebase
 > **Depends on**: [requirements.md](./requirements.md) (CONFIRMED)
 > **See also**: [architecture.md](./architecture.md) | [api_references.md](./api_references.md) | [tests_coverage_status.md](./tests_coverage_status.md) | [changes-provision_gateway-20260708.md](./changes-provision_gateway-20260708.md)
@@ -704,51 +704,60 @@ GET /api/system/nginx-state
 
 GET /api/system/proxy
   Response: 200 {
-    "enabled": false,
-    "protocol": "http",
-    "host": "",
-    "port": 8080,
-    "username": "",
-    "password_masked": "",
-    "url": "",                     // computed: {protocol}://{host}:{port}
-    "reachable": null,             // true | false | null (not yet checked)
-    "last_checked_at": null        // ISO timestamp of last reachability check
+    "configs": [
+      {
+        "id": 1,
+        "name": "Host Proxy",
+        "protocol": "http",
+        "host": "172.18.0.1",
+        "port": 7897,
+        "username": "",
+        "password_masked": "",
+        "url": "http://172.18.0.1:7897",
+        "is_active": true,
+        "reachable": true,
+        "last_checked_at": "2026-07-20T..."
+      }
+    ]
   }
+  → Returns all proxy configurations. Multi-config support (multiple proxies, one active at a time).
 
-PUT /api/system/proxy
+POST /api/system/proxy
   Request:  {
-    "enabled": true,
+    "name": "Host Proxy",
     "protocol": "http",           // 'http' | 'https' | 'socks5'
     "host": "proxy.internal",
     "port": 8080,
-    "username": "",               // optional — leave empty to keep existing
-    "password": ""                // optional — leave empty to keep existing
+    "username": "",               // optional — encrypted at rest
+    "password": ""                // optional — encrypted at rest
   }
-  Response: 200 {
-    "updated": true,
-    "proxy": { ... },
-    "reachability": {             // auto-triggered after save
-      "reachable": true,          // true | false
-      "latency_ms": 12,
-      "error": null,              // error message if unreachable
-      "checked_at": "2026-07-04T..."
-    }
-  }
-  → Proxy credentials are AES-256-GCM encrypted at rest
-  → The computed ``url`` field is returned for display
-  → After saving, the gateway automatically tests connectivity to the proxy URL
-    by attempting a TCP/TLS handshake (or HTTP CONNECT for http proxies)
+  Response: 201 { "id": 2, ... }
+  → Creates a new proxy configuration. Credentials are AES-256-GCM encrypted at rest.
+
+PUT /api/system/proxy/{config_id}
+  Request:  { "protocol": "http", "host": "...", "port": 3128, ... }
+  Response: 200 { "updated": true, "proxy": { ... } }
+  → Updates an existing proxy config by ID.
+
+DELETE /api/system/proxy/{config_id}
+  Response: 200 { "deleted": true }
+
+PUT /api/system/proxy/{config_id}/activate
+  Response: 200 { "activated": true }
+  → Activates a proxy config (only if reachable). Deactivates all others.
+
+POST /api/system/proxy/deactivate
+  Response: 200 { "deactivated": true }
+  → Deactivates all proxy configs.
 
 POST /api/system/proxy/test
   Request:  (no body)
   Response: 200 {
-    "reachable": true,
-    "latency_ms": 8,
-    "error": null,
-    "checked_at": "2026-07-04T12:00:00Z"
+    "configs": [
+      { "id": 1, "reachable": true, "latency_ms": 8, "error": null, "checked_at": "..." }
+    ]
   }
-  → Standalone recheck — tests connectivity to the configured proxy URL
-  → Returns 400 if no proxy is configured
+  → Tests reachability of all configured proxies via TCP handshake.
   → The reachability result is cached and also returned by GET /api/system/proxy
 ```
 
@@ -1243,50 +1252,26 @@ Recheck flow:
 
 ## 7. Key Module Designs
 
-### 7.1 Reconciliation Service (`app/services/reconciliation.py`)
+### 7.1 Reconciliation (Delegated to provision-api)
 
-```
-class ReconciliationService:
-    """
-    Responsible for:
-    1. Reading all *.nginx.conf from $PROVISION_DIR/generated/
-    2. Parsing proxy_pass upstreams
-    3. Verifying target containers exist and are running (docker ps)
-    4. Verifying provision-nginx is connected to each target network
-    5. Reconnecting if needed (docker network connect)
-    6. Reloading nginx (docker exec provision-nginx nginx -s reload)
-    7. Writing provision_nginx_state.json
-    """
+Reconciliation is **delegated to provision-api** via HTTP proxy. The gateway does NOT run
+reconciliation logic itself — it calls `POST /reconcile` on provision-api, which handles:
 
-    async def run_full_reconciliation(self) -> ReconciliationReport:
-        ...
-    
-    async def on_nginx_restart(self) -> ReconciliationReport:
-        # Called when Docker event detects provision-nginx restart
-        ...
-    
-    async def record_current_state(self) -> None:
-        # Called after every register/remove/rebuild
-        ...
-```
+1. Reading all `*.nginx.conf` from `$PROVISION_DIR/generated/`
+2. Parsing `proxy_pass` upstreams
+3. Verifying target containers exist and are running (`docker ps`)
+4. Verifying provision-nginx is connected to each target network
+5. Reconnecting if needed (`docker network connect`)
+6. Reloading nginx (`docker exec provision-nginx nginx -s reload`)
+7. Writing `provision_nginx_state.json`
 
-**Reconciliation algorithm:**
-```
-1. Read generated/*.nginx.conf files
-2. For each conf:
-   a. Parse server_name, proxy_pass directive
-   b. Extract target_container name from proxy_pass URL
-   c. Docker inspect target_container → exists? running?
-   d. Extract network name from container's Networks
-   e. Docker network inspect network → is provision-nginx connected?
-3. For each unreachable:
-   a. If container missing → mark as UNREACHABLE (can't fix)
-   b. If network missing → mark as UNREACHABLE (can't fix)
-   c. If nginx not connected to network → docker network connect + mark RECONNECTED
-4. docker exec provision-nginx nginx -s reload
-5. Write provision_nginx_state.json
-6. Return ReconciliationReport
-```
+The gateway's `provision_service.py` proxies the reconciliation call and the dashboard's
+"Reconcile" button triggers `POST /api/system/reconcile` → `POST http://provision-api:8765/reconcile`.
+
+**Related endpoints (proxied to provision-api):**
+- `POST /api/system/reconcile` → `POST /reconcile` on provision-api
+- `GET /api/system/reconcile/status` → `GET /reconcile/status` on provision-api
+- `GET /api/system/nginx-state` → `GET /nginx-state` on provision-api
 
 ### 7.2 Docker Event Monitor (`app/services/docker_service.py`)
 
@@ -1495,17 +1480,22 @@ Gateway runs:            git config --global http.proxy http://squid-proxy:3128
 
 ## 8. provision-api Gap List
 
-These features need to be implemented in `_users_provision/` to fully support the gateway.
-**They are listed here for tracking; do NOT implement them as part of the gateway.**
+These features have been implemented in `_users_provision/` to fully support the gateway.
+**All items are now implemented and verified.** Verification: 27/27 provision-api shell tests pass (2026-07-20).
 
-| # | Feature | Priority | Endpoint / Change | Notes |
+| # | Feature | Priority | Endpoint / Change | Status |
 |---|---|---|---|---|
-| P1 | **Orphan network cleanup on remove** | High | Inside `provisioner.remove_user()` or `docker_ops.compose_down()` | After `docker compose down`, check if the network still exists. If only `provision-nginx` is connected, run `docker network disconnect provision-nginx {network}` then `docker network rm {network}`. |
-| P2 | **Build log streaming endpoint** | High | `GET /tasks/{task_id}/log?tail=N&follow=true` → SSE | Currently `DOCKER_OPS_LOG` is a file. Add an SSE endpoint that tails the file. The gateway streams this to the browser. |
-| P3 | **Nginx connection state endpoint** | High | `GET /nginx/connections` → JSON | Returns: (a) list of networks provision-nginx is connected to, (b) list of `*.nginx.conf` files in GENERATED_DIR, (c) parsed upstreams. Needed by gateway reconciliation. |
-| P4 | **Reconnect-all endpoint** | High | `POST /nginx/reconnect-all` → JSON | Iterates all entries in user_registry.yml, for each: `docker network connect {network_name} provision-nginx` (idempotent). Then `nginx -s reload`. Returns count of reconnected networks. |
-| P5 | **Password change endpoint** | Medium | `PUT /users/{user_name}/{service_name}/{label}/password` | Re-hash new password, re-write `.htpasswd`, update registry. Currently password is set at registration only. |
-| P6 | **Container logs endpoint** | Low | `GET /users/{user}/{service}/{label}/containers/{container}/logs?tail=N` | For the dashboard to show per-container logs without `docker logs` access. |
+| P1 | **Orphan network cleanup on remove** | High | Inside `provisioner.remove_user()` or `docker_ops.compose_down()` | ✅ Implemented |
+| P2 | **Build log streaming endpoint** | High | `GET /tasks/{task_id}/log?tail=N&follow=true` → SSE | ✅ Implemented |
+| P3 | **Nginx connection state endpoint** | High | `GET /nginx/connections` → JSON | ✅ Implemented |
+| P4 | **Reconnect-all endpoint** | High | `POST /nginx/reconnect-all` → JSON | ✅ Implemented |
+| P5 | **Password change endpoint** | Medium | `PUT /users/{user_name}/{service_name}/{label}/password` | ✅ Implemented |
+| P6 | **Container logs endpoint** | Low | `GET /users/{user}/{service}/{label}/containers/{container}/logs?tail=N` | ✅ Implemented |
+| P7 | **Docker/host stats endpoints** | High | `GET /docker/ps`, `/docker/stats`, `/docker/info`, `/host/stats` | ✅ Implemented |
+| P8 | **Container existence/running check** | High | `GET /docker/container/{name}/exists`, `/running` | ✅ Implemented |
+| P9 | **Service/container stats (registry-based)** | High | `GET /container-stats`, `/service-stats` | ✅ Implemented |
+| P10 | **SSL certificate management** | Medium | `GET/POST/DELETE /ssl-certs`, `POST /ssl-certs/{domain}/refresh` | ✅ Implemented |
+| P11 | **Reconciliation endpoint** | High | `POST /reconcile`, `GET /reconcile/status`, `GET /nginx-state` | ✅ Implemented |
 
 ---
 
