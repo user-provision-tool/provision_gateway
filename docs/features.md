@@ -1,7 +1,7 @@
 # Provision Gateway — Features Status
 
-> **Version**: 1.1
-> **Date**: 2026-07-08 (updated — post-deduplication refactor)
+> **Version**: 1.4
+> **Date**: 2026-07-20 (updated — post comprehensive gap analysis + full test suite)
 > **Purpose**: Quick reference and implementation status tracker for all features.
 
 ---
@@ -29,11 +29,13 @@
 | A5 | Password change | ✅ | `PUT /api/auth/password` |
 | A6 | End-user registration (portal users) | ✅ | `POST /api/auth/users/register` |
 | A7 | End-user approval workflow | ✅ | `PUT /api/auth/users/{id}/approve` |
-| A8 | End-user role management | ✅ | `PUT /api/auth/users/{id}` |
-| A9 | Special users assignment | ✅ | Per-user `allowed_special_users` |
-| A10 | Deployable users list | ✅ | `GET /api/auth/users/deployable` |
-| A11 | End-user login (JWT with user_type) | ✅ | `POST /api/auth/login` supports both admin and end-user |
+| A8 | End-user role management | ✅ | `PUT /api/auth/users/{id}` — roles: viewer, special, admin |
+| A9 | Special users per-user assignment | ✅ | Per-user `allowed_special_users` via toggleable tags modal in Users page |
+| A10 | Deployable users list | ✅ | `GET /api/auth/users/deployable` — DB-driven, returns approved+active users |
+| A11 | End-user login (JWT with user_type) | ✅ | `POST /api/auth/login` supports both admin and end-user tokens |
 | A12 | Role-based sidebar filtering | ✅ | End-user viewers see only Services page |
+| A13 | Auto-register deployed users | ✅ | `GET /api/users` syncs provision-api users into gateway `end_users` table on each list |
+| A14 | Special users as DB records | ✅ | Special users registered via Users page (role="special"), not via Settings textarea |
 
 ---
 
@@ -87,6 +89,10 @@
 | P8 | Duplicate service to another user | ✅ | Same config, new user |
 | P9 | Batch operations | 🔴 | Multi-select not yet implemented |
 | P10 | Volume management UI | ⚠️ | Volume paths shown in expanded card; no disk usage yet |
+| P11 | Deployment file editor | ✅ | Clickable deployment files (env/compose/nginx) open in Monaco editor drawer |
+| P12 | Redeploy blink on file change | ✅ | Redeploy button blinks when deployment files modified after registration; CSS animation `redeploy-blink` |
+| P13 | Service registration time tracking | ✅ | `GET /api/.../registration-time` finds most recent successful register task |
+| P14 | Deployment file CRUD API | ✅ | `GET/PUT /api/users/{u}/{s}/{l}/deployment-files/{type}` for env/compose/nginx |
 
 ---
 
@@ -130,6 +136,7 @@
 | R4 | Task progress tracking | ✅ | Status badges, elapsed time |
 | R5 | Toast notifications | ✅ | Browser Notification API + antd messages |
 | R6 | Audit log auto-refresh (30s) | ✅ | `usePolling` hook |
+| R7 | Task persistence to disk | ✅ | `task_registry.json` in TASK_LOG_DIR; tasks survive provision-api restarts up to TTL |
 
 ---
 
@@ -196,7 +203,7 @@
 | UM2 | Admin approval workflow | ✅ | Pending → Approved status |
 | UM3 | Role assignment (viewer/special/admin) | ✅ | Via user update endpoint |
 | UM4 | Special users per-user assignment | ✅ | Toggleable tags modal |
-| UM5 | Global special users config | ✅ | Settings page textarea |
+| UM5 | Global special users config | ✅ | Collapsible "Special Functional Users Configuration" panel on Users management page (not Settings) |
 | UM6 | Delete end-user | ✅ | With confirmation |
 | UM7 | Role-based sidebar filtering | ✅ | Viewer sees fewer menu items |
 
@@ -219,20 +226,20 @@
 
 | Category | Total | Implemented | Verified | Gaps |
 |---|---|---|---|---|
-| Authentication | 10 | 10 | 10 | 0 |
+| Authentication | 14 | 14 | 14 | 0 |
 | Dashboard | 8 | 8 | 8 | 0 |
-| Service Management | 14 | 12 | 12 | 2 (stretch goals) |
-| User Provisioning | 10 | 8 | 7 | 2 (batch ops, volume UI) |
-| Service URL & Connectivity | 4 | 4 | 3 | 1 (SSL display) |
+| Service Management | 14 | 12 | 12 | 2 (S13, S14: stretch goals) |
+| User Provisioning | 14 | 12 | 12 | 2 (P9: batch ops 🔴, P10: volume UI ⚠️ partial) |
+| Service URL & Connectivity | 5 | 5 | 5 | 0 |
 | LLM Integration | 11 | 11 | 11 | 0 |
-| Real-Time Operations | 6 | 6 | 6 | 0 |
-| Reconciliation | 7 | 5 | 5 | 2 (scheduled, events) |
+| Real-Time Operations | 7 | 7 | 7 | 0 |
+| Reconciliation | 7 | 5 | 5 | 2 (N6: scheduled, N7: Docker events) |
 | System Monitoring | 6 | 6 | 6 | 0 |
 | Audit & Logging | 5 | 5 | 5 | 0 |
 | Proxy Management | 9 | 9 | 9 | 0 |
 | User Management | 7 | 7 | 7 | 0 |
 | MCP Server | 6 | 6 | 6 | 0 |
-| **TOTAL** | **103** | **97** | **95** | **8** |
+| **TOTAL** | **113** | **107** | **105** | **8** |
 
-**Implementation Rate:** 97/103 = **94.2%**
-**Verified Rate:** 95/103 = **92.2%**
+**Implementation Rate:** 107/113 = **94.7%**
+**Verified Rate:** 105/113 = **92.9%**

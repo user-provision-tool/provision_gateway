@@ -42,6 +42,16 @@ body {
   margin-left: 5px;
 }
 
+/* Redeploy button blink animation */
+@keyframes redeploy-blink-anim {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.redeploy-blink {
+  animation: redeploy-blink-anim 1s ease-in-out infinite;
+}
+
 .setup-container {
   display: flex;
   justify-content: center;

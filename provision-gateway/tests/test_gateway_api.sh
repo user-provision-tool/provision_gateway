@@ -7,7 +7,7 @@
 # ============================================================================
 
 set -e
-API="http://localhost:8770/api"
+API="http://localhost:8771/api"
 ADMIN_EMAIL="admin@example.com"
 ADMIN_PASS="admin123"
 PASS=0

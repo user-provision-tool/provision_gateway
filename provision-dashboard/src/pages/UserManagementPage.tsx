@@ -30,9 +30,13 @@ export default function UserManagementPage() {
 
   const loadGlobalSpecialUsers = async () => {
     try {
-      const { data } = await client.get('/system/config')
-      const specialUsers = data.special_users || data.config?.special_users || []
-      setSpecialUsersGlobal(Array.isArray(specialUsers) ? specialUsers : (typeof specialUsers==='string' ? specialUsers.split(',').map((s:string)=>s.trim()).filter(Boolean) : []))
+      const { data } = await client.get('/auth/users')
+      const allUsers = data.users || []
+      // Special users are those registered with role="special"
+      const specialUsers = allUsers
+        .filter((u: any) => u.role === 'special' && u.is_approved)
+        .map((u: any) => u.username)
+      setSpecialUsersGlobal(specialUsers)
     } catch { /* use defaults */ }
   }
 
@@ -81,7 +85,10 @@ export default function UserManagementPage() {
 
   const columns = [
     { title: 'Username', dataIndex: 'username', key: 'username', render: (t:string) => <strong>{t}</strong> },
-    { title: 'Role', dataIndex: 'role', key: 'role', render: (r:string) => <Tag color={r==='viewer'?'blue':'orange'}>{r}</Tag> },
+    { title: 'Role', dataIndex: 'role', key: 'role', render: (r:string) => {
+      const color = r==='admin'?'red':r==='special'?'purple':'blue'
+      return <Tag color={color}>{r}</Tag>
+    }},
     { title: 'Status', key: 'status', render: (_:any, r:any) => r.is_approved ? <Tag color="green">Approved</Tag> : <Tag color="gold">Pending</Tag> },
     { title: 'Allowed Special Users', key: 'special_users', render: (_:any, r:any) => {
       const allowed = r.allowed_special_users || []
@@ -111,14 +118,14 @@ export default function UserManagementPage() {
         label: <Space><SettingOutlined/><Text strong>Special Functional Users Configuration</Text></Space>,
         children: <div>
           <Text type="secondary">
-            Special functional users (e.g. shared, public, internal) are service groups shared by multiple regular users.
-            Below you can configure who can access which special user groups.
+            Special functional users (e.g. shared, public, internal) are registered as regular users with role "Special" via the Register button above.
+            Once registered and approved, they appear in the deployable users list. Below are the currently registered special users.
           </Text>
           <div style={{marginTop:12}}>
-            <Text strong>Global Special Users: </Text>
+            <Text strong>Registered Special Users: </Text>
             {specialUsersGlobal.length > 0
               ? <Space size={4} wrap>{specialUsersGlobal.map(s => <Tag key={s} color="purple">{s}</Tag>)}</Space>
-              : <Text type="secondary">none configured (set in Settings → Special Users)</Text>
+              : <Text type="secondary">none registered yet (register a user with role "Special" using the button above)</Text>
             }
           </div>
         </div>

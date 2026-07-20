@@ -10,9 +10,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from app.services.proxy_service import (
     get_proxy_env,
     inject_proxy_build_args,
-    ProxyConfig,
-    ProxyConfigInput,
 )
+from app.models.proxy_config import ProxyConfig
 from app.utils.crypto import encrypt_api_key, decrypt_api_key
 
 

@@ -10,3 +10,4 @@ node_modules/
 gateway_data/
 _ignore/
 _tasks/
+_tmp/

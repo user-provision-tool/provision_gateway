@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..middleware import get_current_admin
 from ..models.admin import AdminUser
+from ..config import settings
 from ..services import audit_service, curl_service
 from ..services.provision_service import provision_service
 
@@ -19,13 +20,35 @@ router = APIRouter(prefix="/api/users", tags=["users"])
 @router.get("")
 async def list_users(
     current_admin: AdminUser = Depends(get_current_admin),
+    db: Session = Depends(get_db),
 ):
-    """List all end-users from provision-api."""
+    """List all end-users from provision-api, syncing missing users to gateway DB."""
     try:
         result = await provision_service.list_users()
     except Exception as e:
         raise HTTPException(502, f"provision-api error: {e}")
     users = result.get("user_status", [])
+
+    # Sync: ensure all users from provision-api exist in gateway end_users DB
+    from ..models.end_user import EndUser
+    import bcrypt as _bcrypt
+    import secrets
+
+    gateway_users = {u.username for u in db.query(EndUser).all()}
+    for u in users:
+        user_name = u.get("user_name", "").strip()
+        if user_name and user_name not in gateway_users:
+            random_pw = secrets.token_hex(16)
+            new_user = EndUser(
+                username=user_name,
+                password_hash=_bcrypt.hashpw(random_pw.encode(), _bcrypt.gensalt()).decode(),
+                role="viewer",
+                is_approved=True,
+                is_active=True,
+            )
+            db.add(new_user)
+    db.commit()
+
     return {"users": users, "count": len(users)}
 
 
@@ -58,6 +81,26 @@ async def deploy_user(
             raise HTTPException(400, "Global proxy is not enabled. Configure it in Settings first.")
         build_args = req.get("build_args") or {}
         req["build_args"] = inject_proxy_build_args(db, build_args, True)
+
+    # Auto-register the user in gateway end_users if not already present
+    user_name = req.get("user_name", "").strip()
+    if user_name:
+        from ..models.end_user import EndUser
+        import bcrypt as _bcrypt
+        existing = db.query(EndUser).filter(EndUser.username == user_name).first()
+        if not existing:
+            # Auto-register with a random password (not used for login by default)
+            import secrets
+            random_pw = secrets.token_hex(16)
+            new_user = EndUser(
+                username=user_name,
+                password_hash=_bcrypt.hashpw(random_pw.encode(), _bcrypt.gensalt()).decode(),
+                role="viewer",
+                is_approved=True,
+                is_active=True,
+            )
+            db.add(new_user)
+            db.commit()
 
     try:
         result = await provision_service.register_user(**req)
@@ -325,3 +368,163 @@ async def clone_user(
         status="success",
     )
     return {"tasks": tasks, "total": len(tasks)}
+
+
+# ---------------------------------------------------------------------------
+# Deployment File Operations (read/write generated deployment files)
+# ---------------------------------------------------------------------------
+
+from pathlib import Path as _Path
+import os as _os
+
+
+def _resolve_deployment_file(
+    user_name: str, service_name: str, label: str, file_type: str
+) -> _Path | None:
+    """Resolve a deployment file path from file_type identifier.
+    
+    file_type can be:
+    - 'env' → .env.{user_name}.{label}
+    - 'compose' → docker-compose.user-{user_name}.{label}.yml
+    - 'nginx' → {service_name}.user-{user_name}.{label}.nginx.conf
+    """
+    source_dir = settings.SOURCE_PROJECTS_DIR / service_name
+    generated_dir = settings.GENERATED_DIR
+
+    if file_type == "env":
+        return source_dir / f".env.{user_name}.{label}"
+    elif file_type == "compose":
+        return source_dir / f"docker-compose.user-{user_name}.{label}.yml"
+    elif file_type == "nginx":
+        # Try common naming patterns for nginx conf
+        candidates = [
+            generated_dir / f"{service_name}.user-{user_name}.{label}.nginx.conf",
+            generated_dir / f"{user_name}.{service_name}.{label}.nginx.conf",
+        ]
+        for c in candidates:
+            if c.exists():
+                return c
+        return candidates[0]  # Return primary candidate even if not exists (for write)
+    return None
+
+
+@router.get("/{user_name}/{service_name}/{label}/deployment-files")
+async def list_deployment_files(
+    user_name: str, service_name: str, label: str,
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """List deployment files for a service instance (paths, sizes, modification times)."""
+    files = []
+    for ft in ["env", "compose", "nginx"]:
+        fp = _resolve_deployment_file(user_name, service_name, label, ft)
+        if fp:
+            info = {
+                "file_type": ft,
+                "path": str(fp),
+                "filename": fp.name,
+                "exists": fp.exists(),
+            }
+            if fp.exists():
+                stat = fp.stat()
+                info["size"] = stat.st_size
+                info["modified_at"] = stat.st_mtime
+            files.append(info)
+    return {"files": files}
+
+
+@router.get("/{user_name}/{service_name}/{label}/deployment-files/{file_type}")
+async def get_deployment_file(
+    user_name: str, service_name: str, label: str, file_type: str,
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """Get the content of a deployment file."""
+    fp = _resolve_deployment_file(user_name, service_name, label, file_type)
+    if not fp:
+        raise HTTPException(400, f"Unknown file type: {file_type}")
+    if not fp.exists():
+        raise HTTPException(404, f"File not found: {fp}")
+    try:
+        content = fp.read_text()
+    except Exception as e:
+        raise HTTPException(500, f"Failed to read file: {e}")
+    return {
+        "file_type": file_type,
+        "path": str(fp),
+        "filename": fp.name,
+        "content": content,
+        "size": len(content),
+        "modified_at": fp.stat().st_mtime,
+    }
+
+
+@router.put("/{user_name}/{service_name}/{label}/deployment-files/{file_type}")
+async def save_deployment_file(
+    user_name: str, service_name: str, label: str, file_type: str,
+    req: dict[str, Any],
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Save/update a deployment file's content."""
+    content = req.get("content", "")
+    fp = _resolve_deployment_file(user_name, service_name, label, file_type)
+    if not fp:
+        raise HTTPException(400, f"Unknown file type: {file_type}")
+
+    # Ensure parent directory exists
+    fp.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        fp.write_text(content)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to write file: {e}")
+
+    audit_service.log_action(
+        db, action="deployment_file_edit", admin_id=current_admin.id,
+        target_user=user_name, target_service=service_name,
+        target_label=label,
+        detail={"file_type": file_type, "path": str(fp)},
+        status="success",
+    )
+    return {
+        "saved": True,
+        "file_type": file_type,
+        "path": str(fp),
+        "size": len(content),
+        "modified_at": fp.stat().st_mtime,
+    }
+
+
+@router.get("/{user_name}/{service_name}/{label}/registration-time")
+async def get_registration_time(
+    user_name: str, service_name: str, label: str,
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """Get the service registration completion timestamp by finding the most
+    recent successful 'register' task for this service instance."""
+    try:
+        # Query provision-api for all tasks, find the matching successful registration
+        tasks_result = await provision_service.list_tasks()
+        tasks = tasks_result.get("tasks", [])
+        best_time = None
+        for t in tasks:
+            if t.get("type") != "register":
+                continue
+            if t.get("status") not in ("completed", "succeeded"):
+                continue
+            result = t.get("result") or {}
+            if isinstance(result, str):
+                import json
+                try:
+                    result = json.loads(result)
+                except Exception:
+                    pass
+            t_user = result.get("user_name", "") if isinstance(result, dict) else ""
+            t_svc = result.get("service_name", "") if isinstance(result, dict) else ""
+            t_label = str(result.get("label", "0")) if isinstance(result, dict) else "0"
+            if t_user == user_name and t_svc == service_name and t_label == str(label):
+                updated = t.get("updated_at") or t.get("created_at")
+                if updated and (best_time is None or updated > best_time):
+                    best_time = updated
+        return {"registration_time": best_time}
+    except Exception as e:
+        raise HTTPException(502, f"provision-api error: {e}")
