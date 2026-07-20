@@ -105,3 +105,40 @@ No code changes — verification only:
 - D2: Update proxy test scripts
 - CQ1-CQ4: Code quality improvements
 - OP1-OP3: Browser-based operational tasks
+
+## Iteration 5 — 2026-07-20 (D2 + CQ1)
+
+### Gaps Identified
+- **D2**: proxy test script (test_proxy.sh) written for old single-config API — 15/32 pass
+- **CQ1**: No Pydantic schemas for non-auth routers
+
+### Changes Made
+1. **D2** (`tests/test_proxy.sh`): Complete rewrite for multi-config API.
+   - Tests: create (POST), list (GET), update (PUT /{id}), activate (PUT /{id}/activate),
+     deactivate-all (POST /deactivate), test-all (POST /test), credentials encryption,
+     deploy-with-proxy, audit logging, delete (DELETE /{id})
+   - Result: **24/24 pass** (was 15/32)
+
+2. **CQ1 partial** — Created Pydantic schemas:
+   - `app/schemas/llm.py`: LLMConfigCreate/Update/Response, GenerateRequest/Context/Response,
+     LLMTestResponse (13 models)
+   - `app/schemas/proxy.py`: ProxyConfigCreate/Update/Response, ProxyTestResult/Response,
+     activate/deactivate/create responses (12 models)
+   - All schemas import correctly, unit tests still pass (24/24)
+
+### Test Results
+| Suite | Result |
+|-------|--------|
+| proxy shell tests | **24/24** ✅ (was 15/32) |
+| gateway unit tests | 24/24 ✅ |
+| schema imports | 2/2 ✅ |
+
+### Docs Updated
+- `_tasks/tasks-20260720.md`: D2 marked done, CQ1 marked partial
+- `docs/dev_debug_cycle_log.md`: This entry
+
+### Remaining Gaps (post-cycle)
+- F1-F3: Unimplemented features (batch ops, scheduled reconcile, Docker events)
+- CQ1 remaining: schemas for system, services, users, tasks, audit routers
+- CQ2-CQ4: Alembic decision, API modules, component extraction
+- OP1-OP3: Browser-based operational tasks (siyuan deploy, MCP config, cross-user MCP)

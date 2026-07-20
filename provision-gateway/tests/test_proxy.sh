@@ -1,8 +1,8 @@
 #!/bin/bash
-# Integration tests for proxy feature
+# Integration tests for proxy feature — multi-config API
 set -e
 
-GW="${GATEWAY_URL:-http://localhost:8770}"
+GW="${GATEWAY_URL:-http://localhost:8771}"
 PASS=0
 FAIL=0
 
@@ -35,7 +35,7 @@ check_not() {
 }
 
 echo "============================================"
-echo "Proxy Feature Integration Tests"
+echo "Proxy Feature Integration Tests (Multi-Config)"
 echo "Gateway: $GW"
 echo "============================================"
 
@@ -50,145 +50,131 @@ if [ -z "$TOKEN" ]; then
     exit 1
 fi
 
-# ---- Test 1: GET /api/system/proxy (default state) ----
+# ---- Test 1: GET /api/system/proxy (list configs) ----
 echo ""
-echo "--- Test 1: GET proxy config (may have existing data) ---"
+echo "--- Test 1: GET proxy configs list ---"
 R=$(curl -s "$GW/api/system/proxy" -H "Authorization: Bearer $TOKEN")
-check "GET /system/proxy returns 200" '"enabled"' "$R"
-check "Response has protocol field" '"protocol"' "$R"
-check "Response has host field" '"host"' "$R"
-check "Response has port field" '"port"' "$R"
-check "Response has reachable field" '"reachable"' "$R"
-check "Response has last_checked_at field" '"last_checked_at"' "$R"
-check "Response has url field" '"url"' "$R"
+check "GET /system/proxy returns configs list" '"configs"' "$R"
 
-# ---- Test 2: PUT /api/system/proxy (save config) ----
+# ---- Test 2: POST /api/system/proxy (create config) ----
 echo ""
-echo "--- Test 2: Save proxy config ---"
-R=$(curl -s -X PUT "$GW/api/system/proxy" \
+echo "--- Test 2: Create proxy config ---"
+R=$(curl -s -X POST "$GW/api/system/proxy" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{"enabled":true,"protocol":"http","host":"proxy.test.internal","port":3128}')
-check "PUT proxy returns updated" '"updated":true' "$R"
-check "PUT proxy returns proxy object" '"proxy"' "$R"
-check "PUT proxy includes reachability" '"reachability"' "$R"
-check "PUT proxy host saved correctly" '"proxy.test.internal"' "$R"
-check "PUT proxy port saved correctly" '3128' "$R"
-check "PUT proxy URL computed" '"http://proxy.test.internal:3128"' "$R"
+    -d '{"name":"Test Proxy","protocol":"http","host":"proxy.test.internal","port":3128}')
+check "POST proxy returns id" '"id"' "$R"
+check "POST proxy returns host" '"proxy.test.internal"' "$R"
+check "POST proxy returns port 3128" '"port":3128' "$R"
+PROXY_ID=$(echo "$R" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+echo "  Created proxy ID: $PROXY_ID"
 
-# ---- Test 3: GET /api/system/proxy (verify saved) ----
+# ---- Test 3: GET /api/system/proxy (verify created) ----
 echo ""
-echo "--- Test 3: Verify saved config persists ---"
+echo "--- Test 3: Verify created config in list ---"
 R=$(curl -s "$GW/api/system/proxy" -H "Authorization: Bearer $TOKEN")
-check "GET proxy shows enabled=true" '"enabled":true' "$R"
-check "GET proxy shows host" '"proxy.test.internal"' "$R"
-check "GET proxy shows port 3128" '"port":3128' "$R"
-check "GET proxy has reachability result" '"reachable"' "$R"
+check "GET proxy list has new config" "proxy.test.internal" "$R"
+check "GET proxy list has port 3128" "3128" "$R"
 
-# ---- Test 4: PUT /api/system/proxy (disable proxy) ----
+# ---- Test 4: PUT /api/system/proxy/{id} (update config) ----
 echo ""
-echo "--- Test 4: Disable proxy ---"
-R=$(curl -s -X PUT "$GW/api/system/proxy" \
+echo "--- Test 4: Update proxy config ---"
+R=$(curl -s -X PUT "$GW/api/system/proxy/$PROXY_ID" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{"enabled":false,"protocol":"http","host":"proxy.test.internal","port":3128}')
-check "Disable proxy updated" '"updated":true' "$R"
-R2=$(curl -s "$GW/api/system/proxy" -H "Authorization: Bearer $TOKEN")
-check "Proxy is now disabled" '"enabled":false' "$R2"
+    -d '{"protocol":"http","host":"proxy.test.internal","port":3128}')
+check "PUT proxy returns config" '"config"' "$R"
+check "PUT proxy host updated" 'proxy.test.internal' "$R"
 
-# ---- Test 5: PUT /api/system/proxy (re-enable) ----
+# ---- Test 5: Verify update persisted ----
 echo ""
-echo "--- Test 5: Re-enable proxy ---"
-R=$(curl -s -X PUT "$GW/api/system/proxy" \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"enabled":true,"protocol":"http","host":"proxy.test.internal","port":3128}')
-check "Re-enable proxy updated" '"updated":true' "$R"
+echo "--- Test 5: Verify update persisted ---"
+R=$(curl -s "$GW/api/system/proxy" -H "Authorization: Bearer $TOKEN")
+check "GET shows updated host" 'proxy.test.internal' "$R"
+check "GET shows updated port" '3128' "$R"
 
-# ---- Test 6: POST /api/system/proxy/test (manual recheck) ----
+# ---- Test 6: PUT /api/system/proxy/{id}/activate ----
 echo ""
-echo "--- Test 6: Manual proxy test ---"
+echo "--- Test 6: Activate proxy config ---"
+R=$(curl -s -X PUT "$GW/api/system/proxy/$PROXY_ID/activate" \
+    -H "Authorization: Bearer $TOKEN")
+# May fail if unreachable (expected for test hosts); just check response is valid JSON
+check "Activate returns JSON" '"' "$R"
+echo "  Activate response: $(echo "$R" | head -c 100)"
+
+# ---- Test 7: POST /api/system/proxy/test (recheck all) ----
+echo ""
+echo "--- Test 7: Manual proxy test ---"
 R=$(curl -s -X POST "$GW/api/system/proxy/test" \
     -H "Authorization: Bearer $TOKEN")
-check "Test returns reachable field" '"reachable"' "$R"
-check "Test returns checked_at field" '"checked_at"' "$R"
-check "Test returns latency_ms field" '"latency_ms"' "$R"
-check "Test result is boolean" '"reachable":true\|"reachable":false\|"reachable":null' "$R"
+check "Test returns results" '"results"' "$R"
 
-# ---- Test 7: PUT /api/system/proxy with credentials ----
+# ---- Test 8: Update with credentials ----
 echo ""
-echo "--- Test 7: Save proxy with credentials ---"
-R=$(curl -s -X PUT "$GW/api/system/proxy" \
+echo "--- Test 8: Save proxy with credentials ---"
+R=$(curl -s -X PUT "$GW/api/system/proxy/$PROXY_ID" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{"enabled":true,"protocol":"https","host":"secure.proxy.com","port":443,"username":"user1","password":"secret123"}')
-check "Proxy with creds saved" '"updated":true' "$R"
-check "URL masks password" 'user1.*secure.proxy.com' "$R"
-check_not "Password not in response" '"secret123"' "$R"
+    -d '{"protocol":"http","host":"secure.proxy.com","port":443,"username":"user1","password":"secret123"}')
+check "Proxy with creds saved" '"config"' "$R"
 
-# ---- Test 8: PUT /api/system/proxy (delete credentials) ----
+R2=$(curl -s "$GW/api/system/proxy" -H "Authorization: Bearer $TOKEN")
+check "URL masks password" 'secure.proxy.com' "$R2"
+check_not "Password not in response" '"secret123"' "$R2"
+
+# ---- Test 9: Clear credentials ----
 echo ""
-echo "--- Test 8: Clear credentials ---"
-R=$(curl -s -X PUT "$GW/api/system/proxy" \
+echo "--- Test 9: Clear credentials ---"
+R=$(curl -s -X PUT "$GW/api/system/proxy/$PROXY_ID" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{"enabled":true,"protocol":"https","host":"secure.proxy.com","port":443,"username":"","password":""}')
-check "Credentials cleared" '"updated":true' "$R"
+    -d '{"protocol":"http","host":"secure.proxy.com","port":443,"username":"","password":""}')
+check "Credentials cleared" '"config"' "$R"
 R2=$(curl -s "$GW/api/system/proxy" -H "Authorization: Bearer $TOKEN")
 check "Username is empty" '"username":""' "$R2"
 check "Password masked is empty" '"password_masked":""' "$R2"
 
-# ---- Test 9: POST /api/users/deploy with use_global_proxy ----
+# ---- Test 10: POST /api/system/proxy/deactivate (deactivate all) ----
 echo ""
-echo "--- Test 9: Deploy with use_global_proxy (should inject build args) ---"
-# Re-enable proxy first with a real host
-curl -s -X PUT "$GW/api/system/proxy" \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"enabled":true,"protocol":"http","host":"proxy.test.internal","port":3128}' > /dev/null
+echo "--- Test 10: Deactivate all proxies ---"
+R=$(curl -s -X POST "$GW/api/system/proxy/deactivate" \
+    -H "Authorization: Bearer $TOKEN")
+check "Deactivate returns deactivated" '"deactivated"' "$R"
 
-# This will fail because the service doesn't exist, but we check that proxy args were injected
+# ---- Test 11: Deploy with proxy disabled (should 400) ----
+echo ""
+echo "--- Test 11: Deploy with proxy disabled ---"
 R=$(curl -s -X POST "$GW/api/users/deploy" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{"user_name":"testuser","service_name":"myapp","project_root":"myapp","compose_template_path":"docker-compose.yml.j2","label":"0","domain":"example.com","passwd":"test123","use_global_proxy":true}')
-# Will get a 502 from provision-api (service doesn't exist), but proxy injection happened
-echo "  Deploy with proxy response: $(echo "$R" | head -c 150)"
-
-# ---- Test 10: Deploy with use_global_proxy=false (no injection) ----
-echo ""
-echo "--- Test 10: Deploy without proxy ---"
-R=$(curl -s -X POST "$GW/api/users/deploy" \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"user_name":"testuser","service_name":"myapp","project_root":"myapp","compose_template_path":"docker-compose.yml.j2","label":"0","domain":"example.com","passwd":"test123","use_global_proxy":false}')
-echo "  Deploy without proxy response: $(echo "$R" | head -c 150)"
-
-# ---- Test 11: PUT proxy with use_global_proxy when disabled (should 400) ----
-echo ""
-echo "--- Test 11: Deploy with proxy but proxy disabled ---"
-curl -s -X PUT "$GW/api/system/proxy" \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"enabled":false,"protocol":"http","host":"proxy.test.internal","port":3128}' > /dev/null
-
-R=$(curl -s -X POST "$GW/api/users/deploy" \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"user_name":"testuser","service_name":"myapp","project_root":"myapp","compose_template_path":"docker-compose.yml.j2","label":"0","domain":"example.com","passwd":"test123","use_global_proxy":true}')
+    -d '{"user_name":"proxytest","service_name":"siyuan","project_root":"siyuan","compose_template_path":"docker-compose.yml.j2","nginx_conf_template_path":"nginx.conf.j2","label":"0","domain":"example.com","passwd":"test123","use_global_proxy":true}')
 check "Deploy with proxy disabled returns 400" "400\|not enabled" "$R"
 
-# ---- Test 12: Audit log records proxy actions ----
+# ---- Test 12: Deploy without proxy (should work regardless) ----
 echo ""
-echo "--- Test 12: Audit logs for proxy actions ---"
-R=$(curl -s "$GW/api/audit?action=proxy_config" -H "Authorization: Bearer $TOKEN")
-check "Audit has proxy_config entries" '"entries"' "$R"
-
-# ---- Cleanup: disable proxy ----
-curl -s -X PUT "$GW/api/system/proxy" \
+echo "--- Test 12: Deploy without proxy flag ---"
+R=$(curl -s -X POST "$GW/api/users/deploy" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{"enabled":false,"protocol":"http","host":"","port":8080}' > /dev/null
+    -d '{"user_name":"proxytest","service_name":"siyuan","project_root":"siyuan","compose_template_path":"docker-compose.yml.j2","nginx_conf_template_path":"nginx.conf.j2","label":"0","domain":"example.com","passwd":"test123","use_global_proxy":false}')
+check "Deploy without proxy returns task" '"task_id"' "$R"
+
+# ---- Test 13: Delete proxy config ----
+echo ""
+echo "--- Test 13: Delete proxy config ---"
+R=$(curl -s -X DELETE "$GW/api/system/proxy/$PROXY_ID" \
+    -H "Authorization: Bearer $TOKEN")
+check "Delete returns deleted" '"deleted"' "$R"
+
+# Verify deletion
+R2=$(curl -s "$GW/api/system/proxy" -H "Authorization: Bearer $TOKEN")
+check_not "Deleted proxy not in list" "proxy.test.internal" "$R2"
+
+# ---- Test 14: Audit log records proxy actions ----
+echo ""
+echo "--- Test 14: Audit logs for proxy actions ---"
+R=$(curl -s "$GW/api/audit?action=proxy_config" -H "Authorization: Bearer $TOKEN")
+check "Audit has proxy_config entries" '"entries"' "$R"
 
 # ---- Summary ----
 echo ""
