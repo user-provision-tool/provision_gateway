@@ -528,3 +528,50 @@ async def get_registration_time(
         return {"registration_time": best_time}
     except Exception as e:
         raise HTTPException(502, f"provision-api error: {e}")
+
+
+@router.get("/{user_name}/{service_name}/{label}/volume-usage")
+async def get_volume_usage(
+    user_name: str,
+    service_name: str,
+    label: str,
+    db: Session = Depends(get_db),
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """Get disk usage for a service instance's volume directories."""
+    import os as _os
+    import shutil as _shutil
+
+    user_data_dir = settings.USER_DATA_DIR / user_name / service_name
+    volumes: dict[str, dict[str, Any]] = {}
+
+    if user_data_dir.exists():
+        for vol_dir in user_data_dir.iterdir():
+            if vol_dir.is_dir():
+                try:
+                    du = _shutil.disk_usage(str(vol_dir))
+                    dir_size = 0
+                    for dirpath, _dirnames, filenames in _os.walk(str(vol_dir)):
+                        for f in filenames:
+                            fp = _os.path.join(dirpath, f)
+                            try:
+                                dir_size += _os.path.getsize(fp)
+                            except OSError:
+                                pass
+                    volumes[vol_dir.name] = {
+                        "path": str(vol_dir),
+                        "size_bytes": dir_size,
+                        "disk_total_bytes": du.total,
+                        "disk_used_bytes": du.used,
+                        "disk_free_bytes": du.free,
+                    }
+                except OSError:
+                    volumes[vol_dir.name] = {"path": str(vol_dir), "error": "Cannot read usage"}
+
+    return {
+        "user_name": user_name,
+        "service_name": service_name,
+        "label": label,
+        "user_data_dir": str(user_data_dir),
+        "volumes": volumes,
+    }

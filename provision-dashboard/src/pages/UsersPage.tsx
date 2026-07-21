@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Popconfirm, Modal, Drawer } from 'antd'
+import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Popconfirm, Modal, Drawer, Checkbox } from 'antd'
 import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, SwapOutlined, UnorderedListOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
@@ -56,6 +56,13 @@ export default function UsersPage() {
   // Track which services need redeploy (files modified after registration)
   const [needsRedeploy, setNeedsRedeploy] = useState<Record<string, boolean>>({})
 
+  // Volume usage cache: key → {volumes: {...}, user_data_dir: string}
+  const [volumeUsage, setVolumeUsage] = useState<Record<string, any>>({})
+
+  // Batch selection state
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
+  const [batchLoading, setBatchLoading] = useState(false)
+
   useEffect(() => { loadServices() }, [])
 
   // After services are loaded, check registration times and file mod times
@@ -75,6 +82,16 @@ export default function UsersPage() {
     }
     checkTimes()
   }, [services])
+
+  // Fetch volume disk usage for a service instance
+  const fetchVolumeUsage = async (user: string, service: string, label: string) => {
+    const key = `${user}-${service}-${label}`
+    if (volumeUsage[key] !== undefined) return
+    try {
+      const { data } = await client.get(`/users/${user}/${service}/${label}/volume-usage`)
+      setVolumeUsage(prev => ({...prev, [key]: data}))
+    } catch { /* ignore */ }
+  }
 
   // Check file modification times for deployment files
   const checkFileModTimes = useCallback(async (user: string, service: string, label: string) => {
@@ -106,6 +123,9 @@ export default function UsersPage() {
       const key = `${svc.user_name}-${svc.service_name}-${svc.label}`
       if (fileModTimes[key] === undefined) {
         checkFileModTimes(svc.user_name, svc.service_name, svc.label)
+      }
+      if (isAdmin && volumeUsage[key] === undefined) {
+        fetchVolumeUsage(svc.user_name, svc.service_name, svc.label)
       }
     }
   }, [services, checkFileModTimes])
@@ -163,6 +183,51 @@ export default function UsersPage() {
 
   const isEndUser = (admin as any)?.user_type === 'end_user'
   const endUserViewer = isEndUser && admin?.role !== 'admin'
+
+  // Toggle a single service selection
+  const toggleSelect = (key: string) => {
+    setSelectedKeys(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key); else next.add(key)
+      return next
+    })
+  }
+
+  // Toggle select all for a user group
+  const toggleSelectAll = (userName: string) => {
+    const userKeys = services.filter(s => s.user_name === userName).map(s => `${s.user_name}-${s.service_name}-${s.label}`)
+    const allSelected = userKeys.every(k => selectedKeys.has(k))
+    setSelectedKeys(prev => {
+      const next = new Set(prev)
+      if (allSelected) { userKeys.forEach(k => next.delete(k)) }
+      else { userKeys.forEach(k => next.add(k)) }
+      return next
+    })
+  }
+
+  // Batch action: start/stop/rebuild/remove selected services
+  const batchAction = async (action: string) => {
+    setBatchLoading(true)
+    const keys = Array.from(selectedKeys)
+    try {
+      for (const key of keys) {
+        const [user, service, label] = key.split('-')
+        switch (action) {
+          case 'stop': await client.post(`/users/${user}/${service}/${label}/down`); break
+          case 'start': await client.post(`/users/${user}/${service}/${label}/up`); break
+          case 'rebuild': await client.post(`/users/${user}/${service}/${label}/rebuild`, {no_cache: true}); break
+          case 'remove': await client.delete(`/users/${user}/${service}/${label}`); break
+        }
+      }
+      message.success(`Batch ${action}: ${keys.length} service(s) processed`)
+      setSelectedKeys(new Set())
+      loadServices()
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || `Batch ${action} failed`)
+    } finally {
+      setBatchLoading(false)
+    }
+  }
 
   const loadServices = async () => {
     setLoading(true)
@@ -265,6 +330,21 @@ export default function UsersPage() {
         </Space>
       </div>
 
+      {selectedKeys.size > 0 && isAdmin && (
+        <Card size="small" style={{marginBottom:12,background:'#fffbe6',borderColor:'#faad14'}}>
+          <Space>
+            <Text strong>{selectedKeys.size} selected</Text>
+            <Button size="small" loading={batchLoading} onClick={()=>batchAction('stop')}>Stop</Button>
+            <Button size="small" loading={batchLoading} onClick={()=>batchAction('start')}>Start</Button>
+            <Button size="small" loading={batchLoading} icon={<RocketOutlined/>} onClick={()=>batchAction('rebuild')}>Rebuild</Button>
+            <Popconfirm title={`Remove ${selectedKeys.size} service(s)?`} onConfirm={()=>batchAction('remove')}>
+              <Button size="small" danger loading={batchLoading}>Remove</Button>
+            </Popconfirm>
+            <Button size="small" onClick={()=>setSelectedKeys(new Set())}>Clear</Button>
+          </Space>
+        </Card>
+      )}
+
       {loading ? <Spin/> : Object.keys(grouped).length===0 ? (
         <Card><Empty description={search?"No matches":"No services deployed"}/></Card>
       ) : (
@@ -276,6 +356,11 @@ export default function UsersPage() {
           <div key={userName} style={{marginBottom: idx<Object.keys(grouped).length-1?32:0, paddingBottom: idx<Object.keys(grouped).length-1?16:0, borderBottom: idx<Object.keys(grouped).length-1?'1px solid #f0f0f0':'none'}}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
               <Space>
+                {isAdmin && <Checkbox
+                  checked={userSvcs.every(s => selectedKeys.has(`${s.user_name}-${s.service_name}-${s.label}`))}
+                  indeterminate={userSvcs.some(s => selectedKeys.has(`${s.user_name}-${s.service_name}-${s.label}`)) && !userSvcs.every(s => selectedKeys.has(`${s.user_name}-${s.service_name}-${s.label}`))}
+                  onChange={() => toggleSelectAll(userName)}
+                />}
                 <Title level={4} style={{margin:0}}>{highlight(userName, search)}</Title>
                 <Tag color={allHealthy?'green':'orange'}>{userSvcs.length} service{userSvcs.length>1?'s':''}{unhealthyCount > 0 ? ` (${healthyCount} healthy, ${unhealthyCount} unhealthy)` : ` (all healthy)`}</Tag>
               </Space>
@@ -297,7 +382,7 @@ export default function UsersPage() {
                 return (
                   <Collapse.Panel
                     key={key}
-                    header={<Space>{getBadge(svc)}<Text strong>{highlight(svc.service_name, search)}</Text><Tag>{svc.label}</Tag>
+                    header={<Space>{isAdmin && <Checkbox checked={selectedKeys.has(key)} onChange={()=>toggleSelect(key)} onClick={(e:any)=>e.stopPropagation()}/>}{getBadge(svc)}<Text strong>{highlight(svc.service_name, search)}</Text><Tag>{svc.label}</Tag>
                       {activeTasks[key] && <Button type="link" size="small" icon={<UnorderedListOutlined/>} onClick={(e)=>{e.stopPropagation();navigate('/tasks')}} style={{padding:0}}>Building...</Button>}
                     </Space>}
                     extra={
@@ -417,6 +502,15 @@ export default function UsersPage() {
                         })()}
                       </div>
                       {(svc as any).volumes && Object.keys((svc as any).volumes).length>0 && <div><Text strong>Volumes: </Text><Space wrap>{Object.entries((svc as any).volumes).map(([k,v]:[string,any])=><Tag key={k}>{k}: {String(v)}</Tag>)}</Space></div>}
+                      {volumeUsage[key]?.volumes && Object.keys(volumeUsage[key].volumes).length>0 && (
+                        <div style={{marginTop:4}}>
+                          <Text type="secondary" style={{fontSize:12}}>Disk Usage: </Text>
+                          {Object.entries(volumeUsage[key].volumes).map(([name, info]: [string, any]) => {
+                            const mb = info.size_bytes ? (info.size_bytes / 1024 / 1024).toFixed(1) : '?'
+                            return <Tag key={name} style={{fontSize:11}}>{name}: {mb} MB</Tag>
+                          })}
+                        </div>
+                      )}
                     </Space>
                   </Collapse.Panel>
                 )
