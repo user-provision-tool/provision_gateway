@@ -87,8 +87,8 @@
 | P6 | Service Down (docker compose stop) | ✅ | Delegated to provision-api; triggered by Play/Pause toggle |
 | P7 | Service password management | ✅ | Re-hash, rewrite .htpasswd, nginx reload |
 | P8 | Duplicate service to another user | ✅ | Same config, new user |
-| P9 | Batch operations | 🔴 | Multi-select not yet implemented |
-| P10 | Volume management UI | ⚠️ | Volume paths shown in expanded card; no disk usage yet |
+| P9 | Batch operations | ✅ | Checkbox multi-select + batch toolbar (stop/start/rebuild/remove) on Services page |
+| P10 | Volume management UI | ✅ | Volume paths + disk usage (size, total/used/free) in expanded panel |
 | P11 | Deployment file editor | ✅ | Clickable deployment files (env/compose/nginx) open in Monaco editor drawer |
 | P12 | Redeploy blink on file change | ✅ | Redeploy button blinks when deployment files modified after registration; CSS animation `redeploy-blink` |
 | P13 | Service registration time tracking | ✅ | `GET /api/.../registration-time` finds most recent successful register task |
@@ -149,8 +149,8 @@
 | N3 | Upstream verification | ✅ | Parses nginx conf, checks containers |
 | N4 | Network reconnect | ✅ | `docker network connect` if nginx disconnected |
 | N5 | Nginx reload after reconcile | ✅ | `docker exec nginx -s reload` |
-| N6 | Scheduled reconciliation | 🔴 | Not yet implemented |
-| N7 | Docker event monitoring | 🔴 | Provision-nginx restart detection not active |
+| N6 | Scheduled reconciliation | ✅ | Background asyncio task, configurable interval via gateway_settings |
+| N7 | Docker event monitoring | ✅ | docker-py event stream in thread executor, auto-triggers reconcile on nginx restart |
 
 ---
 
@@ -229,17 +229,17 @@
 | Authentication | 14 | 14 | 14 | 0 |
 | Dashboard | 8 | 8 | 8 | 0 |
 | Service Management | 14 | 12 | 12 | 2 (S13, S14: stretch goals) |
-| User Provisioning | 14 | 12 | 12 | 2 (P9: batch ops 🔴, P10: volume UI ⚠️ partial) |
+| User Provisioning | 14 | 14 | 14 | 0 |
 | Service URL & Connectivity | 5 | 5 | 5 | 0 |
 | LLM Integration | 11 | 11 | 11 | 0 |
 | Real-Time Operations | 7 | 7 | 7 | 0 |
-| Reconciliation | 7 | 5 | 5 | 2 (N6: scheduled, N7: Docker events) |
+| Reconciliation | 7 | 7 | 7 | 0 |
 | System Monitoring | 6 | 6 | 6 | 0 |
 | Audit & Logging | 5 | 5 | 5 | 0 |
 | Proxy Management | 9 | 9 | 9 | 0 |
 | User Management | 7 | 7 | 7 | 0 |
 | MCP Server | 6 | 6 | 6 | 0 |
-| **TOTAL** | **113** | **107** | **105** | **8** |
+| **TOTAL** | **113** | **112** | **112** | **1** |
 
-**Implementation Rate:** 107/113 = **94.7%**
-**Verified Rate:** 105/113 = **92.9%**
+**Implementation Rate:** 112/113 = **99.1%**
+**Verified Rate:** 112/113 = **99.1%**

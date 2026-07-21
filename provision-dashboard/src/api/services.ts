@@ -1,0 +1,15 @@
+import client from './client'
+
+export const getServices = () => client.get('/services')
+export const getService = (name: string) => client.get(`/services/${name}`)
+export const createServiceGit = (data: Record<string, any>) => client.post('/services', data)
+export const deleteService = (name: string, force = false) => client.delete(`/services/${name}${force ? '?force=true' : ''}`)
+export const getServiceFile = (name: string, filename: string) => client.get(`/services/${name}/files/${filename}`)
+export const updateServiceFile = (name: string, filename: string, content: string) => client.put(`/services/${name}/files/${filename}`, { content })
+export const convertService = (name: string, composeFile: string, nginxFile: string) => client.post(`/services/${name}/convert`, { compose_file: composeFile, nginx_file: nginxFile })
+export const checkDeploy = (name: string) => client.post('/services/check-deploy', { name })
+export const saveGenerated = (name: string, files: Record<string, string>) => client.post('/services/save-generated', { name, files })
+export const scanDirectory = (path: string) => client.post('/services/scan', { path })
+export const gitStatus = (name: string) => client.get(`/services/${name}/git/status`)
+export const gitDiff = (name: string) => client.get(`/services/${name}/git/diff`)
+export const gitHeadFile = (name: string, filename: string) => client.get(`/services/${name}/git/head-file?file=${encodeURIComponent(filename)}`)
