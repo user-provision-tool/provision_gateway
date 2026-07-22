@@ -88,39 +88,19 @@ export default function ServicesPage() {
       render: (t: string) => <Button type="link" onClick={() => navigate(`/services/${t}`)}><FolderOpenOutlined /> {t}</Button> },
     { title: 'Templates', key: 'templates',
       render: (_:any, r:ServiceInfo) => {
-        // First identify generated files
-        const generatedSet = new Set<string>()
-        r.files.forEach((f: string) => {
-          // Only system-generated compose/nginx files are "generated" — not .env files
-          if (f.match(/docker-compose\.user-.*\.yml$/) || f.match(/\.user-.*\.nginx\.conf$/)) {
-            generatedSet.add(f)
-          }
-        });
-        (r.generated_files || []).forEach((f: string) => generatedSet.add(f))
-        
-        // Templates = non-generated files that are templates (.j2, Dockerfile, .env, etc.)
-        const temps: string[] = []
-        r.files.forEach((f: string) => {
-          if (generatedSet.has(f)) return // skip generated files
-          if (f.endsWith('.yml.j2') || f.endsWith('.conf.j2') || f.includes('Dockerfile') || f.startsWith('.env')) {
-            temps.push(f)
-          }
-        })
+        // Templates = files tracked in git (original repo files).
+        // The backend determines "generated_files" via `git ls-files` — anything
+        // NOT in git (per-user compose/nginx/env, .generated markers, converted .j2
+        // files that weren't in the original repo) is classified as generated.
+        const generatedSet = new Set<string>(r.generated_files || [])
+        const temps = r.files.filter((f: string) => !generatedSet.has(f))
         return <Space size={4} wrap>{temps.length>0 ? temps.map(f=><Tag key={f} color="green" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
       }
     },
     { title: 'Generated Files', key: 'generated',
       render: (_:any, r:ServiceInfo) => {
-        const gens: string[] = []
-        r.files.forEach((f: string) => {
-          // System-generated per-user files: docker-compose.user-*.yml, *.user-*.nginx.conf
-          if (f.match(/docker-compose\.user-.*\.yml$/) || f.match(/\.user-.*\.nginx\.conf$/)) {
-            gens.push(f)
-          }
-        })
-        const backendGens = r.generated_files || []
-        const allGens = [...new Set([...gens, ...backendGens])]
-        return <Space size={4} wrap>{allGens.length>0 ? allGens.map(f=><Tag key={f} color="gold" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
+        const gens = r.generated_files || []
+        return <Space size={4} wrap>{gens.length>0 ? gens.map(f=><Tag key={f} color="gold" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
       }
     },
     { title: 'Actions', key: 'actions',

@@ -1,7 +1,7 @@
 # Provision Gateway — Features Status
 
-> **Version**: 1.4
-> **Date**: 2026-07-20 (updated — post comprehensive gap analysis + full test suite)
+> **Version**: 1.5
+> **Date**: 2026-07-21 (updated — Iteration 1: UI fixes, parallel requests, LLM auto-deploy flow)
 > **Purpose**: Quick reference and implementation status tracker for all features.
 
 ---
@@ -93,6 +93,7 @@
 | P12 | Redeploy blink on file change | ✅ | Redeploy button blinks when deployment files modified after registration; CSS animation `redeploy-blink` |
 | P13 | Service registration time tracking | ✅ | `GET /api/.../registration-time` finds most recent successful register task |
 | P14 | Deployment file CRUD API | ✅ | `GET/PUT /api/users/{u}/{s}/{l}/deployment-files/{type}` for env/compose/nginx |
+| P15 | Service header resource stats | 🟡 | RAM (RSS), Disk, CPU shown on collapse panel header via docker stats + volume usage |
 
 ---
 
@@ -113,7 +114,7 @@
 | # | Feature | Status | Notes |
 |---|---|---|---|
 | L1 | BYOK configuration (OpenAI-compatible) | ✅ | DeepSeek, OpenAI, OpenRouter, etc. |
-| L2 | Local agent configuration (Ollama) | ✅ | Configurable agent URL + model |
+| L2 | Local agent configuration (Ollama) | 🔮 | Removed from Settings UI — future feature alongside provision-agent |
 | L3 | Multi-config management | ✅ | Multiple configs, one active at a time |
 | L4 | Test connection | ✅ | Sends "Hello!", shows latency + response |
 | L5 | Config generation (docker-compose) | ✅ | Context-aware prompt building |
@@ -123,6 +124,9 @@
 | L9 | Troubleshooting chat | ✅ | Chat modal in header, history maintained |
 | L10 | Service template generation | ✅ | `generate_type: service_config` |
 | L11 | API key encryption at rest | ✅ | AES-256-GCM |
+| L12 | Missing files check API | ✅ | `GET /api/services/{name}/check-missing-files` → provision-api `GET /services/{name}/check-missing-files` |
+| L13 | Auto-deploy LLM file generation | 🟡 | Checkbox on DeployForm; LLM generates missing compose/nginx/env/Dockerfile before deploy |
+| L14 | Generated files review in deploy | 🟡 | Inline preview of LLM-generated files with review before saving+saving |
 
 ---
 
@@ -228,10 +232,10 @@
 |---|---|---|---|---|
 | Authentication | 14 | 14 | 14 | 0 |
 | Dashboard | 8 | 8 | 8 | 0 |
-| Service Management | 14 | 12 | 12 | 2 (S13, S14: stretch goals) |
-| User Provisioning | 14 | 14 | 14 | 0 |
+| Service Management | 14 | 12 | 12 | 0 |
+| User Provisioning | 15 | 15 | 14 | 1 |
 | Service URL & Connectivity | 5 | 5 | 5 | 0 |
-| LLM Integration | 11 | 11 | 11 | 0 |
+| LLM Integration | 14 | 13 | 11 | 2 |
 | Real-Time Operations | 7 | 7 | 7 | 0 |
 | Reconciliation | 7 | 7 | 7 | 0 |
 | System Monitoring | 6 | 6 | 6 | 0 |
@@ -239,7 +243,7 @@
 | Proxy Management | 9 | 9 | 9 | 0 |
 | User Management | 7 | 7 | 7 | 0 |
 | MCP Server | 6 | 6 | 6 | 0 |
-| **TOTAL** | **113** | **112** | **112** | **1** |
+| **TOTAL** | **117** | **114** | **111** | **3** |
 
-**Implementation Rate:** 112/113 = **99.1%**
-**Verified Rate:** 112/113 = **99.1%**
+**Implementation Rate:** 114/117 = **97.4%**
+**Verified Rate:** 111/117 = **94.9%**

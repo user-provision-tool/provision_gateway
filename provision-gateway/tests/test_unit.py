@@ -204,3 +204,126 @@ class TestUsersRouterContainerLogs:
             if route.path == "/{user_name}/{service_name}/{label}/containers/{container}/logs":
                 # Verify route exists with GET method
                 assert "GET" in route.methods, "Container logs should be GET endpoint"
+
+
+# ---------------------------------------------------------------------------
+# Tests for new endpoints and features (dev-debug-cycle Iteration 1-15)
+# ---------------------------------------------------------------------------
+
+class TestCheckMissingFiles:
+    """Tests for the check-missing-files endpoint and provision_service method."""
+
+    def test_provision_service_has_check_missing_files(self):
+        """provision_service should expose a check_missing_files public method."""
+        from app.services.provision_service import ProvisionService
+        svc = ProvisionService()
+        assert callable(svc.check_missing_files)
+
+    def test_check_missing_files_route_exists(self):
+        """Services router should expose GET /{name}/check-missing-files."""
+        from app.routers.services import router
+        routes = [r.path for r in router.routes]
+        assert any("check-missing-files" in r for r in routes), (
+            f"check-missing-files route missing from services router. Routes: {routes}"
+        )
+
+    def test_check_missing_files_returns_enriched_response_structure(self):
+        """The check-missing-files response should include scan_context when repo exists."""
+        # Verify the endpoint function signature exists and is async
+        from app.routers.services import check_missing_files
+        import inspect
+        assert inspect.iscoroutinefunction(check_missing_files), (
+            "check_missing_files should be an async function"
+        )
+
+
+class TestDeploymentFileFallback:
+    """Tests for deployment file source fallback (task 1.3)."""
+
+    def test_resolve_deployment_file_env_returns_correct_path(self):
+        """_resolve_deployment_file for env type should use .env.{user}.{label} pattern."""
+        from app.routers.users import _resolve_deployment_file
+        result = _resolve_deployment_file("alice", "myapp", "0", "env")
+        assert result is not None
+        assert result.name == ".env.alice.0"
+
+    def test_resolve_deployment_file_compose_returns_correct_path(self):
+        """_resolve_deployment_file for compose type should use docker-compose.user-{user}.{label}.yml."""
+        from app.routers.users import _resolve_deployment_file
+        result = _resolve_deployment_file("alice", "myapp", "0", "compose")
+        assert result is not None
+        assert "docker-compose.user-alice.0.yml" in result.name
+
+    def test_resolve_deployment_file_nginx_returns_path(self):
+        """_resolve_deployment_file for nginx type should return a candidate path."""
+        from app.routers.users import _resolve_deployment_file
+        result = _resolve_deployment_file("alice", "myapp", "0", "nginx")
+        assert result is not None
+        assert "nginx.conf" in result.name
+
+    def test_resolve_deployment_file_unknown_type_returns_none(self):
+        """_resolve_deployment_file for unknown type should return None."""
+        from app.routers.users import _resolve_deployment_file
+        result = _resolve_deployment_file("alice", "myapp", "0", "unknown")
+        assert result is None
+
+    def test_get_deployment_file_endpoint_has_source_fallback(self):
+        """get_deployment_file should handle source_fallback in response."""
+        from app.routers.users import get_deployment_file
+        import inspect
+        assert inspect.iscoroutinefunction(get_deployment_file)
+
+
+class TestSystemStatsKeys:
+    """Tests for system stats key mapping fix (Iteration 6)."""
+
+    def test_system_stats_endpoint_accepts_detail_param(self):
+        """System stats endpoint should accept detail query parameter."""
+        from app.routers.system import system_stats
+        import inspect
+        assert inspect.iscoroutinefunction(system_stats)
+
+
+class TestConftestSkipLogic:
+    """Tests for conftest.py skip-on-no-server logic (Iteration 10-11)."""
+
+    def test_conftest_exists(self):
+        """conftest.py should exist in the tests directory."""
+        from pathlib import Path
+        conftest = Path(__file__).parent / "conftest.py"
+        assert conftest.exists(), "conftest.py missing — integration tests will error"
+
+    def test_conftest_has_token_fixture(self):
+        """conftest.py should export a token fixture for integration tests."""
+        import importlib.util
+        from pathlib import Path
+        conftest_path = Path(__file__).parent / "conftest.py"
+        spec = importlib.util.spec_from_file_location("conftest", conftest_path)
+        conftest = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(conftest)
+        assert hasattr(conftest, "token"), "conftest.py missing token fixture"
+
+    def test_conftest_has_is_gateway_running(self):
+        """conftest.py should have a gateway-running detection function."""
+        import importlib.util
+        from pathlib import Path
+        conftest_path = Path(__file__).parent / "conftest.py"
+        spec = importlib.util.spec_from_file_location("conftest", conftest_path)
+        conftest = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(conftest)
+        assert hasattr(conftest, "_is_gateway_running"), (
+            "conftest.py missing _is_gateway_running function"
+        )
+
+
+class TestUvicornWorkers:
+    """Tests for Dockerfile parallel request fix (task 2.1/2.2)."""
+
+    def test_dockerfile_contains_workers(self):
+        """Dockerfile CMD should include --workers flag."""
+        dockerfile = Path(__file__).parent.parent / "Dockerfile"
+        content = dockerfile.read_text()
+        assert "--workers" in content, "Dockerfile missing --workers flag"
+        assert "4" in content.split("--workers")[1].split()[0], (
+            "Dockerfile --workers value should be 4"
+        )

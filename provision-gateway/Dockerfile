@@ -67,4 +67,8 @@ RUN mkdir -p /data
 
 EXPOSE 8770
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8770"]
+# Use multiple workers for parallel request handling.
+# --workers 4 balances concurrency with the async I/O event loop.
+# Each worker runs its own event loop; async handlers serve many
+# concurrent connections per worker via cooperative scheduling.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8770", "--workers", "4"]

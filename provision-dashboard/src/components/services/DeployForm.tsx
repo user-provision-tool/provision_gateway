@@ -1,7 +1,19 @@
 import { useState, useEffect } from 'react'
-import { Modal, Form, Input, Select, Button, Switch, Space, Divider, message, Checkbox, Alert } from 'antd'
-import { PlusOutlined, MinusCircleOutlined, GlobalOutlined } from '@ant-design/icons'
+import { Modal, Form, Input, Select, Button, Switch, Space, Divider, message, Checkbox, Alert, Spin, Tag, Typography } from 'antd'
+import { PlusOutlined, MinusCircleOutlined, GlobalOutlined, RobotOutlined } from '@ant-design/icons'
+import Editor from '@monaco-editor/react'
 import client from '../../api/client'
+
+const { Text } = Typography
+
+// Language detection for Monaco based on filename
+function getLanguage(filename: string): string {
+  if (filename.endsWith('.yml') || filename.endsWith('.yaml')) return 'yaml'
+  if (filename.endsWith('.conf') || filename.includes('nginx')) return 'nginx'
+  if (filename.includes('Dockerfile')) return 'dockerfile'
+  if (filename.endsWith('.env') || filename.endsWith('.sh')) return 'shell'
+  return 'plaintext'
+}
 
 interface DeployFormProps {
   open: boolean
@@ -20,12 +32,31 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   const [sslDomains, setSslDomains] = useState<{domain:string, fullchain_path:string, privkey_path:string}[]>([])
   const [selectedSslDomain, setSelectedSslDomain] = useState<string>('')
 
+  // Auto-deploy / missing files state
+  const [checkingMissing, setCheckingMissing] = useState(false)
+  const [missingFiles, setMissingFiles] = useState<string[]>([])
+  const [autoDeploy, setAutoDeploy] = useState(true)
+  const [generatingFiles, setGeneratingFiles] = useState(false)
+  const [generatedFiles, setGeneratedFiles] = useState<Record<string,string>>({})
+  const [showGeneratedReview, setShowGeneratedReview] = useState(false)
+  // Editor modal for reviewing generated files (clickable → built-in editor)
+  const [editorModalOpen, setEditorModalOpen] = useState(false)
+  const [editorFileName, setEditorFileName] = useState('')
+  const [editorContent, setEditorContent] = useState('')
+
   useEffect(() => {
     if (open) {
       loadSources()
       loadProxyStatus()
       loadDeployableUsers()
       loadSslDomains()
+      // Reset auto-deploy state
+      setMissingFiles([])
+      setScanContext(null)
+      setAutoDeploy(true)
+      setGeneratedFiles({})
+      setShowGeneratedReview(false)
+      setEditorModalOpen(false)
     }
   }, [open])
 
@@ -57,11 +88,76 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     } catch { /* proxy not configured */ }
   }
 
+  // Cache scan context from check-missing-files for LLM generation
+  const [scanContext, setScanContext] = useState<any>(null)
+
+  // Check for missing essential files when service selection changes
+  const checkMissingFiles = async (serviceName: string) => {
+    if (!serviceName) { setMissingFiles([]); setScanContext(null); return }
+    setCheckingMissing(true)
+    try {
+      const { data } = await client.get(`/services/${serviceName}/check-missing-files`)
+      setMissingFiles(data.missing || [])
+      if (data.scan_context) {
+        setScanContext(data.scan_context)
+      }
+    } catch { setMissingFiles([]); setScanContext(null) }
+    finally { setCheckingMissing(false) }
+  }
+
+  // Generate missing files via LLM
+  const generateMissingFiles = async () => {
+    setGeneratingFiles(true)
+    try {
+      // Use scan context from check-missing-files response (enriched with repo scan)
+      const ctx = scanContext || {
+        repo_description: `Service: ${form.getFieldValue('service_name') || 'unknown'}`,
+        repo_files: [],
+        port: 80,
+        needs_db: false,
+      }
+      const results: Record<string,string> = {}
+      for (const fileType of missingFiles) {
+        const typeMap: Record<string, string> = {
+          'docker-compose': 'docker_compose',
+          'nginx.conf': 'nginx_conf',
+          '.env': 'env_file',
+          'Dockerfile': 'dockerfile',
+        }
+        const genType = typeMap[fileType] || 'docker_compose'
+        try {
+          const { data } = await client.post('/llm/generate', { type: genType, context: ctx })
+          if (data.generated_content) {
+            const filename = fileType === 'docker-compose' ? 'docker-compose.yml' :
+                            fileType === 'nginx.conf' ? 'nginx.conf' : fileType
+            results[filename] = data.generated_content
+          }
+        } catch { /* skip individual failures */ }
+      }
+      setGeneratedFiles(results)
+      if (Object.keys(results).length > 0) {
+        message.success(`LLM generated ${Object.keys(results).length} file(s)`)
+      } else {
+        message.warning('LLM could not generate any files. Configure BYOK LLM in Settings.')
+      }
+    } catch { message.error('Failed to generate files via LLM') }
+    finally { setGeneratingFiles(false) }
+  }
+
   const handleDeploy = async (values: any) => {
     setLoading(true)
     try {
-      // Build deploy payload
       const selectedService = sources.find(s => s.name === values.service_name)
+
+      // Save any LLM-generated files first (use autoDeploy state, not form value — Input stores strings)
+      if (Object.keys(generatedFiles).length > 0 && autoDeploy) {
+        await client.post('/services/save-generated', {
+          service_name: values.service_name,
+          files: generatedFiles,
+        })
+      }
+
+      // Build deploy payload
       const payload: any = {
         user_name: values.user_name,
         service_name: values.service_name,
@@ -73,12 +169,14 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         use_global_proxy: values.use_global_proxy || false,
       }
 
-      // Add compose/nginx paths
+      // Add compose/nginx paths — if newly generated, use the generated filenames
       if (selectedService) {
         const composeJ2 = selectedService.files.find((f: string) => f.endsWith('.yml.j2'))
         const nginxJ2 = selectedService.files.find((f: string) => f.endsWith('.conf.j2'))
         if (composeJ2) payload.compose_template_path = composeJ2
+        else if (generatedFiles['docker-compose.yml']) payload.compose_file_path = 'docker-compose.yml'
         if (nginxJ2) payload.nginx_conf_template_path = nginxJ2
+        else if (generatedFiles['nginx.conf']) payload.nginx_conf_file_path = 'nginx.conf'
       }
 
       // HTTPS certs
@@ -127,7 +225,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       destroyOnClose
     >
       <Form form={form} layout="vertical" onFinish={handleDeploy}
-        initialValues={{ label: '0', domain: 'localhost', https: false }}>
+        initialValues={{ label: '0', domain: 'localhost', https: false, auto_templates_completion: true }}>
         
         <Space style={{ width: '100%' }} direction="vertical" size="middle">
           {/* ---- User & Service ---- */}
@@ -139,7 +237,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
               <Select
                 showSearch
                 placeholder="Select source project"
-                options={sources.filter(s => s.has_compose_template).map(s => ({ value: s.name, label: s.name }))}
+                options={sources.map(s => ({ value: s.name, label: s.name }))}
+                onChange={(val) => checkMissingFiles(val)}
               />
             </Form.Item>
           </Space.Compact>
@@ -235,6 +334,136 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
               </>
             )}
           </Form.List>
+
+          {/* ---- Auto Deploy / Missing Files LLM Generation ---- */}
+          <Form.Item name="auto_templates_completion" hidden><Input /></Form.Item>
+          {checkingMissing ? (
+            <div style={{padding:'8px 0'}}><Spin size="small" /> <span style={{fontSize:12,color:'#999'}}>Checking deployment readiness...</span></div>
+          ) : missingFiles.length > 0 ? (
+            <Alert
+              type="warning"
+              message={`Missing essential files: ${missingFiles.join(', ')}`}
+              description={
+                <div style={{marginTop:4}}>
+                  <Checkbox
+                    checked={autoDeploy}
+                    onChange={(e) => {
+                      setAutoDeploy(e.target.checked)
+                      form.setFieldsValue({ auto_templates_completion: e.target.checked })
+                    }}
+                  >
+                    <strong>Auto Templates Completion</strong> — use BYOK LLM to generate missing files and deploy automatically
+                  </Checkbox>
+                  {autoDeploy && (
+                    <div style={{marginTop:8}}>
+                      {Object.keys(generatedFiles).length === 0 ? (
+                        <Button
+                          size="small"
+                          icon={<RobotOutlined />}
+                          loading={generatingFiles}
+                          onClick={generateMissingFiles}
+                        >
+                          Generate Missing Files via LLM
+                        </Button>
+                      ) : (
+                        <div>
+                          <Tag color="green">✓ Generated {Object.keys(generatedFiles).length} file(s)</Tag>
+                          {Object.keys(generatedFiles).map(fn => (
+                            <Tag key={fn} color="blue" style={{cursor:'pointer'}}
+                              onClick={() => setShowGeneratedReview(true)}>{fn}</Tag>
+                          ))}
+                          <Button size="small" type="link" onClick={() => setShowGeneratedReview(!showGeneratedReview)}>
+                            {showGeneratedReview ? 'Hide' : 'Review'}
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {!autoDeploy && (
+                    <div style={{marginTop:8}}>
+                      {Object.keys(generatedFiles).length === 0 ? (
+                        <div>
+                          <Text style={{fontSize:12}}>Would you like to use LLM to generate the missing files?</Text>
+                          <div style={{marginTop:4,display:'flex',gap:8}}>
+                            <Button size="small" icon={<RobotOutlined/>} loading={generatingFiles}
+                              onClick={generateMissingFiles}>
+                              Generate with LLM
+                            </Button>
+                            <span style={{fontSize:12,color:'#999',lineHeight:'24px'}}>
+                              — or upload files manually in the source project
+                            </span>
+                          </div>
+                        </div>
+                      ) : (
+                        <div>
+                          <Tag color="green">✓ Generated {Object.keys(generatedFiles).length} file(s)</Tag>
+                          <Text style={{fontSize:12,color:'#666'}}> — review below, then deploy</Text>
+                          {Object.keys(generatedFiles).map(fn => (
+                            <Tag key={fn} color="blue" style={{cursor:'pointer',marginTop:4}}
+                              onClick={() => setShowGeneratedReview(!showGeneratedReview)}>
+                              {fn} — click to review
+                            </Tag>
+                          ))}
+                          <Button size="small" type="link"
+                            onClick={() => setShowGeneratedReview(!showGeneratedReview)}>
+                            {showGeneratedReview ? 'Hide' : 'Show'} Files
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              }
+              style={{marginBottom:12}}
+            />
+          ) : selectedServiceName ? (
+            <Alert type="success" message="All essential files present — ready to deploy" style={{marginBottom:12}} />
+          ) : null}
+
+          {/* ---- Generated Files Review ---- */}
+          {showGeneratedReview && Object.keys(generatedFiles).length > 0 && (
+            <div style={{marginBottom:12, border:'1px solid #d9d9d9', borderRadius:6, padding:12, background:'#fafafa'}}>
+              <Text strong style={{fontSize:13}}>Generated Files (click to review in editor):</Text>
+              <div style={{marginTop:8,display:'flex',flexDirection:'column',gap:4}}>
+              {Object.entries(generatedFiles).map(([fn, content]) => (
+                <Tag key={fn} color="blue" style={{cursor:'pointer',padding:'4px 8px',fontSize:12}}
+                  onClick={() => {
+                    setEditorFileName(fn)
+                    setEditorContent(String(content))
+                    setEditorModalOpen(true)
+                  }}>
+                  📄 {fn} — click to open in editor
+                </Tag>
+              ))}
+              </div>
+            </div>
+          )}
+
+          {/* ---- Generated File Editor Modal (Monaco) ---- */}
+          <Modal
+            title={<Space><Text strong>{editorFileName}</Text><Tag color="blue">LLM Generated</Tag></Space>}
+            open={editorModalOpen}
+            onCancel={() => setEditorModalOpen(false)}
+            footer={<Button onClick={() => setEditorModalOpen(false)}>Close</Button>}
+            width="85%"
+          >
+            <div style={{height:'60vh'}}>
+              <Editor
+                height="100%"
+                language={getLanguage(editorFileName)}
+                theme="vs-dark"
+                value={editorContent}
+                onChange={(val) => setEditorContent(val || '')}
+                options={{
+                  minimap: { enabled: false },
+                  fontSize: 13,
+                  wordWrap: 'on',
+                  scrollBeyondLastLine: false,
+                  automaticLayout: true,
+                }}
+              />
+            </div>
+          </Modal>
 
           {/* ---- Global Proxy ---- */}
           <Form.Item name="use_global_proxy" valuePropName="checked">

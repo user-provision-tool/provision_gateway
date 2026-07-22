@@ -199,6 +199,12 @@ class ProvisionService:
         """Get service statistics from provision-api (registry only)."""
         return await self._request("GET", "/service-stats")
 
+    # ---- Service readiness ----
+
+    async def check_missing_files(self, service_name: str) -> dict[str, Any]:
+        """Check which essential deployment files are missing for a service."""
+        return await self._request("GET", f"/services/{service_name}/check-missing-files")
+
     # ---- SSL certificates ----
 
     async def list_ssl_certs(self) -> dict[str, Any]:

@@ -437,23 +437,43 @@ async def get_deployment_file(
     user_name: str, service_name: str, label: str, file_type: str,
     current_admin: AdminUser = Depends(get_current_admin),
 ):
-    """Get the content of a deployment file."""
+    """Get the content of a deployment file.
+
+    If the per-user deployment file does not exist yet, falls back to the
+    source template (e.g. .env → .env from source project) so the user can
+    edit a meaningful starting point rather than a blank file.
+    """
     fp = _resolve_deployment_file(user_name, service_name, label, file_type)
     if not fp:
         raise HTTPException(400, f"Unknown file type: {file_type}")
-    if not fp.exists():
-        raise HTTPException(404, f"File not found: {fp}")
-    try:
-        content = fp.read_text()
-    except Exception as e:
-        raise HTTPException(500, f"Failed to read file: {e}")
+
+    content = ""
+    exists = fp.exists()
+
+    if exists:
+        try:
+            content = fp.read_text()
+        except Exception as e:
+            raise HTTPException(500, f"Failed to read file: {e}")
+    else:
+        # Fall back to source template for .env files
+        if file_type == "env":
+            source_env = settings.SOURCE_PROJECTS_DIR / service_name / ".env"
+            if source_env.exists():
+                try:
+                    content = source_env.read_text()
+                except Exception:
+                    content = ""
+
     return {
         "file_type": file_type,
         "path": str(fp),
         "filename": fp.name,
         "content": content,
         "size": len(content),
-        "modified_at": fp.stat().st_mtime,
+        "modified_at": fp.stat().st_mtime if exists else None,
+        "exists": exists,
+        "source_fallback": not exists and bool(content),
     }
 
 
