@@ -148,13 +148,18 @@ async def system_stats(
     for c in containers:
         name = c["name"]
         s = stats_map.get(name, {})
+        # provision-api returns "cpu" and "mem" not "cpu_percent"/"mem_usage"
+        cpu_val = s.get("cpu", s.get("cpu_percent", "N/A"))
+        mem_val = s.get("mem", s.get("mem_usage", "N/A"))
+        # Parse memory: "10.5MiB / 1.94GiB" → extract RSS
+        mem_rss = mem_val.split(" / ")[0] if " / " in str(mem_val) else str(mem_val)
         merged.append({
             "name": name,
             "status": c["status"],
             "image": c["image"],
-            "cpu_percent": s.get("cpu_percent", "N/A"),
-            "mem_usage": s.get("mem_usage", "N/A"),
-            "mem_percent": s.get("mem_percent", "N/A"),
+            "cpu_percent": cpu_val,
+            "mem_usage": mem_val,
+            "mem_usage_mb": mem_rss,
             "running_for": c.get("running_for", ""),
         })
 

@@ -1,7 +1,7 @@
 # Provision Gateway — Tests Coverage Status
 
-> **Version**: 1.1
-> **Date**: 2026-07-08 (updated — post-deduplication refactor)
+> **Version**: 1.2
+> **Date**: 2026-07-21 (updated — test counts after Iteration 1 dev-debug-cycle)
 > **Status**: Current state of test coverage
 
 ---
@@ -22,7 +22,7 @@
 
 | File | Language | Type | Test Cases | Status |
 |---|---|---|---|---|
-| `test_unit.py` | Python (pytest) | Unit | 19 | ✅ Passing |
+| `test_unit.py` | Python (pytest) | Unit | 29 | ✅ Passing |
 | `test_proxy.py` | Python (pytest) | Unit | 8 | ✅ Passing |
 | `test_integration.py` | Python (subprocess) | Integration | 9 | ✅ Passing |
 | `test_integration.sh` | Bash | Integration | 9 | ✅ Passing |

@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Popconfirm, Modal, Drawer, Checkbox } from 'antd'
-import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, SwapOutlined, UnorderedListOutlined } from '@ant-design/icons'
+import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, SwapOutlined, UnorderedListOutlined, DashboardOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
 import client from '../api/client'
@@ -59,6 +59,9 @@ export default function UsersPage() {
   // Volume usage cache: key → {volumes: {...}, user_data_dir: string}
   const [volumeUsage, setVolumeUsage] = useState<Record<string, any>>({})
 
+  // Container resource stats cache: key → {cpu_percent, mem_usage_mb, mem_total_mb, disk_usage_mb}
+  const [resourceStats, setResourceStats] = useState<Record<string, {cpu: string, mem: string, disk: string}>>({})
+
   // Batch selection state
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
   const [batchLoading, setBatchLoading] = useState(false)
@@ -90,6 +93,13 @@ export default function UsersPage() {
     try {
       const { data } = await client.get(`/users/${user}/${service}/${label}/volume-usage`)
       setVolumeUsage(prev => ({...prev, [key]: data}))
+      // Also populate disk info into resource stats
+      if (data.volumes) {
+        const volumes = data.volumes
+        const totalBytes = Object.values(volumes).reduce((sum: number, v: any) => sum + (v.size_bytes || 0), 0)
+        const diskStr = totalBytes > 1073741824 ? (totalBytes / 1073741824).toFixed(1) + 'GB' : totalBytes > 1048576 ? (totalBytes / 1048576).toFixed(0) + 'MB' : (totalBytes / 1024).toFixed(0) + 'KB'
+        setResourceStats(prev => ({...prev, [key]: {...(prev[key] || {cpu:'',mem:''}), disk: totalBytes > 0 ? diskStr : ''}}))
+      }
     } catch { /* ignore */ }
   }
 
@@ -117,7 +127,40 @@ export default function UsersPage() {
     } catch { /* ignore */ }
   }, [regTimes])
 
-  // When services load, check their file modification times
+  // Fetch docker stats for container resource usage
+  const fetchResourceStats = useCallback(async () => {
+    if (services.length === 0) return
+    try {
+      const { data: statsData } = await client.get('/system/stats?detail=true')
+      const containers = statsData.containers || []
+      const newStats: Record<string, {cpu: string, mem: string, disk: string}> = {}
+
+      for (const svc of services) {
+        const key = `${svc.user_name}-${svc.service_name}-${svc.label}`
+        const prefix = `${svc.service_name}-user_${svc.user_name}-${svc.label}-`
+        const svcContainers = containers.filter((c: any) => c.name && c.name.startsWith(prefix))
+
+        if (svcContainers.length > 0) {
+          const totalCpu = svcContainers.reduce((sum: number, c: any) => {
+            const cpuStr = c.cpu_percent || c.cpu || '0'
+            return sum + parseFloat(String(cpuStr).replace('%', ''))
+          }, 0)
+          const totalMemMb = svcContainers.reduce((sum: number, c: any) => {
+            const memStr = c.mem_usage_mb || (c.mem_usage || '0')
+            return sum + parseFloat(String(memStr))
+          }, 0)
+          newStats[key] = {
+            cpu: totalCpu.toFixed(1) + '%',
+            mem: totalMemMb > 1024 ? (totalMemMb / 1024).toFixed(1) + 'GB' : totalMemMb.toFixed(0) + 'MB',
+            disk: '' // Will be filled from volume usage
+          }
+        }
+      }
+      setResourceStats(prev => ({...prev, ...newStats}))
+    } catch { /* ignore */ }
+  }, [services])
+
+  // When services load, fetch resource stats and check file mod times
   useEffect(() => {
     for (const svc of services) {
       const key = `${svc.user_name}-${svc.service_name}-${svc.label}`
@@ -127,6 +170,12 @@ export default function UsersPage() {
       if (isAdmin && volumeUsage[key] === undefined) {
         fetchVolumeUsage(svc.user_name, svc.service_name, svc.label)
       }
+    }
+    if (isAdmin && services.length > 0) {
+      fetchResourceStats()
+      // Poll resource stats every 15s for live CPU/RAM updates
+      const interval = setInterval(fetchResourceStats, 15000)
+      return () => clearInterval(interval)
     }
   }, [services, checkFileModTimes])
 
@@ -140,6 +189,11 @@ export default function UsersPage() {
       setEditorContent(data.content || '')
       setEditorOriginal(data.content || '')
       setEditorFile(prev => prev ? {...prev, path: data.path || ''} : null)
+      if (data.source_fallback) {
+        message.info('Loaded from source template. Save to create the per-user deployment file.')
+      } else if (!data.exists) {
+        message.info('File does not exist yet. Create it by saving.')
+      }
     } catch (err: any) {
       if (err.response?.status === 404) {
         setEditorContent('')
@@ -382,7 +436,18 @@ export default function UsersPage() {
                 return (
                   <Collapse.Panel
                     key={key}
-                    header={<Space>{isAdmin && <Checkbox checked={selectedKeys.has(key)} onChange={()=>toggleSelect(key)} onClick={(e:any)=>e.stopPropagation()}/>}{getBadge(svc)}<Text strong>{highlight(svc.service_name, search)}</Text><Tag>{svc.label}</Tag>
+                    header={<Space>
+                      {isAdmin && <Checkbox checked={selectedKeys.has(key)} onChange={()=>toggleSelect(key)} onClick={(e:any)=>e.stopPropagation()}/>}
+                      {getBadge(svc)}
+                      <Text strong>{highlight(svc.service_name, search)}</Text>
+                      <Tag>{svc.label}</Tag>
+                      {resourceStats[key] && (
+                        <span style={{marginLeft:8,display:'inline-flex',gap:6,alignItems:'center'}}>
+                          {resourceStats[key].cpu && <Tag color="blue" style={{fontSize:11,margin:0}}><DashboardOutlined/> CPU {resourceStats[key].cpu}</Tag>}
+                          {resourceStats[key].mem && <Tag color="purple" style={{fontSize:11,margin:0}}>RAM {resourceStats[key].mem}</Tag>}
+                          {resourceStats[key].disk && <Tag color="orange" style={{fontSize:11,margin:0}}>Disk {resourceStats[key].disk}</Tag>}
+                        </span>
+                      )}
                       {activeTasks[key] && <Button type="link" size="small" icon={<UnorderedListOutlined/>} onClick={(e)=>{e.stopPropagation();navigate('/tasks')}} style={{padding:0}}>Building...</Button>}
                     </Space>}
                     extra={
@@ -502,15 +567,6 @@ export default function UsersPage() {
                         })()}
                       </div>
                       {(svc as any).volumes && Object.keys((svc as any).volumes).length>0 && <div><Text strong>Volumes: </Text><Space wrap>{Object.entries((svc as any).volumes).map(([k,v]:[string,any])=><Tag key={k}>{k}: {String(v)}</Tag>)}</Space></div>}
-                      {volumeUsage[key]?.volumes && Object.keys(volumeUsage[key].volumes).length>0 && (
-                        <div style={{marginTop:4}}>
-                          <Text type="secondary" style={{fontSize:12}}>Disk Usage: </Text>
-                          {Object.entries(volumeUsage[key].volumes).map(([name, info]: [string, any]) => {
-                            const mb = info.size_bytes ? (info.size_bytes / 1024 / 1024).toFixed(1) : '?'
-                            return <Tag key={name} style={{fontSize:11}}>{name}: {mb} MB</Tag>
-                          })}
-                        </div>
-                      )}
                     </Space>
                   </Collapse.Panel>
                 )

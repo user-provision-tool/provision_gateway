@@ -91,6 +91,47 @@ async def create_service(
     return svc
 
 
+@router.get("/{name}/check-missing-files")
+async def check_missing_files(
+    name: str,
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """Check which essential deployment files are missing for a service.
+
+    Proxied to provision-api, then enriches with repo scan context
+    for LLM-based file generation.
+    """
+    try:
+        result = await provision_service.check_missing_files(name)
+    except Exception as e:
+        raise HTTPException(502, f"provision-api error: {e}")
+
+    # Enrich with repo scan context for LLM generation
+    from pathlib import Path
+    from ..utils.file_scanner import scan_directory
+    project_dir = settings.SOURCE_PROJECTS_DIR / name
+    if project_dir.is_dir():
+        try:
+            ctx = scan_directory(project_dir)
+            result["scan_context"] = {
+                "repo_description": ctx.repo_description,
+                "repo_files": ctx.repo_files,
+                "port": ctx.port,
+                "needs_db": ctx.needs_db,
+                "needs_cache": ctx.needs_cache,
+                "needs_volume": ctx.needs_volume,
+                "language": ctx.language,
+                "framework": ctx.framework,
+                "has_dockerfile": ctx.has_dockerfile,
+                "has_compose": ctx.has_compose,
+                "has_nginx_conf": ctx.has_nginx_conf,
+            }
+        except Exception:
+            pass
+
+    return result
+
+
 @router.post("/check-deploy")
 async def check_deploy_readiness(
     req: dict[str, Any],

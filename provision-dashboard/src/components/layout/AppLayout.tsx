@@ -103,10 +103,26 @@ export default function AppLayout() {
   }
 
   // Request notification permission and poll for completed tasks
-  const notifiedRef = useRef<Set<string>>(new Set())
+  // Store notified task IDs in localStorage to prevent re-notification on page refresh
+  const NOTIFIED_KEY = 'pg_notified_tasks'
+  const notifiedRef = useRef<Set<string>>(new Set(
+    JSON.parse(localStorage.getItem(NOTIFIED_KEY) || '[]')
+  ))
   useEffect(() => {
     if ('Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission()
+    }
+    const persistNotified = () => {
+      try {
+        localStorage.setItem(NOTIFIED_KEY, JSON.stringify([...notifiedRef.current].slice(-500)))
+      } catch {
+        // localStorage full or unavailable — clear older entries and retry
+        try {
+          const recent = [...notifiedRef.current].slice(-200)
+          localStorage.setItem(NOTIFIED_KEY, JSON.stringify(recent))
+          notifiedRef.current = new Set(recent)
+        } catch { /* silent — notifications still work, just not persisted */ }
+      }
     }
     const poll = async () => {
       try {
@@ -117,6 +133,7 @@ export default function AppLayout() {
           if (!taskId) continue
           if ((t.status === 'completed' || t.status === 'succeeded' || t.status === 'failed') && !notifiedRef.current.has(taskId)) {
             notifiedRef.current.add(taskId)
+            persistNotified()
             const emoji = t.status === 'failed' ? '❌' : '✅'
             if ('Notification' in window && Notification.permission === 'granted') {
               try { new Notification(`Task ${t.status}`, { body: `${t.type||'task'} ${t.target||''}`, icon: '/favicon.ico' }) } catch {}
@@ -124,6 +141,13 @@ export default function AppLayout() {
             message.info({ content: `${emoji} Task ${taskId.substring(0,8)}... ${t.status}`, duration: 5 })
           }
         }
+        // Prune: remove task IDs no longer present (they've been cleaned up)
+        const currentIds = new Set(tasks.map((t: any) => t.id || t.task_id).filter(Boolean))
+        let pruned = false
+        for (const id of notifiedRef.current) {
+          if (!currentIds.has(id)) { notifiedRef.current.delete(id); pruned = true }
+        }
+        if (pruned) persistNotified()
       } catch { /* silent */ }
     }
     const id = setInterval(poll, 15000)

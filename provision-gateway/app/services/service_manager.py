@@ -60,17 +60,39 @@ class ServiceManager:
         return False
 
     def _get_service_info(self, project_dir: Path) -> dict[str, Any]:
-        """Build the service info dict for a project directory. Excludes build artifacts and VCS."""
+        """Build the service info dict for a project directory.
+
+        Uses ``git ls-files`` to distinguish original repo files (templates)
+        from files created by the provision system (generated).
+        """
         name = project_dir.name
         files = []
-        generated_files = []
+        generated_files: list[str] = []
+
+        # Determine which files are tracked by git (original repo files)
+        git_tracked: set[str] = set()
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(project_dir), "ls-files"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                git_tracked = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass  # git not available — fall back to treating all files as templates
+
         for f in sorted(project_dir.rglob("*")):
             if f.is_file():
                 rel = str(f.relative_to(project_dir))
                 if self._is_excluded(rel):
                     continue
                 files.append(rel)
-                if rel.endswith(".generated") or "generated_" in rel:
+                # A file is "generated" if git is available and it is NOT tracked,
+                # OR if it has a .generated marker (LLM-generated files).
+                # If git is unavailable, fall back to marker-only detection.
+                if git_tracked and rel not in git_tracked:
+                    generated_files.append(rel)
+                elif not git_tracked and (rel.endswith(".generated") or "generated_" in rel):
                     generated_files.append(rel)
 
         has_compose_template = any(f.endswith(".yml.j2") for f in files)

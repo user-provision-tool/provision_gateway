@@ -110,7 +110,12 @@ function LlmPanel() {
       <Divider plain>Add LLM Configuration</Divider>
       <Form form={form} layout="vertical" onFinish={handleAdd} initialValues={{ mode: 'byok' }}>
         <Form.Item name="mode" label="Mode">
-          <Select options={[{ value: 'byok', label: 'Bring Your Own Key (OpenAI-compatible)' }, { value: 'local_agent', label: 'Local Agent (Ollama-compatible)' }]} />
+          <Select options={[{ value: 'byok', label: 'Bring Your Own Key (OpenAI-compatible)' }]}
+            disabled
+          />
+          <Text type="secondary" style={{fontSize:11,display:'block',marginTop:4}}>
+            BYOK is the currently supported mode. Local Agent and Provision Agent are planned for future releases.
+          </Text>
         </Form.Item>
         <Form.Item name="byok_base_url" label="API Base URL"><Input placeholder="https://api.deepseek.com/v1" prefix={<ApiOutlined />} /></Form.Item>
         <Form.Item name="byok_model" label="Model Name"><Input placeholder="deepseek-chat" /></Form.Item>
