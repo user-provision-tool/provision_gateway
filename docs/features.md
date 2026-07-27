@@ -1,7 +1,7 @@
 # Provision Gateway — Features Status
 
-> **Version**: 1.5
-> **Date**: 2026-07-21 (updated — Iteration 1: UI fixes, parallel requests, LLM auto-deploy flow)
+> **Version**: 1.6
+> **Date**: 2026-07-22 (updated — Iteration 1: tasks-220702026.md gaps fixed — deploy wiring, upload UI, settings cleanup, notifications, examples)
 > **Purpose**: Quick reference and implementation status tracker for all features.
 
 ---
@@ -72,6 +72,9 @@
 | S12 | Repository scan for LLM context | ✅ | Language/framework/port detection |
 | S13 | Service file versioning (git) | 🔮 | Stretch goal |
 | S14 | Template marketplace | 🔮 | Stretch goal |
+| S15 | Example service (REST API) | ✅ | `examples/service/` — hello-world with Dockerfile, no compose/nginx |
+| S16 | Example MCP (streamable HTTP) | ✅ | `examples/mcp/` — interacts with example service API |
+| S17 | Auto-detect manual source projects | ✅ | `list_services()` scans `SOURCE_PROJECTS_DIR` — all dirs auto-detected |
 
 ---
 
@@ -93,7 +96,7 @@
 | P12 | Redeploy blink on file change | ✅ | Redeploy button blinks when deployment files modified after registration; CSS animation `redeploy-blink` |
 | P13 | Service registration time tracking | ✅ | `GET /api/.../registration-time` finds most recent successful register task |
 | P14 | Deployment file CRUD API | ✅ | `GET/PUT /api/users/{u}/{s}/{l}/deployment-files/{type}` for env/compose/nginx |
-| P15 | Service header resource stats | 🟡 | RAM (RSS), Disk, CPU shown on collapse panel header via docker stats + volume usage |
+| P15 | Service header resource stats | 🟡 | RAM (RSS), CPU shown on collapse panel header via docker stats (disk removed per task 4) |
 
 ---
 
@@ -138,7 +141,7 @@
 | R2 | Task polling (Tasks: 5s) | ✅ | Auto-refresh table |
 | R3 | Build log streaming (SSE) | ✅ | Per-task filtered, terminal-style display |
 | R4 | Task progress tracking | ✅ | Status badges, elapsed time |
-| R5 | Toast notifications | ✅ | Browser Notification API + antd messages |
+| R5 | Toast notifications | ✅ | Browser Notification API + antd messages; time-filtered (2s window, no localStorage) |
 | R6 | Audit log auto-refresh (30s) | ✅ | `usePolling` hook |
 | R7 | Task persistence to disk | ✅ | `task_registry.json` in TASK_LOG_DIR; tasks survive provision-api restarts up to TTL |
 
@@ -232,7 +235,7 @@
 |---|---|---|---|---|
 | Authentication | 14 | 14 | 14 | 0 |
 | Dashboard | 8 | 8 | 8 | 0 |
-| Service Management | 14 | 12 | 12 | 0 |
+| Service Management | 17 | 15 | 15 | 0 |
 | User Provisioning | 15 | 15 | 14 | 1 |
 | Service URL & Connectivity | 5 | 5 | 5 | 0 |
 | LLM Integration | 14 | 13 | 11 | 2 |
@@ -243,7 +246,7 @@
 | Proxy Management | 9 | 9 | 9 | 0 |
 | User Management | 7 | 7 | 7 | 0 |
 | MCP Server | 6 | 6 | 6 | 0 |
-| **TOTAL** | **117** | **114** | **111** | **3** |
+| **TOTAL** | **120** | **117** | **114** | **3** |
 
-**Implementation Rate:** 114/117 = **97.4%**
-**Verified Rate:** 111/117 = **94.9%**
+**Implementation Rate:** 117/120 = **97.5%**
+**Verified Rate:** 114/120 = **95.0%**

@@ -1,7 +1,7 @@
 # Provision Gateway — Tests Coverage Status
 
-> **Version**: 1.2
-> **Date**: 2026-07-21 (updated — test counts after Iteration 1 dev-debug-cycle)
+> **Version**: 1.3
+> **Date**: 2026-07-22 (updated — tasks-220702026.md fixes: 29 gateway + 297 provision tests pass)
 > **Status**: Current state of test coverage
 
 ---

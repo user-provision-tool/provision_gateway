@@ -102,38 +102,35 @@ export default function AppLayout() {
     finally { setChatLoading(false) }
   }
 
-  // Request notification permission and poll for completed tasks
-  // Store notified task IDs in localStorage to prevent re-notification on page refresh
-  const NOTIFIED_KEY = 'pg_notified_tasks'
-  const notifiedRef = useRef<Set<string>>(new Set(
-    JSON.parse(localStorage.getItem(NOTIFIED_KEY) || '[]')
-  ))
+  // Request notification permission and poll for completed tasks.
+  // Time-filtering: only notify about tasks that completed/failed within the
+  // last 2 seconds — prevents re-notification on page refresh (where all existing
+  // tasks have old completion timestamps) and avoids localStorage memory leaks.
+  const notifiedRef = useRef<Set<string>>(new Set())
   useEffect(() => {
     if ('Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission()
-    }
-    const persistNotified = () => {
-      try {
-        localStorage.setItem(NOTIFIED_KEY, JSON.stringify([...notifiedRef.current].slice(-500)))
-      } catch {
-        // localStorage full or unavailable — clear older entries and retry
-        try {
-          const recent = [...notifiedRef.current].slice(-200)
-          localStorage.setItem(NOTIFIED_KEY, JSON.stringify(recent))
-          notifiedRef.current = new Set(recent)
-        } catch { /* silent — notifications still work, just not persisted */ }
-      }
     }
     const poll = async () => {
       try {
         const { data } = await client.get('/tasks')
         const tasks = data.tasks || data || []
+        const nowSec = Date.now() / 1000
+        const NOTIFY_WINDOW_SEC = 2 // only notify for tasks ended within 2 seconds
         for (const t of tasks) {
           const taskId = t.id || t.task_id
           if (!taskId) continue
-          if ((t.status === 'completed' || t.status === 'succeeded' || t.status === 'failed') && !notifiedRef.current.has(taskId)) {
+          const isTerminal = t.status === 'completed' || t.status === 'succeeded' || t.status === 'failed'
+          if (!isTerminal || notifiedRef.current.has(taskId)) continue
+          // Check if task ended recently via updated_at / completed_at timestamp
+          let endedSec = 0
+          const ts = t.updated_at || t.completed_at || t.finished_at || t.ended_at
+          if (ts) {
+            try { endedSec = new Date(ts).getTime() / 1000 } catch { endedSec = 0 }
+          }
+          // If no timestamp available or task ended within the window, notify
+          if (endedSec === 0 || (nowSec - endedSec) <= NOTIFY_WINDOW_SEC) {
             notifiedRef.current.add(taskId)
-            persistNotified()
             const emoji = t.status === 'failed' ? '❌' : '✅'
             if ('Notification' in window && Notification.permission === 'granted') {
               try { new Notification(`Task ${t.status}`, { body: `${t.type||'task'} ${t.target||''}`, icon: '/favicon.ico' }) } catch {}
@@ -141,13 +138,11 @@ export default function AppLayout() {
             message.info({ content: `${emoji} Task ${taskId.substring(0,8)}... ${t.status}`, duration: 5 })
           }
         }
-        // Prune: remove task IDs no longer present (they've been cleaned up)
+        // Prune: remove task IDs no longer present
         const currentIds = new Set(tasks.map((t: any) => t.id || t.task_id).filter(Boolean))
-        let pruned = false
         for (const id of notifiedRef.current) {
-          if (!currentIds.has(id)) { notifiedRef.current.delete(id); pruned = true }
+          if (!currentIds.has(id)) notifiedRef.current.delete(id)
         }
-        if (pruned) persistNotified()
       } catch { /* silent */ }
     }
     const id = setInterval(poll, 15000)

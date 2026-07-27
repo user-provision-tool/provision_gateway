@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Popconfirm, Modal, Drawer, Checkbox } from 'antd'
 import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, SwapOutlined, UnorderedListOutlined, DashboardOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
@@ -21,10 +21,13 @@ interface ServiceInstance {
 export default function UsersPage() {
   const { admin } = useAuth()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const isAdmin = admin?.role === 'admin'
   const [services, setServices] = useState<ServiceInstance[]>([])
   const [loading, setLoading] = useState(true)
-  const [deployOpen, setDeployOpen] = useState(false)
+  const deployParam = searchParams.get('deploy') || ''
+  const [deployOpen, setDeployOpen] = useState(!!deployParam)
+  const [preselectedDeploy, setPreselectedDeploy] = useState(deployParam || undefined)
   const [search, setSearch] = useState('')
   const [visiblePwds, setVisiblePwds] = useState<Record<string,boolean>>({})
   const [activeTasks, setActiveTasks] = useState<Record<string,string>>({}) // key->taskId
@@ -445,7 +448,6 @@ export default function UsersPage() {
                         <span style={{marginLeft:8,display:'inline-flex',gap:6,alignItems:'center'}}>
                           {resourceStats[key].cpu && <Tag color="blue" style={{fontSize:11,margin:0}}><DashboardOutlined/> CPU {resourceStats[key].cpu}</Tag>}
                           {resourceStats[key].mem && <Tag color="purple" style={{fontSize:11,margin:0}}>RAM {resourceStats[key].mem}</Tag>}
-                          {resourceStats[key].disk && <Tag color="orange" style={{fontSize:11,margin:0}}>Disk {resourceStats[key].disk}</Tag>}
                         </span>
                       )}
                       {activeTasks[key] && <Button type="link" size="small" icon={<UnorderedListOutlined/>} onClick={(e)=>{e.stopPropagation();navigate('/tasks')}} style={{padding:0}}>Building...</Button>}
@@ -576,7 +578,7 @@ export default function UsersPage() {
         )})
       )}
 
-      <DeployForm open={deployOpen} onClose={()=>setDeployOpen(false)} onDeployed={()=>{setDeployOpen(false);loadServices()}}/>
+      <DeployForm open={deployOpen} preselectedService={preselectedDeploy} onClose={()=>{setDeployOpen(false); if(deployParam) setSearchParams({})}} onDeployed={()=>{setDeployOpen(false); if(deployParam) setSearchParams({}); loadServices()}}/>
 
       {/* Password change modal */}
       <Modal title="Change Service Password" open={pwdModalOpen} onCancel={()=>setPwdModalOpen(false)}

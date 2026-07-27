@@ -2,11 +2,12 @@ import { useState, useEffect, useMemo } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Typography, Card, Table, Button, Modal, Form, Input,
-  Space, message, Tag, Empty, Tabs, Spin, Checkbox
+  Space, message, Tag, Empty, Tabs, Spin, Checkbox, Upload
 } from 'antd'
+import type { UploadProps } from 'antd'
 import {
   PlusOutlined, DeleteOutlined, FolderOpenOutlined,
-  GithubOutlined, UploadOutlined, FileTextOutlined
+  GithubOutlined, UploadOutlined, InboxOutlined
 } from '@ant-design/icons'
 import Editor, { DiffEditor } from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
@@ -105,7 +106,7 @@ export default function ServicesPage() {
     },
     { title: 'Actions', key: 'actions',
       render: (_:any, r:ServiceInfo) => <Space>
-        <Button size="small" type="primary" onClick={()=>navigate(`/services/${r.name}`)}>Deploy</Button>
+        <Button size="small" type="primary" onClick={()=>navigate(`/users?deploy=${r.name}`)}>Deploy</Button>
         {isAdmin && <Button size="small" danger icon={<DeleteOutlined/>} onClick={()=>handleDelete(r.name)}/>}
       </Space> },
   ]
@@ -121,7 +122,7 @@ export default function ServicesPage() {
         <Table dataSource={services} columns={columns} rowKey="name" pagination={false}/>}
       </Card>
       <Modal title="Add Source Project" open={addModalOpen} onCancel={()=>{setAddModalOpen(false);form.resetFields()}} footer={null} width={560}>
-        <Tabs activeKey={addMode} onChange={(k)=>setAddMode(k as any)} items={[
+        <Tabs activeKey={addMode} onChange={(k)=>{setAddMode(k as any);form.resetFields()}} items={[
           { key:'git', label:<span><GithubOutlined/> From Git</span>, children:
             <Form form={form} layout="vertical" onFinish={handleAdd}>
               <Form.Item name="repo_url" label="Repository URL" rules={[{required:true}]}><Input placeholder="https://github.com/user/repo.git"/></Form.Item>
@@ -136,42 +137,84 @@ export default function ServicesPage() {
               <Button type="primary" htmlType="submit" loading={addLoading} block>Clone & Create</Button>
             </Form> },
           { key:'upload', label:<span><UploadOutlined/> Upload Zip</span>, children:
-            <Form form={form} layout="vertical" onFinish={handleAdd}>
-              <Form.Item name="name" label="Service Name" rules={[{required:true}]}><Input placeholder="myapp"/></Form.Item>
-              <Form.Item name="zip_content" label="Zip (base64)" help="Paste base64-encoded zip"><Input.TextArea rows={3} placeholder="UEsDBBQAAAAI..."/></Form.Item>
-              <Form.Item name="files" label="Or files as JSON"><Input.TextArea rows={2} placeholder='{"file":"content"}'/></Form.Item>
-              <Button type="primary" htmlType="submit" loading={addLoading} block>Create from Upload</Button>
-            </Form> },
-          { key:'template', label:<span><FileTextOutlined/> From Template</span>, children:
-            <Form form={form} layout="vertical" onFinish={async (values)=>{
-              setAddLoading(true)
-              try {
-                const { data } = await client.post('/llm/generate', {
-                  prompt: `Create a production-ready ${values.template_type||'web app'} service named "${values.name}". Generate docker-compose.yml, nginx.conf, .env, and Dockerfile.`,
-                  generate_type: 'service_config'
-                })
-                // Save generated files
-                await client.post('/services/save-generated', { name: values.name, files: data.files||data })
-                message.success('Service created from template!')
-                setAddModalOpen(false); form.resetFields(); loadServices()
-              } catch (err: any) { message.error(err.response?.data?.detail || 'Generation failed') }
-              finally { setAddLoading(false) }
-            }}>
-              <Form.Item name="name" label="Service Name" rules={[{required:true}]}><Input placeholder="myapp"/></Form.Item>
-              <Form.Item name="template_type" label="Service Type" initialValue="web app">
-                <Input placeholder="e.g. Python FastAPI + Redis, WordPress, Node.js app"/>
-              </Form.Item>
-              <Form.Item name="use_proxy" valuePropName="checked">
-                <Checkbox disabled={!proxyEnabled}>
-                  Use global proxy (for LLM API)
-                  {!proxyEnabled && <span style={{color:'#999',fontSize:12}}> (enable in Settings)</span>}
-                </Checkbox>
-              </Form.Item>
-              <Button type="primary" htmlType="submit" loading={addLoading} block icon={<FileTextOutlined/>}>Generate from Template</Button>
-            </Form> },
+            <UploadZipForm form={form} addLoading={addLoading} setAddLoading={setAddLoading}
+              onSuccess={()=>{setAddModalOpen(false);form.resetFields();loadServices()}} /> },
         ]}/>
       </Modal>
     </div>
+  )
+}
+
+// ---- Upload Zip Form (file selector instead of base64 paste) ----
+function UploadZipForm({ form, addLoading, setAddLoading, onSuccess }: {
+  form: any; addLoading: boolean; setAddLoading: (v: boolean) => void; onSuccess: () => void
+}) {
+  const [zipBase64, setZipBase64] = useState<string>('')
+
+  const uploadProps: UploadProps = {
+    accept: '.zip',
+    maxCount: 1,
+    beforeUpload: (file) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const result = reader.result as string
+        // Strip data:application/zip;base64, prefix if present
+        const b64 = result.includes('base64,') ? result.split('base64,')[1] : result
+        setZipBase64(b64)
+        form.setFieldsValue({ zip_content: b64 })
+        message.success(`Selected: ${file.name}`)
+      }
+      reader.readAsDataURL(file)
+      return false // Prevent auto-upload
+    },
+    onRemove: () => {
+      setZipBase64('')
+      form.setFieldsValue({ zip_content: '' })
+    },
+  }
+
+  const handleUpload = async (values: any) => {
+    if (!zipBase64 && !values.files) {
+      message.warning('Please select a zip file or provide file contents')
+      return
+    }
+    setAddLoading(true)
+    try {
+      const payload: any = { name: values.name, mode: 'upload' }
+      if (zipBase64) {
+        payload.zip_content = zipBase64
+      }
+      if (values.files) {
+        try { payload.files = JSON.parse(values.files) } catch { /* not JSON */ }
+      }
+      await client.post('/services', payload)
+      message.success('Service created!')
+      onSuccess()
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || 'Failed to create service')
+    } finally { setAddLoading(false) }
+  }
+
+  return (
+    <Form form={form} layout="vertical" onFinish={handleUpload}>
+      <Form.Item name="name" label="Service Name" rules={[{ required: true }]}>
+        <Input placeholder="myapp" />
+      </Form.Item>
+      <Form.Item name="zip_content" hidden><Input /></Form.Item>
+      <Form.Item label="Select Zip File">
+        <Upload.Dragger {...uploadProps}>
+          <p className="ant-upload-drag-icon"><InboxOutlined /></p>
+          <p className="ant-upload-text">Click or drag a .zip file to this area</p>
+          <p className="ant-upload-hint">Upload a zip archive containing your service files</p>
+        </Upload.Dragger>
+      </Form.Item>
+      <Form.Item name="files" label="Or paste files as JSON">
+        <Input.TextArea rows={2} placeholder='{"docker-compose.yml":"services:...", "nginx.conf":"server {...}"}' />
+      </Form.Item>
+      <Button type="primary" htmlType="submit" loading={addLoading} block>
+        Create from Upload
+      </Button>
+    </Form>
   )
 }
 

@@ -57,8 +57,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       setGeneratedFiles({})
       setShowGeneratedReview(false)
       setEditorModalOpen(false)
+      // Preselect service if provided
+      if (preselectedService) {
+        form.setFieldsValue({ service_name: preselectedService })
+        checkMissingFiles(preselectedService)
+      }
     }
-  }, [open])
+  }, [open, preselectedService])
 
   const loadSslDomains = async () => {
     try {

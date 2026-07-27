@@ -120,9 +120,6 @@ function LlmPanel() {
         <Form.Item name="byok_base_url" label="API Base URL"><Input placeholder="https://api.deepseek.com/v1" prefix={<ApiOutlined />} /></Form.Item>
         <Form.Item name="byok_model" label="Model Name"><Input placeholder="deepseek-chat" /></Form.Item>
         <Form.Item name="byok_api_key" label="API Key"><Input.Password placeholder="sk-..." prefix={<KeyOutlined />} /></Form.Item>
-        <Form.Item name="agent_url" label="Agent URL (for local mode)"><Input placeholder="http://localhost:11434/v1" /></Form.Item>
-        <Form.Item name="agent_model" label="Agent Model"><Input placeholder="llama3.1:8b" /></Form.Item>
-        <Form.Item name="system_prompt" label="System Prompt"><Input.TextArea rows={3} placeholder="You are a DevOps assistant..." /></Form.Item>
         <Space>
           <Button type="primary" htmlType="submit" loading={saving} icon={<SaveOutlined />}>Add Config</Button>
           <Button onClick={handleTest} loading={testing} icon={<RobotOutlined />}>Test Active</Button>
