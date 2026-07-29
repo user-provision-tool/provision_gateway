@@ -21,6 +21,7 @@ interface ServiceInfo {
   has_dockerfile: boolean; active_users: number
   active_instances: string[]; created_at: string
   generated_files?: string[]
+  template_files?: string[]
 }
 
 export default function ServicesPage() {
@@ -89,12 +90,11 @@ export default function ServicesPage() {
       render: (t: string) => <Button type="link" onClick={() => navigate(`/services/${t}`)}><FolderOpenOutlined /> {t}</Button> },
     { title: 'Templates', key: 'templates',
       render: (_:any, r:ServiceInfo) => {
-        // Templates = files tracked in git (original repo files).
-        // The backend determines "generated_files" via `git ls-files` — anything
-        // NOT in git (per-user compose/nginx/env, .generated markers, converted .j2
-        // files that weren't in the original repo) is classified as generated.
-        const generatedSet = new Set<string>(r.generated_files || [])
-        const temps = r.files.filter((f: string) => !generatedSet.has(f))
+        // Template files are now explicitly classified on the backend (G2).
+        // The backend returns a `template_files` list containing only the
+        // deployment-critical file types (Dockerfile, docker-compose*,
+        // *.nginx.conf, *.conf, .env, .env.example).
+        const temps = r.template_files || []
         return <Space size={4} wrap>{temps.length>0 ? temps.map(f=><Tag key={f} color="green" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
       }
     },

@@ -142,6 +142,12 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       setGeneratedFiles(results)
       if (Object.keys(results).length > 0) {
         message.success(`LLM generated ${Object.keys(results).length} file(s)`)
+        // G6: Auto-deploy when "Auto Templates Completion" is selected
+        if (autoDeploy) {
+          message.info('Auto-deploying with generated files...')
+          // Small delay to let the UI update before submitting
+          setTimeout(() => form.submit(), 500)
+        }
       } else {
         message.warning('LLM could not generate any files. Configure BYOK LLM in Settings.')
       }
@@ -154,8 +160,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     try {
       const selectedService = sources.find(s => s.name === values.service_name)
 
-      // Save any LLM-generated files first (use autoDeploy state, not form value — Input stores strings)
-      if (Object.keys(generatedFiles).length > 0 && autoDeploy) {
+      // Save any LLM-generated files first — execute regardless of autoDeploy state
+      if (Object.keys(generatedFiles).length > 0) {
         await client.post('/services/save-generated', {
           service_name: values.service_name,
           files: generatedFiles,
@@ -174,13 +180,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         use_global_proxy: values.use_global_proxy || false,
       }
 
-      // Add compose/nginx paths — if newly generated, use the generated filenames
+      // Add compose/nginx paths — use consistent naming per design.md (G10)
       if (selectedService) {
         const composeJ2 = selectedService.files.find((f: string) => f.endsWith('.yml.j2'))
         const nginxJ2 = selectedService.files.find((f: string) => f.endsWith('.conf.j2'))
-        if (composeJ2) payload.compose_template_path = composeJ2
+        if (composeJ2) payload.compose_file_path = composeJ2
         else if (generatedFiles['docker-compose.yml']) payload.compose_file_path = 'docker-compose.yml'
-        if (nginxJ2) payload.nginx_conf_template_path = nginxJ2
+        if (nginxJ2) payload.nginx_conf_file_path = nginxJ2
         else if (generatedFiles['nginx.conf']) payload.nginx_conf_file_path = 'nginx.conf'
       }
 
@@ -230,7 +236,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       destroyOnClose
     >
       <Form form={form} layout="vertical" onFinish={handleDeploy}
-        initialValues={{ label: '0', domain: 'localhost', https: false, auto_templates_completion: true }}>
+        initialValues={{ label: '0', domain: 'localhost', https: false }}>
         
         <Space style={{ width: '100%' }} direction="vertical" size="middle">
           {/* ---- User & Service ---- */}
@@ -341,7 +347,6 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           </Form.List>
 
           {/* ---- Auto Deploy / Missing Files LLM Generation ---- */}
-          <Form.Item name="auto_templates_completion" hidden><Input /></Form.Item>
           {checkingMissing ? (
             <div style={{padding:'8px 0'}}><Spin size="small" /> <span style={{fontSize:12,color:'#999'}}>Checking deployment readiness...</span></div>
           ) : missingFiles.length > 0 ? (
@@ -352,10 +357,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
                 <div style={{marginTop:4}}>
                   <Checkbox
                     checked={autoDeploy}
-                    onChange={(e) => {
-                      setAutoDeploy(e.target.checked)
-                      form.setFieldsValue({ auto_templates_completion: e.target.checked })
-                    }}
+                    onChange={(e) => setAutoDeploy(e.target.checked)}
                   >
                     <strong>Auto Templates Completion</strong> — use BYOK LLM to generate missing files and deploy automatically
                   </Checkbox>

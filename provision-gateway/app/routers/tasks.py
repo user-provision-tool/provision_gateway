@@ -93,7 +93,8 @@ async def stream_task_log(
             async for line in provision_service.stream_task_log(task_id, tail, follow):
                 yield line
         except Exception as e:
-            yield f"event: error\ndata: {str(e)}\n\n"
+            import json as _json
+            yield f"event: error\ndata: {_json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(
         sse_generator(),

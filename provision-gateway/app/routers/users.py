@@ -346,8 +346,8 @@ async def clone_user(
             "user_name": target_user,
             "service_name": service_entry.get("service_name"),
             "label": service_entry.get("label", "0"),
-            "compose_template_path": service_entry.get("compose_template_path"),
-            "nginx_conf_template_path": service_entry.get("nginx_conf_template_path"),
+            "compose_file_path": service_entry.get("compose_template_path"),
+            "nginx_conf_file_path": service_entry.get("nginx_conf_template_path"),
             "domain": req.get("domain", "localhost"),
             "passwd": req.get("passwd", "123456"),
         }

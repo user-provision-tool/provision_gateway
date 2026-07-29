@@ -771,6 +771,8 @@ GET /api/services
         "name": "myapp",
         "path": "/srv/provision/source_projects/myapp",
         "files": ["docker-compose.myapp.yml.j2", "myapp.nginx.conf.j2", ".env", "Dockerfile"],
+        "generated_files": [],
+        "template_files": [],
         "has_compose_template": true,
         "has_nginx_template": true,
         "active_users": 3,

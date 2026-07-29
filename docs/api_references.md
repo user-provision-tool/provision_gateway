@@ -738,6 +738,7 @@ List all service source projects.
       "path": "/srv/provision/source_projects/siyuan",
       "files": ["Dockerfile", "docker-compose.yml.j2", "nginx.conf.j2"],
       "generated_files": [],
+      "template_files": [],
       "has_compose_template": true,
       "has_nginx_template": true,
       "active_users": 1,
@@ -1394,10 +1395,7 @@ List all LLM configurations and the active one.
       "byok_base_url": "https://api.deepseek.com/v1",
       "byok_model": "deepseek-chat",
       "byok_api_key_masked": "sk-...xxxx",
-      "agent_url": null,
-      "agent_model": null,
       "is_active": true,
-      "system_prompt": "You are a DevOps assistant...",
       "updated_at": "2026-07-05T12:00:00Z"
     }
   ],

@@ -51,11 +51,10 @@
 
 ### 2.1 Add Project Button
 - **Trigger**: Click "Add Project" button (admin only)
-- **Sequence**: Opens modal with 3 tabs:
+- **Sequence**: Opens modal with 2 tabs:
   - **From Git**: Fill repo URL, branch, name → POST /api/services (mode=git) → clone repo
-  - **Upload Zip**: Fill name, base64 zip content → POST /api/services (mode=upload)
-  - **From Template**: Fill name, type → POST /api/llm/generate → POST /api/services/save-generated
-- **Status**: ✅ Working (requires working LLM for template mode)
+  - **Upload Zip**: Fill name, base64 zip content or individual file JSON map → POST /api/services (mode=upload)
+- **Status**: ✅ Working (template tab removed — LLM generation moved to DeployForm)
 
 ### 2.2 Project Name Click (folder-open icon)
 - **Trigger**: Click project name
@@ -109,9 +108,13 @@
 ## 3. Services Page (`/users`) — Deployed Services
 
 ### 3.1 Deploy Button
-- **Trigger**: Click "Deploy" button
+- **Trigger**: Click "Deploy" button (rocket icon, top-right)
 - **Sequence**: Opens DeployForm modal → select user, service, label, domain, password → POST /api/users/deploy → async task created
-- **Status**: ✅ Working
+- **Auto-generated templates flow**: When service is missing essential files (docker-compose, nginx.conf, .env, Dockerfile), an alert shows with "Auto Templates Completion" checkbox.
+  - **Auto mode (checked)**: LLM generates missing files → auto-submits deploy after 500ms delay
+  - **Manual mode (unchecked)**: User clicks "Generate with LLM" → generated files shown as clickable tags for review → deploy saves files to disk first, then submits
+  - If LLM not configured, user must upload files manually in the source project
+- **Status**: ✅ Working (G12 fixed: generated files saved to disk regardless of autoDeploy state)
 
 ### 3.2 Refresh Button
 - **Trigger**: Click "Refresh" button
@@ -192,6 +195,13 @@ Each service card shows these buttons:
 ---
 
 ## 4. Tasks Page (`/tasks`)
+
+### 4.0 Task Notifications (Global)
+- **Trigger**: Any task transitions from pending → completed/failed (detected globally, not per-page)
+- **Sequence**: AppLayout.tsx polls GET /api/tasks every 2s → detects status transitions → shows antd notification toast + browser Notification API alert
+- **Deduplication**: Each task notified only once via `notifiedRef`
+- **Time filter**: 2-second window on `updated_at` timestamps prevents stale-task notifications on page load
+- **Status**: ✅ Working (global notification, not tied to Tasks page)
 
 ### 4.1 Refresh Button
 - **Trigger**: Click "Refresh"
@@ -307,19 +317,25 @@ Each service card shows these buttons:
 | Dashboard | 7 operations | All ✅ |
 | Source Projects | 9 operation groups | All ✅ |
 | Services (Users) | 10 operation groups | All ✅ (Up/Down fixed) |
-| Tasks | 4 operations | ✅ (SSE log per-task ⚠️ reads global log file, filters by task context) |
+| Tasks | 4 operations + 1 global notification | ✅ (SSE log per-task ⚠️ reads global log file, filters by task context); global 2s task notification with toast + browser Notification API |
 | Settings | 3 panels (LLM, Proxy, Special Users) | All ✅ |
 | Audit | 3 operations (filter, CSV export, auto-refresh) | All ✅ |
 | User Management | 5 operations (register, approve, special users, delete, role change) | All ✅ |
 | Login | 2 operations (login, register) | All ✅ |
 
-### Known Issues (Post-ITERATION 1):
+### Known Issues:
 1. **Task SSE log reads global file** — The log endpoint reads `DOCKER_OPS_LOG` and filters by task context. Per-task log files would improve isolation (see Task 10 in tasks-20260705-3.md).
 2. **New user registration flow** — Viewer/admin role switching and page access control needs debugging (see Task 9 in tasks-20260705-3.md).
 3. **Task log persistence** — Task logs should be configurable and per-task (see Task 10.2 in tasks-20260705-3.md).
 4. **Redeploy button flow** — Full e2e verification needed.
 
-### Fixed Issues (ITERATION 1 — 2026-07-05):
+### Fixed Issues:
+**ITERATION 2 (2026-07-28):**
+1. ✅ **G12 — Non-autoDeploy files saved to disk** — `handleDeploy` now saves generated files before deployment regardless of `autoDeploy` state.
+2. ✅ **G15 — Removed unused hidden form field** — Removed `auto_templates_completion` field from DeployForm; auto-deploy uses React state only.
+3. ✅ **G13-G16 — Dead code cleanup** — Removed 12 unused API exports from `services.ts`; kept only `createServiceGit`.
+
+**ITERATION 1 (2026-07-05):**
 1. ✅ **siyuan-mcp always down** — Root cause: container_name template had `{{ container_prefix }}server` but should be `{{ container_prefix }}siyuan-mcp-server`. Fixed template, regenerated compose, restarted container.
 2. ✅ **Separate Up/Down buttons** — Replaced with single Play/Pause toggle button.
 3. ✅ **Task notification error** — "❌ Task undefined... failed" fixed by handling missing task IDs.

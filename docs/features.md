@@ -1,7 +1,7 @@
 # Provision Gateway — Features Status
 
-> **Version**: 1.6
-> **Date**: 2026-07-22 (updated — Iteration 1: tasks-220702026.md gaps fixed — deploy wiring, upload UI, settings cleanup, notifications, examples)
+> **Version**: 1.8
+> **Date**: 2026-07-28 (updated — Iteration 2 dev-debug-flow: G12 non-autoDeploy save fix, G13-G16 dead code cleanup, D1-D4 doc updates, F1 parallel load test)
 > **Purpose**: Quick reference and implementation status tracker for all features.
 
 ---
@@ -128,8 +128,8 @@
 | L10 | Service template generation | ✅ | `generate_type: service_config` |
 | L11 | API key encryption at rest | ✅ | AES-256-GCM |
 | L12 | Missing files check API | ✅ | `GET /api/services/{name}/check-missing-files` → provision-api `GET /services/{name}/check-missing-files` |
-| L13 | Auto-deploy LLM file generation | 🟡 | Checkbox on DeployForm; LLM generates missing compose/nginx/env/Dockerfile before deploy |
-| L14 | Generated files review in deploy | 🟡 | Inline preview of LLM-generated files with review before saving+saving |
+| L13 | Auto-deploy LLM file generation | ✅ | Checkbox on DeployForm; LLM generates missing compose/nginx/env/Dockerfile before deploy — auto-submits (G6). Non-autoDeploy mode saves generated files to disk before deploy (G12 fixed in Iteration 2). |
+| L14 | Generated files review in deploy | ✅ | Inline preview of LLM-generated files with review before saving; clickable file tags open Monaco editor (G6 confirmed working) |
 
 ---
 
@@ -238,7 +238,7 @@
 | Service Management | 17 | 15 | 15 | 0 |
 | User Provisioning | 15 | 15 | 14 | 1 |
 | Service URL & Connectivity | 5 | 5 | 5 | 0 |
-| LLM Integration | 14 | 13 | 11 | 2 |
+| LLM Integration | 14 | 13 | 13 | 1 |
 | Real-Time Operations | 7 | 7 | 7 | 0 |
 | Reconciliation | 7 | 7 | 7 | 0 |
 | System Monitoring | 6 | 6 | 6 | 0 |
@@ -246,7 +246,7 @@
 | Proxy Management | 9 | 9 | 9 | 0 |
 | User Management | 7 | 7 | 7 | 0 |
 | MCP Server | 6 | 6 | 6 | 0 |
-| **TOTAL** | **120** | **117** | **114** | **3** |
+| **TOTAL** | **120** | **117** | **116** | **2** |
 
 **Implementation Rate:** 117/120 = **97.5%**
-**Verified Rate:** 114/120 = **95.0%**
+**Verified Rate:** 116/120 = **96.7%**

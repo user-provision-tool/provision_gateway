@@ -327,3 +327,398 @@ class TestUvicornWorkers:
         assert "4" in content.split("--workers")[1].split()[0], (
             "Dockerfile --workers value should be 4"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for G2 — Template classification filtering
+# ---------------------------------------------------------------------------
+
+class TestTemplateClassification:
+    """Tests for template file classification (G2)."""
+
+    def test_is_template_file_dockerfile(self):
+        """Dockerfile should be classified as template."""
+        from app.services.service_manager import ServiceManager
+        assert ServiceManager._is_template_file("Dockerfile") is True
+        assert ServiceManager._is_template_file("path/to/Dockerfile") is True
+
+    def test_is_template_file_docker_compose(self):
+        """docker-compose* files should be classified as template."""
+        from app.services.service_manager import ServiceManager
+        assert ServiceManager._is_template_file("docker-compose.yml") is True
+        assert ServiceManager._is_template_file("path/docker-compose.prod.yml") is True
+        assert ServiceManager._is_template_file("docker-compose.override.yml") is True
+
+    def test_is_template_file_nginx_conf(self):
+        """*.nginx.conf files should be classified as template."""
+        from app.services.service_manager import ServiceManager
+        assert ServiceManager._is_template_file("myapp.nginx.conf") is True
+        assert ServiceManager._is_template_file("path/to/service.nginx.conf") is True
+
+    def test_is_template_file_conf(self):
+        """*.conf files should be classified as template."""
+        from app.services.service_manager import ServiceManager
+        assert ServiceManager._is_template_file("nginx.conf") is True
+        assert ServiceManager._is_template_file("path/to/app.conf") is True
+
+    def test_is_template_file_env(self):
+        """.env and .env.example should be classified as template."""
+        from app.services.service_manager import ServiceManager
+        assert ServiceManager._is_template_file(".env") is True
+        assert ServiceManager._is_template_file(".env.example") is True
+        assert ServiceManager._is_template_file("path/.env") is True
+
+    def test_is_template_file_not_template(self):
+        """Regular source files should NOT be classified as template."""
+        from app.services.service_manager import ServiceManager
+        assert ServiceManager._is_template_file("main.py") is False
+        assert ServiceManager._is_template_file("app/views.tsx") is False
+        assert ServiceManager._is_template_file("README.md") is False
+        assert ServiceManager._is_template_file(".gitignore") is False
+        assert ServiceManager._is_template_file("package.json") is False
+
+    def test_service_info_has_template_files_field(self):
+        """Service info dict should include a template_files key."""
+        from app.services.service_manager import ServiceManager
+        svc = ServiceManager()
+        import inspect
+        sig = inspect.signature(svc._get_service_info)
+        assert 'project_dir' in sig.parameters
+
+
+# ---------------------------------------------------------------------------
+# Tests for G9 — Agent fields guard in LLMConfig.to_dict()
+# ---------------------------------------------------------------------------
+
+class TestLLMConfigToDict:
+    """Tests that LLMConfig.to_dict() strips agent fields by default (G9)."""
+
+    def test_to_dict_excludes_agent_fields_by_default(self):
+        """to_dict() should not include agent_url, agent_model, or system_prompt."""
+        from app.models.llm_config import LLMConfig
+        config = LLMConfig()
+        config.id = 1
+        config.mode = "byok"
+        config.agent_url = "http://agent:11434"
+        config.agent_model = "llama3.1:8b"
+        config.system_prompt = "You are a helpful assistant."
+        config.byok_base_url = "https://api.openai.com/v1"
+        config.byok_model = "gpt-4o"
+        config.is_active = True
+
+        result = config.to_dict()
+        assert "agent_url" not in result
+        assert "agent_model" not in result
+        assert "system_prompt" not in result
+        assert result["mode"] == "byok"
+        assert result["byok_model"] == "gpt-4o"
+
+    def test_to_dict_includes_agent_fields_when_requested(self):
+        """to_dict(include_agent_fields=True) should include agent fields."""
+        from app.models.llm_config import LLMConfig
+        config = LLMConfig()
+        config.id = 1
+        config.mode = "byok"
+        config.agent_url = "http://agent:11434"
+        config.agent_model = "llama3.1:8b"
+        config.system_prompt = "You are a helpful assistant."
+
+        result = config.to_dict(include_agent_fields=True)
+        assert result["agent_url"] == "http://agent:11434"
+        assert result["agent_model"] == "llama3.1:8b"
+        assert result["system_prompt"] == "You are a helpful assistant."
+
+
+# ---------------------------------------------------------------------------
+# Tests for G11 — SSE format
+# ---------------------------------------------------------------------------
+
+class TestSSEFormat:
+    """Tests for proper SSE event format (G11)."""
+
+    def test_provision_service_stream_task_log_format(self):
+        """stream_task_log should emit proper SSE data: {json} format."""
+        from app.services.provision_service import ProvisionService
+        svc = ProvisionService()
+        import inspect
+        assert inspect.isasyncgenfunction(svc.stream_task_log)
+
+    def test_tasks_router_sse_generator_has_json_error_format(self):
+        """The tasks router SSE generator should emit JSON error events."""
+        from pathlib import Path
+        tasks_path = Path(__file__).parent.parent / "app" / "routers" / "tasks.py"
+        content = tasks_path.read_text()
+        assert "json.dumps" in content or "_json.dumps" in content
+
+
+# ---------------------------------------------------------------------------
+# Tests for G5 — LLM prompts reference provision-api skill
+# ---------------------------------------------------------------------------
+
+class TestLLMPromptsSkillReference:
+    """Tests that LLM prompts reference the provision-api skill (G5)."""
+
+    def test_compose_prompt_references_skill(self):
+        """docker_compose prompt should reference the provision-api skill."""
+        from app.services.llm_service import LLMService
+        svc = LLMService()
+        prompt = svc._build_prompt("docker_compose", {
+            "repo_description": "test app",
+            "repo_files": ["main.py"],
+            "port": 8000,
+            "language": "python",
+            "framework": "fastapi",
+        })
+        assert "_users_provision/skills/provision-api" in prompt
+        assert "Use `build: .`" in prompt
+        assert "Use named volumes" in prompt
+
+    def test_nginx_prompt_references_skill(self):
+        """nginx_conf prompt should reference the provision-api skill."""
+        from app.services.llm_service import LLMService
+        svc = LLMService()
+        prompt = svc._build_prompt("nginx_conf", {
+            "repo_description": "test app",
+            "repo_files": ["main.py"],
+            "port": 8000,
+            "language": "python",
+            "framework": "fastapi",
+        })
+        assert "_users_provision/skills/provision-api" in prompt
+        assert "proxy_pass host must match" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Tests for G10 — Deploy field naming alignment
+# ---------------------------------------------------------------------------
+
+class TestDeployFieldNaming:
+    """Tests for consistent deploy field naming (G10)."""
+
+    def test_frontend_deployform_uses_compose_file_path(self):
+        """DeployForm.tsx should use compose_file_path for template files."""
+        from pathlib import Path
+        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
+        content = deploy_form.read_text()
+        assert "compose_file_path" in content
+        assert "compose_template_path" not in content
+
+    def test_frontend_deployform_uses_nginx_conf_file_path(self):
+        """DeployForm.tsx should use nginx_conf_file_path."""
+        from pathlib import Path
+        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
+        content = deploy_form.read_text()
+        assert "nginx_conf_file_path" in content
+        assert "nginx_conf_template_path" not in content
+
+
+# ---------------------------------------------------------------------------
+# Tests for G3 — Task notification system
+# ---------------------------------------------------------------------------
+
+class TestTaskNotificationSystem:
+    """Tests for task notification system (G3)."""
+
+    def test_app_layout_uses_notification_api(self):
+        """AppLayout should call notification function for task notifications."""
+        from pathlib import Path
+        layout_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "layout" / "AppLayout.tsx"
+        content = layout_path.read_text()
+        assert "notification[" in content
+
+    def test_app_layout_has_2second_window(self):
+        """AppLayout task poller should use 2-second interval."""
+        from pathlib import Path
+        layout_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "layout" / "AppLayout.tsx"
+        content = layout_path.read_text()
+        assert "NOTIFY_WINDOW_SEC" in content
+        assert "setInterval(poll, 2000)" in content
+
+    def test_app_layout_has_notified_ref(self):
+        """AppLayout should track notified task IDs to avoid duplicates."""
+        from pathlib import Path
+        layout_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "layout" / "AppLayout.tsx"
+        content = layout_path.read_text()
+        assert "notifiedRef" in content
+
+
+# ---------------------------------------------------------------------------
+# Tests for G6 — Auto-deploy flow
+# ---------------------------------------------------------------------------
+
+class TestAutoDeploy:
+    """Tests for auto-deploy flow (G6)."""
+
+    def test_deploy_form_has_auto_submit(self):
+        """DeployForm.tsx should auto-submit when autoDeploy is true."""
+        from pathlib import Path
+        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
+        content = deploy_form.read_text()
+        assert "form.submit()" in content
+        assert "Auto-deploying" in content
+
+
+# G4 checkDeploy — function removed in iteration 2 (dead code cleanup G13/G14).
+# Tests removed since the target function no longer exists in services.ts.
+
+
+# ---------------------------------------------------------------------------
+# Tests for G7 — Upload mode JSON format
+# ---------------------------------------------------------------------------
+
+class TestUploadModeJSONFormat:
+    """Tests that upload mode sends JSON with base64 content (G7)."""
+
+    def test_upload_uses_file_reader(self):
+        """AddServiceModal should use FileReader for reading upload files."""
+        from pathlib import Path
+        modal_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "AddServiceModal.tsx"
+        content = modal_path.read_text()
+        assert "FileReader" in content, "Upload should use FileReader to read files"
+
+    def test_upload_uses_base64_encoding(self):
+        """AddServiceModal should encode files as base64 for JSON upload."""
+        from pathlib import Path
+        modal_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "AddServiceModal.tsx"
+        content = modal_path.read_text()
+        assert "base64" in content, "Upload should use base64 encoding"
+
+    def test_upload_uses_json_create_service(self):
+        """AddServiceModal should use createServiceGit with JSON mode 'upload'."""
+        from pathlib import Path
+        modal_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "AddServiceModal.tsx"
+        content = modal_path.read_text()
+        assert "mode: 'upload'" in content or 'mode: "upload"' in content, (
+            "Upload should pass mode: 'upload' to the API"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for G8 — Template tab removed from AddServiceModal
+# ---------------------------------------------------------------------------
+
+class TestNoTemplateTab:
+    """Tests that template tab is removed from AddServiceModal (G8)."""
+
+    def test_no_template_mode_in_state(self):
+        """AddServiceModal mode state should not include 'template'."""
+        from pathlib import Path
+        modal_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "AddServiceModal.tsx"
+        content = modal_path.read_text()
+        mode_line = None
+        for line in content.splitlines():
+            if "useState" in line and ("mode" in line or "Mode" in line):
+                mode_line = line
+                break
+        assert mode_line is not None, "Could not find mode useState declaration"
+        assert "'template'" not in mode_line and '"template"' not in mode_line, (
+            "mode state should not include 'template' option"
+        )
+
+    def test_no_template_tab_in_tab_items(self):
+        """AddServiceModal should not contain 'From Template' or 'template' tab."""
+        from pathlib import Path
+        modal_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "AddServiceModal.tsx"
+        content = modal_path.read_text()
+        assert "From Template" not in content and "From template" not in content, (
+            "Template tab should be removed from AddServiceModal"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for G12 — Save logic before deploy (non-autoDeploy files saved to disk)
+# ---------------------------------------------------------------------------
+
+class TestG12SaveLogic:
+    """Tests that generated files are saved to disk before deployment regardless of autoDeploy state (G12)."""
+
+    def test_save_block_not_gated_by_autodeploy(self):
+        """The save-to-disk block should NOT be conditional on autoDeploy."""
+        from pathlib import Path
+        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
+        content = deploy_form.read_text()
+        # The save block comment explicitly states "regardless of autoDeploy state"
+        assert "regardless of autoDeploy state" in content, (
+            "Save block comment should clarify unconditional execution"
+        )
+        # Verify `&& autoDeploy` is NOT in the save condition
+        # Find the first occurrence of 'save-generated' — that's the save block
+        save_block = content[content.find("save-generated") - 80:content.find("save-generated") + 20]
+        assert "&& autoDeploy" not in save_block, (
+            "Save block should NOT be gated by autoDeploy: " + save_block
+        )
+        assert "Object.keys(generatedFiles).length > 0" in save_block, (
+            "Save block should check if generatedFiles exist"
+        )
+
+    def test_save_block_executes_before_deploy(self):
+        """The save-to-disk call should appear before the deploy POST payload building."""
+        from pathlib import Path
+        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
+        content = deploy_form.read_text()
+        save_idx = content.find("save-generated")
+        payload_idx = content.find("Build deploy payload")
+        assert save_idx > 0, "save-generated call not found in DeployForm.tsx"
+        assert payload_idx > 0, "Payload building comment not found"
+        assert save_idx < payload_idx, (
+            "Save-generated call should appear BEFORE deploy payload building. "
+            f"save at {save_idx}, payload at {payload_idx}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for G15 — Hidden form field removed from DeployForm
+# ---------------------------------------------------------------------------
+
+class TestG15HiddenFieldRemoved:
+    """Tests that auto_templates_completion hidden form field is removed (G15)."""
+
+    def test_auto_templates_completion_hidden_field_removed(self):
+        """The hidden Form.Item for auto_templates_completion should NOT exist."""
+        from pathlib import Path
+        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
+        content = deploy_form.read_text()
+        assert "auto_templates_completion" not in content, (
+            "auto_templates_completion hidden field should have been removed (G15)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for G13/G14/G16 — Dead code cleanup in services.ts
+# ---------------------------------------------------------------------------
+
+class TestG13G14G16DeadCodeCleanup:
+    """Tests that unused exports are removed from services.ts (G13/G14/G16)."""
+
+    def test_only_create_service_git_exported(self):
+        """services.ts should only export createServiceGit."""
+        from pathlib import Path
+        services_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "api" / "services.ts"
+        content = services_path.read_text()
+        assert "export const createServiceGit" in content, (
+            "createServiceGit export must still exist"
+        )
+
+    def test_removed_exports_not_present(self):
+        """All removed exports should NOT be present in services.ts."""
+        from pathlib import Path
+        services_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "api" / "services.ts"
+        content = services_path.read_text()
+        removed_exports = [
+            "getServices",
+            "getService",
+            "deleteService",
+            "getServiceFile",
+            "updateServiceFile",
+            "convertService",
+            "checkDeploy",
+            "saveGenerated",
+            "scanDirectory",
+            "gitStatus",
+            "gitDiff",
+            "gitHeadFile",
+        ]
+        for export_name in removed_exports:
+            assert export_name not in content, (
+                f"Removed export '{export_name}' still present in services.ts (G13/G14/G16)"
+            )

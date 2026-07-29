@@ -23,19 +23,27 @@ class LLMConfig(Base):
     system_prompt = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-    def to_dict(self, mask_key: bool = True) -> dict:
+    def to_dict(self, mask_key: bool = True, include_agent_fields: bool = False) -> dict:
+        """Serialize config to dict.
+
+        Agent fields (agent_url, agent_model, system_prompt) are excluded by default
+        because they are for future use (local_agent/provision_agent modes) and are
+        not exposed in the current BYOK-only UI. Pass include_agent_fields=True to
+        include them (used internally when needed).
+        """
         result = {
             "id": self.id,
             "mode": self.mode,
-            "agent_url": self.agent_url,
-            "agent_model": self.agent_model,
             "byok_configured": bool(self.byok_api_key_enc),
             "byok_base_url": self.byok_base_url,
             "byok_model": self.byok_model,
             "is_active": self.is_active,
-            "system_prompt": self.system_prompt,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+        if include_agent_fields:
+            result["agent_url"] = self.agent_url
+            result["agent_model"] = self.agent_model
+            result["system_prompt"] = self.system_prompt
         if mask_key and self.byok_api_key_enc:
             result["byok_api_key_masked"] = "sk-...xxxx"
         return result

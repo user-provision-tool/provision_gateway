@@ -48,6 +48,17 @@ class ServiceManager:
         ".github", ".DS_Store",
     ]
 
+    # Template file patterns — only these file types are shown in the
+    # "Templates" column. Everything else is classified as "generated"
+    # for the deployment-focused summary view.
+    _TEMPLATE_PATTERNS = (
+        "Dockerfile",
+        "docker-compose",
+        ".nginx.conf",
+        ".conf",
+        ".env",
+    )
+
     def _is_excluded(self, rel_path: str) -> bool:
         """Check if a relative path should be excluded from file listings."""
         parts = rel_path.replace("\\", "/").split("/")
@@ -56,6 +67,27 @@ class ServiceManager:
                 return True
         # Exclude compiled JS/map/ts files inside dist/ directories
         if "/dist/" in rel_path or rel_path.startswith("dist/"):
+            return True
+        return False
+
+    @staticmethod
+    def _is_template_file(rel_path: str) -> bool:
+        """Check if a file matches the template file patterns.
+
+        Only these file types are considered "templates" in the deployment
+        summary view: Dockerfile, docker-compose*, *.nginx.conf, *.conf,
+        .env, .env.example.
+        """
+        basename = rel_path.split("/")[-1]
+        if basename == "Dockerfile":
+            return True
+        if basename in (".env", ".env.example"):
+            return True
+        if basename.startswith("docker-compose"):
+            return True
+        if basename.endswith(".nginx.conf"):
+            return True
+        if basename.endswith(".conf"):
             return True
         return False
 
@@ -68,6 +100,7 @@ class ServiceManager:
         name = project_dir.name
         files = []
         generated_files: list[str] = []
+        template_files: list[str] = []
 
         # Determine which files are tracked by git (original repo files)
         git_tracked: set[str] = set()
@@ -94,6 +127,10 @@ class ServiceManager:
                     generated_files.append(rel)
                 elif not git_tracked and (rel.endswith(".generated") or "generated_" in rel):
                     generated_files.append(rel)
+                # Template classification: only deployment-critical file types
+                # are shown in the "Templates" column (G2).
+                if self._is_template_file(rel):
+                    template_files.append(rel)
 
         has_compose_template = any(f.endswith(".yml.j2") for f in files)
         has_nginx_template = any(f.endswith(".nginx.conf.j2") or f.endswith(".conf.j2") for f in files)
@@ -121,6 +158,7 @@ class ServiceManager:
             "path": str(project_dir),
             "files": files,
             "generated_files": generated_files,
+            "template_files": template_files,
             "has_compose_template": has_compose_template,
             "has_nginx_template": has_nginx_template,
             "has_dockerfile": has_dockerfile,

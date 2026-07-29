@@ -1,7 +1,7 @@
 # Provision Gateway — Workflows of Important Usage Scenarios (WebUI)
 
-> **Version**: 1.1
-> **Date**: 2026-07-08 (updated)
+> **Version**: 1.2
+> **Date**: 2026-07-28 (updated — Iteration 2: auto-deploy flow, task notification, template classification)
 > **Purpose**: Step-by-step WebUI workflows verified against the actual dashboard at `http://localhost:8771`.
 
 ---
@@ -131,7 +131,8 @@
 6. Service appears in the projects table
 
 **What you see after:**
-- Project row with: folder icon + name, template file tags, generated file tags, Deploy/Delete buttons
+- Project row with: folder icon + name, template file tags (only Dockerfile, docker-compose*, *.nginx.conf, *.conf, .env, .env.example — G2 template classification), generated file tags, Deploy/Delete buttons
+- `template_files` and `generated_files` fields distinguish between Jinja2 templates and LLM-generated files
 
 **API calls:**
 - `POST /api/services` (mode=git)
@@ -240,17 +241,25 @@
    - **Volume Mapping:** Form.List — key/value pairs with add/remove buttons
    - **Build Args:** Form.List — key/value pairs with add/remove buttons
    - **Use Global Proxy:** Checkbox (disabled if no proxy configured)
-3. Click **"Deploy"** (rocket button)
-4. Task ID is displayed → link to Tasks page for monitoring
+3. **Template completion flow**: If service is missing essential files (docker-compose, nginx.conf, .env, Dockerfile), a warning alert shows with "Auto Templates Completion" checkbox:
+   - **Auto mode (checked, default)**: Click "Generate Missing Files via LLM" → LLM generates files → auto-submits deploy after 500ms delay
+   - **Manual mode (unchecked)**: Click "Generate with LLM" → generated files appear as clickable tags for review in Monaco editor → click "Deploy" saves files to disk first then submits
+   - Generated file tags are color-coded (blue) and clickable to open full Monaco editor for review
+4. Click **"Deploy"** (rocket button)
+5. If successful, task ID is displayed → link to Tasks page for monitoring
 
 **API calls:**
 - `GET /api/auth/users/deployable` → Available users dropdown
 - `GET /api/services` → Available services dropdown
+- `GET /api/services/{name}/check-missing-files` → Check for missing essential files (auto on mount)
+- `POST /api/llm/generate` → Generate missing file content via LLM
+- `POST /api/services/save-generated` → Save generated files to disk (always before deploy — G12)
 - `POST /api/users/deploy` → Submit deployment
 
 **Verification:**
 - New service card appears on `/users` page under the user's name
 - Task appears on `/tasks` page with status
+- Task notification appears (global 2s polling + browser Notification API)
 
 ---
 
@@ -352,6 +361,14 @@
 **Goal:** Track async tasks and view real-time build logs.
 
 **Page:** `/tasks`
+
+**Global Task Notification** (active on all pages):
+- The AppLayout header polls `GET /api/tasks` every 2 seconds (G3)
+- Detects status transitions: pending → completed or pending → failed
+- Shows antd notification toast + browser Notification API popup
+- Deduplication via `notifiedRef` — each task transition notified only once
+- 2-second time filter on `updated_at` prevents stale-task notifications on page load
+- Clicking the notification does NOT auto-navigate (avoids disrupting current page)
 
 **What you see:**
 1. **Task Table:** Columns — ID, Type, Target, Status (color-coded), Updated, Elapsed, Created, Actions

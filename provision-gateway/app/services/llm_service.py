@@ -215,7 +215,12 @@ class LLMService:
             }
 
     def _build_prompt(self, config_type: str, context: dict) -> str:
-        """Build a prompt for config generation."""
+        """Build a prompt for config generation.
+
+        Prompts are based on the _users_provision/skills/provision-api skill
+        which defines the template conventions used by the provision tool.
+        See SKILL.md for full reference.
+        """
         desc = context.get("repo_description", "an application")
         files = context.get("repo_files", [])
         port = context.get("port", 8000)
@@ -233,14 +238,25 @@ Context:
 - Needs database: {context.get('needs_db', False)}
 - Needs cache: {context.get('needs_cache', False)}
 
-Requirements:
-- Use version '3.8'
-- Define one service named 'web' that builds from the current directory
-- Set container_name to 'myapp-web' (will be templated later)
-- Use a per-service network named 'app_network' (will be templated to {{{{ network_name }}}})
-- Do NOT include 'ports' mapping (reverse proxy handles routing)
-- Include a healthcheck if possible
-- Include named volumes for persistent data
+The generated file will be used by the provision tool (_users_provision/provision-api).
+Follow the _users_provision/skills/provision-api rules for compose files:
+
+1. Use `build: .` (or a subdirectory path) so the Dockerfile is the build context.
+   Do NOT hardcode `image:` unless the docs specify a pre-built image.
+
+2. Do NOT set `container_name:` directly — the provision tool's auto-converter will
+   rewrite container_name to use per-user prefixes. Simply name the service descriptively.
+
+3. Do NOT hardcode host ports — the provision tool strips ports on conversion.
+   Use `expose:` for internal ports instead.
+
+4. Use named volumes for persistent data so the converter can map them to per-user paths.
+
+5. Use ${{VAR}} syntax for runtime secrets (API keys, DB passwords).
+
+6. Define a network so per-user containers are isolated.
+
+7. Provide a healthcheck if possible.
 
 Output ONLY the raw YAML, no markdown fences, no explanations."""
         
@@ -252,13 +268,23 @@ Context:
 - Service will be behind provision-nginx
 - Need basic auth support
 
-Requirements:
-- server_name will be templated to {{{{ hostname }}}}
-- proxy_pass to http://CONTAINER_PREFIX:PORT (will be templated)
-- Include auth_basic and auth_basic_user_file directives
-- Include proxy headers (Host, X-Real-IP, X-Forwarded-For, X-Forwarded-Proto)
-- WebSocket support (Upgrade, Connection headers)
-- client_max_body_size 100m
+The generated file will be used by the provision tool (_users_provision/provision-api).
+Follow the _users_provision/skills/provision-api rules for nginx conf:
+
+1. The proxy_pass host must match a service key from docker-compose.yml exactly.
+   Read the compose file first to get the actual service names.
+
+2. server_name will be templated to {{{{ hostname }}}}.
+
+3. proxy_pass to http://SERVICE_NAME:PORT (use the compose service key).
+
+4. Include auth_basic and auth_basic_user_file directives.
+
+5. Include proxy headers (Host, X-Real-IP, X-Forwarded-For, X-Forwarded-Proto).
+
+6. WebSocket support (Upgrade, Connection headers).
+
+7. client_max_body_size 100m.
 
 Output ONLY the raw nginx config, no markdown fences."""
         

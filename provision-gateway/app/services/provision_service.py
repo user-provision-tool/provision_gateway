@@ -174,7 +174,9 @@ class ProvisionService:
                     )
                 async for line in resp.aiter_lines():
                     if line:
-                        yield f"{line}\n\n"
+                        # Emit proper SSE format: data: {json_line}\n\n — G11 fix
+                        import json as _json
+                        yield f"data: {_json.dumps({'line': line})}\n\n"
 
     # ---- Container logs ----
 

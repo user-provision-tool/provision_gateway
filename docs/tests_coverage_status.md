@@ -1,7 +1,7 @@
 # Provision Gateway — Tests Coverage Status
 
-> **Version**: 1.3
-> **Date**: 2026-07-22 (updated — tasks-220702026.md fixes: 29 gateway + 297 provision tests pass)
+> **Version**: 1.5
+> **Date**: 2026-07-29 (updated — Iteration 2 documenter: QA-added tests reflected, pre-existing failures noted)
 > **Status**: Current state of test coverage
 
 ---
@@ -22,15 +22,16 @@
 
 | File | Language | Type | Test Cases | Status |
 |---|---|---|---|---|
-| `test_unit.py` | Python (pytest) | Unit | 29 | ✅ Passing |
+| `test_unit.py` | Python (pytest) | Unit | 60 (59 pass, 1 fail) | 🟡 1 pre-existing failure (test_check_deploy_uses_service_name — function removed in G14 cleanup) |
 | `test_proxy.py` | Python (pytest) | Unit | 8 | ✅ Passing |
 | `test_integration.py` | Python (subprocess) | Integration | 9 | ✅ Passing |
-| `test_integration.sh` | Bash | Integration | 9 | ✅ Passing |
-| `test_deploy.sh` | Bash | Integration | 9 | ✅ Passing |
-| `test_proxy.sh` | Bash | Integration | 12 | ✅ Passing |
-| `test_gateway_api.sh` | Bash | Integration | 347 lines (comprehensive) | ✅ Passing |
-| `test_provision_api.sh` | Bash | Integration | 252 lines (comprehensive) | ✅ Passing |
-| **Total** | | | **65+** | |
+| `test_integration.sh` | Bash | Integration | 113 lines | ✅ Passing |
+| `test_deploy.sh` | Bash | Integration | 199 lines | 🟡 1 pre-existing failure (proxy enablement uses PUT instead of POST+activate) |
+| `test_proxy.sh` | Bash | Integration | 189 lines | ✅ Passing |
+| `test_gateway_api.sh` | Bash | Integration | 347 lines | ✅ Passing |
+| `test_provision_api.sh` | Bash | Integration | 252 lines | ✅ Passing |
+| `test_load.py` | Python (httpx) | Load/Perf | 5 scenarios | ✅ Working (load test for F1 — 20 concurrent requests) |
+| **Total** | | | **77 Python (67 pass, 1 fail, 9 skip) + 5 shell (108 tests pass, 1 fail)** | |
 
 ### 1.2 Test Execution
 
@@ -206,9 +207,17 @@ bash tests/test_provision_api.sh
 | Tasks | Detail, cancel, SSE log streaming |
 | System | Stats, config, reconcile |
 
-### 5.3 Test Quality Recommendations
+### 5.3 Known Test Issues
 
-1. **Add pytest fixtures** for common setup (DB session, admin auth token, mock HTTP responses)
+| Issue | File | Root Cause | Priority |
+|---|---|---|---|
+| `test_check_deploy_uses_service_name` fails | `test_unit.py` | Test references removed `checkDeploy` export (G14/G16 dead code cleanup). Should be removed or updated. | HIGH |
+| `test_deploy.sh` Test 3 fails | `test_deploy.sh` | Proxy enablement uses `PUT /api/system/proxy` (405); correct API is `POST` then `PUT /{id}/activate`. | HIGH |
+
+### 5.4 Test Quality Recommendations
+
+1. **Fix pre-existing test failures** (see 5.3 above) — these block clean test pipeline runs.
+2. **Add pytest fixtures** for common setup (DB session, admin auth token, mock HTTP responses)
 2. **Add conftest.py** with shared fixtures (currently minimal)
 3. **Separate unit from integration** — use pytest markers (`@pytest.mark.unit`, `@pytest.mark.integration`)
 4. **Add test coverage reporting** — `pytest --cov=app --cov-report=html`
@@ -217,7 +226,7 @@ bash tests/test_provision_api.sh
 7. **Add API contract tests** — Schema validation for request/response payloads
 8. **Add performance tests** — Response time assertions for critical endpoints
 
-### 5.4 Recommended Test Priority
+### 5.5 Recommended Test Priority
 
 | Priority | Area | Reason |
 |---|---|---|

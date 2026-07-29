@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
-import { Layout, Menu, Button, Typography, Dropdown, theme, Modal, Input, message, Space, Tag } from 'antd'
+import { Layout, Menu, Button, Typography, Dropdown, theme, Modal, Input, message, Space, Tag, notification } from 'antd'
 import {
   DashboardOutlined,
   AppstoreOutlined,
@@ -105,39 +105,72 @@ export default function AppLayout() {
   // Request notification permission and poll for completed tasks.
   // Time-filtering: only notify about tasks that completed/failed within the
   // last 2 seconds — prevents re-notification on page refresh (where all existing
-  // tasks have old completion timestamps) and avoids localStorage memory leaks.
+  // tasks have old completion timestamps).
   const notifiedRef = useRef<Set<string>>(new Set())
+  const [activeTaskCount, setActiveTaskCount] = useState(0)
   useEffect(() => {
     if ('Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission()
     }
+    let lastKnownStates = new Map<string, string>()
     const poll = async () => {
       try {
         const { data } = await client.get('/tasks')
         const tasks = data.tasks || data || []
         const nowSec = Date.now() / 1000
         const NOTIFY_WINDOW_SEC = 2 // only notify for tasks ended within 2 seconds
+        let activeCount = 0
+
         for (const t of tasks) {
           const taskId = t.id || t.task_id
           if (!taskId) continue
-          const isTerminal = t.status === 'completed' || t.status === 'succeeded' || t.status === 'failed'
-          if (!isTerminal || notifiedRef.current.has(taskId)) continue
-          // Check if task ended recently via updated_at / completed_at timestamp
-          let endedSec = 0
-          const ts = t.updated_at || t.completed_at || t.finished_at || t.ended_at
-          if (ts) {
-            try { endedSec = new Date(ts).getTime() / 1000 } catch { endedSec = 0 }
+          const status = t.status || ''
+          const prevStatus = lastKnownStates.get(taskId)
+
+          // Count active (pending/running) tasks
+          if (status === 'pending' || status === 'running') {
+            activeCount++
           }
-          // If no timestamp available or task ended within the window, notify
-          if (endedSec === 0 || (nowSec - endedSec) <= NOTIFY_WINDOW_SEC) {
-            notifiedRef.current.add(taskId)
-            const emoji = t.status === 'failed' ? '❌' : '✅'
-            if ('Notification' in window && Notification.permission === 'granted') {
-              try { new Notification(`Task ${t.status}`, { body: `${t.type||'task'} ${t.target||''}`, icon: '/favicon.ico' }) } catch {}
+
+          // Detect transitions to terminal states
+          const isTerminal = status === 'completed' || status === 'succeeded' || status === 'failed'
+          const wasActive = prevStatus === 'pending' || prevStatus === 'running' || prevStatus === undefined
+
+          if (isTerminal && wasActive && !notifiedRef.current.has(taskId)) {
+            // Check if task ended recently via timestamp
+            let endedSec = 0
+            const ts = t.updated_at || t.completed_at || t.finished_at || t.ended_at
+            if (ts) {
+              try { endedSec = new Date(ts).getTime() / 1000 } catch { endedSec = 0 }
             }
-            message.info({ content: `${emoji} Task ${taskId.substring(0,8)}... ${t.status}`, duration: 5 })
+            // Notify if within the 2-second window, or if no timestamp is available
+            if (endedSec === 0 || (nowSec - endedSec) <= NOTIFY_WINDOW_SEC) {
+              notifiedRef.current.add(taskId)
+              const isFail = status === 'failed'
+              // Show Ant Design notification
+              notification[isFail ? 'error' : 'success']({
+                message: `Task ${isFail ? 'Failed' : 'Completed'}`,
+                description: `${t.type || 'task'} ${taskId.substring(0, 8)}... ${status}`,
+                duration: 5,
+                placement: 'topRight',
+              })
+              // Also try browser notification
+              if ('Notification' in window && Notification.permission === 'granted') {
+                try {
+                  new Notification(`Task ${status}`, {
+                    body: `${t.type || 'task'} ${taskId.substring(0, 8)}...`,
+                    icon: '/favicon.ico',
+                  })
+                } catch {}
+              }
+            }
           }
+          // Update last known state
+          lastKnownStates.set(taskId, status)
         }
+
+        setActiveTaskCount(activeCount)
+
         // Prune: remove task IDs no longer present
         const currentIds = new Set(tasks.map((t: any) => t.id || t.task_id).filter(Boolean))
         for (const id of notifiedRef.current) {
@@ -145,7 +178,10 @@ export default function AppLayout() {
         }
       } catch { /* silent */ }
     }
-    const id = setInterval(poll, 15000)
+    // Poll at 2-second interval for time-filtered task notifications (G3)
+    const id = setInterval(poll, 2000)
+    // Run once immediately
+    poll()
     return () => clearInterval(id)
   }, [])
 
