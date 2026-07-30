@@ -29,6 +29,7 @@ _start_time = time.time()
 # Background task handles
 _reconcile_task: asyncio.Task | None = None
 _docker_events_task: asyncio.Task | None = None
+_project_monitor_task: asyncio.Task | None = None
 
 
 def _get_reconcile_interval_min() -> int:
@@ -104,10 +105,30 @@ async def _docker_events_monitor():
     await loop.run_in_executor(None, _blocking_event_loop)
 
 
+async def _project_monitor_loop():
+    """Background loop: periodically scan source_projects for new directories.
+
+    Uses ServiceManager.scan_for_new_projects() to detect projects that
+    were manually placed into PROVISION_DIR/source_projects. Detected
+    projects are stored in an event buffer that the frontend can poll
+    via GET /api/services/notifications.
+    """
+    from .services.service_manager import service_manager as _sm
+    while True:
+        try:
+            new = _sm.scan_for_new_projects()
+            if new:
+                names = [p["name"] for p in new]
+                print(f"[gateway] Detected new project(s) in source_projects: {names}")
+        except Exception:
+            pass  # Silently retry on next cycle
+        await asyncio.sleep(10)  # Poll every 10 seconds
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
-    global _reconcile_task, _docker_events_task
+    global _reconcile_task, _docker_events_task, _project_monitor_task
     # Startup
     init_db()
     print(f"[gateway] Database initialized at {settings.DATABASE_URL}")
@@ -115,12 +136,16 @@ async def lifespan(app: FastAPI):
     print("[gateway] Scheduled reconciliation background task started")
     _docker_events_task = asyncio.create_task(_docker_events_monitor())
     print("[gateway] Docker events monitor started (watching provision-nginx)")
+    _project_monitor_task = asyncio.create_task(_project_monitor_loop())
+    print("[gateway] Project directory monitor started (polling source_projects every 10s)")
     yield
     # Shutdown
     if _reconcile_task:
         _reconcile_task.cancel()
     if _docker_events_task:
         _docker_events_task.cancel()
+    if _project_monitor_task:
+        _project_monitor_task.cancel()
     print("[gateway] Shutting down")
 
 

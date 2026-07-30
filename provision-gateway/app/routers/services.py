@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..middleware import get_current_admin
 from ..models.admin import AdminUser
+from ..models.service_template import ServiceTemplate
 from ..services.audit_service import log_action
 from ..services.service_manager import service_manager
 from ..services.llm_service import llm_service
@@ -26,6 +27,40 @@ async def list_services(
     """List all service projects in source_projects."""
     services = service_manager.list_services()
     return {"services": services}
+
+
+# ------------------------------------------------------------------
+# Service Templates (GAP-001)
+# ------------------------------------------------------------------
+
+
+@router.get("/templates")
+async def list_templates(
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """List all available service templates."""
+    templates = db.query(ServiceTemplate).order_by(ServiceTemplate.name).all()
+    return {"templates": [t.to_dict() for t in templates]}
+
+
+# ------------------------------------------------------------------
+# Project change notifications (GAP-004)
+# ------------------------------------------------------------------
+
+
+@router.get("/notifications")
+async def get_project_notifications(
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """Return newly detected project events from background monitoring.
+
+    These are projects that appeared in source_projects since the
+    last check. The frontend can poll this endpoint to show a
+    notification banner.
+    """
+    events = service_manager.get_new_project_events(clear=True)
+    return {"notifications": events, "count": len(events)}
 
 
 @router.get("/{name}")
@@ -47,7 +82,7 @@ async def create_service(
     db: Session = Depends(get_db),
 ):
     """Create a new service project.
-    
+
     Modes:
     - git: clone from repo_url
     - upload: from file contents
@@ -57,7 +92,7 @@ async def create_service(
     name = req.get("name")
     if not name:
         raise HTTPException(400, "'name' is required")
-    
+
     try:
         if mode == "git":
             repo_url = req.get("repo_url")
@@ -78,14 +113,16 @@ async def create_service(
                 svc = service_manager.create_from_upload(name, files)
         elif mode == "template":
             template_id = req.get("template_id")
-            raise HTTPException(501, "Template mode not yet implemented")
+            if not template_id:
+                raise HTTPException(400, "'template_id' is required for template mode")
+            svc = service_manager.create_from_template(name, template_id, db_session=db)
         else:
             raise HTTPException(400, f"Unknown mode: {mode}")
     except FileExistsError as e:
         raise HTTPException(409, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
-    
+
     log_action(db, action="service_create", admin_id=current_admin.id,
                target_service=name, status="success")
     return svc
@@ -139,37 +176,37 @@ async def check_deploy_readiness(
     db: Session = Depends(get_db),
 ):
     """Check if a service project has all files needed for deployment.
-    
+
     Returns missing files and auto-generates them via LLM if configured.
     User must confirm before generated files are saved.
     """
     service_name = req.get("service_name")
     if not service_name:
         raise HTTPException(400, "'service_name' is required")
-    
+
     info = service_manager._get_service_info(service_manager._source_dir / service_name)
     files = info.get("files", [])
-    
+
     needed = {
         "compose_template": any(f.endswith(".yml.j2") or f.endswith(".yaml.j2") for f in files),
         "compose_file": any(f.endswith(".yml") or f.endswith(".yaml") for f in files if not f.endswith(".j2")),
         "nginx_template": any(f.endswith(".conf.j2") for f in files),
         "nginx_file": any(f.endswith(".conf") for f in files if not f.endswith(".j2")),
     }
-    
+
     # A compose source is required (either template or plain file)
     has_compose = needed["compose_template"] or needed["compose_file"]
     has_nginx = needed["nginx_template"] or needed["nginx_file"]
-    
+
     missing = []
     if not has_compose:
         missing.append("docker-compose.yml (or .yml.j2 template)")
     if not has_nginx:
         missing.append("nginx.conf (or .conf.j2 template)")
-    
+
     generated = {}
     warnings = []
-    
+
     # Auto-generate missing files via LLM if active config exists
     if missing and has_nginx is False:
         try:
@@ -187,7 +224,7 @@ async def check_deploy_readiness(
                     warnings.extend(gen_result["warnings"])
         except Exception:
             pass
-    
+
     if missing and has_compose is False:
         try:
             scan_info = {
@@ -203,7 +240,7 @@ async def check_deploy_readiness(
                     warnings.extend(gen_result["warnings"])
         except Exception:
             pass
-    
+
     return {
         "service": service_name,
         "ready": len(missing) == 0,
@@ -223,33 +260,33 @@ async def save_generated_files(
     db: Session = Depends(get_db),
 ):
     """Save LLM-generated files to the service project.
-    
+
     Body: { "service_name": "myapp", "files": { "nginx.conf": "...", "docker-compose.yml": "..." } }
     """
     service_name = req.get("service_name")
     files = req.get("files", {})
     if not service_name or not files:
         raise HTTPException(400, "service_name and files required")
-    
+
     target = settings.SOURCE_PROJECTS_DIR / service_name
     if not target.exists():
         raise HTTPException(404, f"Service '{service_name}' not found")
-    
+
     saved = []
     for filename, content in files.items():
         filepath = target / filename
         filepath.write_text(content)
         saved.append(filename)
-    
+
     # Mark as generated (add .generated suffix for tracking)
     for filename in saved:
         marker = target / f"{filename}.generated"
         marker.write_text("")
-    
+
     log_action(db, action="llm_generated_files", admin_id=current_admin.id,
                target_service=service_name, status="success",
                detail={"files": saved})
-    
+
     return {"saved": saved, "service": service_name}
 
 
@@ -264,7 +301,7 @@ async def delete_service(
     deleted = service_manager.delete_service(name)
     if not deleted:
         raise HTTPException(404, f"Service '{name}' not found")
-    
+
     log_action(db, action="service_delete", admin_id=current_admin.id,
                target_service=name, status="success")
     return {"deleted": True}
@@ -294,7 +331,7 @@ async def write_service_file(
     """Write or update a file in a service project."""
     content = req.get("content", "")
     ok = service_manager.write_file(name, filename, content)
-    
+
     log_action(db, action="config_edit", admin_id=current_admin.id,
                target_service=name, status="success",
                detail={"filename": filename})
@@ -310,7 +347,7 @@ async def convert_service_files(
 ):
     """Convert plain compose/nginx files to Jinja2 templates."""
     result = {}
-    
+
     compose_file = req.get("compose_file")
     if compose_file:
         try:
@@ -318,7 +355,7 @@ async def convert_service_files(
             result.update(converted)
         except Exception as e:
             raise HTTPException(422, f"Compose conversion failed: {e}")
-    
+
     nginx_file = req.get("nginx_file")
     if nginx_file:
         try:
@@ -326,7 +363,7 @@ async def convert_service_files(
             result.update(converted)
         except Exception as e:
             raise HTTPException(422, f"Nginx conversion failed: {e}")
-    
+
     log_action(db, action="config_edit", admin_id=current_admin.id,
                target_service=name, status="success",
                detail={"converted": list(result.keys())})
@@ -342,7 +379,7 @@ async def scan_repo(
     directory = req.get("directory", "")
     if not directory:
         raise HTTPException(400, "'directory' is required")
-    
+
     from pathlib import Path
     ctx = scan_directory(Path(directory))
     return {

@@ -1,7 +1,7 @@
 # Provision Gateway — Features Status
 
-> **Version**: 1.8
-> **Date**: 2026-07-28 (updated — Iteration 2 dev-debug-flow: G12 non-autoDeploy save fix, G13-G16 dead code cleanup, D1-D4 doc updates, F1 parallel load test)
+> **Version**: 1.9
+> **Date**: 2026-07-29 (updated — Iteration 2: GAP-005 route ordering fix, GAP-006 Select import)
 > **Purpose**: Quick reference and implementation status tracker for all features.
 
 ---
@@ -75,6 +75,8 @@
 | S15 | Example service (REST API) | ✅ | `examples/service/` — hello-world with Dockerfile, no compose/nginx |
 | S16 | Example MCP (streamable HTTP) | ✅ | `examples/mcp/` — interacts with example service API |
 | S17 | Auto-detect manual source projects | ✅ | `list_services()` scans `SOURCE_PROJECTS_DIR` — all dirs auto-detected |
+| S18 | Add service — from pre-built template (DB) | ✅ | `POST /api/services` mode=template with template_id; "From Template" tab in AddServiceModal and ServicesPage. Route ordering fixed in Iteration 2: `/templates` route now registered before `/{name}` catch-all in services.py. The `/api/services/templates` endpoint returns template list correctly. |
+| S19 | Active file system monitoring for new projects | ✅ | Background `_project_monitor_loop` polls source_projects every 10s; events via `GET /api/services/notifications`. Route ordering fixed in Iteration 2: `/notifications` route now registered before `/{name}` catch-all. Missing `Select` import in TemplateForm component also fixed. Both endpoints working correctly. |
 
 ---
 
@@ -82,7 +84,7 @@
 
 | # | Feature | Status | Notes |
 |---|---|---|---|
-| P1 | Deploy service to user | ✅ | Full form: user, service, label, domain, password, volumes, build args, proxy |
+| P1 | Deploy service to user | ✅ | Full form: user, service, domain, password, volumes, build args, proxy; label auto-computed; deploy blocked when missing essential files without LLM |
 | P2 | Clone all: User A → User B | ✅ | Auto-remaps volumes and domains |
 | P3 | Rebuild service | ✅ | Async task with no-cache option |
 | P4 | Remove service | ✅ | With confirmation dialog |
@@ -235,7 +237,7 @@
 |---|---|---|---|---|
 | Authentication | 14 | 14 | 14 | 0 |
 | Dashboard | 8 | 8 | 8 | 0 |
-| Service Management | 17 | 15 | 15 | 0 |
+| Service Management | 19 | 17 | 17 | 0 |
 | User Provisioning | 15 | 15 | 14 | 1 |
 | Service URL & Connectivity | 5 | 5 | 5 | 0 |
 | LLM Integration | 14 | 13 | 13 | 1 |
@@ -246,7 +248,7 @@
 | Proxy Management | 9 | 9 | 9 | 0 |
 | User Management | 7 | 7 | 7 | 0 |
 | MCP Server | 6 | 6 | 6 | 0 |
-| **TOTAL** | **120** | **117** | **116** | **2** |
+| **TOTAL** | **122** | **119** | **118** | **2** |
 
-**Implementation Rate:** 117/120 = **97.5%**
-**Verified Rate:** 116/120 = **96.7%**
+**Implementation Rate:** 119/122 = **97.5%**
+**Verified Rate:** 118/122 = **96.7%**

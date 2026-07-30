@@ -1,6 +1,6 @@
 # Provision Gateway — WebUI Operation Sequences
 
-> Date: 2026-07-05 (updated)
+> Date: 2026-07-29 (updated — Iteration 2: GAP-005 route ordering fix, GAP-006 Select import)
 > Purpose: Document all operation sequences defined by each button on the webui, verified for correctness.
 > Verified against: actual running dashboard at http://localhost:8771
 
@@ -51,10 +51,11 @@
 
 ### 2.1 Add Project Button
 - **Trigger**: Click "Add Project" button (admin only)
-- **Sequence**: Opens modal with 2 tabs:
+- **Sequence**: Opens modal with 3 tabs:
   - **From Git**: Fill repo URL, branch, name → POST /api/services (mode=git) → clone repo
   - **Upload Zip**: Fill name, base64 zip content or individual file JSON map → POST /api/services (mode=upload)
-- **Status**: ✅ Working (template tab removed — LLM generation moved to DeployForm)
+  - **From Template**: Select a pre-built template from the dropdown, enter project name → POST /api/services (mode=template, template_id=N) → create project from DB template
+- **Status**: ✅ Working (route ordering fixed in Iteration 2 — `/templates` and `/notifications` routes now registered before `/{name}` catch-all. Templates endpoint returns data correctly.)
 
 ### 2.2 Project Name Click (folder-open icon)
 - **Trigger**: Click project name
@@ -109,7 +110,8 @@
 
 ### 3.1 Deploy Button
 - **Trigger**: Click "Deploy" button (rocket icon, top-right)
-- **Sequence**: Opens DeployForm modal → select user, service, label, domain, password → POST /api/users/deploy → async task created
+- **Sequence**: Opens DeployForm modal → select user, service → label is auto-computed (GET /api/users/{user}/{service}/next-label) and shown as disabled input → fill domain, password → POST /api/users/deploy → async task created
+- **Deploy validation**: When the selected service is missing essential files (compose, nginx conf) and no LLM-generated files exist, the Deploy button is disabled and a warning is shown. User must either configure LLM to generate missing files or provide them manually.
 - **Auto-generated templates flow**: When service is missing essential files (docker-compose, nginx.conf, .env, Dockerfile), an alert shows with "Auto Templates Completion" checkbox.
   - **Auto mode (checked)**: LLM generates missing files → auto-submits deploy after 500ms delay
   - **Manual mode (unchecked)**: User clicks "Generate with LLM" → generated files shown as clickable tags for review → deploy saves files to disk first, then submits
@@ -315,11 +317,13 @@ Each service card shows these buttons:
 | Page | Operations | Status |
 |---|---|---|
 | Dashboard | 7 operations | All ✅ |
-| Source Projects | 9 operation groups | All ✅ |
+| Source Projects | 10 operation groups (3 tabs in Add Project) | All ✅ |
 | Services (Users) | 10 operation groups | All ✅ (Up/Down fixed) |
 | Tasks | 4 operations + 1 global notification | ✅ (SSE log per-task ⚠️ reads global log file, filters by task context); global 2s task notification with toast + browser Notification API |
 | Settings | 3 panels (LLM, Proxy, Special Users) | All ✅ |
 | Audit | 3 operations (filter, CSV export, auto-refresh) | All ✅ |
+| User Management | 5 operations (register, approve, special users, delete, role change) | All ✅ |
+| Login | 2 operations (login, register) | All ✅ |
 | User Management | 5 operations (register, approve, special users, delete, role change) | All ✅ |
 | Login | 2 operations (login, register) | All ✅ |
 
@@ -334,6 +338,8 @@ Each service card shows these buttons:
 1. ✅ **G12 — Non-autoDeploy files saved to disk** — `handleDeploy` now saves generated files before deployment regardless of `autoDeploy` state.
 2. ✅ **G15 — Removed unused hidden form field** — Removed `auto_templates_completion` field from DeployForm; auto-deploy uses React state only.
 3. ✅ **G13-G16 — Dead code cleanup** — Removed 12 unused API exports from `services.ts`; kept only `createServiceGit`.
+4. ✅ **GAP-005 — Route ordering fix (CRITICAL)** — Moved `/templates` and `/notifications` route definitions before the `/{name}` catch-all in services.py. GET /api/services/templates and GET /api/services/notifications no longer return 404. Verified by 6 new route ordering tests.
+5. ✅ **GAP-006 — Missing Select import** — Added `Select` to antd import in ServicesPage.tsx TemplateForm component. Resolves TypeScript error TS2552.
 
 **ITERATION 1 (2026-07-05):**
 1. ✅ **siyuan-mcp always down** — Root cause: container_name template had `{{ container_prefix }}server` but should be `{{ container_prefix }}siyuan-mcp-server`. Fixed template, regenerated compose, restarted container.

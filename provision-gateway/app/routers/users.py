@@ -72,7 +72,40 @@ async def deploy_user(
     current_admin: AdminUser = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
-    """Deploy a service to a user (proxied to provision-api POST /users)."""
+    """Deploy a service to a user (proxied to provision-api POST /users).
+
+    Validates that essential file paths are provided before proxying.
+    Returns 400 if deploy would fail due to missing compose/nginx paths.
+    """
+    # Validate that compose/nginx paths are provided (GAP-002)
+    service_name = req.get("service_name", "")
+    compose_path = req.get("compose_file_path") or req.get("compose_template_path")
+    nginx_path = req.get("nginx_conf_file_path") or req.get("nginx_conf_template_path")
+
+    # Check if service project has compose/nginx files
+    from ..services.service_manager import service_manager
+    info = service_manager.get_service(service_name)
+    if info:
+        files = info.get("files", [])
+        has_compose = any(f.endswith((".yml", ".yaml")) for f in files if not f.endswith(".j2"))
+        has_compose |= any(f.endswith(".yml.j2") for f in files)
+        has_nginx = any(f.endswith(".conf") for f in files if not f.endswith(".j2"))
+        has_nginx |= any(f.endswith(".conf.j2") for f in files)
+
+        missing = []
+        if not has_compose and not compose_path:
+            missing.append("docker-compose.yml")
+        if not has_nginx and not nginx_path:
+            missing.append("nginx.conf")
+
+        if missing:
+            raise HTTPException(
+                400,
+                f"Cannot deploy '{service_name}': missing essential files ({', '.join(missing)}). "
+                "Use LLM-based auto-generation (configure BYOK in Settings) to generate missing files, "
+                "or upload them manually to the source project before deploying.",
+            )
+
     # Inject global proxy into build_args if requested
     use_global_proxy = req.pop("use_global_proxy", False)
     if use_global_proxy:
@@ -129,6 +162,49 @@ async def deploy_user(
         status="success",
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Service label auto-increment (GAP-003)
+# ---------------------------------------------------------------------------
+
+@router.get("/{user_name}/{service_name}/next-label")
+async def get_next_label(
+    user_name: str,
+    service_name: str,
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """Compute the next available service label for a user+service combo.
+
+    Queries provision-api for existing instances and returns the next
+    auto-incremented integer label. Redeploy does NOT change the label.
+    Label only increments when deploying multiple instances of the same
+    source project for the same user.
+    """
+    try:
+        result = await provision_service.get_user(user_name)
+    except Exception:
+        # If user not found or provision-api unreachable, start at 0
+        return {"label": "0", "source": "default"}
+
+    # Collect all services from provision-api response
+    services_raw = result.get("user_status", result if isinstance(result, list) else [])
+    if isinstance(services_raw, dict):
+        # Handle nested structure
+        services_raw = services_raw.get("healthy_services", []) + \
+                       services_raw.get("unhealthy_services", []) + \
+                       services_raw.get("missing_services", [])
+
+    existing_labels: list[int] = []
+    for entry in services_raw:
+        if isinstance(entry, dict) and entry.get("service_name") == service_name:
+            try:
+                existing_labels.append(int(entry.get("label", "0")))
+            except (ValueError, TypeError):
+                pass
+
+    next_label = max(existing_labels) + 1 if existing_labels else 0
+    return {"label": str(next_label), "source": "auto_increment"}
 
 
 @router.delete("/{user_name}/{service_name}/{label}")

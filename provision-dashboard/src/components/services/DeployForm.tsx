@@ -44,6 +44,31 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   const [editorFileName, setEditorFileName] = useState('')
   const [editorContent, setEditorContent] = useState('')
 
+  // GAP-003: Auto-computed next label state
+  const [nextLabel, setNextLabel] = useState<string>('0')
+  const [computingLabel, setComputingLabel] = useState(false)
+
+  // GAP-003: Compute next label when user+service selections change
+  const computeNextLabel = async (userName: string, serviceName: string) => {
+    if (!userName || !serviceName) {
+      setNextLabel('0')
+      return
+    }
+    setComputingLabel(true)
+    try {
+      const { data } = await client.get(`/users/${userName}/${serviceName}/next-label`)
+      const label = data.label || '0'
+      setNextLabel(label)
+      form.setFieldsValue({ label })
+    } catch {
+      // Fall back to 0 if provision-api is unreachable
+      setNextLabel('0')
+      form.setFieldsValue({ label: '0' })
+    } finally {
+      setComputingLabel(false)
+    }
+  }
+
   useEffect(() => {
     if (open) {
       loadSources()
@@ -57,6 +82,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       setGeneratedFiles({})
       setShowGeneratedReview(false)
       setEditorModalOpen(false)
+      setNextLabel('0')
       // Preselect service if provided
       if (preselectedService) {
         form.setFieldsValue({ service_name: preselectedService })
@@ -158,6 +184,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   const handleDeploy = async (values: any) => {
     setLoading(true)
     try {
+      // GAP-002: Block deploy when missing files exist and no generated files available
+      if (missingFiles.length > 0 && Object.keys(generatedFiles).length === 0) {
+        message.error('Cannot deploy: missing essential files. Use LLM auto-generation or upload files manually.')
+        setLoading(false)
+        return
+      }
+
       const selectedService = sources.find(s => s.name === values.service_name)
 
       // Save any LLM-generated files first — execute regardless of autoDeploy state
@@ -242,25 +275,30 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           {/* ---- User & Service ---- */}
           <Space.Compact block>
             <Form.Item name="user_name" label="User Name" rules={[{ required: true, message: 'Required' }]} style={{ flex: 1 }}>
-              <Select showSearch placeholder="Select registered user" filterOption={(input, option) => (option?.label as string||'').toLowerCase().includes(input.toLowerCase())} options={deployableUsers.map(u=>({value:u.username,label:u.username}))} />
+              <Select showSearch placeholder="Select registered user" filterOption={(input, option) => (option?.label as string||'').toLowerCase().includes(input.toLowerCase())} options={deployableUsers.map(u=>({value:u.username,label:u.username}))}
+                onChange={(val) => {
+                  const svc = form.getFieldValue('service_name')
+                  if (val && svc) computeNextLabel(val, svc)
+                }}
+              />
             </Form.Item>
             <Form.Item name="service_name" label="Service" rules={[{ required: true, message: 'Required' }]} style={{ flex: 1 }}>
               <Select
                 showSearch
                 placeholder="Select source project"
                 options={sources.map(s => ({ value: s.name, label: s.name }))}
-                onChange={(val) => checkMissingFiles(val)}
+                onChange={(val) => {
+                  checkMissingFiles(val)
+                  const user = form.getFieldValue('user_name')
+                  if (val && user) computeNextLabel(user, val)
+                }}
               />
             </Form.Item>
           </Space.Compact>
 
           <Space.Compact block>
             <Form.Item name="label" label="Label" style={{ flex: 1 }}>
-              <Select options={[
-                { value: '0', label: '0 (default)' },
-                { value: '1', label: '1' },
-                { value: '2', label: '2' },
-              ]} />
+              <Input disabled addonAfter={computingLabel ? <Spin size="small" /> : null} />
             </Form.Item>
             <Form.Item name="domain" label="Domain" style={{ flex: 2 }}>
               <Input placeholder="example.com" disabled={!!selectedSslDomain} />
@@ -483,7 +521,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
           <Space style={{ justifyContent: 'flex-end', width: '100%' }}>
             <Button onClick={onClose}>Cancel</Button>
-            <Button type="primary" htmlType="submit" loading={loading} icon={<span>🚀</span>}>
+            <Button type="primary" htmlType="submit" loading={loading} icon={<span>🚀</span>}
+              disabled={missingFiles.length > 0 && Object.keys(generatedFiles).length === 0}>
               Deploy
             </Button>
           </Space>

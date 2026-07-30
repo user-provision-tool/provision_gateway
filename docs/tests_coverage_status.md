@@ -1,7 +1,7 @@
 # Provision Gateway — Tests Coverage Status
 
-> **Version**: 1.5
-> **Date**: 2026-07-29 (updated — Iteration 2 documenter: QA-added tests reflected, pre-existing failures noted)
+> **Version**: 1.7
+> **Date**: 2026-07-29 (updated — Iteration 2: GAP-005 route ordering fix, 6 new tests, resolved test issues)
 > **Status**: Current state of test coverage
 
 ---
@@ -22,7 +22,7 @@
 
 | File | Language | Type | Test Cases | Status |
 |---|---|---|---|---|
-| `test_unit.py` | Python (pytest) | Unit | 60 (59 pass, 1 fail) | 🟡 1 pre-existing failure (test_check_deploy_uses_service_name — function removed in G14 cleanup) |
+| `test_unit.py` | Python (pytest) | Unit | 87 | ✅ All passing (includes 9 test functions added by QA, 16 new methods across TestTemplateMode, TestDeployValidation, TestServiceLabelAutoIncrement, TestProjectMonitoring, plus 6 route ordering tests in TestRouteOrdering) |
 | `test_proxy.py` | Python (pytest) | Unit | 8 | ✅ Passing |
 | `test_integration.py` | Python (subprocess) | Integration | 9 | ✅ Passing |
 | `test_integration.sh` | Bash | Integration | 113 lines | ✅ Passing |
@@ -31,7 +31,7 @@
 | `test_gateway_api.sh` | Bash | Integration | 347 lines | ✅ Passing |
 | `test_provision_api.sh` | Bash | Integration | 252 lines | ✅ Passing |
 | `test_load.py` | Python (httpx) | Load/Perf | 5 scenarios | ✅ Working (load test for F1 — 20 concurrent requests) |
-| **Total** | | | **77 Python (67 pass, 1 fail, 9 skip) + 5 shell (108 tests pass, 1 fail)** | |
+| **Total** | | | **104 Python (87 unit + 8 proxy + 9 integration) + 5 shell (108 tests pass, 1 fail)** | |
 
 ### 1.2 Test Execution
 
@@ -64,7 +64,7 @@ bash tests/test_provision_api.sh
 | `auth_service.py` | 4 (hash, verify, JWT, end-user auth) | 3 (login, refresh, end-user login) | 🟢 Good |
 | `proxy_service.py` | 3 (env injection, disabled proxy) | 12 (full CRUD, deploy integration) | 🟢 Good |
 | `provision_service.py` | 14 (method existence checks) | 3 (list users, get user, error handling) | 🟢 Good |
-| `service_manager.py` | 0 | 1 (list services) | 🔴 None |
+| `service_manager.py` | 5 (create_from_template, scan_for_new_projects, get_new_project_events, project tracking) | 1 (list services) | 🟡 Partial (TestProjectMonitoring, TestTemplateMode in test_unit.py) |
 | `llm_service.py` | 0 | 0 | 🔴 None |
 | `curl_service.py` | 0 | 0 | 🔴 None |
 | `audit_service.py` | 0 | 2 (list audit, filter by action) | 🟡 Partial |
@@ -134,6 +134,8 @@ bash tests/test_provision_api.sh
 | `/api/services/{name}` | GET/DELETE | ❌ | — |
 | `/api/services/{name}/files/{file}` | GET/PUT | ❌ | — |
 | `/api/services/{name}/convert` | POST | ❌ | — |
+| `/api/services/templates` | GET | ✅ | test_unit.py (TestTemplateMode) |
+| `/api/services/notifications` | GET | ✅ | test_unit.py (TestProjectMonitoring) |
 | `/api/services/scan` | POST | ❌ | — |
 | `/api/services/save-generated` | POST | ❌ | — |
 | `/api/services/check-deploy` | POST | ❌ | — |
@@ -142,7 +144,8 @@ bash tests/test_provision_api.sh
 | `/api/services/{name}/git/head-file` | GET | ❌ | — |
 | `/api/users` | GET | ✅ | integration.py, deploy.sh |
 | `/api/users/{name}` | GET | ❌ | — |
-| `/api/users/deploy` | POST | ✅ | deploy.sh (5 variations) |
+| `/api/users/deploy` | POST | ✅ | deploy.sh (5 variations), test_unit.py (TestDeployValidation) |
+| `/api/users/{u}/{s}/next-label` | GET | ✅ | test_unit.py (TestServiceLabelAutoIncrement) |
 | `/api/users/{u}/{s}/{l}` | DELETE | ❌ | — |
 | `/api/users/{u}/{s}/{l}/rebuild` | POST | ❌ | — |
 | `/api/users/{u}/{s}/{l}/up` | POST | ❌ | — |
@@ -161,7 +164,7 @@ bash tests/test_provision_api.sh
 | `/api/llm/generate` | POST | ❌ | — |
 | `/api/audit` | GET | ✅ | integration.py, deploy.sh, proxy.sh |
 
-**Summary:** 11 of 47 endpoints tested (23.4%)
+**Summary:** 14 of 50 endpoints tested (28.0%)
 
 ---
 
@@ -213,6 +216,9 @@ bash tests/test_provision_api.sh
 |---|---|---|---|
 | `test_check_deploy_uses_service_name` fails | `test_unit.py` | Test references removed `checkDeploy` export (G14/G16 dead code cleanup). Should be removed or updated. | HIGH |
 | `test_deploy.sh` Test 3 fails | `test_deploy.sh` | Proxy enablement uses `PUT /api/system/proxy` (405); correct API is `POST` then `PUT /{id}/activate`. | HIGH |
+| ~~`/api/services/templates` returns 404~~ | `services.py` | **RESOLVED in Iteration 2** — `/templates` route moved before `/{name}` catch-all. 6 new route ordering tests verify. | ~~CRITICAL~~ ✅ |
+| ~~`/api/services/notifications` returns 404~~ | `services.py` | **RESOLVED in Iteration 2** — `/notifications` route moved before `/{name}` catch-all. | ~~CRITICAL~~ ✅ |
+| ~~Missing `Select` import in `ServicesPage.tsx`~~ | `ServicesPage.tsx:8` | **RESOLVED in Iteration 2** — `Select` added to antd import. TypeScript error TS2552 fixed. | ~~MEDIUM~~ ✅ |
 
 ### 5.4 Test Quality Recommendations
 

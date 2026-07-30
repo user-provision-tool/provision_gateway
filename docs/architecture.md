@@ -187,7 +187,9 @@ app/
 ├── services/            # Business Logic Services
 │   ├── auth_service.py      # bcrypt hash/verify, JWT create/decode, end-user auth
 │   ├── provision_service.py # Async HTTP proxy to provision-api (all ops)
-│   ├── service_manager.py   # File ops, git clone, template conversion (delegated)
+│   ├── service_manager.py   # File ops, git clone, template conversion (delegated),
+│   │                        #   template-based service creation (create_from_template),
+│   │                        #   project change tracking (scan_for_new_projects, get_new_project_events)
 │   ├── llm_service.py       # LLM client, config generation
 │   ├── curl_service.py      # URL testing via subprocess curl
 │   ├── audit_service.py     # Audit log writer + querier
@@ -258,6 +260,7 @@ Request → FastAPI Router
 | `provision_service` | Yes | HTTP client for provision-api (all Docker, reconciliation, SSL, user ops) |
 | `service_manager` | Yes | File operations on PROVISION_DIR |
 | `llm_service` | Yes | LLM client and config generation |
+| `_project_monitor_loop` | Task | Background asyncio task in main.py lifespan; polls source_projects every 10s for new directories, accessible via GET /api/services/notifications |
 
 ---
 
@@ -493,7 +496,7 @@ _provision_gateway/
 │   │   ├── middleware/           # Auth middleware
 │   │   ├── lib/                  # Template converters
 │   │   └── utils/                # Utilities (crypto, parser, scanner)
-│   └── tests/                    # Test suite (6 files, 49 test cases)
+│   └── tests/                    # Test suite (7 files, 81 test cases)
 │
 ├── provision-dashboard/          # Frontend (React + TypeScript)
 │   ├── Dockerfile

@@ -120,7 +120,7 @@
 
 **Steps:**
 1. Click **"+ Add Project"** button (top-right)
-2. Modal opens with 3 tabs
+2. Modal opens with 3 tabs: From Git, Upload Zip, From Template
 3. **"From Git"** tab:
    - **Repository URL:** Paste GitHub/GitLab URL (e.g., `https://github.com/user/repo.git`)
    - **Branch:** Enter branch name (default: `main`)
@@ -162,7 +162,29 @@
 
 ---
 
-## 6. Source Projects — File Editor with Git Diff
+## 6. Source Projects — Add Service from Template
+
+**Goal:** Create a service project from a pre-built template in the service_templates database table.
+
+**Page:** `/services`
+
+**Steps:**
+1. Click **"+ Add Project"**
+2. Select **"From Template"** tab
+3. **Template** dropdown loads available templates from `GET /api/services/templates`
+4. Select a template (e.g., WordPress with MySQL)
+5. Enter **Service Name** for the new project
+6. Click **"Create from Template"**
+7. The system creates the project using the template's compose_j2, nginx_j2, env_template, and dockerfile content
+8. New project appears in the services table
+
+**API calls:**
+- `GET /api/services/templates` → Load available templates
+- `POST /api/services` (mode=template, template_id=N) → Create project
+
+---
+
+## 7. Source Projects — File Editor with Git Diff
 
 **Goal:** View, edit, and review changes to service project files with syntax highlighting.
 
@@ -199,7 +221,7 @@
 
 ---
 
-## 7. Source Projects — Convert to Templates
+## 8. Source Projects — Convert to Templates
 
 **Goal:** Convert plain `docker-compose.yml` and `nginx.conf` to Jinja2 `.j2` templates.
 
@@ -223,7 +245,7 @@
 
 ---
 
-## 8. Services — Deploy to User
+## 9. Services — Deploy to User
 
 **Goal:** Deploy a service template for a specific user.
 
@@ -234,23 +256,25 @@
 2. **DeployForm Modal** opens:
    - **User Name:** Dropdown of deployable users (from `GET /api/auth/users/deployable`)
    - **Service:** Dropdown of services with templates (from `GET /api/services`)
-   - **Label:** 0, 1, or 2 (auto-increment suggestion)
+   - **Label:** Auto-computed from existing instances (display-only disabled input, fetched via `GET /api/users/{user}/{service}/next-label`)
    - **Domain:** Text input (e.g., `snaprovision.com`)
    - **Password:** Password input (for HTTP basic auth)
    - **HTTPS Toggle:** Enables fullchain/privkey path inputs
    - **Volume Mapping:** Form.List — key/value pairs with add/remove buttons
    - **Build Args:** Form.List — key/value pairs with add/remove buttons
    - **Use Global Proxy:** Checkbox (disabled if no proxy configured)
-3. **Template completion flow**: If service is missing essential files (docker-compose, nginx.conf, .env, Dockerfile), a warning alert shows with "Auto Templates Completion" checkbox:
+3. **Template completion flow**: If service is missing essential files (docker-compose, nginx.conf, .env, Dockerfile), a warning alert shows with "Auto Templates Completion" checkbox. The **"Deploy"** button is disabled when missing files exist and no LLM-generated files are available:
    - **Auto mode (checked, default)**: Click "Generate Missing Files via LLM" → LLM generates files → auto-submits deploy after 500ms delay
    - **Manual mode (unchecked)**: Click "Generate with LLM" → generated files appear as clickable tags for review in Monaco editor → click "Deploy" saves files to disk first then submits
    - Generated file tags are color-coded (blue) and clickable to open full Monaco editor for review
+   - If LLM is not configured, missing files must be uploaded manually in the source project before deploy is allowed
 4. Click **"Deploy"** (rocket button)
 5. If successful, task ID is displayed → link to Tasks page for monitoring
 
 **API calls:**
 - `GET /api/auth/users/deployable` → Available users dropdown
 - `GET /api/services` → Available services dropdown
+- `GET /api/users/{user}/{service}/next-label` → Auto-compute label on user/service selection
 - `GET /api/services/{name}/check-missing-files` → Check for missing essential files (auto on mount)
 - `POST /api/llm/generate` → Generate missing file content via LLM
 - `POST /api/services/save-generated` → Save generated files to disk (always before deploy — G12)
@@ -263,7 +287,7 @@
 
 ---
 
-## 9. Services — Play/Pause/Rebuild/Redeploy/Delete
+## 10. Services — Play/Pause/Rebuild/Redeploy/Delete
 
 **Goal:** Manage the lifecycle of deployed services.
 
@@ -301,7 +325,7 @@
 
 ---
 
-## 10. Services — Clone All Between Users
+## 11. Services — Clone All Between Users
 
 **Goal:** Copy all services from one user to another.
 
@@ -328,7 +352,7 @@
 
 ---
 
-## 11. Services — Change Password & Test Connectivity
+## 12. Services — Change Password & Test Connectivity
 
 **Goal:** Update HTTP basic auth password and test service URL.
 
@@ -356,7 +380,7 @@
 
 ---
 
-## 12. Tasks — Monitor & View Logs
+## 13. Tasks — Monitor & View Logs
 
 **Goal:** Track async tasks and view real-time build logs.
 
@@ -396,7 +420,7 @@
 
 ---
 
-## 13. Settings — LLM Configuration
+## 14. Settings — LLM Configuration
 
 **Goal:** Configure AI provider for config generation and troubleshooting.
 
@@ -429,7 +453,7 @@
 
 ---
 
-## 14. Settings — Global Proxy
+## 15. Settings — Global Proxy
 
 **Goal:** Configure HTTP/HTTPS proxy for git clones and Docker builds.
 
@@ -462,7 +486,7 @@
 
 ---
 
-## 15. Settings — Special Functional Users
+## 16. Settings — Special Functional Users
 
 **Goal:** Configure global special users list (shared, public, internal).
 
@@ -484,7 +508,7 @@
 
 ---
 
-## 16. Audit — Query & Export
+## 17. Audit — Query & Export
 
 **Goal:** Search and export the audit trail.
 
@@ -506,7 +530,7 @@
 
 ---
 
-## 17. User Management — Register, Approve, Assign Roles
+## 18. User Management — Register, Approve, Assign Roles
 
 **Goal:** Manage end-user accounts with role-based access control.
 
@@ -554,7 +578,7 @@
 
 ---
 
-## 18. Troubleshoot Chat
+## 19. Troubleshoot Chat
 
 **Goal:** Get AI-assisted troubleshooting for service issues.
 

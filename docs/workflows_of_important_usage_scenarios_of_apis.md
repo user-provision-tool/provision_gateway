@@ -1,7 +1,7 @@
 # Provision Gateway — Workflows of Important Usage Scenarios (APIs)
 
-> **Version**: 1.1
-> **Date**: 2026-07-08 (updated)
+> **Version**: 1.2
+> **Date**: 2026-07-29 (updated — Iteration 1: added Add Service from Template workflow, label auto-increment, project notifications, deploy validation)
 > **Purpose**: Step-by-step API workflows for the most important usage scenarios, directly usable with `curl` or any HTTP client.
 
 ---
@@ -13,22 +13,23 @@
 3. [End-User Authentication Flow](#3-end-user-authentication-flow)
 4. [Add Service from Git Repository](#4-add-service-from-git-repository)
 5. [Add Service from File Upload](#5-add-service-from-file-upload)
-6. [Edit Service Files (with Git Diff)](#6-edit-service-files-with-git-diff)
-7. [Convert to Jinja2 Templates](#7-convert-to-jinja2-templates)
-8. [Deploy Service to User](#8-deploy-service-to-user)
-9. [Monitor Deploy Task (with Log Streaming)](#9-monitor-deploy-task-with-log-streaming)
-10. [Clone All Services Between Users](#10-clone-all-services-between-users)
-11. [Manage Service Lifecycle (Up/Down/Rebuild/Delete)](#11-manage-service-lifecycle-updownrebuilddelete)
-12. [Change Service Password](#12-change-service-password)
-13. [Get Container Logs](#13-get-container-logs)
-14. [Test Service Connectivity (curl)](#14-test-service-connectivity-curl)
-15. [System Monitoring & Reconciliation](#15-system-monitoring--reconciliation)
-16. [SSL Certificate Management](#16-ssl-certificate-management)
-17. [Configure Global Proxy](#17-configure-global-proxy)
-18. [Configure LLM (BYOK)](#18-configure-llm-byok)
-19. [Generate Config via LLM](#19-generate-config-via-llm)
-20. [Query Audit Logs](#20-query-audit-logs)
-21. [End-User Management](#21-end-user-management)
+6. [Add Service from Template (DB)](#6-add-service-from-template-db)
+7. [Edit Service Files (with Git Diff)](#7-edit-service-files-with-git-diff)
+8. [Convert to Jinja2 Templates](#8-convert-to-jinja2-templates)
+9. [Deploy Service to User](#9-deploy-service-to-user)
+10. [Monitor Deploy Task (with Log Streaming)](#10-monitor-deploy-task-with-log-streaming)
+11. [Clone All Services Between Users](#11-clone-all-services-between-users)
+12. [Manage Service Lifecycle (Up/Down/Rebuild/Delete)](#12-manage-service-lifecycle-updownrebuilddelete)
+13. [Change Service Password](#13-change-service-password)
+14. [Get Container Logs](#14-get-container-logs)
+15. [Test Service Connectivity (curl)](#15-test-service-connectivity-curl)
+16. [System Monitoring & Reconciliation](#16-system-monitoring--reconciliation)
+17. [SSL Certificate Management](#17-ssl-certificate-management)
+18. [Configure Global Proxy](#18-configure-global-proxy)
+19. [Configure LLM (BYOK)](#19-configure-llm-byok)
+20. [Generate Config via LLM](#20-generate-config-via-llm)
+21. [Query Audit Logs](#21-query-audit-logs)
+22. [End-User Management](#22-end-user-management)
 
 ---
 
@@ -228,7 +229,44 @@ curl -s -X POST http://localhost:8771/api/services \
 
 ---
 
-## 5. Edit Service Files (with Git Diff)
+## 5. Add Service from Template (DB)
+
+**Goal:** Create a service project from a pre-built template in the service_templates table.
+
+```bash
+TOKEN="your-jwt-token"
+
+# Step 1: List available templates
+curl -s http://localhost:8771/api/services/templates \
+  -H "Authorization: Bearer $TOKEN"
+
+# Expected:
+# {
+#   "templates": [
+#     {"id": 1, "name": "wordpress", "description": "WordPress with MySQL", ...}
+#   ]
+# }
+
+# Step 2: Create service from template
+curl -s -X POST http://localhost:8771/api/services \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "template",
+    "name": "my-wordpress-site",
+    "template_id": 1
+  }'
+
+# Expected: 201 with project details
+
+# Step 3: Verify the service appears in the list
+curl -s http://localhost:8771/api/services \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+---
+
+## 6. Edit Service Files (with Git Diff)
 
 **Goal:** Read, edit, and review changes to service project files.
 
@@ -263,7 +301,7 @@ curl -s "http://localhost:8771/api/services/$SERVICE/git/diff?file=docker-compos
 
 ---
 
-## 6. Convert to Jinja2 Templates
+## 7. Convert to Jinja2 Templates
 
 **Goal:** Convert plain `docker-compose.yml` and `nginx.conf` to `.j2` templates with provision variables.
 
@@ -298,7 +336,7 @@ curl -s "http://localhost:8771/api/services/$SERVICE" \
 
 ---
 
-## 7. Deploy Service to User
+## 8. Deploy Service to User
 
 **Goal:** Deploy a service template for a user with custom configuration.
 
@@ -351,7 +389,7 @@ TASK_ID="abc123def456"
 
 ---
 
-## 8. Monitor Deploy Task (with Log Streaming)
+## 9. Monitor Deploy Task (with Log Streaming)
 
 **Goal:** Track deployment progress and view build logs in real-time.
 
@@ -384,7 +422,7 @@ curl -s http://localhost:8771/api/tasks \
 
 ---
 
-## 9. Clone All Services Between Users
+## 10. Clone All Services Between Users
 
 **Goal:** Clone all services from user Alice to user Bob.
 
@@ -429,7 +467,7 @@ curl -s http://localhost:8771/api/users/bob \
 
 ---
 
-## 10. Manage Service Lifecycle (Up/Down/Rebuild/Delete)
+## 11. Manage Service Lifecycle (Up/Down/Rebuild/Delete)
 
 **Goal:** Start, stop, rebuild, and remove deployed services.
 
@@ -467,7 +505,7 @@ curl -s -X DELETE "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL" \
 
 ---
 
-## 11. Change Service Password
+## 12. Change Service Password
 
 **Goal:** Update HTTP basic auth password for a user's service.
 
@@ -494,7 +532,7 @@ curl -s -X PUT "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL/password" 
 
 ---
 
-## 12. Test Service Connectivity (curl)
+## 13. Test Service Connectivity (curl)
 
 **Goal:** Test if a deployed service is reachable from within the gateway.
 
@@ -530,7 +568,7 @@ curl -s -X POST "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL/test-curl
 
 ---
 
-## 13. System Monitoring & Reconciliation
+## 14. System Monitoring & Reconciliation
 
 **Goal:** Monitor system health and reconcile nginx state.
 
@@ -560,7 +598,7 @@ curl -s http://localhost:8771/api/system/reconcile/status \
 
 ---
 
-## 14. Configure Global Proxy
+## 15. Configure Global Proxy
 
 **Goal:** Set up a global HTTP proxy for git clones and Docker builds.
 
@@ -617,7 +655,7 @@ curl -s -X DELETE http://localhost:8771/api/system/proxy/1 \
 
 ---
 
-## 15. Configure LLM (BYOK)
+## 16. Configure LLM (BYOK)
 
 **Goal:** Set up Bring-Your-Own-Key LLM for AI-assisted config generation.
 
@@ -661,7 +699,7 @@ curl -s -X POST http://localhost:8771/api/llm/test \
 
 ---
 
-## 16. Generate Config via LLM
+## 17. Generate Config via LLM
 
 **Goal:** Use AI to generate docker-compose.yml, nginx.conf, or .env files.
 
@@ -728,7 +766,7 @@ curl -s -X POST http://localhost:8771/api/llm/generate \
 
 ---
 
-## 17. Query Audit Logs
+## 18. Query Audit Logs
 
 **Goal:** Search and filter the audit trail for compliance and debugging.
 
@@ -762,7 +800,7 @@ curl -s "http://localhost:8771/api/audit?limit=10&offset=10" \
 
 ---
 
-## 18. End-User Management
+## 19. End-User Management
 
 **Goal:** Register, approve, and manage end-user accounts for the portal.
 

@@ -1,7 +1,7 @@
 # Provision Gateway — API Reference
 
-> **Version**: 1.1
-> **Date**: 2026-07-08 (updated)
+> **Version**: 1.2
+> **Date**: 2026-07-29 (updated — Iteration 1 dev-debug-flow: added /templates, /notifications, /next-label endpoints; template mode in POST /api/services)
 > **Base URL**: `http://provision-gateway:8770` (internal) / `http://localhost:8771/api` (via dashboard proxy)
 
 ---
@@ -751,6 +751,49 @@ List all service source projects.
 
 ---
 
+### `GET /api/services/templates`
+
+List all available service templates from the database (service_templates table). Used by the "From Template" tab in the Add Project modal.
+
+**Response 200:**
+```json
+{
+  "templates": [
+    {
+      "id": 1,
+      "name": "wordpress",
+      "description": "WordPress with MySQL",
+      "category": "cms",
+      "icon": "FileTextOutlined",
+      "is_builtin": true,
+      "created_at": "2026-07-29T00:00:00Z"
+    }
+  ]
+}
+```
+
+---
+
+### `GET /api/services/notifications`
+
+Get project detection events from the background project monitor loop (polls source_projects every 10s for new directories).
+
+**Response 200:**
+```json
+{
+  "notifications": [
+    {
+      "project_name": "new-project",
+      "detected_at": "2026-07-29T12:00:05Z",
+      "acknowledged": false
+    }
+  ],
+  "count": 1
+}
+```
+
+---
+
 ### `POST /api/services`
 
 Create a new service project. Three modes:
@@ -786,6 +829,15 @@ Create a new service project. Three modes:
   "mode": "upload",
   "name": "myapp",
   "zip_content": "base64_encoded_zip..."
+}
+```
+
+**Mode 4 — From Template (DB):**
+```json
+{
+  "mode": "template",
+  "name": "myapp",
+  "template_id": 1
 }
 ```
 
@@ -1119,6 +1171,20 @@ Deploy a service to a user. Creates an async task.
   "status": "pending",
   "type": "register",
   "message": "Deployment started. Track progress in Tasks."
+}
+```
+
+---
+
+### `GET /api/users/{user_name}/{service_name}/next-label`
+
+Get the next auto-incremented label for deploying a service to a user. Queries existing instances for the same user+service and returns max+1.
+
+**Response 200:**
+```json
+{
+  "label": "1",
+  "source": "auto_increment"
 }
 ```
 

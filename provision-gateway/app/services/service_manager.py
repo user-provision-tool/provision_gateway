@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,63 @@ class ServiceManager:
     def __init__(self) -> None:
         self._source_dir = settings.SOURCE_PROJECTS_DIR
         self._source_dir.mkdir(parents=True, exist_ok=True)
+        # Project change tracking for active monitoring (GAP-004)
+        self._known_projects: set[str] = set()
+        self._new_project_events: list[dict[str, Any]] = []
+        self._last_scan_time: float = 0.0
+        # Initially populate known projects
+        self._refresh_known_projects()
+
+    def _refresh_known_projects(self) -> None:
+        """Refresh the set of known project names."""
+        current = set()
+        if self._source_dir.exists():
+            for d in self._source_dir.iterdir():
+                if d.is_dir() and not d.name.startswith("."):
+                    current.add(d.name)
+        self._known_projects = current
+
+    def scan_for_new_projects(self) -> list[dict[str, Any]]:
+        """Scan source_projects directory and detect newly added projects.
+
+        Returns a list of new project info dicts.
+        Detects projects added since the last scan by comparing against
+        the known set.
+        """
+        now = time.time()
+        new_projects: list[dict[str, Any]] = []
+        current = set()
+
+        if self._source_dir.exists():
+            for d in self._source_dir.iterdir():
+                if d.is_dir() and not d.name.startswith("."):
+                    current.add(d.name)
+                    if d.name not in self._known_projects:
+                        new_projects.append({
+                            "name": d.name,
+                            "path": str(d),
+                            "detected_at": now,
+                        })
+
+        # Update known set
+        self._known_projects = current
+        self._last_scan_time = now
+
+        # Store events for retrieval via notifications endpoint
+        for np in new_projects:
+            self._new_project_events.append(np)
+
+        return new_projects
+
+    def get_new_project_events(self, clear: bool = True) -> list[dict[str, Any]]:
+        """Return accumulated new project detection events.
+
+        If clear=True, clears the event buffer after reading.
+        """
+        events = list(self._new_project_events)
+        if clear:
+            self._new_project_events.clear()
+        return events
 
     # ------------------------------------------------------------------
     # Listing
@@ -334,6 +392,48 @@ class ServiceManager:
                     if not m.endswith("/"): dest.write_bytes(zf.read(m))
             else:
                 zf.extractall(target)
+        return self._get_service_info(target)
+
+    def create_from_template(
+        self, name: str, template_id: int, db_session,
+    ) -> dict[str, Any]:
+        """Create a service project from a stored template.
+
+        Reads the ServiceTemplate from the database and writes its
+        content files (compose_j2, nginx_j2, env_template, dockerfile)
+        into the project directory.
+        """
+        from ..models.service_template import ServiceTemplate
+
+        target = self._source_dir / name
+        if target.exists():
+            raise FileExistsError(f"Service '{name}' already exists at {target}")
+
+        template = db_session.query(ServiceTemplate).filter(
+            ServiceTemplate.id == template_id
+        ).first()
+        if not template:
+            raise FileNotFoundError(f"Template id={template_id} not found")
+
+        target.mkdir(parents=True)
+
+        # Write compose template
+        compose_filename = f"{name}.yml.j2"
+        (target / compose_filename).write_text(template.compose_j2)
+
+        # Write nginx template if present
+        if template.nginx_j2:
+            nginx_filename = f"{name}.nginx.conf.j2"
+            (target / nginx_filename).write_text(template.nginx_j2)
+
+        # Write env template if present
+        if template.env_template:
+            (target / ".env").write_text(template.env_template)
+
+        # Write Dockerfile if present
+        if template.dockerfile:
+            (target / "Dockerfile").write_text(template.dockerfile)
+
         return self._get_service_info(target)
 
 
