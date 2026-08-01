@@ -121,6 +121,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
   // Cache scan context from check-missing-files for LLM generation
   const [scanContext, setScanContext] = useState<any>(null)
+  const [checkError, setCheckError] = useState<string | null>(null)
 
   // Check for missing essential files when service selection changes
   const checkMissingFiles = async (serviceName: string) => {
@@ -129,11 +130,15 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     try {
       const { data } = await client.get(`/services/${serviceName}/check-missing-files`)
       setMissingFiles(data.missing || [])
+      setCheckError(null)
       if (data.scan_context) {
         setScanContext(data.scan_context)
       }
-    } catch { setMissingFiles([]); setScanContext(null) }
-    finally { setCheckingMissing(false) }
+    } catch (err: any) {
+      setCheckError(err?.message || 'Check failed — try again')
+      setMissingFiles(['(check failed — try again)'])
+      setScanContext(null)
+    } finally { setCheckingMissing(false) }
   }
 
   // Generate missing files via LLM
@@ -461,6 +466,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
               }
               style={{marginBottom:12}}
             />
+          ) : checkError ? (
+            <Alert type="error" message={`Deployment readiness check failed: ${checkError}`} style={{marginBottom:12}} />
           ) : selectedServiceName ? (
             <Alert type="success" message="All essential files present — ready to deploy" style={{marginBottom:12}} />
           ) : null}
@@ -522,7 +529,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           <Space style={{ justifyContent: 'flex-end', width: '100%' }}>
             <Button onClick={onClose}>Cancel</Button>
             <Button type="primary" htmlType="submit" loading={loading} icon={<span>🚀</span>}
-              disabled={missingFiles.length > 0 && Object.keys(generatedFiles).length === 0}>
+              disabled={!!checkError || (missingFiles.length > 0 && Object.keys(generatedFiles).length === 0)}>
               Deploy
             </Button>
           </Space>

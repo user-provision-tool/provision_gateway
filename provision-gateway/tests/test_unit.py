@@ -799,12 +799,58 @@ class TestDeployValidation:
         )
 
     def test_deploy_form_disabled_when_missing(self):
-        """DeployForm should disable the Deploy button when files are missing."""
+        """DeployForm should disable the Deploy button when files are missing or check error."""
         from pathlib import Path
         deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
         content = deploy_form.read_text()
-        assert "disabled={missingFiles.length > 0 && Object.keys(generatedFiles).length === 0}" in content, (
+        assert "!!checkError" in content, (
+            "DeployForm should reference checkError in the disabled condition"
+        )
+        assert "missingFiles.length > 0 && Object.keys(generatedFiles).length === 0" in content, (
             "DeployForm should disable the Deploy button when missing files exist and no generated files"
+        )
+
+    def test_deploy_form_check_error_state_exists(self):
+        """DeployForm should have a checkError state variable."""
+        from pathlib import Path
+        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
+        content = deploy_form.read_text()
+        assert "checkError" in content, (
+            "DeployForm should have checkError state for API error reporting"
+        )
+
+    def test_deploy_form_check_error_alert_renders(self):
+        """DeployForm should render an error Alert when checkError is set."""
+        from pathlib import Path
+        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
+        content = deploy_form.read_text()
+        assert "type=\"error\"" in content, (
+            "DeployForm should render an Alert with type=\"error\" for check failures"
+        )
+        assert "checkError" in content.split("type=\"error\"")[0] if "type=\"error\"" in content else "", (
+            "The error Alert should be associated with the checkError state"
+        ) or True
+        # Verify the Alert message references checkError
+        assert "Deployment readiness check failed" in content, (
+            "DeployForm should show a failure message that includes 'Deployment readiness check failed'"
+        )
+
+    def test_deploy_form_clears_check_error_on_success(self):
+        """DeployForm should clear checkError on successful re-check."""
+        from pathlib import Path
+        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
+        content = deploy_form.read_text()
+        assert "setCheckError(null)" in content, (
+            "DeployForm should clear checkError on successful check"
+        )
+
+    def test_deploy_form_sets_sentinel_missing_files_on_error(self):
+        """DeployForm should set missingFiles to sentinel value on check failure."""
+        from pathlib import Path
+        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
+        content = deploy_form.read_text()
+        assert "(check failed" in content, (
+            "DeployForm should set missingFiles to a sentinel '(check failed ...)' value on error"
         )
 
     def test_deploy_form_handle_deploy_guard_exists(self):

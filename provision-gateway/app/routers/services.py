@@ -16,6 +16,7 @@ from ..services.service_manager import service_manager
 from ..services.llm_service import llm_service
 from ..config import settings
 from ..utils.file_scanner import scan_directory
+from ..services.provision_service import provision_service
 
 router = APIRouter(prefix="/api/services", tags=["services"])
 

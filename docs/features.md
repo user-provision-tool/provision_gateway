@@ -132,6 +132,8 @@
 | L12 | Missing files check API | ✅ | `GET /api/services/{name}/check-missing-files` → provision-api `GET /services/{name}/check-missing-files` |
 | L13 | Auto-deploy LLM file generation | ✅ | Checkbox on DeployForm; LLM generates missing compose/nginx/env/Dockerfile before deploy — auto-submits (G6). Non-autoDeploy mode saves generated files to disk before deploy (G12 fixed in Iteration 2). |
 | L14 | Generated files review in deploy | ✅ | Inline preview of LLM-generated files with review before saving; clickable file tags open Monaco editor (G6 confirmed working) |
+| L15 | Missing provision_service import fix | ✅ | Iteration 4: Added missing `from ..services.provision_service import provision_service` to services.py — fixes NameError at check-missing-files endpoint |
+| L16 | DeployForm error handling | ✅ | Iteration 4: Replaced silent catch with checkError state, error Alert, and disabled deploy button on check failure |
 
 ---
 
@@ -240,7 +242,7 @@
 | Service Management | 19 | 17 | 17 | 0 |
 | User Provisioning | 15 | 15 | 14 | 1 |
 | Service URL & Connectivity | 5 | 5 | 5 | 0 |
-| LLM Integration | 14 | 13 | 13 | 1 |
+| LLM Integration | 16 | 15 | 15 | 1 |
 | Real-Time Operations | 7 | 7 | 7 | 0 |
 | Reconciliation | 7 | 7 | 7 | 0 |
 | System Monitoring | 6 | 6 | 6 | 0 |
@@ -248,7 +250,7 @@
 | Proxy Management | 9 | 9 | 9 | 0 |
 | User Management | 7 | 7 | 7 | 0 |
 | MCP Server | 6 | 6 | 6 | 0 |
-| **TOTAL** | **122** | **119** | **118** | **2** |
+| **TOTAL** | **124** | **121** | **120** | **2** |
 
-**Implementation Rate:** 119/122 = **97.5%**
-**Verified Rate:** 118/122 = **96.7%**
+**Implementation Rate:** 121/124 = **97.6%**
+**Verified Rate:** 120/124 = **96.8%**
