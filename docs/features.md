@@ -1,7 +1,7 @@
 # Provision Gateway — Features Status
 
-> **Version**: 1.9
-> **Date**: 2026-07-29 (updated — Iteration 2: GAP-005 route ordering fix, GAP-006 Select import)
+> **Version**: 2.0
+> **Date**: 2026-08-01 (updated — Cycle 20260801T165901Z Iteration 1: GAP-1 "From Template" tab removed, GAP-2 backend local-agent deferral, GAP-3 concurrency regression test, GAP-4 git-tracked template classification)
 > **Purpose**: Quick reference and implementation status tracker for all features.
 
 ---
@@ -62,7 +62,7 @@
 | S2 | Add service — from file upload | ✅ | `POST /api/services` (mode=upload) |
 | S3 | Add service — from ZIP upload | ✅ | `POST /api/services` (mode=upload, zip_content) |
 | S4 | Add service — from template (LLM) | ✅ | `POST /api/llm/generate` + `save-generated` |
-| S5 | File tree browser | ✅ | Directory structure, .git filtering, git status tags |
+| S5 | File tree browser | ✅ | Directory structure, .git filtering, git status tags. Template classification uses the git-tracked/original criterion (GAP-4, iter-1): a file enters Templates only if git-tracked when git is available; untracked/LLM-generated deployment-critical files appear ONLY under Generated Files; `.generated` marker files excluded from all listings |
 | S6 | Monaco code editor | ✅ | YAML/Nginx syntax highlighting, dark theme |
 | S7 | Git diff view | ✅ | Monaco DiffEditor, line-by-line colored comparison |
 | S8 | File save with git tracking | ✅ | `PUT /api/services/{name}/files/{file}` |
@@ -75,8 +75,8 @@
 | S15 | Example service (REST API) | ✅ | `examples/service/` — hello-world with Dockerfile, no compose/nginx |
 | S16 | Example MCP (streamable HTTP) | ✅ | `examples/mcp/` — interacts with example service API |
 | S17 | Auto-detect manual source projects | ✅ | `list_services()` scans `SOURCE_PROJECTS_DIR` — all dirs auto-detected |
-| S18 | Add service — from pre-built template (DB) | ✅ | `POST /api/services` mode=template with template_id; "From Template" tab in AddServiceModal and ServicesPage. Route ordering fixed in Iteration 2: `/templates` route now registered before `/{name}` catch-all in services.py. The `/api/services/templates` endpoint returns template list correctly. |
-| S19 | Active file system monitoring for new projects | ✅ | Background `_project_monitor_loop` polls source_projects every 10s; events via `GET /api/services/notifications`. Route ordering fixed in Iteration 2: `/notifications` route now registered before `/{name}` catch-all. Missing `Select` import in TemplateForm component also fixed. Both endpoints working correctly. |
+| S18 | Add service — from pre-built template (DB) | ✅ | Backend `POST /api/services` mode=template with template_id retained; `GET /api/services/templates` returns template list correctly (route ordering fixed in Iteration 2). **The "From Template" tab was removed from the Add Source Project modal and orphan `AddServiceModal.tsx` was deleted in iter-1 (GAP-1)** — the UI now offers Git + Upload Zip only; mode=template remains available at the API level. |
+| S19 | Active file system monitoring for new projects | ✅ | Background `_project_monitor_loop` polls source_projects every 10s; events via `GET /api/services/notifications`. Route ordering fixed in Iteration 2: `/notifications` route now registered before `/{name}` catch-all. Both endpoints working correctly. |
 
 ---
 
@@ -119,7 +119,7 @@
 | # | Feature | Status | Notes |
 |---|---|---|---|
 | L1 | BYOK configuration (OpenAI-compatible) | ✅ | DeepSeek, OpenAI, OpenRouter, etc. |
-| L2 | Local agent configuration (Ollama) | 🔮 | Removed from Settings UI — future feature alongside provision-agent |
+| L2 | Local agent configuration (Ollama) | 🔮 | Removed from Settings UI — future feature alongside provision-agent. Backend defers local agent at the API level (GAP-2, iter-1): `mode='local_agent'` is normalized to `byok`, `agent_url`/`agent_model` are never persisted, `_resolve_endpoint` no longer routes to `agent_url`, and the `LLMConfig.mode` column default is now `byok`. |
 | L3 | Multi-config management | ✅ | Multiple configs, one active at a time |
 | L4 | Test connection | ✅ | Sends "Hello!", shows latency + response |
 | L5 | Config generation (docker-compose) | ✅ | Context-aware prompt building |

@@ -578,7 +578,7 @@ export default function UsersPage() {
         )})
       )}
 
-      <DeployForm open={deployOpen} preselectedService={preselectedDeploy} onClose={()=>{setDeployOpen(false); if(deployParam) setSearchParams({})}} onDeployed={()=>{setDeployOpen(false); if(deployParam) setSearchParams({}); loadServices()}}/>
+      <DeployForm open={deployOpen} preselectedService={preselectedDeploy} onClose={()=>{setDeployOpen(false); setPreselectedDeploy(undefined); if(deployParam) setSearchParams({})}} onDeployed={()=>{setDeployOpen(false); setPreselectedDeploy(undefined); if(deployParam) setSearchParams({}); loadServices()}}/>
 
       {/* Password change modal */}
       <Modal title="Change Service Password" open={pwdModalOpen} onCancel={()=>setPwdModalOpen(false)}

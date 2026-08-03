@@ -177,6 +177,10 @@ class ServiceManager:
                 rel = str(f.relative_to(project_dir))
                 if self._is_excluded(rel):
                     continue
+                # `.generated` marker files (written by save_generated_files)
+                # are tracking metadata, not project files — exclude from ALL listings.
+                if rel.endswith(".generated"):
+                    continue
                 files.append(rel)
                 # A file is "generated" if git is available and it is NOT tracked,
                 # OR if it has a .generated marker (LLM-generated files).
@@ -185,10 +189,15 @@ class ServiceManager:
                     generated_files.append(rel)
                 elif not git_tracked and (rel.endswith(".generated") or "generated_" in rel):
                     generated_files.append(rel)
-                # Template classification: only deployment-critical file types
-                # are shown in the "Templates" column (G2).
+                # Template classification: only git-tracked (original repo)
+                # deployment-critical file types are shown in the "Templates"
+                # column (G2 + GAP-4). When git is available, an LLM-generated
+                # (untracked / .generated-marked) deployment-critical file must
+                # appear ONLY in "Generated Files". When git is unavailable we
+                # fall back to type-only classification.
                 if self._is_template_file(rel):
-                    template_files.append(rel)
+                    if not git_tracked or rel in git_tracked:
+                        template_files.append(rel)
 
         has_compose_template = any(f.endswith(".yml.j2") for f in files)
         has_nginx_template = any(f.endswith(".nginx.conf.j2") or f.endswith(".conf.j2") for f in files)

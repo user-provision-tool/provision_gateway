@@ -1,7 +1,7 @@
 # Provision Gateway — Workflows of Important Usage Scenarios (APIs)
 
-> **Version**: 1.2
-> **Date**: 2026-07-29 (updated — Iteration 1: added Add Service from Template workflow, label auto-increment, project notifications, deploy validation)
+> **Version**: 2.0
+> **Date**: 2026-08-01 (updated — Cycle 20260801T165901Z Iteration 1: Add Service from Template is now API-only (GAP-1); local-agent fields deferred at API level (GAP-2); prior: label auto-increment, project notifications, deploy validation)
 > **Purpose**: Step-by-step API workflows for the most important usage scenarios, directly usable with `curl` or any HTTP client.
 
 ---
@@ -675,10 +675,10 @@ curl -s -X POST http://localhost:8771/api/llm/configs \
     "byok_base_url": "https://api.deepseek.com/v1",
     "byok_model": "deepseek-chat",
     "byok_api_key": "sk-your-api-key-here",
-    "agent_url": "",
-    "agent_model": "",
     "system_prompt": "You are a DevOps assistant specializing in Docker, Docker Compose, and Nginx configuration. Generate production-ready configurations."
   }'
+  # Note: local-agent fields (agent_url/agent_model, mode='local_agent') are
+  # deferred at the API level (GAP-2, iter-1) — normalized to byok, never persisted.
 
 # Step 3: Activate the config
 curl -s -X PUT http://localhost:8771/api/llm/configs/1/activate \

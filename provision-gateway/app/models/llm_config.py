@@ -13,7 +13,7 @@ class LLMConfig(Base):
     __tablename__ = "llm_config"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    mode = Column(String(50), nullable=False, default="local_agent")  # 'local_agent' | 'byok'
+    mode = Column(String(50), nullable=False, default="byok")  # 'byok' only; 'local_agent' is a future feature (GAP-2)
     agent_url = Column(String(500), nullable=True)
     agent_model = Column(String(255), nullable=True)
     byok_api_key_enc = Column(Text, nullable=True)  # AES-256-GCM encrypted

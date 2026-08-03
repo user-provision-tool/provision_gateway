@@ -1,7 +1,7 @@
 # Provision Gateway — Architecture Document
 
-> **Version**: 1.1
-> **Date**: 2026-07-08 (updated)
+> **Version**: 1.2
+> **Date**: 2026-08-01 (updated — Cycle 20260801T165901Z Iteration 1: LLM client BYOK-only / llm_config mode default 'byok' (GAP-2), Add Project modal 2 tabs (GAP-1), test-suite counts)
 > **Status**: Current (reflects implemented codebase, post-deduplication refactor)
 
 ---
@@ -93,7 +93,7 @@ Provision Gateway is a **management layer** that wraps the existing `provision-a
 - All Docker operations proxied to provision-api (no direct Docker socket access)
 - All compose/nginx template conversion delegated to provision-api
 - File operations on shared `PROVISION_DIR` volume
-- LLM client for config generation (BYOK + local agent modes)
+- LLM client for config generation (BYOK mode only; local agent deferred to future — GAP-2, iter-1)
 - Proxy configuration management
 - Git operations for service source management
 - Async HTTP proxy to provision-api for all user provisioning operations
@@ -224,6 +224,8 @@ gateway.db
 ├── llm_config              # LLM provider configurations
 │   ├── id (PK), mode, agent_url, agent_model, byok_api_key_enc,
 │   │   byok_base_url, byok_model, is_active, system_prompt, updated_at
+│   │   (mode default is now 'byok'; local-agent fields are deferred —
+│   │   normalized to byok and never persisted — GAP-2, iter-1)
 │
 ├── proxy_configs           # Proxy configurations
 │   ├── id (PK), name, protocol, host, port, username_enc, password_enc,
@@ -287,7 +289,8 @@ main.tsx (Entry Point)
                     │   └── StatCards, Gauges, SystemComponents, UserCards
                     ├── /services[/:name] → ServicesPage
                     │   ├── ServiceTable (list view)
-                    │   ├── AddServiceModal (Git/Upload/Template tabs)
+                    │   ├── Add Project modal (Git / Upload Zip tabs — "From Template"
+                    │   │   tab removed and orphan AddServiceModal.tsx deleted, GAP-1 iter-1)
                     │   └── ServiceDetailPage (file tree, Monaco editor, git diff)
                     ├── /users[/:name] → UsersPage
                     │   ├── DeployForm (modal)
@@ -496,7 +499,7 @@ _provision_gateway/
 │   │   ├── middleware/           # Auth middleware
 │   │   ├── lib/                  # Template converters
 │   │   └── utils/                # Utilities (crypto, parser, scanner)
-│   └── tests/                    # Test suite (7 files, 81 test cases)
+│   └── tests/                    # Test suite (9 test files + conftest.py; full pytest 112 passed / 9 skipped / 0 failed — iter-1, GAP-3 added test_concurrency.py)
 │
 ├── provision-dashboard/          # Frontend (React + TypeScript)
 │   ├── Dockerfile

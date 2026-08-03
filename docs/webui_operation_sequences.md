@@ -1,6 +1,7 @@
 # Provision Gateway — WebUI Operation Sequences
 
-> Date: 2026-07-29 (updated — Iteration 2: GAP-005 route ordering fix, GAP-006 Select import)
+> Version: 2.1
+> Date: 2026-08-01 (updated — Cycle 20260801T165901Z Iteration 2: Upload Zip wording fix — local .zip file picker (DOC-2))
 > Purpose: Document all operation sequences defined by each button on the webui, verified for correctness.
 > Verified against: actual running dashboard at http://localhost:8771
 
@@ -51,10 +52,10 @@
 
 ### 2.1 Add Project Button
 - **Trigger**: Click "Add Project" button (admin only)
-- **Sequence**: Opens modal with 3 tabs:
+- **Sequence**: Opens modal with 2 tabs (iter-1, GAP-1 — "From Template" tab removed):
   - **From Git**: Fill repo URL, branch, name → POST /api/services (mode=git) → clone repo
-  - **Upload Zip**: Fill name, base64 zip content or individual file JSON map → POST /api/services (mode=upload)
-  - **From Template**: Select a pre-built template from the dropdown, enter project name → POST /api/services (mode=template, template_id=N) → create project from DB template
+  - **Upload Zip**: Fill name, select a local .zip file via the file picker, or paste individual file contents as JSON → POST /api/services (mode=upload)
+- **Backend template mode**: `POST /api/services` (mode=template, template_id=N) and `GET /api/services/templates` are RETAINED at the API level but no longer exposed via the modal (the orphan AddServiceModal.tsx component was deleted).
 - **Status**: ✅ Working (route ordering fixed in Iteration 2 — `/templates` and `/notifications` routes now registered before `/{name}` catch-all. Templates endpoint returns data correctly.)
 
 ### 2.2 Project Name Click (folder-open icon)
@@ -317,7 +318,7 @@ Each service card shows these buttons:
 | Page | Operations | Status |
 |---|---|---|
 | Dashboard | 7 operations | All ✅ |
-| Source Projects | 10 operation groups (3 tabs in Add Project) | All ✅ |
+| Source Projects | 10 operation groups (2 tabs in Add Project — From Git / Upload Zip; "From Template" removed, GAP-1) | All ✅ |
 | Services (Users) | 10 operation groups | All ✅ (Up/Down fixed) |
 | Tasks | 4 operations + 1 global notification | ✅ (SSE log per-task ⚠️ reads global log file, filters by task context); global 2s task notification with toast + browser Notification API |
 | Settings | 3 panels (LLM, Proxy, Special Users) | All ✅ |

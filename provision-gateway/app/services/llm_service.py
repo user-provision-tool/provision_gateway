@@ -31,17 +31,25 @@ class LLMService:
         """Get the currently active LLM config (backward compat)."""
         config = db.query(LLMConfig).filter(LLMConfig.is_active == True).first()
         if not config:
-            return {"mode": "local_agent", "agent_url": None, "agent_model": None,
+            return {"mode": "byok", "agent_url": None, "agent_model": None,
                     "byok_configured": False, "byok_model": None,
                     "byok_api_key_masked": None, "is_active": False, "system_prompt": None}
         return config.to_dict()
 
     def create_config(self, db: Session, data: dict) -> LLMConfig:
-        """Create a new LLM config."""
+        """Create a new LLM config.
+
+        Local agent / provision agent are FUTURE features (tasks-21072026
+        #3.1). This API only supports BYOK: any ``mode='local_agent'`` and
+        the ``agent_url`` / ``agent_model`` fields are ignored and normalized
+        to BYOK so the backend never drives generation from a local-agent
+        config (GAP-2).
+        """
+        mode = data.get("mode", "byok")
+        if mode != "byok":
+            mode = "byok"
         config = LLMConfig(
-            mode=data.get("mode", "local_agent"),
-            agent_url=data.get("agent_url", ""),
-            agent_model=data.get("agent_model", ""),
+            mode=mode,
             byok_base_url=data.get("byok_base_url", ""),
             byok_model=data.get("byok_model", ""),
             system_prompt=data.get("system_prompt", ""),
@@ -75,14 +83,25 @@ class LLMService:
         return True
 
     def save_config(self, db: Session, data: dict) -> LLMConfig:
-        """Save/update config (backward compat — creates or updates active)."""
+        """Save/update config (backward compat — creates or updates active).
+
+        Local agent / provision agent are FUTURE features (tasks-21072026
+        #3.1). Any ``mode='local_agent'`` is normalized to BYOK and the
+        ``agent_url`` / ``agent_model`` fields are never persisted (GAP-2).
+        """
         config = db.query(LLMConfig).filter(LLMConfig.is_active == True).first()
         if not config:
             config = LLMConfig()
             db.add(config)
-        config.mode = data.get("mode", config.mode or "local_agent")
-        config.agent_url = data.get("agent_url", config.agent_url)
-        config.agent_model = data.get("agent_model", config.agent_model)
+        mode = data.get("mode")
+        if mode is None:
+            mode = config.mode or "byok"
+        if mode != "byok":
+            mode = "byok"
+        config.mode = mode
+        # Clear local-agent fields — never drive generation from a local-agent config.
+        config.agent_url = None
+        config.agent_model = None
         config.byok_base_url = data.get("byok_base_url", config.byok_base_url)
         config.byok_model = data.get("byok_model", config.byok_model)
         config.system_prompt = data.get("system_prompt", config.system_prompt)
@@ -99,25 +118,26 @@ class LLMService:
 
     def _resolve_endpoint(self, db: Session) -> tuple[str, str, dict]:
         """Resolve which LLM endpoint to use.
-        
+
         Returns (base_url, model, extra_headers).
+
+        Local agent / provision agent are FUTURE features (tasks-21072026
+        #3.1). The backend must NOT drive generation from a local-agent
+        config: only an active BYOK config is used; otherwise a neutral
+        OpenAI-compatible default is returned (GAP-2).
         """
         config = db.query(LLMConfig).filter(LLMConfig.is_active == True).first()
-        
+
         if config and config.mode == "byok" and config.byok_api_key_enc:
             api_key = decrypt_api_key(config.byok_api_key_enc)
             base = config.byok_base_url or "https://api.openai.com/v1"
             model = config.byok_model or "gpt-4o"
             headers = {"Authorization": f"Bearer {api_key}"}
-        elif config and config.agent_url:
-            base = config.agent_url
-            model = config.agent_model or "llama3.1:8b"
-            headers = {}
         else:
             base = "http://localhost:11434/v1"
             model = "llama3.1:8b"
             headers = {}
-        
+
         return base, model, headers
 
     async def test_connection(self, db: Session) -> dict:

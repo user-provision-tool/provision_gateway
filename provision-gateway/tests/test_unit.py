@@ -387,6 +387,104 @@ class TestTemplateClassification:
 
 
 # ---------------------------------------------------------------------------
+# Tests for GAP-4 — template classification must enforce git-tracked/original criterion
+# ---------------------------------------------------------------------------
+
+class TestTemplateClassificationGitTracked:
+    """LLM-generated (untracked / .generated-marked) deployment-critical files
+    must appear ONLY in Generated Files, never in Templates (GAP-4)."""
+
+    @staticmethod
+    def _fake_git_ls_files(stdout: str):
+        import subprocess
+
+        def fake_run(args, *a, **k):
+            if "ls-files" in args:
+                return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+            raise AssertionError(f"unexpected subprocess.run call: {args}")
+        return fake_run
+
+    @staticmethod
+    def _fake_git_missing():
+        import subprocess
+
+        def fake_run(args, *a, **k):
+            if "ls-files" in args:
+                return subprocess.CompletedProcess(args, 128, stdout="", stderr="not a git repo")
+            raise AssertionError(f"unexpected subprocess.run call: {args}")
+        return fake_run
+
+    def test_untracked_deployment_file_not_in_templates(self, tmp_path, monkeypatch):
+        """An untracked (LLM-generated) docker-compose.yml must NOT be in template_files."""
+        from app.services.service_manager import ServiceManager
+        project = tmp_path / "myapp"
+        project.mkdir()
+        (project / "Dockerfile").write_text("FROM python:3.12")
+        (project / "docker-compose.yml").write_text("services: {}\n")
+        (project / "main.py").write_text("print('hi')\n")
+
+        # Dockerfile and main.py are git-tracked (original); docker-compose.yml is not.
+        monkeypatch.setattr(
+            "subprocess.run",
+            self._fake_git_ls_files("Dockerfile\nmain.py\n"),
+        )
+
+        info = ServiceManager()._get_service_info(project)
+        assert "docker-compose.yml" in info["generated_files"]
+        assert "docker-compose.yml" not in info["template_files"]
+        assert "Dockerfile" in info["template_files"]
+        assert "Dockerfile" not in info["generated_files"]
+
+    def test_tracked_deployment_files_are_templates(self, tmp_path, monkeypatch):
+        """A git-tracked original deployment-critical file should be a template."""
+        from app.services.service_manager import ServiceManager
+        project = tmp_path / "myapp"
+        project.mkdir()
+        (project / "Dockerfile").write_text("FROM python:3.12")
+        (project / "nginx.conf").write_text("server {}\n")
+
+        monkeypatch.setattr(
+            "subprocess.run",
+            self._fake_git_ls_files("Dockerfile\nnginx.conf\n"),
+        )
+
+        info = ServiceManager()._get_service_info(project)
+        assert "Dockerfile" in info["template_files"]
+        assert "nginx.conf" in info["template_files"]
+        assert "Dockerfile" not in info["generated_files"]
+
+    def test_generated_marker_excluded_from_all_listings(self, tmp_path, monkeypatch):
+        """`.generated` marker files must be excluded from files, generated_files, template_files."""
+        from app.services.service_manager import ServiceManager
+        project = tmp_path / "myapp"
+        project.mkdir()
+        (project / "docker-compose.yml").write_text("services: {}\n")
+        (project / "docker-compose.yml.generated").write_text("")
+
+        # The marker file itself is untracked; docker-compose.yml is untracked too (LLM-generated).
+        monkeypatch.setattr("subprocess.run", self._fake_git_ls_files(""))
+
+        info = ServiceManager()._get_service_info(project)
+        assert "docker-compose.yml.generated" not in info["files"]
+        assert "docker-compose.yml.generated" not in info["generated_files"]
+        assert "docker-compose.yml.generated" not in info["template_files"]
+
+    def test_no_git_fallback_uses_type_classification(self, tmp_path, monkeypatch):
+        """When git is unavailable, fall back to type-based template classification (GAP-4)."""
+        from app.services.service_manager import ServiceManager
+        project = tmp_path / "myapp"
+        project.mkdir()
+        (project / "Dockerfile").write_text("FROM python:3.12")
+        (project / "main.py").write_text("print('hi')\n")
+
+        monkeypatch.setattr("subprocess.run", self._fake_git_missing())
+
+        info = ServiceManager()._get_service_info(project)
+        assert "Dockerfile" in info["template_files"]
+        assert "main.py" not in info["template_files"]
+
+
+# ---------------------------------------------------------------------------
 # Tests for G9 — Agent fields guard in LLMConfig.to_dict()
 # ---------------------------------------------------------------------------
 
@@ -427,6 +525,131 @@ class TestLLMConfigToDict:
         assert result["agent_url"] == "http://agent:11434"
         assert result["agent_model"] == "llama3.1:8b"
         assert result["system_prompt"] == "You are a helpful assistant."
+
+
+# ---------------------------------------------------------------------------
+# Tests for GAP-2 — backend defers local-agent fields (future feature)
+# ---------------------------------------------------------------------------
+
+class _FakeSession:
+    """Minimal in-memory stand-in for a SQLAlchemy Session used by LLMService.
+
+    Only supports the query/filter/first chain and add/commit/refresh used by
+    llm_service config methods.
+    """
+
+    def __init__(self, config=None):
+        self._config = config
+        self.added = []
+        self.committed = False
+
+    def query(self, *args, **kwargs):
+        return self
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def first(self):
+        return self._config
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    def commit(self):
+        self.committed = True
+
+    def refresh(self, obj):
+        pass
+
+
+class TestLLMConfigDefersLocalAgent:
+    """Backend LLM config API must NOT accept/persist local-agent fields (GAP-2)."""
+
+    def test_create_config_defaults_to_byok(self):
+        """create_config should default mode to 'byok' (not 'local_agent')."""
+        from app.services.llm_service import LLMService
+        db = _FakeSession()
+        config = LLMService().create_config(db, {})
+        assert config.mode == "byok"
+        assert config.agent_url is None
+        assert config.agent_model is None
+
+    def test_create_config_ignores_local_agent_mode(self):
+        """create_config should normalize mode='local_agent' to 'byok' and drop agent fields."""
+        from app.services.llm_service import LLMService
+        db = _FakeSession()
+        config = LLMService().create_config(db, {
+            "mode": "local_agent",
+            "agent_url": "http://agent:11434",
+            "agent_model": "llama3.1:8b",
+            "byok_base_url": "https://api.example.com/v1",
+            "byok_model": "gpt-4o",
+        })
+        assert config.mode == "byok"
+        assert config.agent_url is None
+        assert config.agent_model is None
+        assert config.byok_base_url == "https://api.example.com/v1"
+        assert config.byok_model == "gpt-4o"
+
+    def test_save_config_clears_agent_fields(self):
+        """save_config should clear any previously stored agent_url/agent_model."""
+        from app.services.llm_service import LLMService
+        from app.models.llm_config import LLMConfig
+        existing = LLMConfig()
+        existing.id = 1
+        existing.mode = "local_agent"
+        existing.agent_url = "http://agent:11434"
+        existing.agent_model = "llama3.1:8b"
+        existing.byok_model = "old-model"
+        existing.is_active = True
+
+        db = _FakeSession(config=existing)
+        config = LLMService().save_config(db, {"byok_base_url": "https://api.example.com/v1"})
+        assert config.mode == "byok"
+        assert config.agent_url is None
+        assert config.agent_model is None
+        assert config.byok_base_url == "https://api.example.com/v1"
+
+    def test_resolve_endpoint_never_uses_agent_url(self):
+        """_resolve_endpoint must NOT route to agent_url even for a legacy local_agent config."""
+        from app.services.llm_service import LLMService
+        from app.models.llm_config import LLMConfig
+        legacy = LLMConfig()
+        legacy.id = 1
+        legacy.mode = "local_agent"
+        legacy.agent_url = "http://agent:11434"
+        legacy.agent_model = "llama3.1:8b"
+        legacy.byok_api_key_enc = None
+        legacy.is_active = True
+
+        base, model, headers = LLMService()._resolve_endpoint(_FakeSession(config=legacy))
+        assert "agent" not in base
+        assert base == "http://localhost:11434/v1"
+
+    def test_resolve_endpoint_uses_byok_when_configured(self):
+        """_resolve_endpoint should use the BYOK endpoint when a byok config is active."""
+        from app.services.llm_service import LLMService
+        from app.models.llm_config import LLMConfig
+        byok = LLMConfig()
+        byok.id = 1
+        byok.mode = "byok"
+        byok.byok_api_key_enc = "enc-key"
+        byok.byok_base_url = "https://api.deepseek.com/v1"
+        byok.byok_model = "deepseek-chat"
+        byok.is_active = True
+
+        base, model, headers = LLMService()._resolve_endpoint(_FakeSession(config=byok))
+        assert base == "https://api.deepseek.com/v1"
+        assert model == "deepseek-chat"
+        assert "Authorization" in headers
+
+    def test_model_column_default_is_byok(self):
+        """LLMConfig.mode SQLAlchemy column default must be 'byok' (not 'local_agent', GAP-2)."""
+        from sqlalchemy.schema import ColumnDefault
+        from app.models.llm_config import LLMConfig
+        col = LLMConfig.__table__.c.mode
+        assert isinstance(col.default, ColumnDefault), "mode column should have a column default"
+        assert col.default.arg == "byok", f"expected column default 'byok', got {col.default.arg!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -570,24 +793,24 @@ class TestUploadModeJSONFormat:
     """Tests that upload mode sends JSON with base64 content (G7)."""
 
     def test_upload_uses_file_reader(self):
-        """AddServiceModal should use FileReader for reading upload files."""
+        """UploadZipForm (ServicesPage) should use FileReader for reading upload files."""
         from pathlib import Path
-        modal_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "AddServiceModal.tsx"
-        content = modal_path.read_text()
+        page_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "pages" / "ServicesPage.tsx"
+        content = page_path.read_text()
         assert "FileReader" in content, "Upload should use FileReader to read files"
 
     def test_upload_uses_base64_encoding(self):
-        """AddServiceModal should encode files as base64 for JSON upload."""
+        """UploadZipForm (ServicesPage) should encode files as base64 for JSON upload."""
         from pathlib import Path
-        modal_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "AddServiceModal.tsx"
-        content = modal_path.read_text()
+        page_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "pages" / "ServicesPage.tsx"
+        content = page_path.read_text()
         assert "base64" in content, "Upload should use base64 encoding"
 
     def test_upload_uses_json_create_service(self):
-        """AddServiceModal should use createServiceGit with JSON mode 'upload'."""
+        """UploadZipForm (ServicesPage) should pass JSON mode 'upload' to the API."""
         from pathlib import Path
-        modal_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "AddServiceModal.tsx"
-        content = modal_path.read_text()
+        page_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "pages" / "ServicesPage.tsx"
+        content = page_path.read_text()
         assert "mode: 'upload'" in content or 'mode: "upload"' in content, (
             "Upload should pass mode: 'upload' to the API"
         )
@@ -598,34 +821,10 @@ class TestUploadModeJSONFormat:
 # ---------------------------------------------------------------------------
 
 class TestTemplateMode:
-    """Tests that template mode is implemented (GAP-001)."""
-
-    def test_template_mode_in_state(self):
-        """AddServiceModal mode state should include 'template'."""
-        from pathlib import Path
-        modal_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "AddServiceModal.tsx"
-        content = modal_path.read_text()
-        mode_line = None
-        for line in content.splitlines():
-            if "useState" in line and ("mode" in line or "Mode" in line):
-                mode_line = line
-                break
-        assert mode_line is not None, "Could not find mode useState declaration"
-        assert "'template'" in mode_line or '"template"' in mode_line, (
-            "mode state should include 'template' option"
-        )
-
-    def test_template_tab_in_tab_items(self):
-        """AddServiceModal should contain 'From Template' tab."""
-        from pathlib import Path
-        modal_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "AddServiceModal.tsx"
-        content = modal_path.read_text()
-        assert "From Template" in content, (
-            "Template tab should be present in AddServiceModal"
-        )
+    """Tests that backend template mode remains supported while the UI no longer exposes a "From Template" option (GAP-1)."""
 
     def test_template_endpoint_exists_in_services_router(self):
-        """Services router should expose GET /templates."""
+        """Services router should expose GET /templates (backend template support retained)."""
         from app.routers.services import router
         routes = [r.path for r in router.routes]
         assert any("/templates" in r for r in routes), (
@@ -646,26 +845,45 @@ class TestTemplateMode:
         )
         assert callable(ServiceManager.create_from_template)
 
-    def test_services_page_has_from_template_tab(self):
-        """ServicesPage.tsx should contain 'From Template' tab."""
+    def test_services_page_has_no_from_template_tab(self):
+        """ServicesPage.tsx should NOT contain 'From Template' tab (GAP-1)."""
         from pathlib import Path
         services_page = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "pages" / "ServicesPage.tsx"
         content = services_page.read_text()
-        assert "From Template" in content, (
-            "ServicesPage should have 'From Template' tab in the inline modal"
+        assert "From Template" not in content, (
+            "ServicesPage should NOT have 'From Template' tab in the inline modal (GAP-1)"
         )
 
-    def test_services_page_has_template_form_component(self):
-        """ServicesPage.tsx should have a TemplateForm component."""
+    def test_services_page_has_no_template_form_component(self):
+        """ServicesPage.tsx should NOT have a TemplateForm component (GAP-1)."""
         from pathlib import Path
         services_page = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "pages" / "ServicesPage.tsx"
         content = services_page.read_text()
-        assert "TemplateForm" in content, (
-            "ServicesPage should define a TemplateForm component"
+        assert "TemplateForm" not in content, (
+            "ServicesPage should NOT define a TemplateForm component (GAP-1)"
         )
-        assert "AppstoreOutlined" in content, (
-            "ServicesPage template tab should use AppstoreOutlined icon"
+        assert "AppstoreOutlined" not in content, (
+            "ServicesPage should NOT import AppstoreOutlined for a template tab (GAP-1)"
         )
+
+    def test_add_service_modal_orphan_removed(self):
+        """The orphan AddServiceModal.tsx component should have been removed (GAP-1)."""
+        from pathlib import Path
+        modal_path = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "AddServiceModal.tsx"
+        assert not modal_path.exists(), (
+            "AddServiceModal.tsx is orphan dead code and should have been removed (GAP-1)"
+        )
+
+    def test_add_service_modal_not_imported_anywhere(self):
+        """No remaining source file should import AddServiceModal (GAP-1)."""
+        from pathlib import Path
+        src = Path(__file__).parent.parent.parent / "provision-dashboard" / "src"
+        for p in src.rglob("*.ts*"):
+            if "AddServiceModal" in p.name:
+                continue
+            if "AddServiceModal" in p.read_text(errors="ignore"):
+                raise AssertionError(f"{p} still imports AddServiceModal")
+
 
 
 # ---------------------------------------------------------------------------

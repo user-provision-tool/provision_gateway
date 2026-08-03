@@ -77,6 +77,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       loadSslDomains()
       // Reset auto-deploy state
       setMissingFiles([])
+      setCheckError(null)
       setScanContext(null)
       setAutoDeploy(true)
       setGeneratedFiles({})
@@ -141,7 +142,31 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     } finally { setCheckingMissing(false) }
   }
 
-  // Generate missing files via LLM
+  // Generate missing files via LLM — shared by the manual "Generate" button
+  // and the auto-completion path in handleDeploy
+  const generateFilesFor = async (fileTypes: string[], ctx: any): Promise<Record<string,string>> => {
+    const results: Record<string,string> = {}
+    for (const fileType of fileTypes) {
+      const typeMap: Record<string, string> = {
+        'docker-compose': 'docker_compose',
+        'nginx.conf': 'nginx_conf',
+        '.env': 'env_file',
+        'Dockerfile': 'dockerfile',
+      }
+      const genType = typeMap[fileType] || 'docker_compose'
+      try {
+        const { data } = await client.post('/llm/generate', { type: genType, context: ctx })
+        if (data.generated_content) {
+          const filename = fileType === 'docker-compose' ? 'docker-compose.yml' :
+                          fileType === 'nginx.conf' ? 'nginx.conf' : fileType
+          results[filename] = data.generated_content
+        }
+      } catch { /* skip individual failures */ }
+    }
+    return results
+  }
+
+  // Generate missing files via LLM (manual button)
   const generateMissingFiles = async () => {
     setGeneratingFiles(true)
     try {
@@ -152,24 +177,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         port: 80,
         needs_db: false,
       }
-      const results: Record<string,string> = {}
-      for (const fileType of missingFiles) {
-        const typeMap: Record<string, string> = {
-          'docker-compose': 'docker_compose',
-          'nginx.conf': 'nginx_conf',
-          '.env': 'env_file',
-          'Dockerfile': 'dockerfile',
-        }
-        const genType = typeMap[fileType] || 'docker_compose'
-        try {
-          const { data } = await client.post('/llm/generate', { type: genType, context: ctx })
-          if (data.generated_content) {
-            const filename = fileType === 'docker-compose' ? 'docker-compose.yml' :
-                            fileType === 'nginx.conf' ? 'nginx.conf' : fileType
-            results[filename] = data.generated_content
-          }
-        } catch { /* skip individual failures */ }
-      }
+      const results = await generateFilesFor(missingFiles, ctx)
       setGeneratedFiles(results)
       if (Object.keys(results).length > 0) {
         message.success(`LLM generated ${Object.keys(results).length} file(s)`)
@@ -189,20 +197,49 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   const handleDeploy = async (values: any) => {
     setLoading(true)
     try {
-      // GAP-002: Block deploy when missing files exist and no generated files available
-      if (missingFiles.length > 0 && Object.keys(generatedFiles).length === 0) {
-        message.error('Cannot deploy: missing essential files. Use LLM auto-generation or upload files manually.')
-        setLoading(false)
-        return
+      // Snapshot previously generated files; anything generated during this call is tracked locally
+      let gen = generatedFiles
+
+      // No generated files available yet:
+      //  - Auto Templates Completion ON  → always generate the essential files via LLM and deploy.
+      //    Missing-file state (including a failed readiness check) does NOT block — the user has
+      //    asked the system to provide all needed files.
+      //  - Auto Templates Completion OFF → block deploy while essential files are missing (GAP-002)
+      if (Object.keys(gen).length === 0) {
+        if (autoDeploy) {
+          // If the readiness check failed we don't have a real missing list — fall back to the
+          // full essential set so the LLM still supplies everything needed for deployment.
+          const fileTypes = (missingFiles.length > 0 && missingFiles[0] !== '(check failed — try again)')
+            ? missingFiles
+            : ['docker-compose', 'nginx.conf', 'Dockerfile']
+          const ctx = scanContext || {
+            repo_description: `Service: ${values.service_name || 'unknown'}`,
+            repo_files: [],
+            port: 80,
+            needs_db: false,
+          }
+          gen = await generateFilesFor(fileTypes, ctx)
+          if (Object.keys(gen).length === 0) {
+            message.error('Auto Templates Completion could not generate the missing files. Configure BYOK LLM in Settings.')
+            setLoading(false)
+            return
+          }
+          setGeneratedFiles(gen)
+          message.success(`LLM generated ${Object.keys(gen).length} file(s) — deploying...`)
+        } else {
+          message.error('Cannot deploy: missing essential files. Use LLM auto-generation or upload files manually.')
+          setLoading(false)
+          return
+        }
       }
 
       const selectedService = sources.find(s => s.name === values.service_name)
 
       // Save any LLM-generated files first — execute regardless of autoDeploy state
-      if (Object.keys(generatedFiles).length > 0) {
+      if (Object.keys(gen).length > 0) {
         await client.post('/services/save-generated', {
           service_name: values.service_name,
-          files: generatedFiles,
+          files: gen,
         })
       }
 
@@ -223,9 +260,9 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         const composeJ2 = selectedService.files.find((f: string) => f.endsWith('.yml.j2'))
         const nginxJ2 = selectedService.files.find((f: string) => f.endsWith('.conf.j2'))
         if (composeJ2) payload.compose_file_path = composeJ2
-        else if (generatedFiles['docker-compose.yml']) payload.compose_file_path = 'docker-compose.yml'
+        else if (gen['docker-compose.yml']) payload.compose_file_path = 'docker-compose.yml'
         if (nginxJ2) payload.nginx_conf_file_path = nginxJ2
-        else if (generatedFiles['nginx.conf']) payload.nginx_conf_file_path = 'nginx.conf'
+        else if (gen['nginx.conf']) payload.nginx_conf_file_path = 'nginx.conf'
       }
 
       // HTTPS certs
@@ -263,6 +300,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   }
 
   const selectedServiceName = Form.useWatch('service_name', form)
+  const selectedUserName = Form.useWatch('user_name', form)
 
   return (
     <Modal
@@ -273,7 +311,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       width={640}
       destroyOnClose
     >
-      <Form form={form} layout="vertical" onFinish={handleDeploy}
+      <Form form={form} layout="vertical" onFinish={handleDeploy} preserve={false}
         initialValues={{ label: '0', domain: 'localhost', https: false }}>
         
         <Space style={{ width: '100%' }} direction="vertical" size="middle">
@@ -407,14 +445,19 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
                   {autoDeploy && (
                     <div style={{marginTop:8}}>
                       {Object.keys(generatedFiles).length === 0 ? (
-                        <Button
-                          size="small"
-                          icon={<RobotOutlined />}
-                          loading={generatingFiles}
-                          onClick={generateMissingFiles}
-                        >
-                          Generate Missing Files via LLM
-                        </Button>
+                        <div>
+                          <Button
+                            size="small"
+                            icon={<RobotOutlined />}
+                            loading={generatingFiles}
+                            onClick={generateMissingFiles}
+                          >
+                            Generate Missing Files via LLM
+                          </Button>
+                          <div style={{marginTop:4,fontSize:12,color:'#999'}}>
+                            Optional — you can generate & review first, or just click <strong>Deploy</strong> to auto-generate and deploy.
+                          </div>
+                        </div>
                       ) : (
                         <div>
                           <Tag color="green">✓ Generated {Object.keys(generatedFiles).length} file(s)</Tag>
@@ -529,7 +572,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           <Space style={{ justifyContent: 'flex-end', width: '100%' }}>
             <Button onClick={onClose}>Cancel</Button>
             <Button type="primary" htmlType="submit" loading={loading} icon={<span>🚀</span>}
-              disabled={!!checkError || (missingFiles.length > 0 && Object.keys(generatedFiles).length === 0)}>
+              disabled={!selectedUserName || !selectedServiceName || (!autoDeploy && (!!checkError || (missingFiles.length > 0 && Object.keys(generatedFiles).length === 0)))}>
               Deploy
             </Button>
           </Space>

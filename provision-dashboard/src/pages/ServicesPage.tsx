@@ -2,12 +2,12 @@ import { useState, useEffect, useMemo } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Typography, Card, Table, Button, Modal, Form, Input,
-  Space, message, Tag, Empty, Tabs, Spin, Checkbox, Upload, Select
+  Space, message, Tag, Empty, Tabs, Spin, Checkbox, Upload
 } from 'antd'
 import type { UploadProps } from 'antd'
 import {
   PlusOutlined, DeleteOutlined, FolderOpenOutlined,
-  GithubOutlined, UploadOutlined, InboxOutlined, AppstoreOutlined
+  GithubOutlined, UploadOutlined, InboxOutlined
 } from '@ant-design/icons'
 import Editor, { DiffEditor } from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
@@ -33,7 +33,7 @@ export default function ServicesPage() {
   const [loading, setLoading] = useState(true)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [addLoading, setAddLoading] = useState(false)
-  const [addMode, setAddMode] = useState<'git' | 'upload' | 'template'>('git')
+  const [addMode, setAddMode] = useState<'git' | 'upload'>('git')
   const [form] = Form.useForm()
   const [proxyEnabled, setProxyEnabled] = useState(false)
 
@@ -139,9 +139,6 @@ export default function ServicesPage() {
           { key:'upload', label:<span><UploadOutlined/> Upload Zip</span>, children:
             <UploadZipForm form={form} addLoading={addLoading} setAddLoading={setAddLoading}
               onSuccess={()=>{setAddModalOpen(false);form.resetFields();loadServices()}} /> },
-          { key:'template', label:<span><AppstoreOutlined/> From Template</span>, children:
-            <TemplateForm form={form} addLoading={addLoading} setAddLoading={setAddLoading}
-              onSuccess={()=>{setAddModalOpen(false);form.resetFields();loadServices()}} /> },
         ]}/>
       </Modal>
     </div>
@@ -216,81 +213,6 @@ function UploadZipForm({ form, addLoading, setAddLoading, onSuccess }: {
       </Form.Item>
       <Button type="primary" htmlType="submit" loading={addLoading} block>
         Create from Upload
-      </Button>
-    </Form>
-  )
-}
-
-// ---- Template Form ----
-interface TemplateOption {
-  id: number; name: string; description?: string; category?: string; icon?: string
-}
-
-function TemplateForm({ form, addLoading, setAddLoading, onSuccess }: {
-  form: any; addLoading: boolean; setAddLoading: (v: boolean) => void; onSuccess: () => void
-}) {
-  const [templates, setTemplates] = useState<TemplateOption[]>([])
-  const [loadingTemplates, setLoadingTemplates] = useState(false)
-  const [selectedTemplateId, setSelectedTemplateId] = useState<number | null>(null)
-
-  useEffect(() => {
-    loadTemplates()
-  }, [])
-
-  const loadTemplates = async () => {
-    setLoadingTemplates(true)
-    try {
-      const { data } = await client.get('/services/templates')
-      setTemplates(data.templates || [])
-    } catch {
-      setTemplates([])
-    } finally {
-      setLoadingTemplates(false)
-    }
-  }
-
-  const handleCreateFromTemplate = async (values: any) => {
-    if (!selectedTemplateId) {
-      message.warning('Please select a template')
-      return
-    }
-    setAddLoading(true)
-    try {
-      await client.post('/services', {
-        mode: 'template',
-        name: values.name,
-        template_id: selectedTemplateId,
-      })
-      message.success('Service created from template!')
-      onSuccess()
-    } catch (err: any) {
-      message.error(err.response?.data?.detail || 'Failed to create service from template')
-    } finally { setAddLoading(false) }
-  }
-
-  return (
-    <Form form={form} layout="vertical" onFinish={handleCreateFromTemplate}>
-      <Form.Item name="name" label="Service Name" rules={[{ required: true }]}>
-        <Input placeholder="myapp" />
-      </Form.Item>
-      <Form.Item label="Template" required>
-        {loadingTemplates ? <Spin /> : templates.length === 0 ? (
-          <Card size="small"><Text type="secondary">No templates available. Built-in templates will appear here.</Text></Card>
-        ) : (
-          <Select
-            style={{ width: '100%' }}
-            placeholder="Select a template"
-            value={selectedTemplateId}
-            onChange={(val) => setSelectedTemplateId(val)}
-            options={templates.map(t => ({
-              value: t.id,
-              label: `${t.name}${t.description ? ' — ' + t.description : ''}`,
-            }))}
-          />
-        )}
-      </Form.Item>
-      <Button type="primary" htmlType="submit" loading={addLoading} block>
-        Create from Template
       </Button>
     </Form>
   )

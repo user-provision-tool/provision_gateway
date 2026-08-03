@@ -1,7 +1,7 @@
 # Provision Gateway — API Reference
 
-> **Version**: 1.2
-> **Date**: 2026-07-29 (updated — Iteration 1 dev-debug-flow: added /templates, /notifications, /next-label endpoints; template mode in POST /api/services)
+> **Version**: 2.0
+> **Date**: 2026-08-01 (updated — Cycle 20260801T165901Z Iteration 1: From Template tab removed from UI / mode=template API-only (GAP-1), local-agent fields deferred at API level (GAP-2); prior: /templates, /notifications, /next-label endpoints)
 > **Base URL**: `http://provision-gateway:8770` (internal) / `http://localhost:8771/api` (via dashboard proxy)
 
 ---
@@ -753,7 +753,7 @@ List all service source projects.
 
 ### `GET /api/services/templates`
 
-List all available service templates from the database (service_templates table). Used by the "From Template" tab in the Add Project modal.
+List all available service templates from the database (service_templates table). Backend `mode: template` + this endpoint are RETAINED (iter-1); note the "From Template" tab was removed from the Add Project modal (GAP-1), so the endpoint is now consumed via the API only, not the UI.
 
 **Response 200:**
 ```json
@@ -840,6 +840,7 @@ Create a new service project. Three modes:
   "template_id": 1
 }
 ```
+> Note: supported at the API level and retained by iter-1 (GAP-1). The UI no longer exposes this mode — the "From Template" tab was removed from the Add Project modal; the modal now offers From Git + Upload Zip only.
 
 **Response 201:**
 ```json
@@ -1482,11 +1483,10 @@ Create a new LLM configuration.
   "byok_base_url": "https://api.openai.com/v1",
   "byok_model": "gpt-4o",
   "byok_api_key": "sk-abc123...",
-  "agent_url": "",
-  "agent_model": "",
   "system_prompt": "You are a DevOps assistant specializing in Docker and Nginx."
 }
 ```
+> Local-agent fields (`mode='local_agent'`, `agent_url`, `agent_model`) are deferred at the API level (GAP-2, iter-1): `create_config`/`save_config` normalize any `mode='local_agent'` to `byok` and never persist `agent_url`/`agent_model`.
 
 **Response 201:**
 ```json

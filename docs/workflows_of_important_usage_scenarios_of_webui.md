@@ -1,7 +1,7 @@
 # Provision Gateway — Workflows of Important Usage Scenarios (WebUI)
 
-> **Version**: 1.2
-> **Date**: 2026-07-28 (updated — Iteration 2: auto-deploy flow, task notification, template classification)
+> **Version**: 2.1
+> **Date**: 2026-08-01 (updated — Cycle 20260801T165901Z Iteration 2: Upload Zip section — local .zip file picker wording fix (DOC-1); task-notification polling 15s→2s (DOC-3))
 > **Purpose**: Step-by-step WebUI workflows verified against the actual dashboard at `http://localhost:8771`.
 
 ---
@@ -120,7 +120,7 @@
 
 **Steps:**
 1. Click **"+ Add Project"** button (top-right)
-2. Modal opens with 3 tabs: From Git, Upload Zip, From Template
+2. Modal opens with 2 tabs: From Git, Upload Zip (iter-1, GAP-1 — "From Template" tab removed)
 3. **"From Git"** tab:
    - **Repository URL:** Paste GitHub/GitLab URL (e.g., `https://github.com/user/repo.git`)
    - **Branch:** Enter branch name (default: `main`)
@@ -153,7 +153,7 @@
 1. Click **"+ Add Project"**
 2. Select **"Upload Zip"** tab
 3. Enter **Service Name**
-4. **Option A:** Paste base64-encoded ZIP content
+4. **Option A:** Select a local `.zip` file via the file picker (drag-and-drop / browse — `Upload.Dragger`)
 5. **Option B:** Provide files as JSON map (compose, nginx, env, dockerfile)
 6. Click **"Create"**
 
@@ -166,17 +166,15 @@
 
 **Goal:** Create a service project from a pre-built template in the service_templates database table.
 
+> **IMPORTANT (iter-1, GAP-1):** The "From Template" tab has been REMOVED from the Add Source Project modal (UI now offers From Git + Upload Zip only; orphan `AddServiceModal.tsx` deleted). This flow is now **API-only** — the backend `mode: template` path and `GET /api/services/templates` are retained.
+
 **Page:** `/services`
 
-**Steps:**
-1. Click **"+ Add Project"**
-2. Select **"From Template"** tab
-3. **Template** dropdown loads available templates from `GET /api/services/templates`
-4. Select a template (e.g., WordPress with MySQL)
-5. Enter **Service Name** for the new project
-6. Click **"Create from Template"**
-7. The system creates the project using the template's compose_j2, nginx_j2, env_template, and dockerfile content
-8. New project appears in the services table
+**Steps (API-only):**
+1. Load available templates: `GET /api/services/templates`
+2. Create the project: `POST /api/services` with `{"mode": "template", "template_id": N, "name": "..."}`
+3. The system creates the project using the template's compose_j2, nginx_j2, env_template, and dockerfile content
+4. New project appears in the services table
 
 **API calls:**
 - `GET /api/services/templates` → Load available templates
@@ -429,14 +427,12 @@
 **What you see:**
 1. **LLM Configuration Panel:**
    - Existing configs shown as cards with: mode icon, model name, base URL, ACTIVE badge, delete button
-   - **Add Config Form:**
-     - **Mode:** Dropdown — Bring Your Own Key / Local Agent
+   - **Add Config Form (BYOK-only, GAP-2 iter-1):**
+     - **Mode:** Fixed to "Bring Your Own Key (OpenAI-compatible)" — the dropdown is disabled; Local Agent and Provision Agent are FUTURE features and are no longer selectable in the UI
      - **API Base URL:** Pre-filled placeholder (`https://api.deepseek.com/v1`)
      - **Model Name:** Pre-filled placeholder (`deepseek-chat`)
      - **API Key:** Password input with show/hide toggle
-     - **Agent URL:** For local mode (`http://localhost:11434/v1`)
-     - **Agent Model:** For local mode (`llama3.1:8b`)
-     - **System Prompt:** Textarea for custom system prompt
+     - Note: The **Agent URL / Agent Model / System Prompt** fields have been REMOVED from the BYOK panel (Req R13 — Settings is BYOK-only). Local-agent fields are deferred at the API level too (GAP-2, iter-1): `mode='local_agent'` is normalized to `byok`, and `agent_url`/`agent_model` are never persisted. The SettingsPage.tsx form exposes only Mode / API Base URL / Model Name / API Key.
    - **Add Config** button (save icon)
    - **Test Active** button (robot icon) → Tests connection, shows success/failure alert
 
@@ -606,7 +602,7 @@
 | Login | `/login` | Public | Email+password, register link |
 | Setup | `/setup` | First-run only | Admin account creation |
 | Dashboard | `/dashboard` | Authenticated | Stats, gauges, system components, user cards, reconcile |
-| Source Projects | `/services` | Authenticated | Project table, add (git/upload/template), file editor, git diff, convert |
+| Source Projects | `/services` | Authenticated | Project table, add (git/upload — template creation is API-only, GAP-1), file editor, git diff, convert |
 | Services | `/users` | Authenticated | Per-user service cards, deploy, up/down, rebuild, clone, password, test |
 | Tasks | `/tasks` | Authenticated | Task table, SSE log viewer, cancel/delete |
 | Settings | `/settings` | Admin | LLM config, proxy config, special users |
@@ -623,4 +619,4 @@
 6. **Loading states:** Spin indicators shown while data loads; "Loading..." text for gauges
 7. **Empty states:** Appropriate messages when no data (e.g., "No services yet")
 8. **Error handling:** Toast notifications for API errors; 401 auto-redirects to login
-9. **Task notifications:** Browser notifications + toasts for completed/failed tasks (15s polling)
+9. **Task notifications:** Browser notifications + toasts for completed/failed tasks (2s polling)
