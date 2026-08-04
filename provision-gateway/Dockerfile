@@ -27,9 +27,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Docker Compose plugin (curl honors *_PROXY env vars)
+# Install Docker Compose plugin (curl honors *_PROXY env vars).
+# -C - + --retry --retry-all-errors: the proxy drops long downloads (~2.5-3min),
+# so resume from the partial file instead of failing the whole build.
 RUN mkdir -p /usr/local/lib/docker/cli-plugins && \
-    curl -SL "https://github.com/docker/compose/releases/download/v2.40.3/docker-compose-linux-$(uname -m | sed 's/aarch64/aarch64/;s/x86_64/x86_64/')" -o /usr/local/lib/docker/cli-plugins/docker-compose && \
+    curl -SL -C - --retry 100 --retry-delay 5 --retry-all-errors \
+      "https://github.com/docker/compose/releases/download/v2.40.3/docker-compose-linux-$(uname -m | sed 's/aarch64/aarch64/;s/x86_64/x86_64/')" \
+      -o /usr/local/lib/docker/cli-plugins/docker-compose && \
     chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
 # Install Python dependencies (pip honors *_PROXY env vars)

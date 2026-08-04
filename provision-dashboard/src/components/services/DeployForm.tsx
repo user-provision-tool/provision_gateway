@@ -18,7 +18,7 @@ function getLanguage(filename: string): string {
 interface DeployFormProps {
   open: boolean
   onClose: () => void
-  onDeployed: (taskId: string) => void
+  onDeployed: (taskId: string, user: string, service: string, label: string) => void
   preselectedService?: string
 }
 
@@ -38,11 +38,11 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   const [autoDeploy, setAutoDeploy] = useState(true)
   const [generatingFiles, setGeneratingFiles] = useState(false)
   const [generatedFiles, setGeneratedFiles] = useState<Record<string,string>>({})
-  const [showGeneratedReview, setShowGeneratedReview] = useState(false)
   // Editor modal for reviewing generated files (clickable → built-in editor)
   const [editorModalOpen, setEditorModalOpen] = useState(false)
   const [editorFileName, setEditorFileName] = useState('')
   const [editorContent, setEditorContent] = useState('')
+  const [editorSaving, setEditorSaving] = useState(false)
 
   // GAP-003: Auto-computed next label state
   const [nextLabel, setNextLabel] = useState<string>('0')
@@ -81,7 +81,6 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       setScanContext(null)
       setAutoDeploy(true)
       setGeneratedFiles({})
-      setShowGeneratedReview(false)
       setEditorModalOpen(false)
       setNextLabel('0')
       // Preselect service if provided
@@ -137,7 +136,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       }
     } catch (err: any) {
       setCheckError(err?.message || 'Check failed — try again')
-      setMissingFiles(['(check failed — try again)'])
+      setMissingFiles([])
       setScanContext(null)
     } finally { setCheckingMissing(false) }
   }
@@ -180,18 +179,42 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       const results = await generateFilesFor(missingFiles, ctx)
       setGeneratedFiles(results)
       if (Object.keys(results).length > 0) {
-        message.success(`LLM generated ${Object.keys(results).length} file(s)`)
-        // G6: Auto-deploy when "Auto Templates Completion" is selected
-        if (autoDeploy) {
-          message.info('Auto-deploying with generated files...')
-          // Small delay to let the UI update before submitting
-          setTimeout(() => form.submit(), 500)
+        // Persist to the service project on disk immediately (not just on deploy)
+        try {
+          await client.post('/services/save-generated', {
+            service_name: form.getFieldValue('service_name'),
+            files: results,
+          })
+          message.success(`LLM generated & saved ${Object.keys(results).length} file(s) — review, then deploy`)
+        } catch {
+          message.warning(`Generated ${Object.keys(results).length} file(s), but saving to disk failed`)
         }
       } else {
         message.warning('LLM could not generate any files. Configure BYOK LLM in Settings.')
       }
     } catch { message.error('Failed to generate files via LLM') }
     finally { setGeneratingFiles(false) }
+  }
+
+  // Save an edited generated file back to state + disk
+  const saveEditorFile = async () => {
+    if (!editorFileName) return
+    setEditorSaving(true)
+    try {
+      // Merge the edited content into the generated-files state
+      setGeneratedFiles(prev => ({ ...prev, [editorFileName]: editorContent }))
+      // Persist to the service project on disk
+      await client.post('/services/save-generated', {
+        service_name: form.getFieldValue('service_name'),
+        files: { [editorFileName]: editorContent },
+      })
+      message.success(`${editorFileName} saved`)
+      setEditorModalOpen(false)
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || 'Failed to save file')
+    } finally {
+      setEditorSaving(false)
+    }
   }
 
   const handleDeploy = async (values: any) => {
@@ -201,24 +224,19 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       let gen = generatedFiles
 
       // No generated files available yet:
-      //  - Auto Templates Completion ON  → always generate the essential files via LLM and deploy.
-      //    Missing-file state (including a failed readiness check) does NOT block — the user has
-      //    asked the system to provide all needed files.
+      //  - Auto Templates Completion ON  → generate ONLY missing essential files via LLM and deploy.
+      //    If no files are missing (service is ready), skip generation entirely — do NOT
+      //    overwrite existing project files.
       //  - Auto Templates Completion OFF → block deploy while essential files are missing (GAP-002)
-      if (Object.keys(gen).length === 0) {
+      if (Object.keys(gen).length === 0 && missingFiles.length > 0) {
         if (autoDeploy) {
-          // If the readiness check failed we don't have a real missing list — fall back to the
-          // full essential set so the LLM still supplies everything needed for deployment.
-          const fileTypes = (missingFiles.length > 0 && missingFiles[0] !== '(check failed — try again)')
-            ? missingFiles
-            : ['docker-compose', 'nginx.conf', 'Dockerfile']
           const ctx = scanContext || {
             repo_description: `Service: ${values.service_name || 'unknown'}`,
             repo_files: [],
             port: 80,
             needs_db: false,
           }
-          gen = await generateFilesFor(fileTypes, ctx)
+          gen = await generateFilesFor(missingFiles, ctx)
           if (Object.keys(gen).length === 0) {
             message.error('Auto Templates Completion could not generate the missing files. Configure BYOK LLM in Settings.')
             setLoading(false)
@@ -259,10 +277,19 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       if (selectedService) {
         const composeJ2 = selectedService.files.find((f: string) => f.endsWith('.yml.j2'))
         const nginxJ2 = selectedService.files.find((f: string) => f.endsWith('.conf.j2'))
-        if (composeJ2) payload.compose_file_path = composeJ2
+        // Fallback: look for regular (non-.j2) compose/nginx files that already exist in the project
+        const composeFile = selectedService.files.find((f: string) =>
+          (f.endsWith('.yml') || f.endsWith('.yaml')) && !f.endsWith('.j2'))
+        const nginxFile = selectedService.files.find((f: string) =>
+          f.endsWith('.conf') && !f.endsWith('.j2'))
+
+        if (composeJ2) payload.compose_template_path = composeJ2
         else if (gen['docker-compose.yml']) payload.compose_file_path = 'docker-compose.yml'
-        if (nginxJ2) payload.nginx_conf_file_path = nginxJ2
+        else if (composeFile) payload.compose_file_path = composeFile
+
+        if (nginxJ2) payload.nginx_conf_template_path = nginxJ2
         else if (gen['nginx.conf']) payload.nginx_conf_file_path = 'nginx.conf'
+        else if (nginxFile) payload.nginx_conf_file_path = nginxFile
       }
 
       // HTTPS certs
@@ -289,7 +316,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
       const { data } = await client.post('/users/deploy', payload)
       message.success(`Deploy queued! Task: ${data.task_id}`)
-      onDeployed(data.task_id)
+      onDeployed(data.task_id, values.user_name, values.service_name, values.label || '0')
       form.resetFields()
       onClose()
     } catch (err: any) {
@@ -430,116 +457,79 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           {/* ---- Auto Deploy / Missing Files LLM Generation ---- */}
           {checkingMissing ? (
             <div style={{padding:'8px 0'}}><Spin size="small" /> <span style={{fontSize:12,color:'#999'}}>Checking deployment readiness...</span></div>
+          ) : checkError ? (
+            <Alert type="error" message={`Deployment readiness check failed: ${checkError}`} style={{marginBottom:12}} />
           ) : missingFiles.length > 0 ? (
             <Alert
-              type="warning"
-              message={`Missing essential files: ${missingFiles.join(', ')}`}
+              type={Object.keys(generatedFiles).length > 0 ? 'success' : 'warning'}
+              message={
+                Object.keys(generatedFiles).length === 0
+                  ? `Missing essential files: ${missingFiles.join(', ')}`
+                  : undefined
+              }
               description={
                 <div style={{marginTop:4}}>
-                  <Checkbox
-                    checked={autoDeploy}
-                    onChange={(e) => setAutoDeploy(e.target.checked)}
-                  >
-                    <strong>Auto Templates Completion</strong> — use BYOK LLM to generate missing files and deploy automatically
-                  </Checkbox>
-                  {autoDeploy && (
-                    <div style={{marginTop:8}}>
-                      {Object.keys(generatedFiles).length === 0 ? (
-                        <div>
-                          <Button
-                            size="small"
-                            icon={<RobotOutlined />}
-                            loading={generatingFiles}
-                            onClick={generateMissingFiles}
-                          >
-                            Generate Missing Files via LLM
-                          </Button>
-                          <div style={{marginTop:4,fontSize:12,color:'#999'}}>
-                            Optional — you can generate & review first, or just click <strong>Deploy</strong> to auto-generate and deploy.
-                          </div>
+                  {Object.keys(generatedFiles).length === 0 ? (
+                    <>
+                      <Checkbox
+                        checked={autoDeploy}
+                        onChange={(e) => setAutoDeploy(e.target.checked)}
+                      >
+                        <strong>Auto Templates Completion</strong> — use BYOK LLM to generate missing files and deploy automatically
+                      </Checkbox>
+                      <div style={{marginTop:8}}>
+                        <Button
+                          size="small"
+                          icon={<RobotOutlined />}
+                          loading={generatingFiles}
+                          onClick={generateMissingFiles}
+                        >
+                          Generate Missing Files via LLM
+                        </Button>
+                        <div style={{marginTop:4,fontSize:12,color:'#999'}}>
+                          Generates only the missing files — review them before deploying. You can also click <strong>Deploy</strong> directly to auto-generate and deploy (Auto Templates Completion).
                         </div>
-                      ) : (
-                        <div>
-                          <Tag color="green">✓ Generated {Object.keys(generatedFiles).length} file(s)</Tag>
-                          {Object.keys(generatedFiles).map(fn => (
-                            <Tag key={fn} color="blue" style={{cursor:'pointer'}}
-                              onClick={() => setShowGeneratedReview(true)}>{fn}</Tag>
-                          ))}
-                          <Button size="small" type="link" onClick={() => setShowGeneratedReview(!showGeneratedReview)}>
-                            {showGeneratedReview ? 'Hide' : 'Review'}
-                          </Button>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  {!autoDeploy && (
-                    <div style={{marginTop:8}}>
-                      {Object.keys(generatedFiles).length === 0 ? (
-                        <div>
-                          <Text style={{fontSize:12}}>Would you like to use LLM to generate the missing files?</Text>
-                          <div style={{marginTop:4,display:'flex',gap:8}}>
-                            <Button size="small" icon={<RobotOutlined/>} loading={generatingFiles}
-                              onClick={generateMissingFiles}>
-                              Generate with LLM
-                            </Button>
-                            <span style={{fontSize:12,color:'#999',lineHeight:'24px'}}>
-                              — or upload files manually in the source project
-                            </span>
-                          </div>
-                        </div>
-                      ) : (
-                        <div>
-                          <Tag color="green">✓ Generated {Object.keys(generatedFiles).length} file(s)</Tag>
-                          <Text style={{fontSize:12,color:'#666'}}> — review below, then deploy</Text>
-                          {Object.keys(generatedFiles).map(fn => (
-                            <Tag key={fn} color="blue" style={{cursor:'pointer',marginTop:4}}
-                              onClick={() => setShowGeneratedReview(!showGeneratedReview)}>
-                              {fn} — click to review
-                            </Tag>
-                          ))}
-                          <Button size="small" type="link"
-                            onClick={() => setShowGeneratedReview(!showGeneratedReview)}>
-                            {showGeneratedReview ? 'Hide' : 'Show'} Files
-                          </Button>
-                        </div>
-                      )}
-                    </div>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <Tag color="green">✓ Generated {Object.keys(generatedFiles).length} file(s)</Tag>
+                      <div style={{marginTop:8}}>
+                        {Object.keys(generatedFiles).map(fn => (
+                          <Tag key={fn} color="blue" style={{cursor:'pointer',marginTop:4}}
+                            onClick={() => {
+                              setEditorFileName(fn)
+                              setEditorContent(String(generatedFiles[fn]))
+                              setEditorModalOpen(true)
+                            }}>
+                            📄 {fn} — click to view
+                          </Tag>
+                        ))}
+                      </div>
+                      <div style={{marginTop:8,fontSize:12,color:'#666'}}>
+                        Review the generated files (click to open in the editor). When ready, click <strong>Deploy</strong> to proceed — or edit the files first.
+                      </div>
+                    </>
                   )}
                 </div>
               }
               style={{marginBottom:12}}
             />
-          ) : checkError ? (
-            <Alert type="error" message={`Deployment readiness check failed: ${checkError}`} style={{marginBottom:12}} />
           ) : selectedServiceName ? (
             <Alert type="success" message="All essential files present — ready to deploy" style={{marginBottom:12}} />
           ) : null}
-
-          {/* ---- Generated Files Review ---- */}
-          {showGeneratedReview && Object.keys(generatedFiles).length > 0 && (
-            <div style={{marginBottom:12, border:'1px solid #d9d9d9', borderRadius:6, padding:12, background:'#fafafa'}}>
-              <Text strong style={{fontSize:13}}>Generated Files (click to review in editor):</Text>
-              <div style={{marginTop:8,display:'flex',flexDirection:'column',gap:4}}>
-              {Object.entries(generatedFiles).map(([fn, content]) => (
-                <Tag key={fn} color="blue" style={{cursor:'pointer',padding:'4px 8px',fontSize:12}}
-                  onClick={() => {
-                    setEditorFileName(fn)
-                    setEditorContent(String(content))
-                    setEditorModalOpen(true)
-                  }}>
-                  📄 {fn} — click to open in editor
-                </Tag>
-              ))}
-              </div>
-            </div>
-          )}
 
           {/* ---- Generated File Editor Modal (Monaco) ---- */}
           <Modal
             title={<Space><Text strong>{editorFileName}</Text><Tag color="blue">LLM Generated</Tag></Space>}
             open={editorModalOpen}
             onCancel={() => setEditorModalOpen(false)}
-            footer={<Button onClick={() => setEditorModalOpen(false)}>Close</Button>}
+            footer={
+              <Space>
+                <Button onClick={() => setEditorModalOpen(false)}>Close</Button>
+                <Button type="primary" loading={editorSaving} onClick={saveEditorFile}>Save</Button>
+              </Space>
+            }
             width="85%"
           >
             <div style={{height:'60vh'}}>

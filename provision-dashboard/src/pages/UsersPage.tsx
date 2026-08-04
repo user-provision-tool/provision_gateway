@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useCallback } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Popconfirm, Modal, Drawer, Checkbox } from 'antd'
-import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, SwapOutlined, UnorderedListOutlined, DashboardOutlined } from '@ant-design/icons'
+import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, SwapOutlined, UnorderedListOutlined, DashboardOutlined, GlobalOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
 import client from '../api/client'
@@ -16,6 +16,7 @@ interface ServiceInstance {
   missing_containers?: Record<string,string>
   compose_template_path?: string; nginx_conf_template_path?: string
   has_auth?: boolean; url?: string
+  status?: string  // "building" | "running" | "unknown"
 }
 
 export default function UsersPage() {
@@ -30,7 +31,6 @@ export default function UsersPage() {
   const [preselectedDeploy, setPreselectedDeploy] = useState(deployParam || undefined)
   const [search, setSearch] = useState('')
   const [visiblePwds, setVisiblePwds] = useState<Record<string,boolean>>({})
-  const [activeTasks, setActiveTasks] = useState<Record<string,string>>({}) // key->taskId
 
   // Password change modal
   const [pwdModalOpen, setPwdModalOpen] = useState(false)
@@ -69,9 +69,13 @@ export default function UsersPage() {
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
   const [batchLoading, setBatchLoading] = useState(false)
 
+  // Rebuild confirmation modal
+  const [rebuildTarget, setRebuildTarget] = useState<{user:string;service:string;label:string;noCache:boolean}|null>(null)
+  const [rebuildProxy, setRebuildProxy] = useState(false)
+  const [rebuildLoading, setRebuildLoading] = useState(false)
+
   useEffect(() => { loadServices() }, [])
 
-  // After services are loaded, check registration times and file mod times
   useEffect(() => {
     if (services.length === 0) return
     // Check registration times for each service
@@ -153,8 +157,8 @@ export default function UsersPage() {
             return sum + parseFloat(String(memStr))
           }, 0)
           newStats[key] = {
-            cpu: totalCpu.toFixed(1) + '%',
-            mem: totalMemMb > 1024 ? (totalMemMb / 1024).toFixed(1) + 'GB' : totalMemMb.toFixed(0) + 'MB',
+            cpu: isNaN(totalCpu) ? '' : totalCpu.toFixed(1) + '%',
+            mem: isNaN(totalMemMb) ? '' : (totalMemMb > 1024 ? (totalMemMb / 1024).toFixed(1) + 'GB' : totalMemMb.toFixed(0) + 'MB'),
             disk: '' // Will be filled from volume usage
           }
         }
@@ -278,7 +282,7 @@ export default function UsersPage() {
       }
       message.success(`Batch ${action}: ${keys.length} service(s) processed`)
       setSelectedKeys(new Set())
-      loadServices()
+      refreshServices()
     } catch (err: any) {
       message.error(err.response?.data?.detail || `Batch ${action} failed`)
     } finally {
@@ -286,23 +290,39 @@ export default function UsersPage() {
     }
   }
 
+  const _fetchServices = async (): Promise<ServiceInstance[]> => {
+    const { data } = await client.get('/users')
+    const users = data.users || data.user_status || []
+    const all: ServiceInstance[] = []
+    for (const u of users) {
+      if (endUserViewer && admin?.email && u.user_name !== admin.email) continue
+      for (const s of (u.healthy_services||[])) all.push({...s, user_name: u.user_name})
+      for (const s of (u.unhealthy_services||[])) all.push({...s, user_name: u.user_name})
+      for (const s of (u.missing_services||[])) all.push({...s, user_name: u.user_name})
+    }
+    return all
+  }
+
   const loadServices = async () => {
     setLoading(true)
     try {
-      const { data } = await client.get('/users')
-      const users = data.users || data.user_status || []
-      const all: ServiceInstance[] = []
-      for (const u of users) {
-        // End-user viewers only see their own services
-        if (endUserViewer && admin?.email && u.user_name !== admin.email) continue
-        for (const s of (u.healthy_services||[])) all.push({...s, user_name: u.user_name})
-        for (const s of (u.unhealthy_services||[])) all.push({...s, user_name: u.user_name})
-        for (const s of (u.missing_services||[])) all.push({...s, user_name: u.user_name})
-      }
-      setServices(all)
+      setServices(await _fetchServices())
     } catch (err: any) { message.error('Failed to load services') }
     finally { setLoading(false) }
   }
+
+  // Silent refresh — no loading spinner, for auto-polling
+  const refreshServices = useCallback(async () => {
+    try {
+      setServices(await _fetchServices())
+    } catch { /* silent */ }
+  }, [])
+
+  // Auto-poll every 10s — silent refresh, no loading spinner
+  useEffect(() => {
+    const interval = setInterval(refreshServices, 10000)
+    return () => clearInterval(interval)
+  }, [refreshServices])
 
   const grouped = useMemo(() => {
     const map: Record<string, ServiceInstance[]> = {}
@@ -324,6 +344,8 @@ export default function UsersPage() {
   }, [services, search])
 
   const getBadge = (s: ServiceInstance) => {
+    // Building: containers don't exist yet, don't show misleading "down" count
+    if (s.status === 'building') return <Badge status="processing" text="Building..."/>
     const h = Object.keys(s.healthy_containers||{}).length
     const uh = Object.keys(s.unhealthy_containers||{}).length
     const m = Object.keys(s.missing_containers||{}).length
@@ -356,7 +378,7 @@ export default function UsersPage() {
       await client.post('/users/clone', { source_user: cloneSource, target_user: cloneTarget })
       message.success(`Cloning ${cloneSource} → ${cloneTarget}`)
       setCloneOpen(false)
-      loadServices()
+      refreshServices()
     } catch (err: any) { message.error(err.response?.data?.detail || 'Failed') }
     finally { setCloneLoading(false) }
   }
@@ -366,6 +388,28 @@ export default function UsersPage() {
       const r = await client.post(`/users/${svc.user_name}/${svc.service_name}/${svc.label}/test-curl`, { include_auth: true })
       message.info({ content: <div><Text strong>HTTP {r.data.http_code||'?'}</Text><pre style={{fontSize:11,maxHeight:200,overflow:'auto'}}>{r.data.body?.substring(0,500)||r.data.headers||''}</pre></div>, duration: 8 })
     } catch { message.error('Test failed') }
+  }
+
+  const handleRebuildConfirm = async () => {
+    if (!rebuildTarget) return
+    const { user, service, label, noCache } = rebuildTarget
+    const key = `${user}-${service}-${label}`
+    setRebuildLoading(true)
+    // Optimistic: mark as building immediately
+    setServices(prev => prev.map(s => s.user_name === user && s.service_name === service && s.label === label ? {...s, healthy_containers:{}, unhealthy_containers:{}, missing_containers:{}, status:'building'} : s))
+    try {
+      const payload: any = {}
+      if (noCache) payload.no_cache = true
+      if (rebuildProxy) payload.use_global_proxy = true
+      const r = await client.post(`/users/${user}/${service}/${label}/rebuild`, payload)
+      const taskId = r.data?.task_id || r.data?.id
+      message.success({content:<span>{noCache ? 'Redeploying' : 'Rebuilding'}... {taskId && <Button type="link" size="small" icon={<UnorderedListOutlined/>} onClick={()=>navigate('/tasks')}>View Task</Button>}</span>,duration:5})
+      if (noCache) setNeedsRedeploy(prev => ({...prev, [key]: false}))
+    } catch(e:any) { message.error(e.response?.data?.detail||'Failed') }
+    setRebuildTarget(null)
+    setRebuildProxy(false)
+    setRebuildLoading(false)
+    setTimeout(refreshServices, 2000)
   }
 
   // Highlight matching text
@@ -406,9 +450,10 @@ export default function UsersPage() {
         <Card><Empty description={search?"No matches":"No services deployed"}/></Card>
       ) : (
         Object.entries(grouped).map(([userName, userSvcs], idx) => {
-          const allHealthy = userSvcs.every(s => Object.keys(s.unhealthy_containers||{}).length===0 && Object.keys(s.missing_containers||{}).length===0)
+          const allHealthy = userSvcs.every(s => s.status === 'building' || (Object.keys(s.unhealthy_containers||{}).length===0 && Object.keys(s.missing_containers||{}).length===0))
           const healthyCount = userSvcs.filter(s => Object.keys(s.healthy_containers||{}).length > 0 && Object.keys(s.unhealthy_containers||{}).length===0 && Object.keys(s.missing_containers||{}).length===0).length
-          const unhealthyCount = userSvcs.length - healthyCount
+          const buildingCount = userSvcs.filter(s => s.status === 'building').length
+          const unhealthyCount = userSvcs.length - healthyCount - buildingCount
           return (
           <div key={userName} style={{marginBottom: idx<Object.keys(grouped).length-1?32:0, paddingBottom: idx<Object.keys(grouped).length-1?16:0, borderBottom: idx<Object.keys(grouped).length-1?'1px solid #f0f0f0':'none'}}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
@@ -444,18 +489,17 @@ export default function UsersPage() {
                       {getBadge(svc)}
                       <Text strong>{highlight(svc.service_name, search)}</Text>
                       <Tag>{svc.label}</Tag>
-                      {resourceStats[key] && (
+                      {resourceStats[key] && Object.keys(svc.healthy_containers||{}).length > 0 && (
                         <span style={{marginLeft:8,display:'inline-flex',gap:6,alignItems:'center'}}>
                           {resourceStats[key].cpu && <Tag color="blue" style={{fontSize:11,margin:0}}><DashboardOutlined/> CPU {resourceStats[key].cpu}</Tag>}
                           {resourceStats[key].mem && <Tag color="purple" style={{fontSize:11,margin:0}}>RAM {resourceStats[key].mem}</Tag>}
                         </span>
                       )}
-                      {activeTasks[key] && <Button type="link" size="small" icon={<UnorderedListOutlined/>} onClick={(e)=>{e.stopPropagation();navigate('/tasks')}} style={{padding:0}}>Building...</Button>}
                     </Space>}
                     extra={
                       <Space onClick={e=>e.stopPropagation()}>
                         {isAdmin && <>
-                          <Tooltip title={Object.keys(svc.healthy_containers||{}).length > 0 ? 'Stop containers' : 'Start containers'}>
+                          {svc.status !== 'building' && <Tooltip title={Object.keys(svc.healthy_containers||{}).length > 0 ? 'Stop containers' : 'Start containers'}>
                             <Button size="small" 
                               icon={Object.keys(svc.healthy_containers||{}).length > 0 ? <PauseOutlined/> : <CaretRightOutlined/>}
                               type={Object.keys(svc.healthy_containers||{}).length > 0 ? 'default' : 'primary'}
@@ -464,34 +508,22 @@ export default function UsersPage() {
                                 const action = isRunning ? 'down' : 'up'
                                 const label = isRunning ? 'Stopping...' : 'Starting...'
                                 client.post(`/users/${svc.user_name}/${svc.service_name}/${svc.label}/${action}`)
-                                  .then(()=>{message.success(label);loadServices()})
+                                  .then(()=>{message.success(label); refreshServices()})
                                   .catch(e=>message.error(e.response?.data?.detail||'Failed'))
                               }}
                             />
-                          </Tooltip>
-                          <Button size="small" onClick={async ()=>{
-                            try {
-                              const r = await client.post(`/users/${svc.user_name}/${svc.service_name}/${svc.label}/rebuild`,{})
-                              const taskId = r.data?.task_id || r.data?.id
-                              if (taskId) setActiveTasks(t=>({...t,[key]:taskId}))
-                              message.success({content:<span>Rebuilding... {taskId && <Button type="link" size="small" icon={<UnorderedListOutlined/>} onClick={()=>navigate('/tasks')}>View Task</Button>}</span>,duration:5})
-                              loadServices()
-                            } catch(e:any) { message.error(e.response?.data?.detail||'Failed') }
+                          </Tooltip>}
+                          <Button size="small" onClick={()=>{
+                            setRebuildTarget({user:svc.user_name,service:svc.service_name,label:svc.label,noCache:false})
+                            setRebuildProxy(false)
                           }}>Rebuild</Button>
                           <Tooltip title="Redeploy service with no-cache rebuild">
                             <Button size="small" icon={<RocketOutlined/>} 
                               className={needsRedeploy[key] ? 'redeploy-blink' : ''}
                               style={needsRedeploy[key] ? {borderColor:'#faad14',color:'#faad14'} : {}}
-                              onClick={async ()=>{
-                            try {
-                              const r = await client.post(`/users/${svc.user_name}/${svc.service_name}/${svc.label}/rebuild`,{no_cache:true})
-                              const taskId = r.data?.task_id || r.data?.id
-                              if (taskId) setActiveTasks(t=>({...t,[key]:taskId}))
-                              message.success({content:<span>Redeploying... {taskId && <Button type="link" size="small" icon={<UnorderedListOutlined/>} onClick={()=>navigate('/tasks')}>View Task</Button>}</span>,duration:5})
-                              // Clear the needs-redeploy flag
-                              setNeedsRedeploy(prev => ({...prev, [key]: false}))
-                              loadServices()
-                            } catch(e:any) { message.error(e.response?.data?.detail||'Failed') }
+                              onClick={()=>{
+                            setRebuildTarget({user:svc.user_name,service:svc.service_name,label:svc.label,noCache:true})
+                            setRebuildProxy(false)
                           }}>Redeploy</Button>
                           </Tooltip>
                           <Tooltip title="Change password">
@@ -500,11 +532,11 @@ export default function UsersPage() {
                           <Tooltip title="Duplicate for another user">
                             <Button size="small" icon={<CopyOutlined/>} onClick={()=>{
                               const t = prompt('Target user:')
-                              if (t) client.post('/users/deploy',{user_name:t,service_name:svc.service_name,project_root:svc.service_name,compose_file_path:svc.compose_template_path,nginx_conf_file_path:svc.nginx_conf_template_path,label:svc.label,domain:'example.com',passwd:'default123',use_global_proxy:false}).then(()=>{message.success('Duplicated');loadServices()}).catch(e=>message.error(e.response?.data?.detail||'Failed'))
+                              if (t) client.post('/users/deploy',{user_name:t,service_name:svc.service_name,project_root:svc.service_name,compose_file_path:svc.compose_template_path,nginx_conf_file_path:svc.nginx_conf_template_path,label:svc.label,domain:'example.com',passwd:'default123',use_global_proxy:false}).then(()=>{message.success('Duplicated');refreshServices()}).catch(e=>message.error(e.response?.data?.detail||'Failed'))
                             }}>Dup</Button>
                           </Tooltip>
                           <Popconfirm title="Delete?" onConfirm={()=>{
-                            client.delete(`/users/${svc.user_name}/${svc.service_name}/${svc.label}`).then(()=>{message.success('Deleted');loadServices()}).catch(()=>message.error('Failed'))
+                            client.delete(`/users/${svc.user_name}/${svc.service_name}/${svc.label}`).then(()=>{message.success('Deleted');refreshServices()}).catch(()=>message.error('Failed'))
                           }}>
                             <Button size="small" danger icon={<DeleteOutlined/>}/>
                           </Popconfirm>
@@ -578,7 +610,22 @@ export default function UsersPage() {
         )})
       )}
 
-      <DeployForm open={deployOpen} preselectedService={preselectedDeploy} onClose={()=>{setDeployOpen(false); setPreselectedDeploy(undefined); if(deployParam) setSearchParams({})}} onDeployed={()=>{setDeployOpen(false); setPreselectedDeploy(undefined); if(deployParam) setSearchParams({}); loadServices()}}/>
+      <DeployForm open={deployOpen} preselectedService={preselectedDeploy} onClose={()=>{setDeployOpen(false); setPreselectedDeploy(undefined); if(deployParam) setSearchParams({})}} onDeployed={(taskId: string, user: string, service: string, label: string)=>{
+        setDeployOpen(false); setPreselectedDeploy(undefined); if(deployParam) setSearchParams({});
+        // Optimistic update: immediately show the new service as "building"
+        const optimisticEntry: ServiceInstance = {
+          user_name: user, service_name: service, label: label,
+          healthy_containers: {}, unhealthy_containers: {}, missing_containers: {},
+          status: 'building',
+        }
+        setServices(prev => {
+          // Remove any existing entry for this service (in case of redeploy)
+          const filtered = prev.filter(s => !(s.user_name === user && s.service_name === service && s.label === label))
+          return [...filtered, optimisticEntry]
+        })
+        // Then also do a real reload (will update once registry is written)
+        setTimeout(refreshServices, 2000)
+      }}/>
 
       {/* Password change modal */}
       <Modal title="Change Service Password" open={pwdModalOpen} onCancel={()=>setPwdModalOpen(false)}
@@ -586,6 +633,34 @@ export default function UsersPage() {
         <Space direction="vertical" style={{width:'100%'}} size="middle">
           <div><Text strong>Service: </Text>{pwdTarget?.service}/{pwdTarget?.user}/{pwdTarget?.label}</div>
           <Input.Password prefix={<KeyOutlined/>} placeholder="New password" value={newPassword} onChange={e=>setNewPassword(e.target.value)}/>
+        </Space>
+      </Modal>
+
+      {/* Rebuild / Redeploy confirmation modal */}
+      <Modal
+        title={rebuildTarget?.noCache ? 'Redeploy Service' : 'Rebuild Service'}
+        open={!!rebuildTarget}
+        onCancel={() => { setRebuildTarget(null); setRebuildProxy(false) }}
+        onOk={handleRebuildConfirm}
+        confirmLoading={rebuildLoading}
+        okText={rebuildTarget?.noCache ? 'Redeploy' : 'Rebuild'}
+      >
+        <Space direction="vertical" style={{width:'100%'}} size="middle">
+          <div>
+            <Text strong>Service: </Text>
+            {rebuildTarget?.service}/{rebuildTarget?.user}/{rebuildTarget?.label}
+          </div>
+          {rebuildTarget?.noCache && (
+            <div>
+              <Text type="warning">No-cache rebuild — will rebuild Docker image from scratch.</Text>
+            </div>
+          )}
+          <Checkbox checked={rebuildProxy} onChange={e => setRebuildProxy(e.target.checked)}>
+            <Space>
+              <GlobalOutlined />
+              Use global proxy for this {rebuildTarget?.noCache ? 'redeploy' : 'rebuild'}
+            </Space>
+          </Checkbox>
         </Space>
       </Modal>
 

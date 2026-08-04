@@ -237,10 +237,11 @@ class LLMService:
     def _build_prompt(self, config_type: str, context: dict) -> str:
         """Build a prompt for config generation.
 
-        Prompts are based on the _users_provision/skills/provision-api skill
-        which defines the template conventions used by the provision tool.
-        See SKILL.md for full reference.
+        Prompts are loaded from _users_provision/skills/provision-api SKILL.md
+        which defines the authoritative template conventions used by provision-api.
         """
+        from ..utils.skill_loader import get_compose_rules, get_nginx_rules, get_compose_template, get_nginx_template
+
         desc = context.get("repo_description", "an application")
         files = context.get("repo_files", [])
         port = context.get("port", 8000)
@@ -248,6 +249,11 @@ class LLMService:
         framework = context.get("framework", "unknown")
         
         if config_type == "docker_compose":
+            compose_rules = get_compose_rules()
+            compose_template = get_compose_template()
+            template_block = ""
+            if compose_template:
+                template_block = f"\nReference template (fill in placeholders):\n```yaml\n{compose_template}\n```\n"
             return f"""Generate a docker-compose.yml for {desc}
 
 Context:
@@ -258,54 +264,44 @@ Context:
 - Needs database: {context.get('needs_db', False)}
 - Needs cache: {context.get('needs_cache', False)}
 
-The generated file will be used by the provision tool (_users_provision/provision-api).
-Follow the _users_provision/skills/provision-api rules for compose files:
+The generated file will be used by the provision tool (provision-api).
+Follow these rules EXACTLY:
 
-1. Use `build: .` (or a subdirectory path) so the Dockerfile is the build context.
-   Do NOT hardcode `image:` unless the docs specify a pre-built image.
-
-2. Do NOT set `container_name:` directly — the provision tool's auto-converter will
-   rewrite container_name to use per-user prefixes. Simply name the service descriptively.
-
-3. Do NOT hardcode host ports — the provision tool strips ports on conversion.
-   Use `expose:` for internal ports instead.
-
-4. Use named volumes for persistent data so the converter can map them to per-user paths.
-
-5. Use ${{VAR}} syntax for runtime secrets (API keys, DB passwords).
-
-6. Define a network so per-user containers are isolated.
-
-7. Provide a healthcheck if possible.
-
+{compose_rules}
+{template_block}
 Output ONLY the raw YAML, no markdown fences, no explanations."""
         
         elif config_type == "nginx_conf":
+            nginx_rules = get_nginx_rules()
+            nginx_template = get_nginx_template()
+            compose_services = context.get("compose_services", [])
+            compose_hint = ""
+            if compose_services:
+                compose_hint = (
+                    f"\nCRITICAL: The docker-compose.yml defines these service(s): {', '.join(compose_services)}.\n"
+                    f"Your proxy_pass MUST use one of these exact service names as the host.\n"
+                    f"For example: proxy_pass http://{compose_services[0]}:PORT;\n"
+                )
+            else:
+                compose_hint = (
+                    "\nCRITICAL: You MUST determine the service name from docker-compose.yml.\n"
+                    "The proxy_pass host must match a compose service key exactly, or registration will be rejected.\n"
+                )
+            template_block = ""
+            if nginx_template:
+                template_block = f"\nReference template (fill in placeholders):\n```nginx\n{nginx_template}\n```\n"
             return f"""Generate an nginx reverse proxy configuration for {desc}
 
 Context:
 - App port: {port}
 - Service will be behind provision-nginx
 - Need basic auth support
+- Files in repo: {', '.join(files[:15])}{compose_hint}
+The generated file will be used by the provision tool (provision-api).
+Follow these rules from the provision-api skill:
 
-The generated file will be used by the provision tool (_users_provision/provision-api).
-Follow the _users_provision/skills/provision-api rules for nginx conf:
-
-1. The proxy_pass host must match a service key from docker-compose.yml exactly.
-   Read the compose file first to get the actual service names.
-
-2. server_name will be templated to {{{{ hostname }}}}.
-
-3. proxy_pass to http://SERVICE_NAME:PORT (use the compose service key).
-
-4. Include auth_basic and auth_basic_user_file directives.
-
-5. Include proxy headers (Host, X-Real-IP, X-Forwarded-For, X-Forwarded-Proto).
-
-6. WebSocket support (Upgrade, Connection headers).
-
-7. client_max_body_size 100m.
-
+{nginx_rules}
+{template_block}
 Output ONLY the raw nginx config, no markdown fences."""
         
         elif config_type == "env_file":

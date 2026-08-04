@@ -24,6 +24,8 @@ class RepoContext:
     has_env_file: bool = False
     dockerfile_content: str = ""
     env_content: str = ""
+    compose_services: list[str] = field(default_factory=list)
+    compose_content: str = ""
 
 
 def scan_directory(directory: str | Path) -> RepoContext:
@@ -71,6 +73,31 @@ def scan_directory(directory: str | Path) -> RepoContext:
     compose_files = list(root.glob("docker-compose*.yml")) + list(root.glob("docker-compose*.yaml"))
     if compose_files:
         ctx.has_compose = True
+        # Extract service names from the first compose file found
+        compose_path = compose_files[0]
+        try:
+            ctx.compose_content = compose_path.read_text()
+            # Simple YAML parsing for service names (avoid heavy dependency)
+            import re as _re
+            # Match top-level "services:" block keys (indented service names)
+            in_services = False
+            for line in ctx.compose_content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#") or not stripped:
+                    continue
+                if stripped == "services:" or stripped.startswith("services:"):
+                    in_services = True
+                    continue
+                if in_services:
+                    # A new top-level key ends the services block
+                    if line and not line.startswith(" ") and not line.startswith("\t") and ":" in line:
+                        break
+                    # Service names are 2-space indented keys ending with ":"
+                    m = _re.match(r"  (\S[^:]*):", line)
+                    if m:
+                        ctx.compose_services.append(m.group(1))
+        except Exception:
+            pass
 
     # ---- nginx conf detection ----
     nginx_files = list(root.glob("*.nginx.conf")) + list(root.glob("nginx*.conf"))

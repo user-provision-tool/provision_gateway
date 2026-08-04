@@ -242,6 +242,15 @@ async def rebuild_user_service(
     db: Session = Depends(get_db),
 ):
     """Rebuild a user's service instance."""
+    # Inject global proxy into build_args if requested
+    use_global_proxy = req.pop("use_global_proxy", False)
+    if use_global_proxy:
+        from ..services.proxy_service import inject_proxy_build_args, has_active_proxy
+        if not has_active_proxy(db):
+            raise HTTPException(400, "Global proxy is not enabled. Configure it in Settings first.")
+        build_args = req.get("build_args") or {}
+        req["build_args"] = inject_proxy_build_args(db, build_args, True)
+
     try:
         result = await provision_service.rebuild_user(user_name, service_name, label, **req)
     except Exception as e:

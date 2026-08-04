@@ -182,20 +182,25 @@ class ServiceManager:
                 if rel.endswith(".generated"):
                     continue
                 files.append(rel)
-                # A file is "generated" if git is available and it is NOT tracked,
-                # OR if it has a .generated marker (LLM-generated files).
-                # If git is unavailable, fall back to marker-only detection.
-                if git_tracked and rel not in git_tracked:
+                # A file is "generated" if:
+                #   1. It has a .generated marker file (created by save-generated LLM endpoint), OR
+                #   2. Git is available and the file is NOT tracked by git.
+                # The .generated marker check works regardless of git availability
+                # and correctly handles cases where an LLM regenerated/overwrote
+                # a file that was already tracked by git.
+                has_marker = (project_dir / f"{rel}.generated").exists()
+                if has_marker:
                     generated_files.append(rel)
-                elif not git_tracked and (rel.endswith(".generated") or "generated_" in rel):
+                elif git_tracked and rel not in git_tracked:
                     generated_files.append(rel)
                 # Template classification: only git-tracked (original repo)
                 # deployment-critical file types are shown in the "Templates"
                 # column (G2 + GAP-4). When git is available, an LLM-generated
                 # (untracked / .generated-marked) deployment-critical file must
                 # appear ONLY in "Generated Files". When git is unavailable we
-                # fall back to type-only classification.
-                if self._is_template_file(rel):
+                # fall back to type-only classification, but still exclude
+                # files that have a .generated marker (LLM-generated).
+                if self._is_template_file(rel) and not has_marker:
                     if not git_tracked or rel in git_tracked:
                         template_files.append(rel)
 

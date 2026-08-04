@@ -163,6 +163,7 @@ async def check_missing_files(
                 "has_dockerfile": ctx.has_dockerfile,
                 "has_compose": ctx.has_compose,
                 "has_nginx_conf": ctx.has_nginx_conf,
+                "compose_services": ctx.compose_services,
             }
         except Exception:
             pass
