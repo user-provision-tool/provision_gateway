@@ -125,6 +125,8 @@ async def system_status(
         "tasks_running": tasks_running,
         "service_stats": service_stats,
         "container_stats": container_stats,
+        "nginx_http_port": settings.NGINX_HTTP_PORT,
+        "nginx_https_port": settings.NGINX_HTTPS_PORT,
     }
 
 

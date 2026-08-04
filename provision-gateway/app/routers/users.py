@@ -189,22 +189,14 @@ async def get_next_label(
 
     # Collect all services from provision-api response
     services_raw = result.get("user_status", result if isinstance(result, list) else [])
-    # Flatten nested structure: user_status is a list of user dicts,
-    # each containing healthy_services, unhealthy_services, missing_services lists
-    all_services: list[dict] = []
-    for item in services_raw:
-        if isinstance(item, dict):
-            # Top-level dict may have service lists nested inside
-            for key in ("healthy_services", "unhealthy_services", "missing_services"):
-                svc_list = item.get(key, [])
-                if isinstance(svc_list, list):
-                    all_services.extend(svc_list)
-            # Also check if the item itself is a service entry (has service_name directly)
-            if item.get("service_name"):
-                all_services.append(item)
+    if isinstance(services_raw, dict):
+        # Handle nested structure
+        services_raw = services_raw.get("healthy_services", []) + \
+                       services_raw.get("unhealthy_services", []) + \
+                       services_raw.get("missing_services", [])
 
     existing_labels: list[int] = []
-    for entry in all_services:
+    for entry in services_raw:
         if isinstance(entry, dict) and entry.get("service_name") == service_name:
             try:
                 existing_labels.append(int(entry.get("label", "0")))
@@ -361,9 +353,9 @@ async def get_service_url(
     import re
 
     generated_dir = settings.PROVISION_DIR / "generated"
-    nginx_conf = generated_dir / f"{user_name}.{service_name}.{label}.nginx.conf"
+    nginx_conf = generated_dir / f"{service_name}.user-{user_name}.{label}.nginx.conf"
 
-    server_name = f"{service_name}-{user_name}-{label}.example.com"
+    server_name = f"{service_name}-{user_name}-{label}.localhost"
     https_enabled = False
 
     if nginx_conf.exists():
@@ -371,18 +363,29 @@ async def get_service_url(
         m = re.search(r"server_name\s+([^;]+);", content)
         if m:
             server_name = m.group(1).strip().split()[0]
-        https_enabled = "listen 443 ssl" in content or "ssl_certificate" in content
+        # Only detect HTTPS from actual directives, not comments
+        https_enabled = bool(re.search(r"^\s*listen\s+443\s+ssl", content, re.MULTILINE))
 
     http_port = settings.NGINX_HTTP_PORT
     https_port = settings.NGINX_HTTPS_PORT
 
+    # Append port to URL when non-standard
+    http_url = f"http://{server_name}"
+    if http_port != 80:
+        http_url += f":{http_port}"
+    https_url = f"https://{server_name}"
+    if https_port != 443:
+        https_url += f":{https_port}"
+
     return {
-        "url": f"https://{server_name}" if https_enabled else f"http://{server_name}",
-        "http_url": f"http://{server_name}",
+        "url": https_url if https_enabled else http_url,
+        "http_url": http_url,
         "https_enabled": https_enabled,
         "auth_enabled": True,
         "nginx_http_port": http_port,
         "nginx_https_port": https_port,
+        # Internal URL reachable from Docker network (test-curl uses this)
+        "_internal_host": "provision-nginx",
     }
 
 

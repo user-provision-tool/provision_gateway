@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Popconfirm, Modal, Drawer, Checkbox } from 'antd'
 import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, SwapOutlined, UnorderedListOutlined, DashboardOutlined, GlobalOutlined } from '@ant-design/icons'
@@ -73,6 +73,54 @@ export default function UsersPage() {
   const [rebuildTarget, setRebuildTarget] = useState<{user:string;service:string;label:string;noCache:boolean}|null>(null)
   const [rebuildProxy, setRebuildProxy] = useState(false)
   const [rebuildLoading, setRebuildLoading] = useState(false)
+
+  // Track which panels are currently expanded (for container-status refresh)
+  const [expandedPanels, setExpandedPanels] = useState<string[]>([])
+  // Timer ref for container-status refresh
+  const refreshTimersRef = useRef<Record<string, ReturnType<typeof setInterval>>>({})
+  const servicesRef = useRef(services)
+  servicesRef.current = services
+
+  // Nginx ports from system status (used for URL construction)
+  const [nginxHttpPort, setNginxHttpPort] = useState(80)
+  const [nginxHttpsPort, setNginxHttpsPort] = useState(443)
+
+  // Fetch nginx ports once on mount
+  useEffect(() => {
+    client.get('/system/status').then(({data}) => {
+      if (data.nginx_http_port) setNginxHttpPort(data.nginx_http_port)
+      if (data.nginx_https_port) setNginxHttpsPort(data.nginx_https_port)
+    }).catch(() => {})
+  }, [])
+
+  // Build service URL with correct port
+  const buildServiceUrl = useCallback((svc: ServiceInstance): string => {
+    if (svc.url) return svc.url
+    const host = `${svc.service_name}-${svc.user_name}-${svc.label}.localhost`
+    return `http://${host}${nginxHttpPort !== 80 ? ':' + nginxHttpPort : ''}`
+  }, [nginxHttpPort])
+
+  // Parse "user-service-label" key (service may contain hyphens like "example-mcp")
+  const parseServiceKey = (key: string) => {
+    const parts = key.split('-')
+    return { user: parts[0], service: parts.slice(1, -1).join('-'), label: parts[parts.length - 1] }
+  }
+
+  // Container-status refresh: when a panel is expanded, re-fetch services every 5s
+  // so container tags stay up-to-date without full page reload
+  useEffect(() => {
+    const timers = refreshTimersRef.current
+    for (const k of Object.keys(timers)) {
+      if (!expandedPanels.includes(k)) { clearInterval(timers[k]); delete timers[k] }
+    }
+    for (const key of expandedPanels) {
+      if (timers[key]) continue
+      timers[key] = setInterval(() => {
+        refreshServices()
+      }, 5000)
+    }
+    return () => { for (const t of Object.values(refreshTimersRef.current)) clearInterval(t); refreshTimersRef.current = {} }
+  }, [expandedPanels])
 
   useEffect(() => { loadServices() }, [])
 
@@ -153,15 +201,7 @@ export default function UsersPage() {
             return sum + parseFloat(String(cpuStr).replace('%', ''))
           }, 0)
           const totalMemMb = svcContainers.reduce((sum: number, c: any) => {
-            // API returns "mem": "12MB / 256MB" or "0B / 0B"
-            const memStr = c.mem_usage_mb || c.mem_usage || c.mem || '0'
-            if (typeof memStr === 'string' && memStr.includes('/')) {
-              const used = memStr.split('/')[0].trim()
-              const num = parseFloat(used)
-              if (used.toUpperCase().includes('GB')) return sum + num * 1024
-              if (used.toUpperCase().includes('KB')) return sum + num / 1024
-              return sum + num
-            }
+            const memStr = c.mem_usage_mb || (c.mem_usage || '0')
             return sum + parseFloat(String(memStr))
           }, 0)
           newStats[key] = {
@@ -280,7 +320,7 @@ export default function UsersPage() {
     const keys = Array.from(selectedKeys)
     try {
       for (const key of keys) {
-        const [user, service, label] = key.split('-')
+        const {user, service, label} = parseServiceKey(key)
         switch (action) {
           case 'stop': await client.post(`/users/${user}/${service}/${label}/down`); break
           case 'start': await client.post(`/users/${user}/${service}/${label}/up`); break
@@ -391,13 +431,6 @@ export default function UsersPage() {
     finally { setCloneLoading(false) }
   }
 
-  const testCurl = async (svc: ServiceInstance) => {
-    try {
-      const r = await client.post(`/users/${svc.user_name}/${svc.service_name}/${svc.label}/test-curl`, { include_auth: true })
-      message.info({ content: <div><Text strong>HTTP {r.data.http_code||'?'}</Text><pre style={{fontSize:11,maxHeight:200,overflow:'auto'}}>{r.data.body?.substring(0,500)||r.data.headers||''}</pre></div>, duration: 8 })
-    } catch { message.error('Test failed') }
-  }
-
   const handleRebuildConfirm = async () => {
     if (!rebuildTarget) return
     const { user, service, label, noCache } = rebuildTarget
@@ -484,7 +517,7 @@ export default function UsersPage() {
               </Space>
             </div>
 
-            <Collapse>
+            <Collapse activeKey={expandedPanels} onChange={(keys) => setExpandedPanels(typeof keys === 'string' ? [keys] : keys)}>
               {userSvcs.map((svc) => {
                 const key = `${svc.user_name}-${svc.service_name}-${svc.label}`
                 const containers = {...svc.healthy_containers, ...svc.unhealthy_containers, ...svc.missing_containers}
@@ -540,7 +573,7 @@ export default function UsersPage() {
                           <Tooltip title="Duplicate for another user">
                             <Button size="small" icon={<CopyOutlined/>} onClick={()=>{
                               const t = prompt('Target user:')
-                              if (t) client.post('/users/deploy',{user_name:t,service_name:svc.service_name,project_root:svc.service_name,compose_file_path:svc.compose_template_path,nginx_conf_file_path:svc.nginx_conf_template_path,label:svc.label,domain:'example.com',passwd:'default123',use_global_proxy:false}).then(()=>{message.success('Duplicated');refreshServices()}).catch(e=>message.error(e.response?.data?.detail||'Failed'))
+                              if (t) client.post('/users/deploy',{user_name:t,service_name:svc.service_name,project_root:svc.service_name,compose_file_path:svc.compose_template_path,nginx_conf_file_path:svc.nginx_conf_template_path,label:svc.label,domain:'localhost',passwd:'default123',use_global_proxy:false}).then(()=>{message.success('Duplicated');refreshServices()}).catch(e=>message.error(e.response?.data?.detail||'Failed'))
                             }}>Dup</Button>
                           </Tooltip>
                           <Popconfirm title="Delete?" onConfirm={()=>{
@@ -555,14 +588,19 @@ export default function UsersPage() {
                     <Space direction="vertical" style={{width:'100%'}} size="small">
                       <div>
                         <Text strong>URL: </Text>
-                        <a href={svc.url || `http://${svc.service_name}-${svc.user_name}-${svc.label}.example.com`} target="_blank" rel="noopener noreferrer">
-                          <Text code style={{color:'#1677ff'}}>{svc.url || `http://${svc.service_name}-${svc.user_name}-${svc.label}.example.com`}</Text>
+                        <a href={buildServiceUrl(svc)} target="_blank" rel="noopener noreferrer">
+                          <Text code style={{color:'#1677ff'}}>{buildServiceUrl(svc)}</Text>
                         </a>
-                        <Button size="small" type="link" icon={<LinkOutlined/>} onClick={()=>testCurl(svc)}>Test</Button>
                         {svc.has_auth && <Tag color="blue" style={{marginLeft:4}}>Auth</Tag>}
                       </div>
                       <div><Text strong>Containers: </Text>
-                        <Space wrap>{Object.entries(containers).map(([n,s])=><Tag key={n} color={String(s).toLowerCase().includes('running')||String(s).toLowerCase().includes('up')?'green':'orange'}>{n}: {String(s)}</Tag>)}</Space>
+                        <Space wrap>{Object.entries(containers).map(([n,s])=>{
+                          const status = String(s).toLowerCase();
+                          const color = status.includes('up') || status.includes('healthy') ? 'green'
+                            : status.includes('unhealthy') ? 'orange'
+                            : 'red';
+                          return <Tag key={n} color={color}>{n}: {String(s)}</Tag>
+                        })}</Space>
                       </div>
                       <div><Text strong>Deployment Files: </Text></div>
                       <div style={{paddingLeft:16}}>
