@@ -153,7 +153,15 @@ export default function UsersPage() {
             return sum + parseFloat(String(cpuStr).replace('%', ''))
           }, 0)
           const totalMemMb = svcContainers.reduce((sum: number, c: any) => {
-            const memStr = c.mem_usage_mb || (c.mem_usage || '0')
+            // API returns "mem": "12MB / 256MB" or "0B / 0B"
+            const memStr = c.mem_usage_mb || c.mem_usage || c.mem || '0'
+            if (typeof memStr === 'string' && memStr.includes('/')) {
+              const used = memStr.split('/')[0].trim()
+              const num = parseFloat(used)
+              if (used.toUpperCase().includes('GB')) return sum + num * 1024
+              if (used.toUpperCase().includes('KB')) return sum + num / 1024
+              return sum + num
+            }
             return sum + parseFloat(String(memStr))
           }, 0)
           newStats[key] = {

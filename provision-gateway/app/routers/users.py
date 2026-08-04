@@ -189,14 +189,22 @@ async def get_next_label(
 
     # Collect all services from provision-api response
     services_raw = result.get("user_status", result if isinstance(result, list) else [])
-    if isinstance(services_raw, dict):
-        # Handle nested structure
-        services_raw = services_raw.get("healthy_services", []) + \
-                       services_raw.get("unhealthy_services", []) + \
-                       services_raw.get("missing_services", [])
+    # Flatten nested structure: user_status is a list of user dicts,
+    # each containing healthy_services, unhealthy_services, missing_services lists
+    all_services: list[dict] = []
+    for item in services_raw:
+        if isinstance(item, dict):
+            # Top-level dict may have service lists nested inside
+            for key in ("healthy_services", "unhealthy_services", "missing_services"):
+                svc_list = item.get(key, [])
+                if isinstance(svc_list, list):
+                    all_services.extend(svc_list)
+            # Also check if the item itself is a service entry (has service_name directly)
+            if item.get("service_name"):
+                all_services.append(item)
 
     existing_labels: list[int] = []
-    for entry in services_raw:
+    for entry in all_services:
         if isinstance(entry, dict) and entry.get("service_name") == service_name:
             try:
                 existing_labels.append(int(entry.get("label", "0")))
