@@ -290,6 +290,12 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         if (nginxJ2) payload.nginx_conf_template_path = nginxJ2
         else if (gen['nginx.conf']) payload.nginx_conf_file_path = 'nginx.conf'
         else if (nginxFile) payload.nginx_conf_file_path = nginxFile
+
+        // Auto-detect .env file in source project
+        const envFile = selectedService.files.find((f: string) =>
+          f === '.env' || f.endsWith('/.env'))
+        if (envFile) payload.env_file_path = '.env'
+        else if (gen['.env']) payload.env_file_path = '.env'
       }
 
       // HTTPS certs
@@ -356,6 +362,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
               <Select
                 showSearch
                 placeholder="Select source project"
+                disabled={!!preselectedService}
                 options={sources.map(s => ({ value: s.name, label: s.name }))}
                 onChange={(val) => {
                   checkMissingFiles(val)

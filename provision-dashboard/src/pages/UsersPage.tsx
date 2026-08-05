@@ -572,8 +572,8 @@ export default function UsersPage() {
                           </Tooltip>
                           <Tooltip title="Duplicate for another user">
                             <Button size="small" icon={<CopyOutlined/>} onClick={()=>{
-                              const t = prompt('Target user:')
-                              if (t) client.post('/users/deploy',{user_name:t,service_name:svc.service_name,project_root:svc.service_name,compose_file_path:svc.compose_template_path,nginx_conf_file_path:svc.nginx_conf_template_path,label:svc.label,domain:'localhost',passwd:'default123',use_global_proxy:false}).then(()=>{message.success('Duplicated');refreshServices()}).catch(e=>message.error(e.response?.data?.detail||'Failed'))
+                              setPreselectedDeploy(svc.service_name)
+                              setDeployOpen(true)
                             }}>Dup</Button>
                           </Tooltip>
                           <Popconfirm title="Delete?" onConfirm={()=>{
