@@ -149,6 +149,57 @@ class ServiceManager:
             return True
         return False
 
+    @staticmethod
+    def _discover_recipes(
+        project_dir: Path, git_tracked: set[str],
+    ) -> list[dict[str, Any]]:
+        """Auto-discover deployable recipe directories in a project.
+
+        A recipe directory must contain BOTH a Dockerfile AND at least one
+        docker-compose*.yml file (both git-tracked). Returns list sorted
+        so the root recipe comes first.
+        """
+        recipes: list[dict[str, Any]] = []
+        all_files = sorted(git_tracked)
+
+        # Find directories with Dockerfile + docker-compose*
+        dir_has_dockerfile: dict[str, bool] = {}
+        dir_has_compose: dict[str, bool] = {}
+        seen_dirs: set[str] = set()
+
+        for f in all_files:
+            parent = str(Path(f).parent) if "/" in f else ""
+            basename = f.split("/")[-1]
+            if basename == "Dockerfile":
+                dir_has_dockerfile[parent] = True
+                seen_dirs.add(parent)
+            if basename.startswith("docker-compose") and basename.endswith((".yml", ".yaml")):
+                dir_has_compose[parent] = True
+                seen_dirs.add(parent)
+
+        for d in sorted(seen_dirs):
+            if dir_has_dockerfile.get(d) and dir_has_compose.get(d):
+                template_files: list[str] = []
+                for f in all_files:
+                    if not ServiceManager._is_template_file(f):
+                        continue
+                    if d == "":
+                        if "/" not in f:
+                            template_files.append(f)
+                    else:
+                        prefix = d + "/"
+                        if f.startswith(prefix):
+                            template_files.append(f)
+                recipes.append({
+                    "path": d,
+                    "label": d if d else "(root)",
+                    "is_root": d == "",
+                    "template_files": template_files,
+                })
+
+        recipes.sort(key=lambda r: (not r["is_root"], r["path"]))
+        return recipes
+
     def _get_service_info(self, project_dir: Path) -> dict[str, Any]:
         """Build the service info dict for a project directory.
 
@@ -208,6 +259,9 @@ class ServiceManager:
         has_nginx_template = any(f.endswith(".nginx.conf.j2") or f.endswith(".conf.j2") for f in files)
         has_dockerfile = any("Dockerfile" in f for f in files)
 
+        # Auto-discover deployable recipe directories
+        recipes = self._discover_recipes(project_dir, git_tracked)
+
         # Detect active users from registry
         active_users = 0
         active_instances = []
@@ -231,6 +285,7 @@ class ServiceManager:
             "files": files,
             "generated_files": generated_files,
             "template_files": template_files,
+            "recipes": recipes,
             "has_compose_template": has_compose_template,
             "has_nginx_template": has_nginx_template,
             "has_dockerfile": has_dockerfile,
@@ -326,6 +381,29 @@ class ServiceManager:
         filepath.write_text(content)
         return True
 
+    def create_file(self, service_name: str, filename: str, content: str) -> bool:
+        """Create a new file in a service project with .generated marker."""
+        filepath = self._source_dir / service_name / filename
+        if filepath.exists():
+            return False  # already exists
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        filepath.write_text(content)
+        # Track as generated
+        (self._source_dir / service_name / f"{filename}.generated").write_text("")
+        return True
+
+    def delete_file(self, service_name: str, filename: str) -> bool:
+        """Delete a file from a service project and its .generated marker."""
+        filepath = self._source_dir / service_name / filename
+        if not filepath.is_file():
+            return False
+        filepath.unlink()
+        # Also remove .generated marker if present
+        marker = self._source_dir / service_name / f"{filename}.generated"
+        if marker.is_file():
+            marker.unlink()
+        return True
+
     def list_files(self, service_name: str) -> list[str]:
         """List all files in a service project, excluding build artifacts and VCS."""
         target = self._source_dir / service_name
@@ -344,12 +422,15 @@ class ServiceManager:
     # ------------------------------------------------------------------
 
     def convert_compose(
-        self, service_name: str, compose_file: str
+        self, service_name: str, compose_file: str, recipe_path: str = "",
     ) -> dict[str, str]:
         """Mark a plain docker-compose file for template conversion.
         
         Conversion is handled by provision-api at deploy time.
         The gateway just copies the file with a .j2 extension as a marker.
+
+        Args:
+            recipe_path: Subdirectory of the recipe (empty = root recipe).
         """
         src = self._source_dir / service_name / compose_file
         if not src.exists():
@@ -360,6 +441,8 @@ class ServiceManager:
         content = src.read_text()
         header = f"# Jinja2 compose template — conversion handled by provision-api at deploy time\n# Service: {service_name}\n\n"
         template_out.write_text(header + content)
+        # Mark as generated
+        (template_out.parent / f"{template_out.name}.generated").write_text("")
         return {
             "compose_template": str(template_out.name),
             "compose_file": compose_file,
@@ -381,6 +464,8 @@ class ServiceManager:
         content = src.read_text()
         header = f"# Jinja2 nginx template — conversion handled by provision-api at deploy time\n# Service: {service_name}\n\n"
         template_out.write_text(header + content)
+        # Mark as generated
+        (template_out.parent / f"{template_out.name}.generated").write_text("")
         return {
             "nginx_template": str(template_out.name),
             "nginx_file": nginx_file,

@@ -132,12 +132,16 @@ async def create_service(
 @router.get("/{name}/check-missing-files")
 async def check_missing_files(
     name: str,
+    recipe_path: str = Query("", description="Recipe subdirectory path"),
     current_admin: AdminUser = Depends(get_current_admin),
 ):
     """Check which essential deployment files are missing for a service.
 
     Proxied to provision-api, then enriches with repo scan context
     for LLM-based file generation.
+
+    Args:
+        recipe_path: Optional subdirectory for multi-recipe projects.
     """
     try:
         result = await provision_service.check_missing_files(name)
@@ -148,9 +152,12 @@ async def check_missing_files(
     from pathlib import Path
     from ..utils.file_scanner import scan_directory
     project_dir = settings.SOURCE_PROJECTS_DIR / name
-    if project_dir.is_dir():
+    scan_dir = project_dir / recipe_path if recipe_path else project_dir
+    if recipe_path and not scan_dir.is_dir():
+        scan_dir = project_dir
+    if scan_dir.is_dir():
         try:
-            ctx = scan_directory(project_dir)
+            ctx = scan_directory(scan_dir)
             result["scan_context"] = {
                 "repo_description": ctx.repo_description,
                 "repo_files": ctx.repo_files,
@@ -340,6 +347,42 @@ async def write_service_file(
     return {"filename": filename, "written": ok}
 
 
+@router.post("/{name}/files/{filename:path}", status_code=201)
+async def create_service_file(
+    name: str,
+    filename: str,
+    req: dict[str, Any],
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Create a new file in a service project with .generated marker."""
+    content = req.get("content", "")
+    created = service_manager.create_file(name, filename, content)
+
+    log_action(db, action="file_create", admin_id=current_admin.id,
+               target_service=name, status="success",
+               detail={"filename": filename})
+    return {"filename": filename, "created": created}
+
+
+@router.delete("/{name}/files/{filename:path}")
+async def delete_service_file(
+    name: str,
+    filename: str,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Delete a file from a service project."""
+    deleted = service_manager.delete_file(name, filename)
+    if not deleted:
+        raise HTTPException(404, f"File '{filename}' not found in service '{name}'")
+
+    log_action(db, action="file_delete", admin_id=current_admin.id,
+               target_service=name, status="success",
+               detail={"filename": filename})
+    return {"filename": filename, "deleted": True}
+
+
 @router.post("/{name}/convert")
 async def convert_service_files(
     name: str,
@@ -347,13 +390,17 @@ async def convert_service_files(
     current_admin: AdminUser = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
-    """Convert plain compose/nginx files to Jinja2 templates."""
+    """Convert plain compose/nginx files to Jinja2 templates.
+
+    Accepts optional ``recipe_path`` for multi-recipe projects.
+    """
     result = {}
+    recipe_path = req.get("recipe_path", "")
 
     compose_file = req.get("compose_file")
     if compose_file:
         try:
-            converted = service_manager.convert_compose(name, compose_file)
+            converted = service_manager.convert_compose(name, compose_file, recipe_path)
             result.update(converted)
         except Exception as e:
             raise HTTPException(422, f"Compose conversion failed: {e}")

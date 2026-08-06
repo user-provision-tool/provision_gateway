@@ -17,6 +17,7 @@ interface ServiceInstance {
   compose_template_path?: string; nginx_conf_template_path?: string
   has_auth?: boolean; url?: string
   status?: string  // "building" | "running" | "unknown"
+  volumes?: Record<string,string>
 }
 
 export default function UsersPage() {
@@ -646,7 +647,17 @@ export default function UsersPage() {
                           </div>
                         })()}
                       </div>
-                      {(svc as any).volumes && Object.keys((svc as any).volumes).length>0 && <div><Text strong>Volumes: </Text><Space wrap>{Object.entries((svc as any).volumes).map(([k,v]:[string,any])=><Tag key={k}>{k}: {String(v)}</Tag>)}</Space></div>}
+                      {(svc.volumes && Object.keys(svc.volumes).length > 0) && <div>
+                        <Text strong>Volumes: </Text>
+                        <div style={{paddingLeft:16}}>
+                          {Object.entries(svc.volumes).map(([k,v]) => (
+                            <div key={k} style={{marginBottom:2}}>
+                              <Tag color="blue">{k}</Tag>
+                              <Text type="secondary" style={{fontSize:11,marginLeft:4}}>→ {String(v)}</Text>
+                            </div>
+                          ))}
+                        </div>
+                      </div>}
                     </Space>
                   </Collapse.Panel>
                 )

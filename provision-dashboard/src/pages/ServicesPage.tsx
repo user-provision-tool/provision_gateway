@@ -2,12 +2,14 @@ import { useState, useEffect, useMemo } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Typography, Card, Table, Button, Modal, Form, Input,
-  Space, message, Tag, Empty, Tabs, Spin, Checkbox, Upload
+  Space, message, Tag, Empty, Tabs, Spin, Checkbox, Upload,
+  Tooltip, Select
 } from 'antd'
 import type { UploadProps } from 'antd'
 import {
   PlusOutlined, DeleteOutlined, FolderOpenOutlined,
-  GithubOutlined, UploadOutlined, InboxOutlined
+  GithubOutlined, UploadOutlined, InboxOutlined, FileAddOutlined,
+  RobotOutlined
 } from '@ant-design/icons'
 import Editor, { DiffEditor } from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
@@ -22,6 +24,15 @@ interface ServiceInfo {
   active_instances: string[]; created_at: string
   generated_files?: string[]
   template_files?: string[]
+  recipes?: { path: string; label: string; is_root: boolean; template_files: string[] }[]
+}
+
+interface TableRow extends ServiceInfo {
+  nameRowSpan: number
+  recipePath: string
+  recipeLabel: string
+  recipeTemplates: string[]
+  recipeGeneratedFiles: string[]
 }
 
 export default function ServicesPage() {
@@ -36,6 +47,8 @@ export default function ServicesPage() {
   const [addMode, setAddMode] = useState<'git' | 'upload'>('git')
   const [form] = Form.useForm()
   const [proxyEnabled, setProxyEnabled] = useState(false)
+  const [genLoading, setGenLoading] = useState<string | null>(null)
+  const [missingFilesMap, setMissingFilesMap] = useState<Record<string, string[]>>({})  // service name being generated
 
   useEffect(() => { loadServices(); loadProxyStatus() }, [])
 
@@ -50,11 +63,50 @@ export default function ServicesPage() {
     setLoading(true)
     try {
       const { data } = await client.get('/services')
-      setServices(data.services || [])
+      const svcs = data.services || []
+      setServices(svcs)
+      // Check missing files for all services in parallel
+      checkAllMissing(svcs)
     } catch (err: any) {
       message.error('Failed to load services')
     } finally { setLoading(false) }
   }
+
+  const refreshServices = async () => {
+    try {
+      const { data } = await client.get('/services')
+      const svcs = data.services || []
+      setServices(svcs)
+      checkAllMissing(svcs)
+    } catch {}
+  }
+
+  const checkAllMissing = async (svcs: ServiceInfo[]) => {
+    const map: Record<string, string[]> = {}
+    const checks = svcs.flatMap(async (s) => {
+      const recipes = s.recipes || []
+      if (recipes.length > 1) {
+        return recipes.map(async (r) => {
+          const key = r.path ? `${s.name}@@${r.path}` : s.name
+          try {
+            const params: any = {}
+            if (r.path) params.recipe_path = r.path
+            const { data } = await client.get(`/services/${s.name}/check-missing-files`, { params })
+            map[key] = data.missing || []
+          } catch { map[key] = [] }
+        })
+      }
+      try {
+        const { data } = await client.get(`/services/${s.name}/check-missing-files`)
+        map[s.name] = data.missing || []
+      } catch { map[s.name] = [] }
+    })
+    await Promise.all(checks)
+    setMissingFilesMap(map)
+  }
+
+  // Silent reload when coming back from project detail view
+  useEffect(() => { if (!name) { refreshServices() } }, [name])
 
   const handleAdd = async (values: any) => {
     setAddLoading(true)
@@ -83,32 +135,124 @@ export default function ServicesPage() {
     })
   }
 
+  // Generate missing files via LLM for a service project
+  const generateMissingFiles = async (serviceName: string, recipePath: string = '') => {
+    const genKey = recipePath ? `${serviceName}@@${recipePath}` : serviceName
+    setGenLoading(genKey)
+    try {
+      const params: any = {}
+      if (recipePath) params.recipe_path = recipePath
+      const { data: check } = await client.get(`/services/${serviceName}/check-missing-files`, { params })
+      const missing: string[] = check.missing || []
+      if (missing.length === 0) { message.info('All essential files are present'); return }
+      
+      const ctx = check.scan_context || { repo_description: `Service: ${serviceName}${recipePath ? ` (${recipePath})` : ''}` }
+      const typeMap: Record<string, string> = {
+        'docker-compose': 'docker_compose', 'nginx.conf': 'nginx_conf',
+        '.env': 'env_file', 'Dockerfile': 'dockerfile',
+      }
+      const results: Record<string, string> = {}
+      for (const ft of missing) {
+        try {
+          const { data: gen } = await client.post('/llm/generate', { type: typeMap[ft] || 'docker_compose', context: ctx })
+          if (gen.generated_content) {
+            const fn = ft === 'docker-compose' ? 'docker-compose.yml' : ft === 'nginx.conf' ? 'nginx.conf' : ft
+            results[fn] = gen.generated_content
+          }
+        } catch { /* skip individual failures */ }
+      }
+      
+      if (Object.keys(results).length > 0) {
+        await client.post('/services/save-generated', { service_name: serviceName, files: results, recipe_path: recipePath })
+        message.success(`LLM generated ${Object.keys(results).length} file(s) for ${serviceName}${recipePath ? ` @ ${recipePath}` : ''}`)
+        refreshServices()
+      } else {
+        message.warning('LLM could not generate any files. Configure BYOK LLM in Settings.')
+      }
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || 'Generation failed')
+    } finally { setGenLoading(null) }
+  }
+
+  // Flatten multi-recipe projects into table rows with rowSpan on Name
+  // MUST be before the early return (React hooks rule)
+  const tableData: TableRow[] = useMemo(() => {
+    const rows: TableRow[] = []
+    for (const s of services) {
+      const recipes = s.recipes || []
+      const allGenerated = s.generated_files || []
+      if (recipes.length > 1) {
+        // Collect all recipe subdirectory prefixes
+        const recipePrefixes = recipes.map(r => r.path ? r.path + '/' : '')
+        recipes.forEach((r, i) => {
+          const prefix = r.path ? r.path + '/' : ''
+          // Generated files belong to this recipe if they start with its prefix
+          // Root recipe: files that don't start with any other recipe prefix
+          const genFiles = r.path
+            ? allGenerated.filter(f => f.startsWith(prefix))
+            : allGenerated.filter(f => !recipePrefixes.some(p => p && f.startsWith(p)))
+          rows.push({
+            ...s,
+            nameRowSpan: i === 0 ? recipes.length : 0,
+            recipePath: r.path,
+            recipeLabel: r.label,
+            recipeTemplates: r.template_files,
+            recipeGeneratedFiles: genFiles,
+          })
+        })
+      } else {
+        rows.push({
+          ...s,
+          nameRowSpan: 1,
+          recipePath: '',
+          recipeLabel: '',
+          recipeTemplates: s.template_files || [],
+          recipeGeneratedFiles: allGenerated,
+        })
+      }
+    }
+    return rows
+  }, [services])
+
   if (name) return <ServiceDetailPage name={name} onBack={() => navigate('/services')} />
 
   const columns = [
     { title: 'Name', dataIndex: 'name', key: 'name',
-      render: (t: string) => <Button type="link" onClick={() => navigate(`/services/${t}`)}><FolderOpenOutlined /> {t}</Button> },
+      render: (t: string, r: TableRow) => ({
+        children: <Space size={4}>
+          <Button type="link" onClick={() => navigate(`/services/${t}`)}><FolderOpenOutlined /> {t}</Button>
+          {isAdmin && r.nameRowSpan > 0 && <Button size="small" danger icon={<DeleteOutlined/>} onClick={()=>handleDelete(r.name)} style={{marginLeft:4}}/>}
+        </Space>,
+        props: { rowSpan: r.nameRowSpan },
+      }) },
     { title: 'Templates', key: 'templates',
-      render: (_:any, r:ServiceInfo) => {
-        // Template files are now explicitly classified on the backend (G2).
-        // The backend returns a `template_files` list containing only the
-        // deployment-critical file types (Dockerfile, docker-compose*,
-        // *.nginx.conf, *.conf, .env, .env.example).
+      render: (_:any, r: TableRow) => {
+        const recipes = (r as any).recipes || []
+        if (recipes.length > 1 && r.recipeLabel) {
+          return <Space size={4} wrap>
+            <Tag color="blue" style={{fontWeight:600}}>{r.recipeLabel}</Tag>
+            {r.recipeTemplates.map(f => <Tag key={f} color="green" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>)}
+          </Space>
+        }
         const temps = r.template_files || []
         return <Space size={4} wrap>{temps.length>0 ? temps.map(f=><Tag key={f} color="green" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
       }
     },
     { title: 'Generated Files', key: 'generated',
-      render: (_:any, r:ServiceInfo) => {
-        const gens = r.generated_files || []
+      render: (_:any, r: TableRow) => {
+        const gens = r.recipeGeneratedFiles || r.generated_files || []
         return <Space size={4} wrap>{gens.length>0 ? gens.map(f=><Tag key={f} color="gold" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
       }
     },
     { title: 'Actions', key: 'actions',
-      render: (_:any, r:ServiceInfo) => <Space>
-        <Button size="small" type="primary" onClick={()=>navigate(`/users?deploy=${r.name}`)}>Deploy</Button>
-        {isAdmin && <Button size="small" danger icon={<DeleteOutlined/>} onClick={()=>handleDelete(r.name)}/>}
-      </Space> },
+      render: (_:any, r: TableRow) => {
+        const genKey = r.recipePath ? `${r.name}@@${r.recipePath}` : r.name
+        const missing = missingFilesMap[genKey] ?? null
+        const hasAll = missing !== null && missing.length === 0
+        return <Tooltip title={missing === null ? 'Checking...' : hasAll ? 'No missing basic files, ready for deployment' : `Missing: ${missing.join(', ')}`}>
+          <Button size="small" type="primary" icon={<RobotOutlined/>} disabled={hasAll} loading={genLoading === genKey} onClick={()=>generateMissingFiles(r.name, r.recipePath)}/>
+        </Tooltip>
+      } },
   ]
 
   return (
@@ -119,7 +263,7 @@ export default function ServicesPage() {
       </div>
       <Card>
         {loading ? <Spin/> : services.length===0 ? <Empty description="No source projects yet"><Button type="primary" icon={<PlusOutlined/>} onClick={()=>setAddModalOpen(true)}>Add Project</Button></Empty> :
-        <Table dataSource={services} columns={columns} rowKey="name" pagination={false}/>}
+        <Table dataSource={tableData} columns={columns} rowKey={(r: TableRow) => r.recipePath ? `${r.name}@@${r.recipePath}` : r.name} pagination={false}/>}
       </Card>
       <Modal title="Add Source Project" open={addModalOpen} onCancel={()=>{setAddModalOpen(false);form.resetFields()}} footer={null} width={560}>
         <Tabs activeKey={addMode} onChange={(k)=>{setAddMode(k as any);form.resetFields()}} items={[
@@ -229,11 +373,32 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
   const [gitModifiedFiles, setGitModifiedFiles] = useState<Set<string>>(new Set())
   const [gitNewFiles, setGitNewFiles] = useState<Set<string>>(new Set())
   const [treeReady, setTreeReady] = useState(false)
+  const [selectedRecipe, setSelectedRecipe] = useState('')
+
+  // Add file modal
+  const [addFileOpen, setAddFileOpen] = useState(false)
+  const [addFileName, setAddFileName] = useState('')
+  const [addFileContent, setAddFileContent] = useState('')
+  const [addFileLoading, setAddFileLoading] = useState(false)
 
   useEffect(() => {
     client.get(`/services/${name}`).then(r=>{setService(r.data);setTreeReady(true)}).catch(()=>message.error('Failed'))
     refreshGitStatus()
   }, [name])
+
+  // When recipe selection changes, collapse all then expand the recipe path
+  useEffect(() => {
+    if (!selectedRecipe) {
+      setExpandedDirs(new Set())
+      return
+    }
+    const parts = selectedRecipe.split('/')
+    const toExpand = new Set<string>()
+    for (let i = 0; i < parts.length; i++) {
+      toExpand.add(parts.slice(0, i + 1).join('/'))
+    }
+    setExpandedDirs(toExpand)
+  }, [selectedRecipe])
 
   // Auto-load file from URL query param ?file=...
   const fileParam = searchParams.get('file')
@@ -310,19 +475,51 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
       await client.post(`/services/${name}/convert`,{
         compose_file: service?.files.find(f=>f.includes('docker-compose')&&!f.endsWith('.j2')),
         nginx_file: service?.files.find(f=>f.includes('nginx')&&f.endsWith('.conf')&&!f.endsWith('.j2')),
+        recipe_path: selectedRecipe,
       })
       message.success('Converted'); client.get(`/services/${name}`).then(r=>setService(r.data))
     } catch (err:any) { message.error(err.response?.data?.detail||'Failed') }
+  }
+
+  // Add new file
+  const handleAddFile = async () => {
+    if (!addFileName.trim()) { message.warning('Enter a filename'); return }
+    setAddFileLoading(true)
+    try {
+      await client.post(`/services/${name}/files/${addFileName}`, { content: addFileContent })
+      message.success(`Created ${addFileName}`)
+      setAddFileOpen(false); setAddFileName(''); setAddFileContent('')
+      client.get(`/services/${name}`).then(r => setService(r.data))
+    } catch (err: any) { message.error(err.response?.data?.detail || 'Failed') }
+    finally { setAddFileLoading(false) }
+  }
+
+  // Delete file
+  const handleDeleteFile = () => {
+    Modal.confirm({
+      title: 'Delete File',
+      content: `Permanently delete "${selectedFile}"?`,
+      okText: 'Delete', okType: 'danger',
+      onOk: async () => {
+        try {
+          await client.delete(`/services/${name}/files/${selectedFile}`)
+          message.success(`Deleted ${selectedFile}`)
+          setSelectedFile('')
+          setFileContent('')
+          client.get(`/services/${name}`).then(r => setService(r.data))
+        } catch (err: any) { message.error(err.response?.data?.detail || 'Failed') }
+      },
+    })
   }
 
   const headLoaded = selectedFile && headContent !== undefined
   const hasDiff = headLoaded && fileContent !== headContent
 
   // ---- Build directory tree from flat file list ----
-  type TreeNode = { name: string; isDir: boolean; children: TreeNode[]; hasModified: boolean; hasNew: boolean; fullPath: string }
+  type TreeNode = { name: string; isDir: boolean; children: Record<string, TreeNode>; hasModified: boolean; hasNew: boolean; fullPath: string }
   
   const fileTree = useMemo(() => {
-    if (!service) return []
+    if (!service) return [] as TreeNode[]
     const filtered = service.files.filter((f: string) => {
       if (f.startsWith('.git/') || f === '.git' || f === '.gitignore' || f === '.gitattributes') return false
       if (f.startsWith('node_modules/') || f === 'node_modules') return false
@@ -335,7 +532,7 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
     
     for (const f of filtered) {
       const parts = f.split('/')
-      let current = root
+      let current: Record<string, TreeNode> = root
       
       for (let i = 0; i < parts.length; i++) {
         const name = parts[i]
@@ -343,11 +540,7 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
         const fullPath = parts.slice(0, i + 1).join('/')
         
         if (!current[name]) {
-          current[name] = { name, isDir: !isLast, children: [], hasModified: false, hasNew: false, fullPath }
-          // Link to parent's children array for rendering
-          if (i === 0) {
-            // top-level entry — will be added to result later
-          }
+          current[name] = { name, isDir: !isLast, children: {}, hasModified: false, hasNew: false, fullPath }
         }
         
         if (isLast) {
@@ -356,35 +549,29 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
           current[name].hasNew = gitNewFiles.has(f)
         }
         
-        current = current[name].children as any
+        current = current[name].children
       }
     }
     
-    // Convert root map to sorted array
-    const result: TreeNode[] = Object.values(root)
-    // Compute directory-level status (post-order)
-    const computeDirStatus = (nodes: TreeNode[]) => {
+    // Convert dict-based tree to sorted array-based tree for rendering
+    const dictToArray = (dict: Record<string, TreeNode>): TreeNode[] => {
+      const nodes = Object.values(dict)
       for (const node of nodes) {
         if (node.isDir) {
-          computeDirStatus(node.children)
-          node.hasModified = node.children.some(c => c.hasModified)
-          node.hasNew = node.children.some(c => c.hasNew)
+          node.children = dictToArray(node.children) as any
+          const childArr = node.children as unknown as TreeNode[]
+          node.hasModified = childArr.some(c => c.hasModified)
+          node.hasNew = childArr.some(c => c.hasNew)
         }
       }
-    }
-    computeDirStatus(result)
-    
-    // Sort: dirs first, then files; alphabetical within each group
-    const sortNodes = (nodes: TreeNode[]) => {
       nodes.sort((a, b) => {
         if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
         return a.name.localeCompare(b.name)
       })
-      for (const n of nodes) { if (n.isDir) sortNodes(n.children) }
+      return nodes as any
     }
-    sortNodes(result)
     
-    return result
+    return dictToArray(root)
   }, [service, gitModifiedFiles, gitNewFiles])
 
   // ---- Recursive file tree renderer ----
@@ -399,6 +586,7 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
     
     if (node.isDir) {
       const expanded = expandedDirs.has(node.fullPath)
+      const childArray = node.children as unknown as TreeNode[]
       return <div key={node.fullPath}>
         <div
           onClick={() => setExpandedDirs(prev => { const next = new Set(prev); if (next.has(node.fullPath)) next.delete(node.fullPath); else next.add(node.fullPath); return next })}
@@ -409,7 +597,7 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
           {node.hasNew && <Tag color="green" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>N</Tag>}
           {node.hasModified && <Tag color="orange" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>M</Tag>}
         </div>
-        {expanded && node.children.map(c => renderTreeNode(c, depth + 1))}
+        {expanded && childArray.map(c => renderTreeNode(c, depth + 1))}
       </div>
     }
     
@@ -426,16 +614,34 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
   }
 
   if (!service) return <Spin/>
+
+  // Compute per-recipe status from files
+  const recipePrefix = selectedRecipe ? selectedRecipe + '/' : ''
+  const hasComposeTemplate = service.files.some(f => f.startsWith(recipePrefix) && f.endsWith('.yml.j2'))
+  const hasNginxTemplate = service.files.some(f => f.startsWith(recipePrefix) && (f.endsWith('.nginx.conf.j2') || f.endsWith('.conf.j2')))
+  const hasTemplate = hasComposeTemplate || hasNginxTemplate
+
   return (
     <div>
       <Button onClick={onBack} style={{marginBottom:16}}>← Back to Source Projects</Button>
       <Title level={3}>{name}</Title>
       <Card style={{marginBottom:16}}>
         <Space direction="vertical"><div><strong>Path:</strong> {service.path}</div>
-        <div><strong>Status:</strong> {service.has_compose_template&&<Tag color="green">Compose ✓</Tag>}{service.has_nginx_template&&<Tag color="purple">Nginx ✓</Tag>}
-        {!service.has_compose_template&&!service.has_nginx_template&&<Button size="small" onClick={handleConvert}>Convert</Button>}</div></Space>
+        <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+          {(service.recipes && service.recipes.length > 1) && (
+            <Select size="small" value={selectedRecipe} onChange={setSelectedRecipe} style={{width:200}}
+              options={service.recipes.map(r => ({ value: r.path, label: r.label }))}
+              placeholder="Select recipe"
+            />
+          )}
+          <strong>Status:</strong>
+          {hasComposeTemplate && <Tag color="green">Compose ✓</Tag>}
+          {hasNginxTemplate && <Tag color="purple">Nginx ✓</Tag>}
+          {!hasTemplate && <Button size="small" onClick={handleConvert}>Convert</Button>}
+          {hasTemplate && <Button size="small" onClick={handleConvert}>Re-Convert</Button>}
+        </div></Space>
       </Card>
-      <Card title="Files">
+      <Card title={<Space>Files <Button size="small" icon={<FileAddOutlined/>} onClick={() => setAddFileOpen(true)}>Add File</Button></Space>}>
         <div style={{display:'flex',gap:16}}>
           <div style={{width:280,borderRight:'1px solid #f0f0f0',paddingRight:16,overflow:'auto',maxHeight:'calc(100vh - 300px)'}}>
             <div style={{marginBottom:8,display:'flex',gap:8,alignItems:'center'}}>
@@ -455,7 +661,10 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
                   {editing ? <>
                     <Button onClick={handleCancel}>Cancel</Button>
                     <Button type="primary" onClick={saveFile} loading={saving}>Save</Button>
-                  </> : <Button onClick={()=>setEditing(true)}>Edit</Button>}
+                  </> : <>
+                    <Button onClick={()=>setEditing(true)}>Edit</Button>
+                    <Button danger icon={<DeleteOutlined/>} onClick={handleDeleteFile}>Delete</Button>
+                  </>}
                 </Space>
               </div>
               {editing ? (
@@ -501,6 +710,33 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
           </div>
         </div>
       </Card>
+
+      {/* Add File Modal */}
+      <Modal
+        title={`Add File to ${name}`}
+        open={addFileOpen}
+        onCancel={() => { setAddFileOpen(false); setAddFileName(''); setAddFileContent('') }}
+        onOk={handleAddFile}
+        confirmLoading={addFileLoading}
+        okText="Create"
+      >
+        <Space direction="vertical" style={{ width: '100%' }} size="middle">
+          <Input
+            placeholder="filename (e.g. docker-compose.yml)"
+            value={addFileName}
+            onChange={e => setAddFileName(e.target.value)}
+            prefix={<FileAddOutlined/>}
+          />
+          <Editor
+            height="300px"
+            defaultLanguage="yaml"
+            value={addFileContent}
+            onChange={(v) => setAddFileContent((v || '').replace(/\r\n/g, '\n'))}
+            theme="vs-dark"
+            options={{ minimap: { enabled: false }, fontSize: 13, lineNumbers: 'on', automaticLayout: true, scrollBeyondLastLine: false, wordWrap: 'on' }}
+          />
+        </Space>
+      </Modal>
     </div>
   )
 }

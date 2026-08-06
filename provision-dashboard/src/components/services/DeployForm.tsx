@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Modal, Form, Input, Select, Button, Switch, Space, Divider, message, Checkbox, Alert, Spin, Tag, Typography } from 'antd'
 import { PlusOutlined, MinusCircleOutlined, GlobalOutlined, RobotOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
@@ -27,7 +27,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   const [loading, setLoading] = useState(false)
   const [proxyEnabled, setProxyEnabled] = useState(false)
   const [httpsEnabled, setHttpsEnabled] = useState(false)
-  const [sources, setSources] = useState<{ name: string; files: string[]; has_compose_template?: boolean }[]>([])
+  const [sources, setSources] = useState<{ name: string; files: string[]; has_compose_template?: boolean; recipes?: { path: string; label: string; is_root: boolean; template_files: string[] }[] }[]>([])
   const [deployableUsers, setDeployableUsers] = useState<{username:string,label:string}[]>([])
   const [sslDomains, setSslDomains] = useState<{domain:string, fullchain_path:string, privkey_path:string}[]>([])
   const [selectedSslDomain, setSelectedSslDomain] = useState<string>('')
@@ -47,6 +47,44 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   // GAP-003: Auto-computed next label state
   const [nextLabel, setNextLabel] = useState<string>('0')
   const [computingLabel, setComputingLabel] = useState(false)
+
+  // Auto-detected volume keys from compose template
+  const [expectedVolumeKeys, setExpectedVolumeKeys] = useState<string[]>([])
+
+  // Fetch expected volumes from compose template
+  const fetchExpectedVolumes = async (serviceName: string, sourcesList?: { name: string; files: string[] }[]) => {
+    try {
+      // Parse recipe path from service value (format: "name@@recipe_path")
+      const [baseName, recipePath] = serviceName.includes('@@') ? serviceName.split('@@') : [serviceName, '']
+      const list = sourcesList || sources
+      const svc = list.find(s => s.name === baseName)
+      if (!svc) return
+      const composeJ2 = svc.files.find((f: string) => f.endsWith('.yml.j2'))
+      if (!composeJ2) { setExpectedVolumeKeys([]); return }
+      
+      const { data } = await client.get(`/services/${serviceName}/files/${composeJ2}`)
+      const content = data.content || ''
+      // Extract {{ volumes['key'] }} or {{ volumes[\"key\"] }}
+      const volRegex = /\{\{-?\s*volumes\[['\"]([^'\"]+)['\"]\]\s*-?\}\}/g
+      const keys: string[] = []
+      let m
+      while ((m = volRegex.exec(content)) !== null) {
+        if (!keys.includes(m[1])) keys.push(m[1])
+      }
+      // Also check for named volumes block
+      const namedVolMatch = content.match(/^volumes:\s*\n((?:\s+\w+:\s*\n)+)/m)
+      if (namedVolMatch) {
+        const namedVols = namedVolMatch[1].match(/^\s+(\w+):\s*$/gm)
+        if (namedVols) {
+          for (const nv of namedVols) {
+            const name = nv.replace(/^\s+|\s*:\s*$/g, '')
+            if (name && !keys.includes(name)) keys.push(name)
+          }
+        }
+      }
+      setExpectedVolumeKeys(keys)
+    } catch { setExpectedVolumeKeys([]) }
+  }
 
   // GAP-003: Compute next label when user+service selections change
   const computeNextLabel = async (userName: string, serviceName: string) => {
@@ -71,23 +109,27 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
   useEffect(() => {
     if (open) {
-      loadSources()
-      loadProxyStatus()
-      loadDeployableUsers()
-      loadSslDomains()
-      // Reset auto-deploy state
-      setMissingFiles([])
-      setCheckError(null)
-      setScanContext(null)
-      setAutoDeploy(true)
-      setGeneratedFiles({})
-      setEditorModalOpen(false)
-      setNextLabel('0')
-      // Preselect service if provided
-      if (preselectedService) {
-        form.setFieldsValue({ service_name: preselectedService })
-        checkMissingFiles(preselectedService)
+      const init = async () => {
+        const sourcesData = await loadSources()
+        loadProxyStatus()
+        loadDeployableUsers()
+        loadSslDomains()
+        // Reset auto-deploy state
+        setMissingFiles([])
+        setCheckError(null)
+        setScanContext(null)
+        setAutoDeploy(true)
+        setGeneratedFiles({})
+        setEditorModalOpen(false)
+        setNextLabel('0')
+        // Preselect service if provided
+        if (preselectedService) {
+          form.setFieldsValue({ service_name: preselectedService })
+          checkMissingFiles(preselectedService)
+          fetchExpectedVolumes(preselectedService, sourcesData)
+        }
       }
+      init()
     }
   }, [open, preselectedService])
 
@@ -109,7 +151,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     try {
       const { data } = await client.get('/services')
       setSources(data.services || [])
-    } catch { /* ignore */ }
+      return data.services || []
+    } catch { return [] }
   }
 
   const loadProxyStatus = async () => {
@@ -186,6 +229,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
             files: results,
           })
           message.success(`LLM generated & saved ${Object.keys(results).length} file(s) — review, then deploy`)
+          // Refresh expected volumes (compose template may have been generated)
+          fetchExpectedVolumes(form.getFieldValue('service_name'))
         } catch {
           message.warning(`Generated ${Object.keys(results).length} file(s), but saving to disk failed`)
         }
@@ -334,6 +379,36 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
   const selectedServiceName = Form.useWatch('service_name', form)
   const selectedUserName = Form.useWatch('user_name', form)
+  const selectedLabel = Form.useWatch('label', form)
+
+  // Ref to access Form.List's add() function from outside the render
+  const volumeAddRef = useRef<((defaultValue?: any) => void) | null>(null)
+
+  // Auto-fill volume mapping when service+user+label selected
+  useEffect(() => {
+    if (!selectedServiceName || !selectedUserName) return
+    // Parse recipe path from service value (format: "name@@recipe_path")
+    const serviceBaseName = selectedServiceName.includes('@@') ? selectedServiceName.split('@@')[0] : selectedServiceName
+    const label = selectedLabel || '0'
+    const keys = expectedVolumeKeys
+    if (keys.length === 0) return
+    const volumes = keys.map(key => ({
+      key,
+      value: `/srv/provision/user_data/${selectedUserName}/${serviceBaseName}/${label}/${key}`
+    }))
+    // First set the values on the form
+    form.setFieldsValue({ volumes })
+    // Also ensure Form.List has the right number of items
+    if (volumeAddRef.current) {
+      const currentVolumes = form.getFieldValue('volumes') || []
+      while (currentVolumes.length < keys.length) {
+        volumeAddRef.current()
+        currentVolumes.push({})
+      }
+      // After adding, set values again
+      setTimeout(() => form.setFieldsValue({ volumes }), 0)
+    }
+  }, [selectedServiceName, selectedUserName, selectedLabel, expectedVolumeKeys])
 
   return (
     <Modal
@@ -363,11 +438,28 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
                 showSearch
                 placeholder="Select source project"
                 disabled={!!preselectedService}
-                options={sources.map(s => ({ value: s.name, label: s.name }))}
+                options={(() => {
+                  const opts: { value: string; label: string }[] = []
+                  for (const s of sources) {
+                    const recipes = s.recipes || []
+                    if (recipes.length > 1) {
+                      for (const r of recipes) {
+                        const suffix = r.is_root ? '' : ` @ ${r.path}`
+                        opts.push({ value: `${s.name}${r.is_root ? '' : '@@' + r.path}`, label: `${s.name}${suffix}` })
+                      }
+                    } else {
+                      opts.push({ value: s.name, label: s.name })
+                    }
+                  }
+                  return opts
+                })()}
                 onChange={(val) => {
                   checkMissingFiles(val)
+                  fetchExpectedVolumes(val)
+                  // Parse base name for label computation (strip @@recipe_path)
+                  const baseName = val.includes('@@') ? val.split('@@')[0] : val
                   const user = form.getFieldValue('user_name')
-                  if (val && user) computeNextLabel(user, val)
+                  if (val && user) computeNextLabel(user, baseName)
                 }}
               />
             </Form.Item>
@@ -421,23 +513,26 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
           <Divider plain>Volume Mapping (optional)</Divider>
           <Form.List name="volumes">
-            {(fields, { add, remove }) => (
-              <>
-                {fields.map(({ key, name, ...rest }) => (
-                  <Space key={key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
-                    <Form.Item {...rest} name={[name, 'key']} rules={[{ required: true, message: 'Volume name' }]}>
-                      <Input placeholder="app_data" style={{ width: 180 }} />
-                    </Form.Item>
-                    <span>→</span>
-                    <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Host path' }]}>
-                      <Input placeholder="/srv/provision/user-data/alice/app" style={{ width: 320 }} />
-                    </Form.Item>
-                    <Button type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(name)} />
-                  </Space>
-                ))}
-                <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>Add Volume</Button>
-              </>
-            )}
+            {(fields, { add, remove }) => {
+              volumeAddRef.current = add
+              return (
+                <>
+                  {fields.map(({ key, name, ...rest }) => (
+                    <Space key={key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
+                      <Form.Item {...rest} name={[name, 'key']} rules={[{ required: true, message: 'Volume name' }]}>
+                        <Input placeholder="app_data" style={{ width: 180 }} />
+                      </Form.Item>
+                      <span>→</span>
+                      <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Host path' }]}>
+                        <Input placeholder="/srv/provision/user-data/alice/app" style={{ width: 320 }} />
+                      </Form.Item>
+                      <Button type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(name)} />
+                    </Space>
+                  ))}
+                  <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>Add Volume</Button>
+                </>
+              )
+            }}
           </Form.List>
 
           <Divider plain>Build Args (optional)</Divider>
