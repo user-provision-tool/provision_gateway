@@ -98,7 +98,7 @@
 | P12 | Redeploy blink on file change | ✅ | Redeploy button blinks when deployment files modified after registration; CSS animation `redeploy-blink` |
 | P13 | Service registration time tracking | ✅ | `GET /api/.../registration-time` finds most recent successful register task |
 | P14 | Deployment file CRUD API | ✅ | `GET/PUT /api/users/{u}/{s}/{l}/deployment-files/{type}` for env/compose/nginx |
-| P15 | Service header resource stats | 🟡 | RAM (RSS), CPU shown on collapse panel header via docker stats (disk removed per task 4) |
+| P15 | Service header resource stats | ✅ | RAM (RSS), CPU shown on collapse panel header via docker stats; verified — /api/system/stats proxies to provision-api /docker/stats |
 
 ---
 
@@ -233,6 +233,44 @@
 
 ---
 
+## ACL. ACL & Access Control
+
+| # | Feature | Status | Notes |
+|---|---|---|---|
+| ACL1 | ENABLE_ACL environment variable | ✅ | Toggle ACL-based service access control at gateway level |
+| ACL2 | /api/auth/verify endpoint | ✅ | NGINX auth_request subrequest; validates JWT from provision_token cookie or X-Provision-Token header |
+| ACL3 | gateway_token cookie (admin session) | ✅ | HTTP-only cookie set on admin login for dashboard auth |
+| ACL4 | provision_token cookie (service access) | ✅ | HTTP-only cookie set on /go/{hostname} redirect for service access |
+| ACL5 | HostnameIndex | ✅ | In-memory hostname-to-registry-entry lookup; maps service URLs to registry entries |
+| ACL6 | Registry (user_registry.yml) | ✅ | Read-only registry wrapper; reads provision-api registry via shared filesystem |
+| ACL7 | /go/{hostname} service redirect | ✅ | Dashboard redirect to service URL with provision_token cookie |
+| ACL8 | Viewer ACL: own services only | ✅ | Viewers can only access their own services + allowed_special_users |
+| ACL9 | Admin unrestricted access | ✅ | Admins have unrestricted access to all services |
+| ACL10 | X-Service-Basic credential injection | ✅ | Base64-encoded username:password header for nginx auth_basic on target service |
+
+---
+
+## AK. API Key Management
+
+| # | Feature | Status | Notes |
+|---|---|---|---|
+| AK1 | Create API key | ✅ | `POST /api/auth/keys`; admin for any user, viewer for self |
+| AK2 | List API keys | ✅ | `GET /api/auth/keys`; admin sees all, viewer sees own |
+| AK3 | Revoke/delete API key | ✅ | `DELETE /api/auth/keys/{id}`; admin revokes any, viewer own |
+| AK4 | API key with provision token | ✅ | Key creation returns raw token, provision_token for service access |
+| AK5 | ApiKeysPage frontend | ✅ | Admin page at /api-keys for managing end-user API keys |
+
+---
+
+## AL. Alerts Page
+
+| # | Feature | Status | Notes |
+|---|---|---|---|
+| AL1 | AlertPage frontend | ✅ | Page at /alerts for system notifications and alerts |
+| AL2 | Project detection alerts | ✅ | Notifications from background project monitor loop (new projects in source_projects/) |
+
+---
+
 ## Summary Statistics
 
 | Category | Total | Implemented | Verified | Gaps |
@@ -240,7 +278,7 @@
 | Authentication | 14 | 14 | 14 | 0 |
 | Dashboard | 8 | 8 | 8 | 0 |
 | Service Management | 19 | 17 | 17 | 0 |
-| User Provisioning | 15 | 15 | 14 | 1 |
+| User Provisioning | 15 | 15 | 15 | 0 |
 | Service URL & Connectivity | 5 | 5 | 5 | 0 |
 | LLM Integration | 16 | 15 | 15 | 1 |
 | Real-Time Operations | 7 | 7 | 7 | 0 |
@@ -250,7 +288,10 @@
 | Proxy Management | 9 | 9 | 9 | 0 |
 | User Management | 7 | 7 | 7 | 0 |
 | MCP Server | 6 | 6 | 6 | 0 |
-| **TOTAL** | **124** | **121** | **120** | **2** |
+| ACL & Access Control | 10 | 10 | 10 | 0 |
+| API Key Management | 5 | 5 | 5 | 0 |
+| Alerts Page | 2 | 2 | 2 | 0 |
+| **TOTAL** | **141** | **138** | **138** | **3** |
 
-**Implementation Rate:** 121/124 = **97.6%**
-**Verified Rate:** 120/124 = **96.8%**
+**Implementation Rate:** 138/141 = **97.9%**
+**Verified Rate:** 138/141 = **97.9%**

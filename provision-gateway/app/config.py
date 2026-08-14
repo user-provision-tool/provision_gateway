@@ -26,7 +26,7 @@ class Settings:
 
         # ---- provision-api connection ----
         self.PROVISION_API_URL: str = os.environ.get(
-            "PROVISION_API_URL", "http://provision-api:8000"
+            "PROVISION_API_URL", "http://subnet-acl-provision-api:8000"
         )
 
         # ---- Nginx display ports (for URL generation) ----
@@ -63,6 +63,14 @@ class Settings:
             os.environ.get("JWT_REFRESH_EXPIRE_SEC", "604800")
         )
         self.JWT_ALGORITHM: str = "HS256"
+
+        # ---- ACL ----
+        self.ENABLE_ACL: bool = os.environ.get("ENABLE_ACL", "false").lower() == "true"
+        self.REGISTRY_FILE: str = os.environ.get(
+            "REGISTRY_FILE",
+            str(self.PROVISION_DIR / "generated" / "user_registry.yml"),
+        )
+        self.PROVISION_COOKIE_TTL: int = int(os.environ.get("PROVISION_COOKIE_TTL", "86400"))
 
         # ---- Logging ----
         self.LOG_LEVEL: str = os.environ.get("GATEWAY_LOG_LEVEL", "INFO")

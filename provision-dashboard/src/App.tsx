@@ -11,10 +11,12 @@ import SettingsPage from './pages/SettingsPage'
 import AuditPage from './pages/AuditPage'
 import UserManagementPage from './pages/UserManagementPage'
 import SSLPage from './pages/SSLPage'
+import ApiKeysPage from './pages/ApiKeysPage'
+import AlertPage from './pages/AlertPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, isLoading } = useAuth()
-  
+
   if (isLoading) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh' }}>
@@ -23,7 +25,17 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
     )
   }
   if (!isAuthenticated) return <Navigate to="/login" replace />
-  
+
+  return <>{children}</>
+}
+
+// Admin-only route guard (Gap 10 / G3): viewers may only reach Services + API Keys.
+// The sidebar hides admin nav items, but without this the routes themselves were
+// reachable by direct URL (e.g. /dashboard, /audit, /users/manage), leaking admin
+// page shells and buttons (and a Reconcile button → 403, Gap 5).
+function AdminRoute({ children }: { children: React.ReactNode }) {
+  const { admin } = useAuth()
+  if (admin?.role !== 'admin') return <Navigate to="/users" replace />
   return <>{children}</>
 }
 
@@ -52,17 +64,20 @@ export default function App() {
         </ProtectedRoute>
       }>
         <Route index element={<Navigate to="/dashboard" replace />} />
-        <Route path="dashboard" element={<DashboardPage />} />
-        <Route path="services" element={<ServicesPage />} />
-        <Route path="services/:name" element={<ServicesPage />} />
+        <Route path="dashboard" element={<AdminRoute><DashboardPage /></AdminRoute>} />
+        <Route path="services" element={<AdminRoute><ServicesPage /></AdminRoute>} />
+        <Route path="services/:name" element={<AdminRoute><ServicesPage /></AdminRoute>} />
         <Route path="users" element={<UsersPage />} />
         <Route path="users/:name" element={<UsersPage />} />
-        <Route path="tasks" element={<TasksPage />} />
-        <Route path="settings" element={<SettingsPage />} />
-        <Route path="audit" element={<AuditPage />} />
-        <Route path="users/manage" element={<UserManagementPage />} />
-        <Route path="ssl" element={<SSLPage />} />
+        <Route path="tasks" element={<AdminRoute><TasksPage /></AdminRoute>} />
+        <Route path="settings" element={<AdminRoute><SettingsPage /></AdminRoute>} />
+        <Route path="audit" element={<AdminRoute><AuditPage /></AdminRoute>} />
+        <Route path="users/manage" element={<AdminRoute><UserManagementPage /></AdminRoute>} />
+        <Route path="ssl" element={<AdminRoute><SSLPage /></AdminRoute>} />
+        <Route path="api-keys" element={<ApiKeysPage />} />
+        <Route path="alert" element={<AlertPage />} />
       </Route>
+      <Route path="/alert" element={<AlertPage />} />
     </Routes>
   )
 }

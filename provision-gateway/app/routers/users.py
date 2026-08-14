@@ -8,8 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..middleware import get_current_admin
-from ..models.admin import AdminUser
+from ..middleware import require_admin, require_gateway_token
+from ..models.end_user import EndUser
 from ..config import settings
 from ..services import audit_service, curl_service
 from ..services.provision_service import provision_service
@@ -19,10 +19,15 @@ router = APIRouter(prefix="/api/users", tags=["users"])
 
 @router.get("")
 async def list_users(
-    current_admin: AdminUser = Depends(get_current_admin),
+    request: Request = None,
+    current_user: dict = Depends(require_gateway_token),
     db: Session = Depends(get_db),
 ):
-    """List all end-users from provision-api, syncing missing users to gateway DB."""
+    """List all end-users from provision-api, syncing missing users to gateway DB.
+
+    Viewers: results are filtered to own services + allowed_special_users.
+    Admins: see all services.
+    """
     try:
         result = await provision_service.list_users()
     except Exception as e:
@@ -49,15 +54,50 @@ async def list_users(
             db.add(new_user)
     db.commit()
 
+    # Filter for viewers: own services + allowed_special_users only
+    if current_user["role"] != "admin":
+        viewer_name = current_user.get("email", "")
+        allowed_users = set()
+        if viewer_name:
+            allowed_users.add(viewer_name)
+        # Get allowed_special_users from the current user
+        if current_user.get("user_type") == "end_user":
+            eu = db.query(EndUser).filter(EndUser.id == current_user["id"]).first()
+            if eu and eu.allowed_special_users:
+                for name in eu.allowed_special_users.split(","):
+                    name = name.strip()
+                    if name:
+                        allowed_users.add(name)
+        users = [u for u in users if u.get("user_name") in allowed_users]
+
     return {"users": users, "count": len(users)}
 
 
 @router.get("/{user_name}")
 async def get_user(
     user_name: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    request: Request = None,
+    current_user: dict = Depends(require_gateway_token),
+    db: Session = Depends(get_db),
 ):
-    """Get a single end-user's services from provision-api."""
+    """Get a single end-user's services from provision-api.
+
+    Viewers may only see their own services; admins can see anyone's.
+    """
+    # ACL check for viewers
+    if current_user["role"] != "admin":
+        viewer_name = current_user.get("email", "")
+        allowed = {viewer_name}
+        if current_user.get("user_type") == "end_user":
+            eu = db.query(EndUser).filter(EndUser.id == current_user["id"]).first()
+            if eu and eu.allowed_special_users:
+                for name in eu.allowed_special_users.split(","):
+                    name = name.strip()
+                    if name:
+                        allowed.add(name)
+        if user_name not in allowed:
+            raise HTTPException(403, "Access denied: you can only view your own services")
+
     try:
         result = await provision_service.get_user(user_name)
     except Exception as e:
@@ -69,7 +109,7 @@ async def get_user(
 async def deploy_user(
     req: dict[str, Any],
     request: Request,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Deploy a service to a user (proxied to provision-api POST /users).
@@ -141,7 +181,7 @@ async def deploy_user(
         audit_service.log_action(
             db,
             action="register",
-            admin_id=current_admin.id,
+            admin_id=current_admin["id"],
             target_user=req.get("user_name"),
             target_service=req.get("service_name"),
             target_label=req.get("label", "0"),
@@ -154,7 +194,7 @@ async def deploy_user(
     audit_service.log_action(
         db,
         action="register",
-        admin_id=current_admin.id,
+        admin_id=current_admin["id"],
         target_user=req.get("user_name"),
         target_service=req.get("service_name"),
         target_label=req.get("label", "0"),
@@ -172,7 +212,7 @@ async def deploy_user(
 async def get_next_label(
     user_name: str,
     service_name: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Compute the next available service label for a user+service combo.
 
@@ -212,7 +252,7 @@ async def remove_user_service(
     user_name: str,
     service_name: str,
     label: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Remove a user's service instance."""
@@ -220,14 +260,14 @@ async def remove_user_service(
         result = await provision_service.remove_user(user_name, service_name, label)
     except Exception as e:
         audit_service.log_action(
-            db, action="remove", admin_id=current_admin.id,
+            db, action="remove", admin_id=current_admin["id"],
             target_user=user_name, target_service=service_name,
             target_label=label, status="failure", error_message=str(e),
         )
         raise HTTPException(502, f"provision-api error: {e}")
 
     audit_service.log_action(
-        db, action="remove", admin_id=current_admin.id,
+        db, action="remove", admin_id=current_admin["id"],
         target_user=user_name, target_service=service_name,
         target_label=label, status="success",
     )
@@ -238,7 +278,7 @@ async def remove_user_service(
 async def rebuild_user_service(
     user_name: str, service_name: str, label: str,
     req: dict[str, Any] = {},
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Rebuild a user's service instance."""
@@ -255,14 +295,14 @@ async def rebuild_user_service(
         result = await provision_service.rebuild_user(user_name, service_name, label, **req)
     except Exception as e:
         audit_service.log_action(
-            db, action="rebuild", admin_id=current_admin.id,
+            db, action="rebuild", admin_id=current_admin["id"],
             target_user=user_name, target_service=service_name,
             target_label=label, status="failure", error_message=str(e),
         )
         raise HTTPException(502, f"provision-api error: {e}")
 
     audit_service.log_action(
-        db, action="rebuild", admin_id=current_admin.id,
+        db, action="rebuild", admin_id=current_admin["id"],
         target_user=user_name, target_service=service_name,
         target_label=label, status="success",
     )
@@ -272,7 +312,7 @@ async def rebuild_user_service(
 @router.post("/{user_name}/{service_name}/{label}/up")
 async def start_user_service(
     user_name: str, service_name: str, label: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Start a user's service (delegated to provision-api)."""
@@ -280,7 +320,7 @@ async def start_user_service(
         result = await provision_service.start_user(user_name, service_name, label)
     except Exception as e:
         raise HTTPException(502, f"provision-api error: {e}")
-    audit_service.log_action(db, action="start", admin_id=current_admin.id,
+    audit_service.log_action(db, action="start", admin_id=current_admin["id"],
         target_user=user_name, target_service=service_name, target_label=label, status="success")
     return result
 
@@ -288,7 +328,7 @@ async def start_user_service(
 @router.post("/{user_name}/{service_name}/{label}/down")
 async def stop_user_service(
     user_name: str, service_name: str, label: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Stop a user's service (delegated to provision-api)."""
@@ -296,7 +336,7 @@ async def stop_user_service(
         result = await provision_service.stop_user(user_name, service_name, label)
     except Exception as e:
         raise HTTPException(502, f"provision-api error: {e}")
-    audit_service.log_action(db, action="stop", admin_id=current_admin.id,
+    audit_service.log_action(db, action="stop", admin_id=current_admin["id"],
         target_user=user_name, target_service=service_name, target_label=label, status="success")
     return result
 
@@ -305,7 +345,7 @@ async def stop_user_service(
 async def change_user_password(
     user_name: str, service_name: str, label: str,
     req: dict[str, Any],
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Change a user's htpasswd password (delegated to provision-api)."""
@@ -319,7 +359,7 @@ async def change_user_password(
         raise HTTPException(502, f"provision-api error: {e}")
 
     audit_service.log_action(
-        db, action="password_change", admin_id=current_admin.id,
+        db, action="password_change", admin_id=current_admin["id"],
         target_user=user_name, target_service=service_name,
         target_label=label, status="success",
     )
@@ -330,7 +370,7 @@ async def change_user_password(
 async def get_container_logs(
     user_name: str, service_name: str, label: str, container: str,
     tail: int = Query(100, ge=1, le=10000, description="Number of log lines to return"),
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Get container logs for a specific compose service (delegated to provision-api)."""
     try:
@@ -345,7 +385,7 @@ async def get_container_logs(
 @router.get("/{user_name}/{service_name}/{label}/url")
 async def get_service_url(
     user_name: str, service_name: str, label: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Get the URL for a user's service instance."""
     from ..config import settings
@@ -385,7 +425,7 @@ async def get_service_url(
         "nginx_http_port": http_port,
         "nginx_https_port": https_port,
         # Internal URL reachable from Docker network (test-curl uses this)
-        "_internal_host": "provision-nginx",
+        "_internal_host": "subnet-acl-nginx",
     }
 
 
@@ -393,7 +433,7 @@ async def get_service_url(
 async def test_curl(
     user_name: str, service_name: str, label: str,
     req: dict[str, Any] = {},
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Test a user's service URL with curl from inside the gateway container."""
     url_info = await get_service_url(user_name, service_name, label, current_admin)
@@ -418,7 +458,7 @@ async def test_curl(
 @router.post("/clone", status_code=202)
 async def clone_user(
     req: dict[str, Any],
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Clone all services from source_user to target_user."""
@@ -458,7 +498,7 @@ async def clone_user(
                           "error": str(e)})
 
     audit_service.log_action(
-        db, action="clone", admin_id=current_admin.id,
+        db, action="clone", admin_id=current_admin["id"],
         target_user=target_user,
         detail={"source_user": source_user, "tasks": tasks},
         status="success",
@@ -507,7 +547,7 @@ def _resolve_deployment_file(
 @router.get("/{user_name}/{service_name}/{label}/deployment-files")
 async def list_deployment_files(
     user_name: str, service_name: str, label: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """List deployment files for a service instance (paths, sizes, modification times)."""
     files = []
@@ -531,7 +571,7 @@ async def list_deployment_files(
 @router.get("/{user_name}/{service_name}/{label}/deployment-files/{file_type}")
 async def get_deployment_file(
     user_name: str, service_name: str, label: str, file_type: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Get the content of a deployment file.
 
@@ -577,7 +617,7 @@ async def get_deployment_file(
 async def save_deployment_file(
     user_name: str, service_name: str, label: str, file_type: str,
     req: dict[str, Any],
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Save/update a deployment file's content."""
@@ -595,7 +635,7 @@ async def save_deployment_file(
         raise HTTPException(500, f"Failed to write file: {e}")
 
     audit_service.log_action(
-        db, action="deployment_file_edit", admin_id=current_admin.id,
+        db, action="deployment_file_edit", admin_id=current_admin["id"],
         target_user=user_name, target_service=service_name,
         target_label=label,
         detail={"file_type": file_type, "path": str(fp)},
@@ -613,7 +653,7 @@ async def save_deployment_file(
 @router.get("/{user_name}/{service_name}/{label}/registration-time")
 async def get_registration_time(
     user_name: str, service_name: str, label: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Get the service registration completion timestamp by finding the most
     recent successful 'register' task for this service instance."""
@@ -652,7 +692,7 @@ async def get_volume_usage(
     service_name: str,
     label: str,
     db: Session = Depends(get_db),
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Get disk usage for a service instance's volume directories."""
     import os as _os

@@ -24,7 +24,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from jose import jwt
 
-GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://provision-gateway:8770")
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://subnet-acl-gateway:8770")
 GATEWAY_SECRET = os.environ.get("GATEWAY_SECRET_KEY", "dev-secret-change-me-in-production-32chars!")
 JWT_ALGORITHM = "HS256"
 

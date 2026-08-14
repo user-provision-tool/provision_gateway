@@ -8,6 +8,7 @@ from .service_template import ServiceTemplate
 from .gateway_setting import GatewaySetting
 from .proxy_config import ProxyConfig
 from .end_user import EndUser
+from .api_key import ApiKey
 
 __all__ = [
     "AdminUser",
@@ -17,4 +18,5 @@ __all__ = [
     "GatewaySetting",
     "ProxyConfig",
     "EndUser",
+    "ApiKey",
 ]

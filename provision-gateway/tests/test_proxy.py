@@ -10,6 +10,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from app.services.proxy_service import (
     get_proxy_env,
     inject_proxy_build_args,
+    list_configs,
+    create_config,
 )
 from app.models.proxy_config import ProxyConfig
 from app.utils.crypto import encrypt_api_key, decrypt_api_key
@@ -100,3 +102,54 @@ class TestProxyConfigModel:
         public_keys = {"enabled", "protocol", "host", "port", "username",
                        "password_masked", "url", "reachable", "last_checked_at"}
         assert len(public_keys) == 9
+
+
+def _make_config(id_, host, port, active=False, name="global-proxy"):
+    """Build a fake ProxyConfig row for dedupe tests."""
+    c = MagicMock()
+    c.id = id_
+    c.protocol = "http"
+    c.host = host
+    c.port = port
+    c.is_active = active
+    c.name = name
+    c.to_dict.return_value = {
+        "id": id_, "name": name, "protocol": "http",
+        "host": host, "port": port, "is_active": active,
+    }
+    return c
+
+
+class TestProxyDedupe:
+    """BUG-3: Settings Global Proxy list must show exactly one entry."""
+
+    def test_list_configs_dedupes_duplicate_rows(self):
+        """~30 accumulated identical rows collapse to exactly one (active preferred)."""
+        active = _make_config(30, "172.18.0.1", 7897, active=True)
+        inactive = [_make_config(i, "172.18.0.1", 7897) for i in range(1, 30)]
+        db = MagicMock()
+        # order_by(is_active.desc(), created_at) puts active first in real DB
+        db.query.return_value.order_by.return_value.all.return_value = [active] + inactive
+        result = list_configs(db)
+        assert len(result) == 1
+        assert result[0]["id"] == 30
+
+    def test_list_configs_preserves_distinct_endpoints(self):
+        """Distinct (host, port) endpoints are all retained."""
+        a = _make_config(1, "172.18.0.1", 7897)
+        b = _make_config(2, "10.0.0.1", 3128)
+        db = MagicMock()
+        db.query.return_value.order_by.return_value.all.return_value = [a, b]
+        result = list_configs(db)
+        assert len(result) == 2
+
+    def test_create_config_returns_existing_duplicate(self):
+        """Re-saving the same endpoint must not create a new row."""
+        existing = MagicMock()
+        existing.name = ""
+        existing.to_dict.return_value = {"id": 5}
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = existing
+        result = create_config(db, {"protocol": "http", "host": "172.18.0.1", "port": "7897"})
+        assert result["id"] == 5
+        db.add.assert_not_called()

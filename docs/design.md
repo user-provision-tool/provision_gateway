@@ -3,8 +3,7 @@
 > **Version**: 1.3
 > **Date**: 2026-07-20 (updated — post comprehensive gap analysis)
 > **Status**: Implemented — reflects current codebase
-> **Depends on**: [requirements.md](./requirements.md) (CONFIRMED)
-> **See also**: [architecture.md](./architecture.md) | [api_references.md](./api_references.md) | [tests_coverage_status.md](./tests_coverage_status.md) | [changes-provision_gateway-20260708.md](./changes-provision_gateway-20260708.md)
+> **See also**: [architecture.md](./architecture.md) | [api_references.md](./api_references.md) | [tests_coverage_status.md](./tests_coverage_status.md)
 
 ---
 
@@ -659,6 +658,45 @@ PUT /api/auth/password
   Response: 200 { "message": "Password updated." }
 ```
 
+### 5.3b ACL (Access Control List)
+
+```
+GET /api/auth/verify
+  → Called by provision-nginx as auth_request subrequest
+  → Extracts JWT from provision_token cookie or X-Provision-Token header
+  → When ENABLE_ACL=false: always returns 200 (pass-through to auth_basic)
+  → When ENABLE_ACL=true: validates JWT, checks ACL permissions
+  → Response (ACL passed): 200 + X-Service-Basic header (base64 user:pass)
+  → Response (ACL denied): 403 + X-Auth-Action: redirect_acl_denied
+  → Response (token expired): 401 + X-Auth-Action: redirect_token_expired
+  → Response (no token): 401 + X-Auth-Action: redirect_login
+
+GET /go/{hostname}
+  → Dashboard service access redirect
+  → Validates gateway_token, checks ACL, creates provision_token
+  → Redirects to service URL via /_set_token?token=...&redirect=/
+
+POST /api/auth/keys
+  → Create API key for end-user programmatic access
+  → Admin can create for any user; viewer for self only
+  → Response: 201 { key, token, provision_token }
+
+GET /api/auth/keys
+  → List API keys
+  → Admin sees all; viewer sees own
+
+DELETE /api/auth/keys/{id}
+  → Revoke an API key
+  → Admin can revoke any; viewer own only
+  → Response: 200 { revoked: true, key_id: id }
+```
+
+**ACL Authorization Rules:**
+- Admins have unrestricted access to all services
+- Viewers can access their own services + services belonging to `allowed_special_users`
+- Special users (role=special) are blocked from dashboard login
+- API keys provide an alternative to JWT tokens for end-user service access
+
 ### 5.4 System
 
 ```
@@ -1027,8 +1065,12 @@ GET /api/audit?admin_id=1&action=register&user=alice&from=2026-07-01&to=2026-07-
 /users/:name             → UserDetailPage (user's service instances)
 /users/manage            → UserManagementPage (register/approve/assign roles)
 /tasks                   → TasksPage (task queue)
+/tasks/:id               → TaskDetailPage (task details + logs)
 /settings                → SettingsPage (LLM config, global proxy, domain, ports)
 /audit                   → AuditPage
+/ssl                     → SSLPage (SSL certificate management)
+/api-keys                → ApiKeysPage (API key management for end-users)
+/alerts                  → AlertPage (system notifications and alerts)
 ```
 
 ### 6.2 Page Layout

@@ -19,25 +19,26 @@ export default function UserManagementPage() {
   const [specialUsersSelected, setSpecialUsersSelected] = useState<string[]>([])
   const [specialUsersLoading, setSpecialUsersLoading] = useState(false)
 
-  useEffect(() => { loadUsers(); loadGlobalSpecialUsers() }, [])
+  useEffect(() => { loadUsers() }, [])
 
   const loadUsers = async () => {
     setLoading(true)
-    try { const { data } = await client.get('/auth/users'); setUsers(data.users || []) }
-    catch (err: any) { message.error('Failed to load users') }
-    finally { setLoading(false) }
-  }
-
-  const loadGlobalSpecialUsers = async () => {
     try {
       const { data } = await client.get('/auth/users')
-      const allUsers = data.users || []
-      // Special users are those registered with role="special"
-      const specialUsers = allUsers
-        .filter((u: any) => u.role === 'special' && u.is_approved)
-        .map((u: any) => u.username)
-      setSpecialUsersGlobal(specialUsers)
-    } catch { /* use defaults */ }
+      const all = data.users || []
+      setUsers(all)
+      // Derive the "special functional users" list from the same payload
+      // (role='special' && approved) so the grant dialog's tag list stays in
+      // sync after register/approve/delete/refresh — previously it was loaded
+      // only once on mount and went stale (Gap 4).
+      setSpecialUsersGlobal(
+        all
+          .filter((u: any) => u.role === 'special' && u.is_approved)
+          .map((u: any) => u.username)
+      )
+    }
+    catch (err: any) { message.error('Failed to load users') }
+    finally { setLoading(false) }
   }
 
   const handleAdd = async (values: any) => {

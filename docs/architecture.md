@@ -84,6 +84,8 @@ Provision Gateway is a **management layer** that wraps the existing `provision-a
 | `provision-api` | External dependency | 8765→8000 | `users_provision_default` | User provisioning operations |
 | `provision-nginx` | External dependency | 99→80, 1993→443 | `users_provision_default` + per-user networks | End-user service ingress |
 
+> **Note on naming**: The container names shown above use the `provision-*` prefix as referenced throughout the documentation. In certain deployments, the actual Docker container names may use a `subnet-acl-*` prefix (e.g., `subnet-acl-gateway`, `subnet-acl-nginx`). Both naming conventions refer to the same set of containers — the difference is deployment-specific and does not affect functionality.
+
 ### 2.2 Container Responsibilities
 
 #### provision-gateway (Backend)
@@ -149,6 +151,50 @@ Per-User Networks (isolated)
 | Gateway → provision-api | HTTP | None | Internal Docker DNS |
 | End User → provision-nginx | HTTP/HTTPS | HTTP Basic Auth (htpasswd) | Public |
 | End User → Service Container | HTTP | Service-specific | Via provision-nginx proxy |
+
+### 3.3 ACL (Access Control List)
+
+When `ENABLE_ACL=true` (disabled by default), the gateway enforces fine-grained service access control through nginx `auth_request` subrequests.
+
+**How it works:**
+
+1. **Cookie-based authentication**: Two HTTP-only cookies carry access tokens:
+   - `gateway_token` — Admin/end-user JWT set on dashboard login; used to authenticate dashboard API requests.
+   - `provision_token` — Short-lived JWT set on `/go/{hostname}` redirect; used by nginx `auth_request` to authorize end-user service access.
+
+2. **`/api/auth/verify` endpoint**: Called by provision-nginx as an `auth_request` subrequest before serving any end-user service traffic. The endpoint:
+   - Extracts JWT from `provision_token` cookie or `X-Provision-Token` header.
+   - If ACL is disabled (`ENABLE_ACL=false`): always returns 200 (pass-through to auth_basic).
+   - If ACL is enabled: validates the JWT, looks up the target service by hostname, and checks whether the authenticated user is authorized to access that service.
+
+3. **Authorization rules**:
+   - **Admins**: Have unrestricted access to all services.
+   - **Viewers**: Can only access their own services (where `target_user == viewer's username`) plus services belonging to users in their `allowed_special_users` list.
+   - **Denied**: Returns 403 with `X-Auth-Action: redirect_acl_denied` header.
+
+4. **Credential injection**: On successful verification, the endpoint returns an `X-Service-Basic` header containing the base64-encoded `username:password` for the target service's auth_basic. Nginx uses this to authenticate against the service's htpasswd.
+
+5. **Hostname-to-service resolution**: Two in-memory services read `user_registry.yml` from the shared filesystem:
+   - **HostnameIndex** (`app/services/hostname_index.py`): Maps hostnames (e.g., `myapp-alice-0.localhost`) to registry entries for O(1) lookup.
+   - **Registry** (`app/services/registry.py`): Read-only registry wrapper for listing all entries.
+
+6. **Service access redirect (`/go/{hostname}`)**: Dashboard endpoint that validates the `gateway_token`, checks ACL, creates a `provision_token`, and redirects the browser to the service URL with the provision token set via `/_set_token`.
+
+**ACL-related environment variables:**
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_ACL` | `false` | Enable ACL-based access control |
+| `REGISTRY_FILE` | `generated/user_registry.yml` | Path to the registry YAML file |
+| `PROVISION_COOKIE_TTL` | `86400` | Provision token cookie TTL in seconds |
+
+### 3.4 API Key Authentication
+
+End-users can create API keys as an alternative to JWT-based authentication for programmatic service access. API keys are generated via `POST /api/auth/keys` and managed through the `/api-keys` dashboard page.
+
+- Each API key is associated with a specific end-user.
+- Key creation returns a raw token (shown once) and a `provision_token` for service access.
+- API keys can be listed and revoked (`GET /api/auth/keys`, `DELETE /api/auth/keys/{id}`).
+- Admins can manage keys for any user; viewers can only manage their own keys.
 
 ---
 
@@ -473,7 +519,6 @@ Admin clicks "Add Project" → "From Git"
 ```
 _provision_gateway/
 ├── docker-compose.gateway.yml    # Docker Compose for gateway stack
-├── requirements.md               # Product requirements (CONFIRMED)
 ├── LICENSE
 │
 ├── docs/                         # Documentation

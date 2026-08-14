@@ -30,6 +30,7 @@ const menuItems = [
   { key: '/audit', icon: <AuditOutlined />, label: 'Audit' },
   { key: '/users/manage', icon: <UserOutlined />, label: 'Users' },
   { key: '/ssl', icon: <SafetyCertificateOutlined />, label: 'SSL Certs' },
+  { key: '/api-keys', icon: <KeyOutlined />, label: 'API Keys' },
 ]
 
 export default function AppLayout() {
@@ -56,8 +57,8 @@ export default function AppLayout() {
   const visibleMenuItems = (() => {
     if (isAdmin && !isEndUser) return menuItems // Gateway admin: all items
     if (isEndUser && admin?.role === 'admin') return menuItems // End-user promoted to admin: all items
-    // End-user viewer: only Services page
-    return menuItems.filter(m => m.key === '/users')
+    // End-user viewer: Services page + API Keys page
+    return menuItems.filter(m => m.key === '/users' || m.key === '/api-keys')
   })()
 
   const handleMenuClick = ({ key }: { key: string }) => {
@@ -109,6 +110,10 @@ export default function AppLayout() {
   const notifiedRef = useRef<Set<string>>(new Set())
   const [activeTaskCount, setActiveTaskCount] = useState(0)
   useEffect(() => {
+    // Task completion notifications poll the admin-only /api/tasks endpoint.
+    // Viewers get a 403 on every poll; skip the whole effect for non-admins
+    // (Gap 5/10 follow-up: viewer Services page was flooding the console).
+    if (!isAdmin) return
     if ('Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission()
     }
@@ -183,7 +188,7 @@ export default function AppLayout() {
     // Run once immediately
     poll()
     return () => clearInterval(id)
-  }, [])
+  }, [isAdmin])
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
@@ -219,7 +224,9 @@ export default function AppLayout() {
           mode="inline"
           selectedKeys={[location.pathname.startsWith('/services') ? '/services' :
                          location.pathname.startsWith('/users/manage') ? '/users/manage' :
-                         location.pathname.startsWith('/users') ? '/users' : location.pathname]}
+                         location.pathname.startsWith('/users') ? '/users' :
+                         location.pathname.startsWith('/api-keys') ? '/api-keys' :
+                         location.pathname.startsWith('/alert') ? '/alert' : location.pathname]}
           items={visibleMenuItems}
           onClick={handleMenuClick}
         />

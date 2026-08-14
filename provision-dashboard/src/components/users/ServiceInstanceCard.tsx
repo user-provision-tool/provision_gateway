@@ -17,6 +17,7 @@ export interface ServiceInstance {
   nginx_conf_template_path?: string
   has_auth?: boolean
   url?: string
+  subnet?: string
 }
 
 interface ServiceInstanceCardProps {
@@ -89,6 +90,9 @@ export default function ServiceInstanceCard({ svc, key_, isAdmin, activeTasks, n
             <a href={svc.url} target="_blank" rel="noreferrer">{svc.url}</a>
             {svc.has_auth && <Tag style={{ marginLeft: 8 }}>🔒 auth</Tag>}
           </div>
+        )}
+        {svc.subnet && (
+          <div><Text strong>Subnet: </Text><Tag color="purple">{svc.subnet}</Tag></div>
         )}
         <div>
           <Space wrap>

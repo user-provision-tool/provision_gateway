@@ -14,7 +14,7 @@ export default function SettingsPage() {
     <div>
       <Title level={3}>Settings</Title>
       {isAdmin ? <><LlmPanel /><ProxyPanel /></> : <Card><Empty description="Settings management requires admin role."/></Card>}
-      <Card title="System Info"><Space direction="vertical"><Text><strong>Gateway:</strong> v1.0.0</Text><Text><strong>Provision API:</strong> provision-api:8000</Text></Space></Card>
+      <Card title="System Info"><Space direction="vertical"><Text><strong>Gateway:</strong> v1.0.0</Text><Text><strong>Provision API:</strong> subnet-acl-provision-api:8000</Text></Space></Card>
     </div>
   )
 }

@@ -8,8 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, 
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..middleware import get_current_admin
-from ..models.admin import AdminUser
+from ..middleware import require_admin
 from ..models.service_template import ServiceTemplate
 from ..services.audit_service import log_action
 from ..services.service_manager import service_manager
@@ -23,7 +22,7 @@ router = APIRouter(prefix="/api/services", tags=["services"])
 
 @router.get("")
 async def list_services(
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """List all service projects in source_projects."""
     services = service_manager.list_services()
@@ -37,7 +36,7 @@ async def list_services(
 
 @router.get("/templates")
 async def list_templates(
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """List all available service templates."""
@@ -52,7 +51,7 @@ async def list_templates(
 
 @router.get("/notifications")
 async def get_project_notifications(
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Return newly detected project events from background monitoring.
 
@@ -67,7 +66,7 @@ async def get_project_notifications(
 @router.get("/{name}")
 async def get_service(
     name: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Get details for a single service project."""
     svc = service_manager.get_service(name)
@@ -79,7 +78,7 @@ async def get_service(
 @router.post("", status_code=201)
 async def create_service(
     req: dict[str, Any],
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Create a new service project.
@@ -124,7 +123,7 @@ async def create_service(
     except Exception as e:
         raise HTTPException(500, str(e))
 
-    log_action(db, action="service_create", admin_id=current_admin.id,
+    log_action(db, action="service_create", admin_id=current_admin["id"],
                target_service=name, status="success")
     return svc
 
@@ -133,7 +132,7 @@ async def create_service(
 async def check_missing_files(
     name: str,
     recipe_path: str = Query("", description="Recipe subdirectory path"),
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Check which essential deployment files are missing for a service.
 
@@ -181,7 +180,7 @@ async def check_missing_files(
 @router.post("/check-deploy")
 async def check_deploy_readiness(
     req: dict[str, Any],
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Check if a service project has all files needed for deployment.
@@ -265,7 +264,7 @@ async def check_deploy_readiness(
 @router.post("/save-generated")
 async def save_generated_files(
     req: dict[str, Any],
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Save LLM-generated files to the service project.
@@ -292,7 +291,7 @@ async def save_generated_files(
         marker = target / f"{filename}.generated"
         marker.write_text("")
 
-    log_action(db, action="llm_generated_files", admin_id=current_admin.id,
+    log_action(db, action="llm_generated_files", admin_id=current_admin["id"],
                target_service=service_name, status="success",
                detail={"files": saved})
 
@@ -303,7 +302,7 @@ async def save_generated_files(
 async def delete_service(
     name: str,
     force: bool = Query(False),
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Delete a service project."""
@@ -311,7 +310,7 @@ async def delete_service(
     if not deleted:
         raise HTTPException(404, f"Service '{name}' not found")
 
-    log_action(db, action="service_delete", admin_id=current_admin.id,
+    log_action(db, action="service_delete", admin_id=current_admin["id"],
                target_service=name, status="success")
     return {"deleted": True}
 
@@ -320,7 +319,7 @@ async def delete_service(
 async def get_service_file(
     name: str,
     filename: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Read a file from a service project."""
     content = service_manager.get_file(name, filename)
@@ -334,14 +333,14 @@ async def write_service_file(
     name: str,
     filename: str,
     req: dict[str, Any],
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Write or update a file in a service project."""
     content = req.get("content", "")
     ok = service_manager.write_file(name, filename, content)
 
-    log_action(db, action="config_edit", admin_id=current_admin.id,
+    log_action(db, action="config_edit", admin_id=current_admin["id"],
                target_service=name, status="success",
                detail={"filename": filename})
     return {"filename": filename, "written": ok}
@@ -352,14 +351,14 @@ async def create_service_file(
     name: str,
     filename: str,
     req: dict[str, Any],
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Create a new file in a service project with .generated marker."""
     content = req.get("content", "")
     created = service_manager.create_file(name, filename, content)
 
-    log_action(db, action="file_create", admin_id=current_admin.id,
+    log_action(db, action="file_create", admin_id=current_admin["id"],
                target_service=name, status="success",
                detail={"filename": filename})
     return {"filename": filename, "created": created}
@@ -369,7 +368,7 @@ async def create_service_file(
 async def delete_service_file(
     name: str,
     filename: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Delete a file from a service project."""
@@ -377,7 +376,7 @@ async def delete_service_file(
     if not deleted:
         raise HTTPException(404, f"File '{filename}' not found in service '{name}'")
 
-    log_action(db, action="file_delete", admin_id=current_admin.id,
+    log_action(db, action="file_delete", admin_id=current_admin["id"],
                target_service=name, status="success",
                detail={"filename": filename})
     return {"filename": filename, "deleted": True}
@@ -387,7 +386,7 @@ async def delete_service_file(
 async def convert_service_files(
     name: str,
     req: dict[str, Any],
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Convert plain compose/nginx files to Jinja2 templates.
@@ -413,7 +412,7 @@ async def convert_service_files(
         except Exception as e:
             raise HTTPException(422, f"Nginx conversion failed: {e}")
 
-    log_action(db, action="config_edit", admin_id=current_admin.id,
+    log_action(db, action="config_edit", admin_id=current_admin["id"],
                target_service=name, status="success",
                detail={"converted": list(result.keys())})
     return result
@@ -422,7 +421,7 @@ async def convert_service_files(
 @router.post("/scan")
 async def scan_repo(
     req: dict[str, Any],
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Scan a directory and return RepoContext for LLM generation."""
     directory = req.get("directory", "")
@@ -474,7 +473,7 @@ def _git_command(service_name: str, *args: str) -> str:
 @router.get("/{name}/git/status")
 async def git_status(
     name: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Get git status for a service project (git status --porcelain)."""
     try:
@@ -501,7 +500,7 @@ async def git_status(
 async def git_diff(
     name: str,
     file: str = Query(None, description="Specific file to diff (relative path)"),
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Get git diff for a service project (working tree vs HEAD)."""
     try:
@@ -518,7 +517,7 @@ async def git_diff(
 async def git_head_file(
     name: str,
     file: str = Query(..., description="File path relative to project root"),
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Get file content from HEAD revision (git show HEAD:file)."""
     try:

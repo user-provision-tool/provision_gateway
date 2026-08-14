@@ -82,24 +82,15 @@ export default function UsersPage() {
   const servicesRef = useRef(services)
   servicesRef.current = services
 
-  // Nginx ports from system status (used for URL construction)
-  const [nginxHttpPort, setNginxHttpPort] = useState(80)
-  const [nginxHttpsPort, setNginxHttpsPort] = useState(443)
-
-  // Fetch nginx ports once on mount
-  useEffect(() => {
-    client.get('/system/status').then(({data}) => {
-      if (data.nginx_http_port) setNginxHttpPort(data.nginx_http_port)
-      if (data.nginx_https_port) setNginxHttpsPort(data.nginx_https_port)
-    }).catch(() => {})
-  }, [])
-
-  // Build service URL with correct port
+  // Build the service-access redirect URL (Gap 9). Clicking it goes to
+  // `/go/{hostname}` on the dashboard domain, which the gateway turns into a
+  // 302 → `{hostname}/_set_token?token=…` (setting the provision_token cookie for
+  // the service domain) → service loads silently. This is required because the
+  // login cookie is host-scoped and is NOT sent to the service hostname directly.
   const buildServiceUrl = useCallback((svc: ServiceInstance): string => {
-    if (svc.url) return svc.url
     const host = `${svc.service_name}-${svc.user_name}-${svc.label}.localhost`
-    return `http://${host}${nginxHttpPort !== 80 ? ':' + nginxHttpPort : ''}`
-  }, [nginxHttpPort])
+    return `/go/${host}`
+  }, [])
 
   // Parse "user-service-label" key (service may contain hyphens like "example-mcp")
   const parseServiceKey = (key: string) => {
@@ -127,6 +118,9 @@ export default function UsersPage() {
 
   useEffect(() => {
     if (services.length === 0) return
+    // registration-time is an admin-only endpoint; skip for viewers (Gap 5/10
+    // follow-up — otherwise every card emits a 403 in the console).
+    if (!isAdmin) return
     // Check registration times for each service
     const checkTimes = async () => {
       for (const svc of services) {
@@ -140,7 +134,7 @@ export default function UsersPage() {
       }
     }
     checkTimes()
-  }, [services])
+  }, [services, isAdmin])
 
   // Fetch volume disk usage for a service instance
   const fetchVolumeUsage = async (user: string, service: string, label: string) => {
@@ -220,7 +214,8 @@ export default function UsersPage() {
   useEffect(() => {
     for (const svc of services) {
       const key = `${svc.user_name}-${svc.service_name}-${svc.label}`
-      if (fileModTimes[key] === undefined) {
+      // deployment-files (checkFileModTimes) is admin-only — skip for viewers
+      if (isAdmin && fileModTimes[key] === undefined) {
         checkFileModTimes(svc.user_name, svc.service_name, svc.label)
       }
       if (isAdmin && volumeUsage[key] === undefined) {
@@ -291,9 +286,6 @@ export default function UsersPage() {
     }
   }
 
-  const isEndUser = (admin as any)?.user_type === 'end_user'
-  const endUserViewer = isEndUser && admin?.role !== 'admin'
-
   // Toggle a single service selection
   const toggleSelect = (key: string) => {
     setSelectedKeys(prev => {
@@ -341,10 +333,14 @@ export default function UsersPage() {
 
   const _fetchServices = async (): Promise<ServiceInstance[]> => {
     const { data } = await client.get('/users')
+    // The backend (GET /api/users, gateway `list_users`) already ACL-filters the
+    // response to a viewer's own services + their allowed_special_users. Do NOT
+    // re-filter client-side here: the prior `if (endUserViewer && u.user_name !==
+    // admin.email) continue` dropped granted special-user services, hiding them
+    // from the viewer despite the backend returning them (Gap 3).
     const users = data.users || data.user_status || []
     const all: ServiceInstance[] = []
     for (const u of users) {
-      if (endUserViewer && admin?.email && u.user_name !== admin.email) continue
       for (const s of (u.healthy_services||[])) all.push({...s, user_name: u.user_name})
       for (const s of (u.unhealthy_services||[])) all.push({...s, user_name: u.user_name})
       for (const s of (u.missing_services||[])) all.push({...s, user_name: u.user_name})
@@ -594,6 +590,9 @@ export default function UsersPage() {
                         </a>
                         {svc.has_auth && <Tag color="blue" style={{marginLeft:4}}>Auth</Tag>}
                       </div>
+                      {(svc as any).subnet && (
+                        <div><Text strong>Subnet: </Text><Tag color="purple">{(svc as any).subnet}</Tag></div>
+                      )}
                       <div><Text strong>Containers: </Text>
                         <Space wrap>{Object.entries(containers).map(([n,s])=>{
                           const status = String(s).toLowerCase();
@@ -603,6 +602,7 @@ export default function UsersPage() {
                           return <Tag key={n} color={color}>{n}: {String(s)}</Tag>
                         })}</Space>
                       </div>
+                      {isAdmin && <>
                       <div><Text strong>Deployment Files: </Text></div>
                       <div style={{paddingLeft:16}}>
                         {/* .env file */}
@@ -647,6 +647,7 @@ export default function UsersPage() {
                           </div>
                         })()}
                       </div>
+                      </>}
                       {(svc.volumes && Object.keys(svc.volumes).length > 0) && <div>
                         <Text strong>Volumes: </Text>
                         <div style={{paddingLeft:16}}>

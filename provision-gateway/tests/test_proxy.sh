@@ -2,7 +2,7 @@
 # Integration tests for proxy feature — multi-config API
 set -e
 
-GW="${GATEWAY_URL:-http://localhost:8771}"
+GW="${GATEWAY_URL:-http://localhost:8775}"
 PASS=0
 FAIL=0
 
@@ -42,7 +42,7 @@ echo "============================================"
 # Login
 TOKEN=$(curl -s -X POST "$GW/api/auth/login" \
     -H "Content-Type: application/json" \
-    -d '{"email":"admin@example.com","password":"admin123"}' \
+    -d '{"email":"admin@subnet-acl.local","password":"admin-pass-123"}' \
     | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
 
 if [ -z "$TOKEN" ]; then
@@ -147,7 +147,7 @@ echo "--- Test 11: Deploy with proxy disabled ---"
 R=$(curl -s -X POST "$GW/api/users/deploy" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{"user_name":"proxytest","service_name":"siyuan","project_root":"siyuan","compose_template_path":"docker-compose.yml.j2","nginx_conf_template_path":"nginx.conf.j2","label":"0","domain":"example.com","passwd":"test123","use_global_proxy":true}')
+    -d '{"user_name":"proxytest","service_name":"example-service","project_root":"example-service","compose_template_path":"docker-compose.yml.j2","nginx_conf_template_path":"nginx.conf.j2","label":"0","domain":"example.com","passwd":"test123","use_global_proxy":true}')
 check "Deploy with proxy disabled returns 400" "400\|not enabled" "$R"
 
 # ---- Test 12: Deploy without proxy (should work regardless) ----
@@ -156,7 +156,7 @@ echo "--- Test 12: Deploy without proxy flag ---"
 R=$(curl -s -X POST "$GW/api/users/deploy" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Content-Type: application/json" \
-    -d '{"user_name":"proxytest","service_name":"siyuan","project_root":"siyuan","compose_template_path":"docker-compose.yml.j2","nginx_conf_template_path":"nginx.conf.j2","label":"0","domain":"example.com","passwd":"test123","use_global_proxy":false}')
+    -d '{"user_name":"proxytest","service_name":"example-service","project_root":"example-service","compose_template_path":"docker-compose.yml.j2","nginx_conf_template_path":"nginx.conf.j2","label":"0","domain":"example.com","passwd":"test123","use_global_proxy":false}')
 check "Deploy without proxy returns task" '"task_id"' "$R"
 
 # ---- Test 13: Delete proxy config ----

@@ -7,9 +7,8 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..middleware import get_current_admin
-from ..models.admin import AdminUser
-from ..services.auth_service import decode_access_token, get_admin_by_id
+from ..middleware import require_admin
+from ..services.auth_service import decode_gateway_token, get_admin_by_id
 from ..services.provision_service import provision_service
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
@@ -17,7 +16,7 @@ router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
 @router.get("")
 async def list_tasks(
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """List all tasks from provision-api."""
     try:
@@ -30,7 +29,7 @@ async def list_tasks(
 @router.get("/{task_id}")
 async def get_task(
     task_id: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Get a single task's status from provision-api."""
     try:
@@ -43,7 +42,7 @@ async def get_task(
 @router.delete("/{task_id}")
 async def cancel_task(
     task_id: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
 ):
     """Cancel a pending/running task."""
     try:
@@ -64,22 +63,26 @@ async def stream_task_log(
 ):
     """Stream task build log via Server-Sent Events (proxied to provision-api).
 
-    Authentication: accepts JWT via ``Authorization: Bearer`` header,
-    OR via ``?token=`` query parameter (for EventSource which cannot set headers).
+    Authentication: accepts the ``gateway_token`` cookie, the
+    ``Authorization: Bearer`` header, OR the ``?token=`` query parameter
+    (for EventSource which cannot set headers). Uses ``decode_gateway_token``
+    so both ``type='gateway'`` (cookie) and ``type='access'`` (header/query)
+    credentials are honoured, per gateway-acl-architecture.md §5.
     """
-    # Authenticate: try Authorization header first, then query param token
+    # Authenticate: gateway_token cookie first, then Authorization header,
+    # then query param token.
     admin = None
-    auth_header = request.headers.get("Authorization", "")
-    actual_token = ""
-
-    if auth_header.startswith("Bearer "):
-        actual_token = auth_header[7:]
-    elif token:
+    actual_token = request.cookies.get("gateway_token", "")
+    if not actual_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            actual_token = auth_header[7:]
+    if not actual_token and token:
         actual_token = token
 
     if actual_token:
         try:
-            payload = decode_access_token(actual_token)
+            payload = decode_gateway_token(actual_token)
             admin_id = int(payload.get("sub", 0))
             admin = get_admin_by_id(db, admin_id)
         except Exception:

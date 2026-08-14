@@ -7,7 +7,7 @@
 # ============================================================================
 
 set -e
-API="http://localhost:8765"
+API="${PROVISION_API_URL:-http://localhost:8875}"
 PASS=0
 FAIL=0
 
@@ -73,12 +73,12 @@ echo -n "  2.4 GET /host/stats: "
 RESP=$(curl -s "$API/host/stats")
 check "returns cpu_percent" '"cpu_percent"' "$RESP"
 
-echo -n "  2.5 GET /docker/container/provision-api/exists: "
-RESP=$(curl -s "$API/docker/container/provision-api/exists")
+echo -n "  2.5 GET /docker/container/subnet-acl-provision-api/exists: "
+RESP=$(curl -s "$API/docker/container/subnet-acl-provision-api/exists")
 check "exists=true" 'true' "$RESP"
 
-echo -n "  2.6 GET /docker/container/provision-api/running: "
-RESP=$(curl -s "$API/docker/container/provision-api/running")
+echo -n "  2.6 GET /docker/container/subnet-acl-provision-api/running: "
+RESP=$(curl -s "$API/docker/container/subnet-acl-provision-api/running")
 check "running=true" 'true' "$RESP"
 
 echo -n "  2.7 GET /docker/container/nonexistent-container/exists: "
@@ -90,25 +90,36 @@ check "exists=false" 'false' "$RESP"
 
 echo "── 3. Users — Register ──"
 
-echo -n "  3.1 POST /users (register siyuan for testuser): "
+echo -n "  3.1 POST /users (register example-service for testuser): "
 RESP=$(curl -s -X POST "$API/users" \
   -H "Content-Type: application/json" \
   -d '{
     "user_name": "testuser",
-    "service_name": "siyuan",
-    "project_root": "siyuan",
+    "service_name": "example-service",
+    "project_root": "example-service",
     "compose_template_path": "docker-compose.yml.j2",
     "nginx_conf_template_path": "nginx.conf.j2",
     "label": "1",
     "domain": "snaprovision.com",
     "passwd": "test123",
-    "volumes": {"siyuan_data": "/srv/provision/user_data/testuser/siyuan/1/siyuan_data"},
     "https": false
   }')
 check "returns task_id" '"task_id"' "$RESP"
 
-echo "     (waiting for registration to complete...)"
-sleep 8
+echo "     (polling until testuser/example-service/1 is registered...)"
+REGISTERED=0
+for i in $(seq 1 30); do
+    POLL_RESP=$(curl -s "$API/users")
+    if echo "$POLL_RESP" | grep -q "testuser"; then
+        echo "     service registered after ${i}s"
+        REGISTERED=1
+        break
+    fi
+    sleep 1
+done
+if [ "$REGISTERED" -eq 0 ]; then
+    echo "     WARNING: service did not appear in user list within 30s — lifecycle tests may fail"
+fi
 
 echo -n "  3.2 GET /users (list all): "
 RESP=$(curl -s "$API/users")
@@ -116,33 +127,33 @@ check "shows testuser" "testuser" "$RESP"
 
 echo -n "  3.3 GET /users/testuser (single user): "
 RESP=$(curl -s "$API/users/testuser")
-check "has service siyuan" "siyuan" "$RESP"
+check "has service example-service" "example-service" "$RESP"
 
 
 # ─── 4. Service Lifecycle — Stop / Start / Password ─────────────────────────
 
 echo "── 4. Service Lifecycle ──"
 
-echo -n "  4.1 POST /users/testuser/services/siyuan/1/down (stop): "
-RESP=$(curl -s -X POST "$API/users/testuser/services/siyuan/1/down")
+echo -n "  4.1 POST /users/testuser/services/example-service/1/down (stop): "
+RESP=$(curl -s -X POST "$API/users/testuser/services/example-service/1/down")
 check "returns stopped" '"down"' "$RESP"
 sleep 2
 
 echo -n "  4.2 Container stopped after down: "
-RESP=$(curl -s "$API/docker/container/siyuan-user_testuser-1-siyuan/running" 2>/dev/null)
+RESP=$(curl -s "$API/docker/container/example-service-user_testuser-1-fastapi-app/running" 2>/dev/null)
 check "running=false" 'false' "$RESP"
 
-echo -n "  4.3 POST /users/testuser/services/siyuan/1/up (start): "
-RESP=$(curl -s -X POST "$API/users/testuser/services/siyuan/1/up")
+echo -n "  4.3 POST /users/testuser/services/example-service/1/up (start): "
+RESP=$(curl -s -X POST "$API/users/testuser/services/example-service/1/up")
 check "returns started" '"up"' "$RESP"
 sleep 2
 
 echo -n "  4.4 Container running after up: "
-RESP=$(curl -s "$API/docker/container/siyuan-user_testuser-1-siyuan/running" 2>/dev/null)
+RESP=$(curl -s "$API/docker/container/example-service-user_testuser-1-fastapi-app/running" 2>/dev/null)
 check "running=true" 'true' "$RESP"
 
-echo -n "  4.5 PUT /users/testuser/services/siyuan/1/password (change): "
-RESP=$(curl -s -X PUT "$API/users/testuser/services/siyuan/1/password" \
+echo -n "  4.5 PUT /users/testuser/services/example-service/1/password (change): "
+RESP=$(curl -s -X PUT "$API/users/testuser/services/example-service/1/password" \
   -H "Content-Type: application/json" \
   -d '{"passwd": "newpass456"}')
 check "password updated" "Password updated" "$RESP"
@@ -155,8 +166,8 @@ check "has user_name" '"user_name"' "$RESP"
 
 echo "── 5. Rebuild ──"
 
-echo -n "  5.1 POST /users/testuser/services/siyuan/1/rebuild: "
-RESP=$(curl -s -X POST "$API/users/testuser/services/siyuan/1/rebuild")
+echo -n "  5.1 POST /users/testuser/services/example-service/1/rebuild: "
+RESP=$(curl -s -X POST "$API/users/testuser/services/example-service/1/rebuild")
 check "returns task_id" '"task_id"' "$RESP"
 
 
@@ -199,18 +210,18 @@ check "returns reloaded" '"reloaded"' "$RESP"
 
 echo "── 8. Remove Service ──"
 
-echo -n "  8.1 DELETE /users/testuser/services/siyuan/1: "
-RESP=$(curl -s -X DELETE "$API/users/testuser/services/siyuan/1")
+echo -n "  8.1 DELETE /users/testuser/services/example-service/1: "
+RESP=$(curl -s -X DELETE "$API/users/testuser/services/example-service/1")
 check "returns task_id" '"task_id"' "$RESP"
 
 sleep 5
 
 echo -n "  8.2 GET /users/testuser (should be empty after removal): "
 RESP=$(curl -s "$API/users/testuser")
-if echo "$RESP" | grep -q '"siyuan"'; then
-    echo "  ⚠️ siyuan still present (may not have finished removing)"
+if echo "$RESP" | grep -q '"example-service"'; then
+    echo "  ⚠️ example-service still present (may not have finished removing)"
 else
-    echo "  ✅ service removed (no siyuan found)"
+    echo "  ✅ service removed (no example-service found)"
     PASS=$((PASS + 1))
 fi
 

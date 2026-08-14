@@ -362,6 +362,154 @@ List users available for deployment (approved + active end-users, plus special u
 
 ---
 
+### `GET /api/auth/verify`
+
+NGINX `auth_request` subrequest endpoint for ACL-based service access control. No authentication required (called by nginx, not browser).
+
+**Request Headers:**
+| Header | Description |
+|---|---|
+| `Cookie: provision_token=<JWT>` | Provision token from `/go/{hostname}` redirect |
+| `X-Provision-Token: <JWT>` | Alternative to cookie (for non-browser clients) |
+
+**Response 200 (ACL disabled or passed):**
+- When `ENABLE_ACL=false`: returns empty 200 (pass-through to auth_basic).
+- When `ENABLE_ACL=true` and JWT valid + ACL passed:
+  ```
+  Headers: X-Service-Basic: <base64-encoded user:pass>
+  ```
+  Nginx uses this header for `auth_basic` on the target service.
+
+**Response 401 (no token):**
+```json
+{
+  "detail": "No provision token"
+}
+```
+Headers: `X-Auth-Action: redirect_login`
+
+**Response 401 (token expired):**
+```json
+{
+  "detail": "Token expired"
+}
+```
+Headers: `X-Auth-Action: redirect_token_expired`
+
+**Response 403 (ACL denied):**
+```json
+{
+  "detail": "ACL denied"
+}
+```
+Headers: `X-Auth-Action: redirect_acl_denied`
+
+> **ACL Authorization Rules:**
+> - Admins: unrestricted access to all services.
+> - Viewers: access to own services + services belonging to users in `allowed_special_users` list.
+> - Special users (role=special): blocked from dashboard login; cannot receive provision tokens.
+
+---
+
+### `GET /go/{hostname}`
+
+Dashboard service access redirect. Validates `gateway_token`, checks ACL permissions, creates a `provision_token`, and redirects the browser to the service URL.
+
+**Path Parameters:**
+| Param | Description |
+|---|---|
+| `hostname` | Service hostname (e.g., `myapp-alice-0.localhost`) |
+
+**Response 302:**
+Redirects to `http://{hostname}/_set_token?token={provision_token}&redirect=/`
+
+**Errors:**
+- `401` — No valid gateway_token
+- `403` — ACL denied (viewer cannot access that service)
+- `404` — Service not found for given hostname
+
+---
+
+### `POST /api/auth/keys`
+
+Create a new API key for end-user programmatic service access. Returns raw token (shown once only).
+
+**Request:**
+```json
+{
+  "label": "my-ci-key",
+  "user_id": 1
+}
+```
+| Field | Type | Description |
+|---|---|---|
+| `label` | string | Human-readable name for the key (required) |
+| `user_id` | int | Target end-user ID (admin only; viewers auto-use their own) |
+
+**Response 201:**
+```json
+{
+  "key": {
+    "id": 1,
+    "label": "my-ci-key",
+    "key_prefix": "pg_...",
+    "user_id": 1,
+    "is_active": true,
+    "created_at": "2026-07-08T00:00:00Z"
+  },
+  "token": "pg_abc123...",
+  "provision_token": "eyJhbGciOi...",
+  "message": "Save this token — it will not be shown again."
+}
+```
+
+**Errors:**
+- `400` — label is required
+- `403` — Viewer attempting to create a key for another user
+
+---
+
+### `GET /api/auth/keys`
+
+List API keys. Admin sees all keys; viewers see only their own.
+
+**Response 200:**
+```json
+{
+  "keys": [
+    {
+      "id": 1,
+      "label": "my-ci-key",
+      "key_prefix": "pg_abc...",
+      "user_id": 1,
+      "is_active": true,
+      "created_at": "2026-07-08T00:00:00Z"
+    }
+  ]
+}
+```
+
+---
+
+### `DELETE /api/auth/keys/{key_id}`
+
+Revoke an API key (soft delete — sets `is_active=false`).
+
+**Response 200:**
+```json
+{
+  "revoked": true,
+  "key_id": 1
+}
+```
+
+**Errors:**
+- `401` — No valid gateway_token
+- `403` — Viewer attempting to revoke another user's key
+- `404` — Key not found
+
+---
+
 ## 4. System
 
 ### `GET /api/system/status`
@@ -723,6 +871,27 @@ Delete SSL certificates for a domain.
 
 ---
 
+### `GET /api/system/subnet-pool`
+
+Get subnet pool usage statistics for the dashboard (proxied to provision-api).
+
+**Response 200:**
+```json
+{
+  "subnets": [
+    {
+      "subnet": "10.90.0.0/16",
+      "used_ips": 42,
+      "total_ips": 65534,
+      "usage_percent": 0.06
+    }
+  ],
+  "total_subnets": 1
+}
+```
+
+---
+
 ## 5. Services (Source Projects)
 
 ### `GET /api/services`
@@ -935,6 +1104,44 @@ Write/update a file in a service project.
   "written": true
 }
 ```
+
+---
+
+### `POST /api/services/{name}/files/{filename}`
+
+Create a new file in a service project. Annotates the file with a `.generated` marker to indicate LLM-generated origin.
+
+**Request:**
+```json
+{
+  "content": "FROM python:3.13-slim\n..."
+}
+```
+
+**Response 201:**
+```json
+{
+  "filename": "Dockerfile",
+  "created": true
+}
+```
+
+---
+
+### `DELETE /api/services/{name}/files/{filename}`
+
+Delete a file from a service project.
+
+**Response 200:**
+```json
+{
+  "filename": "docker-compose.yml",
+  "deleted": true
+}
+```
+
+**Errors:**
+- `404` — File not found in the service project
 
 ---
 
@@ -1372,6 +1579,76 @@ Clone all services from one user to another.
     {"service": "siyuan-mcp", "label": "0", "task_id": "def456"}
   ],
   "total": 2
+}
+```
+
+---
+
+### `GET /api/users/{user_name}/{service_name}/{label}/volume-usage`
+
+Get disk usage for a service instance's volume directories. Computes directory size by walking files and reports filesystem-level disk usage.
+
+**Response 200:**
+```json
+{
+  "user_name": "alice",
+  "service_name": "siyuan",
+  "label": "0",
+  "user_data_dir": "/srv/provision/user_data/alice/siyuan",
+  "volumes": {
+    "workspace": {
+      "path": "/srv/provision/user_data/alice/siyuan/workspace",
+      "size_bytes": 1048576,
+      "disk_total_bytes": 107374182400,
+      "disk_used_bytes": 21474836480,
+      "disk_free_bytes": 85899345920
+    }
+  }
+}
+```
+
+---
+
+### `GET /api/users/{user_name}/{service_name}/{label}/deployment-files`
+
+List deployment files (compose, nginx, env) for a service instance.
+
+**Response 200:**
+```json
+{
+  "files": {
+    "compose": "docker-compose.user-alice.0.yml",
+    "nginx": "siyuan.user-alice.0.nginx.conf",
+    "env": ".env.alice.0"
+  }
+}
+```
+
+#### `GET /api/users/{user_name}/{service_name}/{label}/deployment-files/{type}`
+
+Get the content of a specific deployment file. Valid types: `compose`, `nginx`, `env`.
+
+#### `PUT /api/users/{user_name}/{service_name}/{label}/deployment-files/{type}`
+
+Update a deployment file for a service instance.
+
+**Request:**
+```json
+{
+  "content": "..."
+}
+```
+
+---
+
+### `GET /api/users/{user_name}/{service_name}/{label}/registration-time`
+
+Get the registration timestamp for a service instance (most recent successful register task).
+
+**Response 200:**
+```json
+{
+  "registration_time": "2026-07-08T12:00:00Z"
 }
 ```
 

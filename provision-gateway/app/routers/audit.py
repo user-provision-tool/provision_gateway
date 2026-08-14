@@ -6,8 +6,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..middleware import get_current_admin
-from ..models.admin import AdminUser
+from ..middleware import require_admin
 from ..services.audit_service import query_logs
 
 router = APIRouter(prefix="/api/audit", tags=["audit"])
@@ -22,7 +21,7 @@ async def list_audit_logs(
     to_date: str | None = Query(None, alias="to"),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Query audit logs with optional filters."""

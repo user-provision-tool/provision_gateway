@@ -7,9 +7,9 @@
 # ============================================================================
 
 set -e
-API="http://localhost:8771/api"
-ADMIN_EMAIL="admin@example.com"
-ADMIN_PASS="admin123"
+API="${GATEWAY_URL:-http://localhost:8775}/api"
+ADMIN_EMAIL="admin@subnet-acl.local"
+ADMIN_PASS="admin-pass-123"
 PASS=0
 FAIL=0
 
@@ -121,11 +121,11 @@ echo "── 2. Source Projects ──"
 
 echo -n "  2.1 GET /services (list): "
 RESP=$(curl -s "$API/services" -H "$AUTH")
-check "has siyuan project" "siyuan" "$RESP"
-check "has siyuan-mcp project" "siyuan-mcp" "$RESP"
+check "has example-service project" "example-service" "$RESP"
+check "has example-mcp project" "example-mcp" "$RESP"
 
-echo -n "  2.2 GET /services/siyuan (detail): "
-RESP=$(curl -s "$API/services/siyuan" -H "$AUTH")
+echo -n "  2.2 GET /services/example-service (detail): "
+RESP=$(curl -s "$API/services/example-service" -H "$AUTH")
 check "has files" '"files"' "$RESP"
 check "has name" '"name"' "$RESP"
 
@@ -146,12 +146,12 @@ else
     echo "  ⚠️ alice not found (may have been cleaned up)"
 fi
 
-echo -n "  3.2 POST /users/deploy (deploy siyuan-mcp for testuser): "
+echo -n "  3.2 POST /users/deploy (deploy example-mcp for testuser): "
 RESP=$(curl -s -X POST "$API/users/deploy" -H "$AUTH" -H "Content-Type: application/json" \
   -d '{
     "user_name": "testuser",
-    "service_name": "siyuan-mcp",
-    "project_root": "siyuan-mcp",
+    "service_name": "example-mcp",
+    "project_root": "example-mcp",
     "compose_template_path": "docker-compose.yml.j2",
     "nginx_conf_template_path": "nginx.conf.j2",
     "label": "1",
@@ -161,34 +161,46 @@ RESP=$(curl -s -X POST "$API/users/deploy" -H "$AUTH" -H "Content-Type: applicat
   }')
 check "returns task_id" '"task_id"' "$RESP"
 
-echo "     (waiting for deploy...)"
-sleep 12
+echo "     (polling until testuser/example-mcp/1 is registered...)"
+REGISTERED=0
+for i in $(seq 1 30); do
+    POLL_RESP=$(curl -s "$API/users" -H "$AUTH")
+    if echo "$POLL_RESP" | grep -q "testuser"; then
+        echo "     service registered after ${i}s"
+        REGISTERED=1
+        break
+    fi
+    sleep 1
+done
+if [ "$REGISTERED" -eq 0 ]; then
+    echo "     WARNING: service did not appear in user list within 30s — lifecycle tests may fail"
+fi
 
 
 # ─── 4. Up / Down / Password (delegated to provision-api) ───────────────────
 
 echo "── 4. Service Lifecycle (via gateway → provision-api) ──"
 
-echo -n "  4.1 POST /users/testuser/siyuan-mcp/1/down (stop): "
-RESP=$(curl -s -X POST "$API/users/testuser/siyuan-mcp/1/down" -H "$AUTH")
+echo -n "  4.1 POST /users/testuser/example-mcp/1/down (stop): "
+RESP=$(curl -s -X POST "$API/users/testuser/example-mcp/1/down" -H "$AUTH")
 check "returns stopped" '"down"' "$RESP"
 sleep 2
 
-echo -n "  4.2 POST /users/testuser/siyuan-mcp/1/up (start): "
-RESP=$(curl -s -X POST "$API/users/testuser/siyuan-mcp/1/up" -H "$AUTH")
+echo -n "  4.2 POST /users/testuser/example-mcp/1/up (start): "
+RESP=$(curl -s -X POST "$API/users/testuser/example-mcp/1/up" -H "$AUTH")
 check "returns started" '"up"' "$RESP"
 sleep 2
 
-echo -n "  4.3 PUT /users/testuser/siyuan-mcp/1/password (change): "
-RESP=$(curl -s -X PUT "$API/users/testuser/siyuan-mcp/1/password" -H "$AUTH" \
+echo -n "  4.3 PUT /users/testuser/example-mcp/1/password (change): "
+RESP=$(curl -s -X PUT "$API/users/testuser/example-mcp/1/password" -H "$AUTH" \
   -H "Content-Type: application/json" \
   -d '{"passwd": "newpass789"}')
 check "password updated" "Password updated" "$RESP"
 
-echo -n "  4.4 GET /users/testuser/siyuan-mcp/1/containers/siyuan-mcp-server/logs (container logs): "
+echo -n "  4.4 GET /users/testuser/example-mcp/1/containers/example-mcp-user_testuser-1-fastapi-app/logs (container logs): "
 # The container logs endpoint proxies to provision-api.
 # If the container exists, returns 200 with logs. If not, provision-api returns 404.
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$API/users/testuser/siyuan-mcp/1/containers/siyuan-mcp-server/logs?tail=10" -H "$AUTH")
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$API/users/testuser/example-mcp/1/containers/example-mcp-user_testuser-1-fastapi-app/logs?tail=10" -H "$AUTH")
 if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "404" ] || [ "$HTTP_CODE" = "502" ]; then
     echo "  ✅ container logs endpoint responds ($HTTP_CODE)"
     PASS=$((PASS + 1))
@@ -321,8 +333,8 @@ check "returns configs" '"configs"' "$RESP"
 
 echo "── 10. Cleanup ──"
 
-echo -n "  10.1 DELETE /users/testuser/siyuan-mcp/1: "
-RESP=$(curl -s -X DELETE "$API/users/testuser/siyuan-mcp/1" -H "$AUTH")
+echo -n "  10.1 DELETE /users/testuser/example-mcp/1: "
+RESP=$(curl -s -X DELETE "$API/users/testuser/example-mcp/1" -H "$AUTH")
 check "removal queued" '"task_id"' "$RESP"
 
 echo -n "  10.2 DELETE /auth/users/$GATEWAYTEST_ID (remove test end-user): "
@@ -334,6 +346,45 @@ else
 fi
 
 sleep 5
+
+
+# ─── 11. Viewer ACL — sees granted special-user service (Gap 3) ─────────────
+
+echo "── 11. Viewer sees granted special-user service (Gap 3) ──"
+
+echo -n "  11.1 POST /auth/login (viewer1): "
+VRESP=$(curl -s -X POST "$API/auth/login" -H "Content-Type: application/json" \
+  -d '{"email":"viewer1","password":"viewer-pass-123"}')
+VTOKEN=$(echo "$VRESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+if [ -n "$VTOKEN" ]; then
+    echo "  ✅ viewer login OK"
+    PASS=$((PASS + 1))
+else
+    echo "  ❌ viewer login failed: $(echo "$VRESP" | head -c 200)"
+    FAIL=$((FAIL + 1))
+fi
+
+echo -n "  11.2 GET /api/users (viewer sees granted 'internal'): "
+if [ -n "$VTOKEN" ]; then
+    VUSERS=$(curl -s "$API/users" -H "Authorization: Bearer $VTOKEN")
+    check "viewer sees granted special user 'internal'" "internal" "$VUSERS"
+    check "internal's example-service listed" "example-service" "$VUSERS"
+else
+    echo "  ⚠️ skipping (no viewer token)"
+fi
+
+
+# ─── 12. Service URL port (Gap 2) ───────────────────────────────────────────
+
+echo "── 12. Service URL uses subnet-acl port 8766 (Gap 2) ──"
+
+echo -n "  12.1 GET /system/status nginx_http_port=8766: "
+SRESP=$(curl -s "$API/system/status" -H "$AUTH")
+check "nginx_http_port is 8766" '"nginx_http_port":8766' "$SRESP"
+
+echo -n "  12.2 GET /users/alice/example-service/0/url uses :8766: "
+URESP=$(curl -s "$API/users/alice/example-service/0/url" -H "$AUTH")
+check "service URL uses port 8766" 'http://example-service-alice-0.localhost:8766' "$URESP"
 
 
 # ─── Summary ────────────────────────────────────────────────────────────────

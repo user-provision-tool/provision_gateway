@@ -4,7 +4,7 @@ import os
 import pytest
 import subprocess
 
-GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:8770")
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8870")
 
 _gateway_checked = False
 _gateway_running = False
@@ -49,8 +49,8 @@ def token():
         pytest.skip("Gateway is not running — skipping integration test")
 
     # Try to get a token by logging in as admin
-    admin_email = os.environ.get("GATEWAY_ADMIN_EMAIL", "admin@example.com")
-    admin_password = os.environ.get("GATEWAY_ADMIN_PASSWORD", "admin123")
+    admin_email = os.environ.get("GATEWAY_ADMIN_EMAIL", "admin@subnet-acl.local")
+    admin_password = os.environ.get("GATEWAY_ADMIN_PASSWORD", "admin-pass-123")
 
     result = subprocess.run(
         ["curl", "-s", "-X", "POST",

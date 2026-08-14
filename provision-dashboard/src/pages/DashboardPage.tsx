@@ -11,6 +11,7 @@ export default function DashboardPage() {
   const { admin } = useAuth()
   const [sysStatus, setSysStatus] = useState<any>(null)
   const [proxyStatus, setProxyStatus] = useState<any>(null)
+  const [subnetPool, setSubnetPool] = useState<any>(null)
   const [refreshing, setRefreshing] = useState(false)
 
   const fetchAll = useCallback(async () => {
@@ -24,7 +25,12 @@ export default function DashboardPage() {
       const proxyRes = await client.get('/system/proxy')
       setProxyStatus(proxyRes.data)
     } catch { /* proxy not configured */ }
-    
+
+    try {
+      const subnetRes = await client.get('/system/subnet-pool')
+      setSubnetPool(subnetRes.data)
+    } catch { /* subnet management not configured */ }
+
     setRefreshing(true)
     setTimeout(() => setRefreshing(false), 500)
   }, [])
@@ -96,17 +102,17 @@ export default function DashboardPage() {
       <Row gutter={[16, 16]} style={{marginTop:16}}>
         <Col xs={24} sm={8}>
           <Card size="small" title="CPU">
-            {cpuPct !== null ? <Progress type="dashboard" percent={Math.round(cpuPct)} size={120} status={cpuPct>80?'exception':'normal'}/> : <Text type="secondary">Loading...</Text>}
+            {cpuPct !== null ? <Progress type="dashboard" percent={Math.round(cpuPct)} size={120} status="normal" strokeColor={cpuPct>80?'#ff4d4f':undefined}/> : <Text type="secondary">Loading...</Text>}
           </Card>
         </Col>
         <Col xs={24} sm={8}>
           <Card size="small" title="RAM">
-            {ramPct !== null ? <Progress type="dashboard" percent={Math.round(ramPct)} size={120} status={ramPct>80?'exception':'normal'}/> : <Text type="secondary">Loading...</Text>}
+            {ramPct !== null ? <Progress type="dashboard" percent={Math.round(ramPct)} size={120} status="normal" strokeColor={ramPct>80?'#ff4d4f':undefined}/> : <Text type="secondary">Loading...</Text>}
           </Card>
         </Col>
         <Col xs={24} sm={8}>
           <Card size="small" title="Disk">
-            {diskPct !== null ? <Progress type="dashboard" percent={Math.round(diskPct)} size={120} status={diskPct>80?'exception':'normal'}/> : <Text type="secondary">Loading...</Text>}
+            {diskPct !== null ? <Progress type="dashboard" percent={Math.round(diskPct)} size={120} status="normal" strokeColor={diskPct>80?'#ff4d4f':undefined}/> : <Text type="secondary">Loading...</Text>}
           </Card>
         </Col>
       </Row>
@@ -134,6 +140,46 @@ export default function DashboardPage() {
           </Card>
         </Col>
       </Row>
+
+      {/* Subnet Pool */}
+      {subnetPool && (
+        <Row gutter={[16, 16]} style={{marginTop:16}}>
+          <Col span={24}>
+            <Card title={<Space><GlobalOutlined />Subnet Pool</Space>} size="small">
+              {subnetPool.enabled ? (
+                <Row gutter={[16, 16]}>
+                  {subnetPool.pools.map((pool: any, i: number) => {
+                    const color = pool.used_pct > 90 ? '#ff4d4f' : pool.used_pct > 70 ? '#faad14' : '#52c41a'
+                    return (
+                      <Col xs={24} sm={12} md={8} key={i}>
+                        <Card size="small" bodyStyle={{padding:'12px 16px'}}>
+                          <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+                            <Text strong>{pool.cidr}</Text>
+                            <Tag color={pool.used_pct > 90 ? 'red' : pool.used_pct > 70 ? 'orange' : 'green'}>
+                              {pool.used_pct}%
+                            </Tag>
+                          </div>
+                          <Progress
+                            percent={pool.used_pct}
+                            strokeColor={color}
+                            showInfo={false}
+                            style={{marginTop:8}}
+                          />
+                          <Text type="secondary" style={{fontSize:11}}>
+                            {pool.used_slots} / {pool.total_slots} slots used
+                          </Text>
+                        </Card>
+                      </Col>
+                    )
+                  })}
+                </Row>
+              ) : (
+                <Text type="secondary">Subnet management is disabled. Set SUBNET_POOLS to enable per-service subnet allocation.</Text>
+              )}
+            </Card>
+          </Col>
+        </Row>
+      )}
 
       {/* Welcome */}
       <Card style={{marginTop:16}}>

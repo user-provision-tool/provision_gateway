@@ -18,8 +18,21 @@ from ..utils.crypto import encrypt_api_key, decrypt_api_key
 # ---------------------------------------------------------------------------
 
 def list_configs(db: Session) -> list[dict]:
-    configs = db.query(ProxyConfigModel).order_by(ProxyConfigModel.created_at).all()
-    return [c.to_dict() for c in configs]
+    configs = db.query(ProxyConfigModel).order_by(
+        ProxyConfigModel.is_active.desc(),
+        ProxyConfigModel.created_at,
+    ).all()
+    # Dedupe by (protocol, host, port) so accumulated duplicate rows (BUG-3)
+    # render as exactly one entry, with the active config preferred first.
+    seen: set[tuple[str, str, int]] = set()
+    unique: list[dict] = []
+    for c in configs:
+        key = (c.protocol, c.host, c.port)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(c.to_dict())
+    return unique
 
 
 def get_active_config(db: Session) -> dict | None:
@@ -32,11 +45,33 @@ def has_active_proxy(db: Session) -> bool:
 
 
 def create_config(db: Session, data: dict) -> dict:
+    protocol = data.get("protocol", "http")
+    host = data.get("host", "")
+    port = int(data.get("port", 8080))
+
+    # Prevent duplicate rows for the same endpoint (BUG-3): return the
+    # existing config instead of accumulating a new row on every save.
+    existing = (
+        db.query(ProxyConfigModel)
+        .filter(
+            ProxyConfigModel.protocol == protocol,
+            ProxyConfigModel.host == host,
+            ProxyConfigModel.port == port,
+        )
+        .first()
+    )
+    if existing:
+        if data.get("name") and not existing.name:
+            existing.name = data["name"]
+            db.commit()
+            db.refresh(existing)
+        return existing.to_dict()
+
     config = ProxyConfigModel(
         name=data.get("name", ""),
-        protocol=data.get("protocol", "http"),
-        host=data.get("host", ""),
-        port=int(data.get("port", 8080)),
+        protocol=protocol,
+        host=host,
+        port=port,
         username_enc=encrypt_api_key(data.get("username", "")) if data.get("username") else "",
         password_enc=encrypt_api_key(data.get("password", "")) if data.get("password") else "",
     )

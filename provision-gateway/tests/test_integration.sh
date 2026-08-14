@@ -3,7 +3,7 @@
 # Tests the gateway API against the running provision-api stack.
 set -e
 
-GATEWAY_URL="${GATEWAY_URL:-http://localhost:8770}"
+GATEWAY_URL="${GATEWAY_URL:-http://localhost:8870}"
 PASS=0
 FAIL=0
 
@@ -36,7 +36,7 @@ echo ""
 echo "2. Auth Setup"
 SETUP_RESP=$(curl -s -X POST "$GATEWAY_URL/api/auth/setup" \
     -H "Content-Type: application/json" \
-    -d '{"email":"admin@example.com","password":"admin123"}')
+    -d '{"email":"admin@subnet-acl.local","password":"admin-pass-123"}')
 # May return 409 if already exists - both are acceptable
 if echo "$SETUP_RESP" | grep -q '"message"'; then
     echo "  ✓ Setup completed"
@@ -54,7 +54,7 @@ echo ""
 echo "3. Auth Login"
 LOGIN_RESP=$(curl -s -X POST "$GATEWAY_URL/api/auth/login" \
     -H "Content-Type: application/json" \
-    -d '{"email":"admin@example.com","password":"admin123"}')
+    -d '{"email":"admin@subnet-acl.local","password":"admin-pass-123"}')
 check "Login returns access_token" '"access_token"' "$LOGIN_RESP"
 
 # Extract token

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..database import get_db
-from ..middleware import get_current_admin
+from ..middleware import require_gateway_token, require_admin
 from ..models.admin import AdminUser
 from ..models.system_config import SystemConfig
 from ..services.provision_service import provision_service
@@ -21,7 +21,7 @@ _start_time = time.time()
 
 @router.get("/status")
 async def system_status(
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_gateway_token),
     db: Session = Depends(get_db),
 ):
     """Get system health status including per-component Docker stats."""
@@ -34,7 +34,7 @@ async def system_status(
 
     # Per-component status from Docker (via provision-api)
     components = {}
-    for name in ["provision-api", "provision-nginx", "provision-gateway", "provision-dashboard"]:
+    for name in ["subnet-acl-provision-api", "subnet-acl-nginx", "subnet-acl-gateway", "subnet-acl-dashboard"]:
         try:
             running = await provision_service.container_running(name)
             exists = await provision_service.container_exists(name)
@@ -115,7 +115,7 @@ async def system_status(
 
     return {
         "provision_api": provision_api_status,
-        "provision_nginx": {"status": components["provision-nginx"]["status"]},
+        "subnet_acl_nginx": {"status": components["subnet-acl-nginx"]["status"]},
         "docker_host": docker_host,
         "gateway": gateway,
         "components": components,
@@ -133,7 +133,7 @@ async def system_status(
 @router.get("/stats")
 async def system_stats(
     detail: bool = Query(False),
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_gateway_token),
 ):
     """Get detailed system stats including per-container metrics (via provision-api)."""
     try:
@@ -179,7 +179,7 @@ async def system_stats(
 
 @router.post("/reconcile")
 async def trigger_reconciliation(
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Run a full nginx upstream reconciliation (proxied to provision-api)."""
@@ -189,14 +189,14 @@ async def trigger_reconciliation(
         result = await provision_service.reconcile()
     except Exception as e:
         log_action(
-            db, action="reconcile", admin_id=current_admin.id,
+            db, action="reconcile", admin_id=current_user["id"],
             status="failure", error_message=str(e),
         )
         raise HTTPException(500, f"Reconciliation failed: {e}")
 
     report = result.get("report", {})
     log_action(
-        db, action="reconcile", admin_id=current_admin.id,
+        db, action="reconcile", admin_id=current_user["id"],
         status="success",
         detail={
             "total_upstreams": report.get("total_upstreams", 0),
@@ -210,7 +210,7 @@ async def trigger_reconciliation(
 
 @router.get("/reconcile/status")
 async def reconciliation_status(
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_gateway_token),
 ):
     """Get the last reconciliation status (proxied to provision-api)."""
     return await provision_service.reconciliation_status()
@@ -218,7 +218,7 @@ async def reconciliation_status(
 
 @router.get("/nginx-state")
 async def get_nginx_state(
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_gateway_token),
 ):
     """Get the full nginx state JSON (proxied to provision-api)."""
     return await provision_service.nginx_state()
@@ -238,10 +238,13 @@ from ..services.proxy_service import (
 
 @router.get("/proxy")
 async def get_proxy_list(
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Get all proxy configs plus active state."""
+    """Get all proxy configs plus active state.
+
+    Admin-only (Gap G5): proxy config may contain credentials.
+    """
     configs = list_configs(db)
     active = get_active_config(db)
     return {
@@ -254,7 +257,7 @@ async def get_proxy_list(
 @router.post("/proxy")
 async def add_proxy_config(
     req: dict[str, Any] = Body(...),
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Add a new proxy config. Auto-tests reachability after save."""
@@ -263,7 +266,7 @@ async def add_proxy_config(
     config = db.query(ProxyConfigModel).filter(ProxyConfigModel.id == config["id"]).first().to_dict()
 
     from ..services.audit_service import log_action
-    log_action(db, action="proxy_config_create", admin_id=current_admin.id,
+    log_action(db, action="proxy_config_create", admin_id=current_user["id"],
                status="success", detail={"host": config["host"]})
 
     return {"config": config, "reachability": reachability}
@@ -273,7 +276,7 @@ async def add_proxy_config(
 async def update_proxy_config(
     config_id: int,
     req: dict[str, Any] = Body(...),
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Update a proxy config. Re-tests reachability."""
@@ -288,7 +291,7 @@ async def update_proxy_config(
 @router.delete("/proxy/{config_id}")
 async def delete_proxy_config(
     config_id: int,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Delete a proxy config."""
@@ -300,7 +303,7 @@ async def delete_proxy_config(
 @router.put("/proxy/{config_id}/activate")
 async def activate_proxy_config(
     config_id: int,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Activate a proxy config. Only works if reachable."""
@@ -313,7 +316,7 @@ async def activate_proxy_config(
         raise HTTPException(404, "Config not found")
 
     from ..services.audit_service import log_action
-    log_action(db, action="proxy_config_activate", admin_id=current_admin.id,
+    log_action(db, action="proxy_config_activate", admin_id=current_user["id"],
                status="success", detail={"host": config["host"]})
 
     return {"activated": True, "config": config}
@@ -321,7 +324,7 @@ async def activate_proxy_config(
 
 @router.post("/proxy/deactivate")
 async def deactivate_proxy(
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Deactivate all proxy configs."""
@@ -331,7 +334,7 @@ async def deactivate_proxy(
 
 @router.post("/proxy/test")
 async def test_proxy_reachability_endpoint(
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_gateway_token),
     db: Session = Depends(get_db),
 ):
     """Test reachability of all proxy configs."""
@@ -346,9 +349,14 @@ async def test_proxy_reachability_endpoint(
 @router.get("/config")
 def get_system_config(
     key: str = Query(None, description="Config key to fetch, or all if omitted"),
+    current_user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Get system configuration value(s)."""
+    """Get system configuration value(s).
+
+    Admin-only (Gap G1): config may hold sensitive values (e.g. proxy
+    credentials). Every other ``system.py`` route is gated; this one was not.
+    """
     if key:
         cfg = db.query(SystemConfig).filter(SystemConfig.key == key).first()
         return {"key": key, "value": cfg.value if cfg else ""}
@@ -360,7 +368,7 @@ def get_system_config(
 def set_system_config(
     key: str = Query(...),
     value: str = Body(..., embed=True),
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Set a system configuration value."""
@@ -385,9 +393,12 @@ from fastapi import UploadFile, File, Form
 
 @router.get("/ssl-certs")
 async def list_ssl_certs(
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_admin),
 ):
-    """List available SSL certificate domains (proxied to provision-api)."""
+    """List available SSL certificate domains (proxied to provision-api).
+
+    Admin-only (Gap G5): SSL cert inventory is an admin-page concern.
+    """
     return await provision_service.list_ssl_certs()
 
 
@@ -397,7 +408,7 @@ async def upload_ssl_cert(
     fullchain: str = Form(""),
     privkey: str = Form(""),
     ssl_path: str = Form(""),
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Upload SSL certificates for a domain (proxied to provision-api).
@@ -419,7 +430,7 @@ async def upload_ssl_cert(
         )
     except Exception as e:
         raise HTTPException(502, f"provision-api error: {e}")
-    log_action(db, action="ssl_upload", admin_id=current_admin.id,
+    log_action(db, action="ssl_upload", admin_id=current_user["id"],
         detail={"domain": domain, "mode": "path" if ssl_path else "paste"}, status="success")
     return result
 
@@ -427,7 +438,7 @@ async def upload_ssl_cert(
 @router.post("/ssl-certs/{domain}/refresh")
 async def refresh_ssl_cert(
     domain: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_admin),
 ):
     """Refresh SSL certificates for a domain from its original source path."""
     try:
@@ -440,7 +451,25 @@ async def refresh_ssl_cert(
 @router.delete("/ssl-certs/{domain}")
 async def delete_ssl_cert(
     domain: str,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_user: dict = Depends(require_admin),
 ):
     """Delete SSL certificates for a domain (proxied to provision-api)."""
     return await provision_service.delete_ssl_cert(domain)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/system/subnet-pool  —  subnet pool usage statistics
+# ---------------------------------------------------------------------------
+
+@router.get("/subnet-pool")
+async def get_subnet_pool(
+    current_user: dict = Depends(require_admin),
+):
+    """Get subnet pool usage statistics for the dashboard (proxied to provision-api).
+
+    Admin-only (Gap G5): pool CIDRs/usage are an admin-dashboard concern.
+    """
+    try:
+        return await provision_service.subnet_pool()
+    except Exception as e:
+        raise HTTPException(502, f"provision-api error: {e}")

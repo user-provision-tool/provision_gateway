@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, Response
+from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
+from jose import JWTError
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..middleware import get_current_admin, get_current_user, require_admin_role
-from ..models.admin import AdminUser
+from ..middleware import require_gateway_token, require_admin
+from ..models.end_user import EndUser
+from ..models.api_key import ApiKey
 from ..schemas.auth import (
     LoginRequest,
     PasswordChangeRequest,
@@ -17,6 +22,7 @@ from ..schemas.auth import (
 )
 from ..services import auth_service
 from ..config import settings
+import bcrypt as _bcrypt
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -44,16 +50,21 @@ def setup_admin(req: SetupRequest, db: Session = Depends(get_db)):
 @router.post("/register", status_code=201)
 def register_admin(
     req: RegisterRequest,
-    current_admin: AdminUser = Depends(require_admin_role),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Create a new admin user. Only existing admins can create others."""
+    """Create a new admin user. Only existing admins can create others.
+
+    Uses the shared ``require_admin`` dependency (``gateway_token`` cookie or
+    Bearer, 24h TTL) per gateway-acl-architecture.md §5, instead of the old
+    Bearer-``access_token`` admin-only middleware.
+    """
     existing = auth_service.get_admin_by_email(db, req.email)
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
 
-    # Viewers cannot create admins
-    if req.role == "admin" and current_admin.role != "admin":
+    # Viewers cannot create admins (require_admin already enforces admin role)
+    if req.role == "admin" and current_admin["role"] != "admin":
         raise HTTPException(status_code=403, detail="Only admins can create admin users")
 
     admin = auth_service.create_admin(db, req.email, req.password, role=req.role)
@@ -66,40 +77,81 @@ def register_admin(
 
 @router.post("/login")
 def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
-    """Authenticate and return JWT tokens. Supports both admin and end-user accounts."""
+    """Authenticate and return JWT tokens with cookie support.
+
+    Sets two cookies:
+      - gateway_token: short-lived (24h), for dashboard/gateway API access
+      - provision_token: long-lived (1yr), for service access via provision-nginx
+
+    Special users (role=special) are blocked with 403.
+    If no existing API key, a default key is created.
+    """
     result = auth_service.authenticate_user(db, req.email, req.password)
     if result is None:
         raise HTTPException(status_code=401, detail="Invalid email/username or password")
-    
+
     user_type, user_info = result
-    
-    access_token = auth_service.create_access_token(
-        user_info["id"], user_info.get("email", user_info.get("username", "")),
-        user_info["role"], user_type
-    )
-    refresh_token = auth_service.create_refresh_token(
-        user_info["id"], user_info.get("email", user_info.get("username", "")),
-        user_type
-    )
-    
-    response = {
+    role = user_info.get("role", "viewer")
+    user_id = user_info["id"]
+    email = user_info.get("email", user_info.get("username", ""))
+
+    # Block special users at login
+    if role == "special":
+        raise HTTPException(status_code=403, detail="Special users cannot access the dashboard")
+
+    # Create access and refresh tokens
+    access_token = auth_service.create_access_token(user_id, email, role, user_type)
+    refresh_token = auth_service.create_refresh_token(user_id, email, user_type)
+
+    # Create gateway token (24h) and provision token (1yr)
+    gateway_token = auth_service.create_gateway_token(user_id, email, role, user_type)
+    provision_token = auth_service.create_provision_token(user_id, email, role, user_type)
+
+    # Create default API key if none exists for end-users
+    if user_type == "end_user":
+        existing_keys = auth_service.list_api_keys(db, user_id)
+        if not existing_keys:
+            auth_service.create_default_api_key(db, user_id)
+
+    # Build JSON response body
+    body = {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
         "expires_in": settings.JWT_EXPIRE_SEC,
         "user_type": user_type,
     }
-    
+
     if user_type == "admin":
-        response["admin"] = user_info
+        body["admin"] = user_info
     else:
-        response["user"] = {
+        body["user"] = {
             "id": user_info["id"],
-            "username": user_info["username"],
-            "role": user_info["role"],
+            "username": user_info.get("username", ""),
+            "role": user_info.get("role", "viewer"),
         }
-    
-    return response
+
+    # Set cookies
+    resp = JSONResponse(content=body)
+    resp.set_cookie(
+        key="gateway_token",
+        value=gateway_token,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        max_age=86400,
+        path="/",
+    )
+    resp.set_cookie(
+        key="provision_token",
+        value=provision_token,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        max_age=settings.PROVISION_COOKIE_TTL,
+        path="/",
+    )
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +201,290 @@ def refresh_token(req: RefreshRequest, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @router.get("/me")
-def get_me(current_user: dict = Depends(get_current_user)):
-    """Return the currently authenticated user's profile (admin or end-user)."""
+def get_me(current_user: dict = Depends(require_gateway_token)):
+    """Return the currently authenticated user's profile (admin or end-user).
+
+    Uses the shared ``require_gateway_token`` dependency (``gateway_token``
+    cookie or Bearer, 24h TTL) instead of ``get_current_user`` (Bearer
+    ``access_token``, 1h TTL). This matches gateway-acl-architecture.md §5
+    (every ``/api/*`` route gated by ``gateway_token``) and removes the
+    transient 401 the browser emitted once the 1h access token expired — the
+    long-lived ``gateway_token`` cookie is now consulted directly.
+    """
     return current_user
+
+
+# ---------------------------------------------------------------------------
+# GET /api/auth/verify — nginx auth_request subrequest (no auth required)
+# ---------------------------------------------------------------------------
+
+@router.get("/verify")
+def verify_auth(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Verify JWT for provision-nginx auth_request subrequest.
+
+    Returns the FINAL HTTP status that nginx consumes:
+      - 200 + ``X-Service-Basic``  → allowed (nginx injects the credential)
+      - 401 + ``X-Auth-Action``    → login_required / token_expired
+      - 403 + ``X-Auth-Action``    → acl_denied
+
+    The browser-vs-API distinction is handled by nginx (``error_page`` +
+    ``map $http_accept``), not here. This matches acl-enforcement-design-v2.md §5.
+    """
+    if not settings.ENABLE_ACL:
+        # ACL disabled → 401 so nginx falls back to auth_basic (Basic dialog)
+        return Response(status_code=401)
+
+    cookie_token = request.cookies.get("provision_token")
+    header_token = request.headers.get("X-Provision-Token", "")
+    token = cookie_token or header_token
+
+    def _deny(action: str, status: int, detail: str) -> Response:
+        """Deny with a status code + X-Auth-Action for nginx's map to read."""
+        return JSONResponse(
+            status_code=status,
+            headers={"X-Auth-Action": action},
+            content={"detail": detail},
+        )
+
+    if not token:
+        return _deny("login_required", 401, "No provision token")
+
+    try:
+        payload = auth_service.verify_provision_token(token)
+    except JWTError:
+        # Check if expired vs invalid
+        try:
+            from jose import jwt as _jwt
+            _jwt.decode(token, settings.GATEWAY_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM],
+                        options={"verify_exp": False})
+            # Token is structurally valid but expired
+            return _deny("token_expired", 401, "Token expired")
+        except Exception:
+            return _deny("login_required", 401, "Invalid token")
+
+    # Extract user info
+    user_id = int(payload.get("sub", 0))
+    user_type = payload.get("user_type", "end_user")
+
+    if user_type == "admin":
+        # Admins have access to everything
+        svc_basic = _get_service_basic_credential(request, db)
+        return Response(status_code=200, headers={"X-Service-Basic": svc_basic})
+
+    # End-user: must be active + approved
+    end_user = db.query(EndUser).filter(EndUser.id == user_id).first()
+    if not end_user or not end_user.is_active or not end_user.is_approved:
+        return _deny("login_required", 401, "User not found, inactive, or not approved")
+
+    # Extract target service from request hostname
+    host = request.headers.get("Host", "")
+    registry_entry = _lookup_by_hostname(host, request)
+
+    if registry_entry:
+        target_user = registry_entry.get("user_name", "")
+        # Check if viewer is accessing their own service
+        if target_user == end_user.username:
+            svc_basic = _get_service_basic_credential(request, db)
+            return Response(status_code=200, headers={"X-Service-Basic": svc_basic})
+
+        # Check allowed_special_users
+        allowed = (end_user.allowed_special_users or "").split(",")
+        if target_user in allowed:
+            svc_basic = _get_service_basic_credential(request, db)
+            return Response(status_code=200, headers={"X-Service-Basic": svc_basic})
+
+    # ACL denied
+    return _deny("acl_denied", 403, "ACL denied")
+
+
+def _lookup_by_hostname(host: str, request: Request) -> dict | None:
+    """Look up a registry entry by hostname from the HostnameIndex."""
+    try:
+        hostname_index = request.app.state.hostname_index
+        return hostname_index.get_by_hostname(host)
+    except Exception:
+        return None
+
+
+def _get_service_basic_credential(request: Request, db: Session) -> str:
+    """Get the X-Service-Basic credential for a service.
+
+    Returns the base64-encoded username:password for auth_basic on the target service.
+    Falls back to looking up the registry entry's passwd_plain.
+    """
+    host = request.headers.get("Host", "")
+    entry = _lookup_by_hostname(host, request)
+    if entry:
+        user_name = entry.get("user_name", "")
+        passwd = entry.get("passwd_plain", "123456")
+        import base64
+        return base64.b64encode(f"{user_name}:{passwd}".encode()).decode()
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# API Key CRUD — POST/GET/DELETE /api/auth/keys
+# ---------------------------------------------------------------------------
+
+@router.post("/keys", status_code=201)
+def create_key(
+    req: dict,
+    current_user: dict = Depends(require_gateway_token),
+    db: Session = Depends(get_db),
+):
+    """Generate a new API key. Admin can create for any user; viewer for self.
+
+    Request body: {"label": "my-key", "user_id": 1}  (user_id is optional for viewers)
+    """
+    label = req.get("label", "Default").strip()
+    if not label:
+        raise HTTPException(400, "label is required")
+
+    # Determine target user_id
+    is_admin = current_user["role"] == "admin"
+    target_user_id = req.get("user_id", current_user["id"]) if is_admin else current_user["id"]
+
+    if not is_admin and target_user_id != current_user["id"]:
+        raise HTTPException(403, "Viewers can only create keys for themselves")
+
+    key, raw_token = auth_service.create_api_key(db, target_user_id, label)
+    # Create a provision token embedding this api_key_id
+    end_user = db.query(EndUser).filter(EndUser.id == target_user_id).first()
+    email = end_user.username if end_user else ""
+    role = end_user.role if end_user else "viewer"
+    provision_token = auth_service.create_provision_token(target_user_id, email, role,
+                                                          api_key_id=key.id)
+
+    return {
+        "key": key.to_dict(),
+        "token": raw_token,
+        "provision_token": provision_token,
+        "message": "Save this token — it will not be shown again.",
+    }
+
+
+@router.get("/keys")
+def list_keys(
+    current_user: dict = Depends(require_gateway_token),
+    db: Session = Depends(get_db),
+):
+    """List API keys. Admin sees all; viewer sees own.
+
+    Uses the shared ``require_gateway_token`` dependency (cookie or Bearer) so
+    the extraction is consistent with ``POST /keys`` and other gateway routes —
+    the previous hand-rolled ``_get_gateway_user_safe`` 401'd a valid admin
+    ``gateway_token`` cookie.
+    """
+    is_admin = current_user["role"] == "admin"
+    user_id = None if is_admin else current_user["id"]
+    keys = auth_service.list_api_keys(db, user_id)
+    return {"keys": [k.to_dict() for k in keys]}
+
+
+def _get_gateway_user_safe(request: Request, db: Session) -> dict | None:
+    """Extract gateway user from cookie/header without raising."""
+    token = request.cookies.get("gateway_token") or ""
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+    if not token:
+        return None
+    try:
+        payload = auth_service.decode_gateway_token(token)
+    except Exception:
+        return None
+    return {
+        "id": int(payload.get("sub", 0)),
+        "email": payload.get("email", ""),
+        "role": payload.get("role", "viewer"),
+        "user_type": payload.get("user_type", "end_user"),
+    }
+
+
+@router.delete("/keys/{key_id}")
+def delete_key(
+    key_id: int,
+    current_user: dict = Depends(require_gateway_token),
+    db: Session = Depends(get_db),
+):
+    """Revoke an API key. Admin can revoke any; viewer own.
+
+    Uses the shared ``require_gateway_token`` dependency for consistency with
+    the other key routes (see ``list_keys``).
+    """
+    key = auth_service.get_api_key_by_id(db, key_id)
+    if key is None:
+        raise HTTPException(404, "Key not found")
+
+    is_admin = current_user["role"] == "admin"
+    if not is_admin and key.user_id != current_user["id"]:
+        raise HTTPException(403, "You can only revoke your own keys")
+
+    auth_service.revoke_api_key(db, key_id)
+    return {"revoked": True, "key_id": key_id}
+
+
+# ---------------------------------------------------------------------------
+# GET /go/{hostname} — service access redirect from dashboard
+# ---------------------------------------------------------------------------
+
+@router.get("/go/{hostname}")
+def go_to_service(
+    hostname: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Redirect to a service URL, setting the provision_token cookie.
+
+    Validates gateway_token, checks ACL, then redirects to the service
+    with a 302, setting the provision_token cookie for the service domain.
+    """
+    current_user = _get_gateway_user_safe(request, db)
+    if current_user is None:
+        raise HTTPException(401, "Authentication required")
+
+    # Look up service by hostname
+    try:
+        hostname_index = request.app.state.hostname_index
+        entry = hostname_index.get_by_hostname(hostname)
+    except Exception:
+        entry = None
+
+    if entry is None:
+        raise HTTPException(404, f"Service not found: {hostname}")
+
+    # ACL check for viewers
+    if current_user["role"] != "admin":
+        target_user = entry.get("user_name", "")
+        if target_user != current_user["email"]:
+            # Check allowed_special_users
+            eu = db.query(EndUser).filter(EndUser.id == current_user["id"]).first()
+            allowed = (eu.allowed_special_users or "").split(",") if eu else []
+            if target_user not in allowed:
+                raise HTTPException(403, "Access denied: service not in your allowed list")
+
+    # Get provision token for this user
+    email = current_user["email"]
+    role = current_user["role"]
+    user_type = current_user["user_type"]
+    provision_token = auth_service.create_provision_token(current_user["id"], email, role, user_type)
+
+    # Build service URL (with the nginx host port so the browser reaches the
+    # subnet-acl nginx, not the default :80).
+    domain = entry.get("hostname", hostname)
+    nginx_http_port = request.app.state.config_http_port if hasattr(request.app.state, "config_http_port") else settings.NGINX_HTTP_PORT
+    service_url = f"http://{domain}"
+    if nginx_http_port != 80:
+        service_url += f":{nginx_http_port}"
+
+    # Redirect with cookie via _set_token
+    # We redirect to the service at /_set_token first, which sets the cookie and redirects to /
+    _set_token_url = f"{service_url}/_set_token?token={provision_token}&redirect=/"
+    return RedirectResponse(url=_set_token_url, status_code=302)
 
 
 # ---------------------------------------------------------------------------
@@ -161,12 +494,20 @@ def get_me(current_user: dict = Depends(get_current_user)):
 @router.put("/password")
 def change_password(
     req: PasswordChangeRequest,
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Change the current admin's password."""
+    """Change the current admin's password.
+
+    Uses the shared ``require_admin`` dependency (``gateway_token`` cookie or
+    Bearer, 24h TTL) per gateway-acl-architecture.md §5, instead of the old
+    Bearer-``access_token`` admin-only middleware.
+    """
+    admin = auth_service.get_admin_by_id(db, current_admin["id"])
+    if admin is None:
+        raise HTTPException(status_code=401, detail="Admin not found")
     success = auth_service.change_password(
-        db, current_admin, req.current_password, req.new_password
+        db, admin, req.current_password, req.new_password
     )
     if not success:
         raise HTTPException(status_code=400, detail="Current password is incorrect")
@@ -177,17 +518,13 @@ def change_password(
 # End-User Management (admin-only)
 # ---------------------------------------------------------------------------
 
-from ..models.end_user import EndUser
-import bcrypt as _bcrypt
-from datetime import datetime, timezone
-
 
 @router.get("/users")
 def list_end_users(
-    current_admin: AdminUser = Depends(require_admin_role),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """List all registered end-users."""
+    """List all registered end-users (admin-only)."""
     users = db.query(EndUser).order_by(EndUser.created_at.desc()).all()
     return {"users": [u.to_dict() for u in users]}
 
@@ -197,7 +534,12 @@ def register_end_user(
     req: dict,
     db: Session = Depends(get_db),
 ):
-    """Register a new end-user. Requires admin approval before activation."""
+    """Register a new end-user. Requires admin approval before activation.
+
+    Intentionally left unauthenticated: this is the public pre-auth signup
+    flow from the login page (creates an unapproved end-user awaiting admin
+    approval), so it cannot be gated by ``gateway_token``.
+    """
     username = req.get("username", "").strip()
     password = req.get("password", "")
     if not username or not password:
@@ -225,7 +567,7 @@ def register_end_user(
 @router.put("/users/{user_id}/approve")
 def approve_end_user(
     user_id: int,
-    current_admin: AdminUser = Depends(require_admin_role),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Admin approves an end-user."""
@@ -242,7 +584,7 @@ def approve_end_user(
 def update_end_user(
     user_id: int,
     req: dict,
-    current_admin: AdminUser = Depends(require_admin_role),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Update end-user settings (role, special users, active status)."""
@@ -262,7 +604,7 @@ def update_end_user(
 @router.delete("/users/{user_id}")
 def delete_end_user(
     user_id: int,
-    current_admin: AdminUser = Depends(require_admin_role),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Delete an end-user."""
@@ -276,7 +618,7 @@ def delete_end_user(
 
 @router.get("/users/deployable")
 def list_deployable_users(
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """List users available for deployment (approved + active end-users, plus special users)."""

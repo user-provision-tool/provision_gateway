@@ -9,8 +9,8 @@ import json
 import time
 import os
 
-GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:8770")
-PROVISION_API_URL = os.environ.get("PROVISION_API_URL", "http://localhost:8765")
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8870")
+PROVISION_API_URL = os.environ.get("PROVISION_API_URL", "http://127.0.0.1:8875")
 
 def run_curl(method, path, data=None, token=None):
     """Make a curl request and return (status_code, response_body)."""
@@ -66,7 +66,7 @@ def test_auth_flow():
     if status == 409:
         print("  Admin already exists, using existing credentials")
         # Use the existing admin
-        login_data = {"email": "admin@example.com", "password": "admin123"}
+        login_data = {"email": "admin@subnet-acl.local", "password": "admin-pass-123"}
     elif status == 201:
         print("  Created test admin")
     else:

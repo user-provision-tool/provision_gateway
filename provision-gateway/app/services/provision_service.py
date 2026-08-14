@@ -143,7 +143,7 @@ class ProvisionService:
     async def network_connect(self, network: str, container: str) -> dict[str, Any]:
         return await self._request("POST", f"/docker/network/{network}/connect/{container}")
 
-    async def nginx_reload(self, container: str = "provision-nginx") -> dict[str, Any]:
+    async def nginx_reload(self, container: str = "subnet-acl-nginx") -> dict[str, Any]:
         return await self._request("POST", "/docker/nginx/reload", params={"container": container})
 
     # ---- Tasks ----
@@ -202,6 +202,13 @@ class ProvisionService:
         return await self._request("GET", "/service-stats")
 
     # ---- Service readiness ----
+
+    # ---- Subnet pool ----
+
+    async def subnet_pool(self) -> dict[str, Any]:
+        """Get subnet pool usage statistics from provision-api."""
+        return await self._request("GET", "/subnet-pool")
+
 
     async def check_missing_files(self, service_name: str) -> dict[str, Any]:
         """Check which essential deployment files are missing for a service."""

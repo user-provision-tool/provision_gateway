@@ -84,7 +84,7 @@ async def _docker_events_monitor():
             try:
                 client = docker.from_env()
                 events = client.events(
-                    filters={"type": ["container"], "container": ["provision-nginx"], "event": ["restart", "start"]},
+                    filters={"type": ["container"], "container": ["subnet-acl-nginx"], "event": ["restart", "start"]},
                     decode=True,
                 )
                 for event in events:
@@ -93,7 +93,7 @@ async def _docker_events_monitor():
                         if now - last_triggered < 30:
                             continue
                         last_triggered = now
-                        print(f"[gateway] provision-nginx {event['status']} detected — triggering reconciliation")
+                        print(f"[gateway] subnet-acl-nginx {event['status']} detected — triggering reconciliation")
                         try:
                             sync_requests.post(f"{settings.PROVISION_API_URL}/reconcile", timeout=30)
                         except Exception:
@@ -132,10 +132,18 @@ async def lifespan(app: FastAPI):
     # Startup
     init_db()
     print(f"[gateway] Database initialized at {settings.DATABASE_URL}")
+
+    # Initialize Registry and HostnameIndex for ACL/service access
+    from .services.registry import Registry
+    from .services.hostname_index import HostnameIndex
+    app.state.registry = Registry(settings.REGISTRY_FILE)
+    app.state.hostname_index = HostnameIndex(settings.REGISTRY_FILE)
+    print(f"[gateway] Registry + HostnameIndex initialized (registry: {settings.REGISTRY_FILE})")
+
     _reconcile_task = asyncio.create_task(_reconcile_loop())
     print("[gateway] Scheduled reconciliation background task started")
     _docker_events_task = asyncio.create_task(_docker_events_monitor())
-    print("[gateway] Docker events monitor started (watching provision-nginx)")
+    print("[gateway] Docker events monitor started (watching subnet-acl-nginx)")
     _project_monitor_task = asyncio.create_task(_project_monitor_loop())
     print("[gateway] Project directory monitor started (polling source_projects every 10s)")
     yield
