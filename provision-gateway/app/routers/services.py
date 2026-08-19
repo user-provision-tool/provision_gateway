@@ -143,7 +143,7 @@ async def check_missing_files(
         recipe_path: Optional subdirectory for multi-recipe projects.
     """
     try:
-        result = await provision_service.check_missing_files(name)
+        result = await provision_service.check_missing_files(name, recipe_path)
     except Exception as e:
         raise HTTPException(502, f"provision-api error: {e}")
 
@@ -269,16 +269,19 @@ async def save_generated_files(
 ):
     """Save LLM-generated files to the service project.
 
-    Body: { "service_name": "myapp", "files": { "nginx.conf": "...", "docker-compose.yml": "..." } }
+    Body: { "service_name": "myapp", "recipe_path": "sub/dir", "files": { "nginx.conf": "...", "docker-compose.yml": "..." } }
     """
     service_name = req.get("service_name")
+    recipe_path = req.get("recipe_path", "")
     files = req.get("files", {})
     if not service_name or not files:
         raise HTTPException(400, "service_name and files required")
 
     target = settings.SOURCE_PROJECTS_DIR / service_name
+    if recipe_path:
+        target = target / recipe_path
     if not target.exists():
-        raise HTTPException(404, f"Service '{service_name}' not found")
+        target.mkdir(parents=True, exist_ok=True)
 
     saved = []
     for filename, content in files.items():

@@ -51,18 +51,24 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   // Auto-detected volume keys from compose template
   const [expectedVolumeKeys, setExpectedVolumeKeys] = useState<string[]>([])
 
+  // Helper: parse service value which may include recipe path (format: "name@@recipe_path")
+  const parseServiceValue = (val: string): { baseName: string; recipePath: string } => {
+    const idx = val.indexOf('@@')
+    return idx >= 0 ? { baseName: val.slice(0, idx), recipePath: val.slice(idx + 2) } : { baseName: val, recipePath: '' }
+  }
+
   // Fetch expected volumes from compose template
   const fetchExpectedVolumes = async (serviceName: string, sourcesList?: { name: string; files: string[] }[]) => {
     try {
-      // Parse recipe path from service value (format: "name@@recipe_path")
-      const [baseName, recipePath] = serviceName.includes('@@') ? serviceName.split('@@') : [serviceName, '']
+      const svcVal = serviceName || ''
+      const { baseName } = parseServiceValue(svcVal)
       const list = sourcesList || sources
       const svc = list.find(s => s.name === baseName)
       if (!svc) return
       const composeJ2 = svc.files.find((f: string) => f.endsWith('.yml.j2'))
       if (!composeJ2) { setExpectedVolumeKeys([]); return }
       
-      const { data } = await client.get(`/services/${serviceName}/files/${composeJ2}`)
+      const { data } = await client.get(`/services/${baseName}/files/${composeJ2}`)
       const content = data.content || ''
       // Extract {{ volumes['key'] }} or {{ volumes[\"key\"] }}
       const volRegex = /\{\{-?\s*volumes\[['\"]([^'\"]+)['\"]\]\s*-?\}\}/g
@@ -171,7 +177,11 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     if (!serviceName) { setMissingFiles([]); setScanContext(null); return }
     setCheckingMissing(true)
     try {
-      const { data } = await client.get(`/services/${serviceName}/check-missing-files`)
+      // Parse recipe path from service value (format: "name@@recipe_path")
+      const [baseName, recipePath] = serviceName.includes('@@') ? serviceName.split('@@') : [serviceName, '']
+      const params: Record<string, string> = {}
+      if (recipePath) params.recipe_path = recipePath
+      const { data } = await client.get(`/services/${baseName}/check-missing-files`, { params })
       setMissingFiles(data.missing || [])
       setCheckError(null)
       if (data.scan_context) {
@@ -223,14 +233,17 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       setGeneratedFiles(results)
       if (Object.keys(results).length > 0) {
         // Persist to the service project on disk immediately (not just on deploy)
+        const svcVal = form.getFieldValue('service_name') || ''
+        const { baseName, recipePath } = parseServiceValue(svcVal)
         try {
           await client.post('/services/save-generated', {
-            service_name: form.getFieldValue('service_name'),
+            service_name: baseName,
+            recipe_path: recipePath,
             files: results,
           })
           message.success(`LLM generated & saved ${Object.keys(results).length} file(s) — review, then deploy`)
           // Refresh expected volumes (compose template may have been generated)
-          fetchExpectedVolumes(form.getFieldValue('service_name'))
+          fetchExpectedVolumes(svcVal)
         } catch {
           message.warning(`Generated ${Object.keys(results).length} file(s), but saving to disk failed`)
         }
@@ -249,8 +262,11 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       // Merge the edited content into the generated-files state
       setGeneratedFiles(prev => ({ ...prev, [editorFileName]: editorContent }))
       // Persist to the service project on disk
+      const svcVal = form.getFieldValue('service_name') || ''
+      const { baseName, recipePath } = parseServiceValue(svcVal)
       await client.post('/services/save-generated', {
-        service_name: form.getFieldValue('service_name'),
+        service_name: baseName,
+        recipe_path: recipePath,
         files: { [editorFileName]: editorContent },
       })
       message.success(`${editorFileName} saved`)
@@ -296,12 +312,15 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         }
       }
 
-      const selectedService = sources.find(s => s.name === values.service_name)
+      const svcVal = values.service_name || ''
+      const { baseName, recipePath } = parseServiceValue(svcVal)
+      const selectedService = sources.find(s => s.name === baseName)
 
       // Save any LLM-generated files first — execute regardless of autoDeploy state
       if (Object.keys(gen).length > 0) {
         await client.post('/services/save-generated', {
-          service_name: values.service_name,
+          service_name: baseName,
+          recipe_path: recipePath,
           files: gen,
         })
       }
@@ -309,8 +328,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       // Build deploy payload
       const payload: any = {
         user_name: values.user_name,
-        service_name: values.service_name,
-        project_root: values.service_name,
+        service_name: baseName,
+        project_root: recipePath ? `${baseName}/${recipePath}` : baseName,
         label: values.label || '0',
         domain: values.domain || 'localhost',
         passwd: values.passwd || '',
@@ -320,24 +339,33 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
       // Add compose/nginx paths — use consistent naming per design.md (G10)
       if (selectedService) {
-        const composeJ2 = selectedService.files.find((f: string) => f.endsWith('.yml.j2'))
-        const nginxJ2 = selectedService.files.find((f: string) => f.endsWith('.conf.j2'))
+        // For a multi-recipe service, scope file lookup to the SELECTED recipe
+        // subdirectory. project_root already points into the recipe dir, so the
+        // template paths sent to the API are the bare filenames within it.
+        const recipePrefix = recipePath ? `${recipePath}/` : ''
+        const recipeFiles = recipePrefix
+          ? selectedService.files.filter((f: string) => f.startsWith(recipePrefix))
+          : selectedService.files
+        const pathFor = (f: string) => (recipePrefix ? f.slice(recipePrefix.length) : f)
+
+        const composeJ2 = recipeFiles.find((f: string) => f.endsWith('.yml.j2'))
+        const nginxJ2 = recipeFiles.find((f: string) => f.endsWith('.conf.j2'))
         // Fallback: look for regular (non-.j2) compose/nginx files that already exist in the project
-        const composeFile = selectedService.files.find((f: string) =>
+        const composeFile = recipeFiles.find((f: string) =>
           (f.endsWith('.yml') || f.endsWith('.yaml')) && !f.endsWith('.j2'))
-        const nginxFile = selectedService.files.find((f: string) =>
+        const nginxFile = recipeFiles.find((f: string) =>
           f.endsWith('.conf') && !f.endsWith('.j2'))
 
-        if (composeJ2) payload.compose_template_path = composeJ2
+        if (composeJ2) payload.compose_template_path = pathFor(composeJ2)
         else if (gen['docker-compose.yml']) payload.compose_file_path = 'docker-compose.yml'
-        else if (composeFile) payload.compose_file_path = composeFile
+        else if (composeFile) payload.compose_file_path = pathFor(composeFile)
 
-        if (nginxJ2) payload.nginx_conf_template_path = nginxJ2
+        if (nginxJ2) payload.nginx_conf_template_path = pathFor(nginxJ2)
         else if (gen['nginx.conf']) payload.nginx_conf_file_path = 'nginx.conf'
-        else if (nginxFile) payload.nginx_conf_file_path = nginxFile
+        else if (nginxFile) payload.nginx_conf_file_path = pathFor(nginxFile)
 
         // Auto-detect .env file in source project
-        const envFile = selectedService.files.find((f: string) =>
+        const envFile = recipeFiles.find((f: string) =>
           f === '.env' || f.endsWith('/.env'))
         if (envFile) payload.env_file_path = '.env'
         else if (gen['.env']) payload.env_file_path = '.env'
@@ -367,7 +395,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
       const { data } = await client.post('/users/deploy', payload)
       message.success(`Deploy queued! Task: ${data.task_id}`)
-      onDeployed(data.task_id, values.user_name, values.service_name, values.label || '0')
+      onDeployed(data.task_id, values.user_name, baseName, values.label || '0')
       form.resetFields()
       onClose()
     } catch (err: any) {
@@ -428,8 +456,9 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
             <Form.Item name="user_name" label="User Name" rules={[{ required: true, message: 'Required' }]} style={{ flex: 1 }}>
               <Select showSearch placeholder="Select registered user" filterOption={(input, option) => (option?.label as string||'').toLowerCase().includes(input.toLowerCase())} options={deployableUsers.map(u=>({value:u.username,label:u.username}))}
                 onChange={(val) => {
-                  const svc = form.getFieldValue('service_name')
-                  if (val && svc) computeNextLabel(val, svc)
+                  const svc = form.getFieldValue('service_name') || ''
+                  const { baseName: svcBase } = parseServiceValue(svc)
+                  if (val && svcBase) computeNextLabel(val, svcBase)
                 }}
               />
             </Form.Item>

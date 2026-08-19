@@ -48,7 +48,8 @@ export default function ServicesPage() {
   const [form] = Form.useForm()
   const [proxyEnabled, setProxyEnabled] = useState(false)
   const [genLoading, setGenLoading] = useState<string | null>(null)
-  const [missingFilesMap, setMissingFilesMap] = useState<Record<string, string[]>>({})  // service name being generated
+  const [missingFilesMap, setMissingFilesMap] = useState<Record<string, string[]>>({})  // recipeKey → missing file types
+  const [checkingMap, setCheckingMap] = useState<Record<string, boolean>>({})  // recipeKey → currently checking
 
   useEffect(() => { loadServices(); loadProxyStatus() }, [])
 
@@ -88,18 +89,23 @@ export default function ServicesPage() {
       if (recipes.length > 1) {
         return recipes.map(async (r) => {
           const key = r.path ? `${s.name}@@${r.path}` : s.name
+          setCheckingMap(prev => ({ ...prev, [key]: true }))
           try {
             const params: any = {}
             if (r.path) params.recipe_path = r.path
             const { data } = await client.get(`/services/${s.name}/check-missing-files`, { params })
             map[key] = data.missing || []
           } catch { map[key] = [] }
+          finally { setCheckingMap(prev => ({ ...prev, [key]: false })) }
         })
       }
+      const key = s.name
+      setCheckingMap(prev => ({ ...prev, [key]: true }))
       try {
         const { data } = await client.get(`/services/${s.name}/check-missing-files`)
         map[s.name] = data.missing || []
       } catch { map[s.name] = [] }
+      finally { setCheckingMap(prev => ({ ...prev, [key]: false })) }
     })
     await Promise.all(checks)
     setMissingFilesMap(map)
@@ -248,9 +254,11 @@ export default function ServicesPage() {
       render: (_:any, r: TableRow) => {
         const genKey = r.recipePath ? `${r.name}@@${r.recipePath}` : r.name
         const missing = missingFilesMap[genKey] ?? null
-        const hasAll = missing !== null && missing.length === 0
-        return <Tooltip title={missing === null ? 'Checking...' : hasAll ? 'No missing basic files, ready for deployment' : `Missing: ${missing.join(', ')}`}>
-          <Button size="small" type="primary" icon={<RobotOutlined/>} disabled={hasAll} loading={genLoading === genKey} onClick={()=>generateMissingFiles(r.name, r.recipePath)}/>
+        const checking = checkingMap[genKey] === true
+        const hasAll = !checking && missing !== null && missing.length === 0
+        const isChecking = checking || missing === null
+        return <Tooltip title={isChecking ? 'Checking deployment readiness...' : hasAll ? 'No missing basic files, ready for deployment' : `Missing: ${(missing||[]).join(', ')}`}>
+          <Button size="small" type="primary" icon={<RobotOutlined/>} disabled={isChecking || hasAll} loading={isChecking || genLoading === genKey} onClick={()=>generateMissingFiles(r.name, r.recipePath)}/>
         </Tooltip>
       } },
   ]

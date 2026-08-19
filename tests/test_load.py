@@ -193,6 +193,9 @@ async def test_deploy_parallel(
         payload = {
             "user_name": user,
             "service_name": svc,
+            "project_root": svc,
+            "compose_template_path": "docker-compose.yml.j2",
+            "nginx_conf_template_path": "nginx.conf.j2",
             "label": label,
             "domain": "localhost",
             "passwd": "loadtest",

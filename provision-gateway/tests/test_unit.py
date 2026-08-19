@@ -1199,8 +1199,11 @@ class TestServiceLabelAutoIncrement:
         from pathlib import Path
         deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
         content = deploy_form.read_text()
-        # The user_name onChange calls computeNextLabel with user + service values
-        assert 'if (val && svc) computeNextLabel(val, svc)' in content, (
+        # The user_name onChange calls computeNextLabel with user + service values.
+        # The service variable may be named `svc` or `svcBase` (multi-recipe
+        # support splits "name@@recipe_path" — base name is `svcBase`).
+        assert 'if (val && svcBase) computeNextLabel(val, svcBase)' in content or \
+               'if (val && svc) computeNextLabel(val, svc)' in content, (
             "user_name onChange should trigger computeNextLabel with user and service"
         )
 
