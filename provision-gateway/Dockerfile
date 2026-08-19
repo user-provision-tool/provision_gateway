@@ -25,7 +25,8 @@ COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && git config --global --add safe.directory '*'
 
 # Install Docker Compose plugin (curl honors *_PROXY env vars).
 # -C - + --retry --retry-all-errors: the proxy drops long downloads (~2.5-3min),

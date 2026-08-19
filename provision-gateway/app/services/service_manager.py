@@ -213,6 +213,7 @@ class ServiceManager:
 
         # Determine which files are tracked by git (original repo files)
         git_tracked: set[str] = set()
+        git_available = False
         try:
             result = subprocess.run(
                 ["git", "-C", str(project_dir), "ls-files"],
@@ -220,6 +221,7 @@ class ServiceManager:
             )
             if result.returncode == 0:
                 git_tracked = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+                git_available = True
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass  # git not available — fall back to treating all files as templates
 
@@ -260,7 +262,16 @@ class ServiceManager:
         has_dockerfile = any("Dockerfile" in f for f in files)
 
         # Auto-discover deployable recipe directories
-        recipes = self._discover_recipes(project_dir, git_tracked)
+        if git_available:
+            recipes = self._discover_recipes(project_dir, git_tracked)
+        else:
+            # Fall back to filesystem-based discovery when git is unavailable
+            all_rel_files = sorted(
+                str(f.relative_to(project_dir))
+                for f in project_dir.rglob("*")
+                if f.is_file() and not self._is_excluded(str(f.relative_to(project_dir)))
+            )
+            recipes = self._discover_recipes(project_dir, set(all_rel_files))
 
         # Detect active users from registry
         active_users = 0

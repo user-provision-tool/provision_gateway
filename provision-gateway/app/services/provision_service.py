@@ -203,9 +203,12 @@ class ProvisionService:
 
     # ---- Service readiness ----
 
-    async def check_missing_files(self, service_name: str) -> dict[str, Any]:
+    async def check_missing_files(self, service_name: str, recipe_path: str = "") -> dict[str, Any]:
         """Check which essential deployment files are missing for a service."""
-        return await self._request("GET", f"/services/{service_name}/check-missing-files")
+        params: dict[str, str] = {}
+        if recipe_path:
+            params["recipe_path"] = recipe_path
+        return await self._request("GET", f"/services/{service_name}/check-missing-files", params=params)
 
     # ---- SSL certificates ----
 
