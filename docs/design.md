@@ -156,6 +156,7 @@ services:
 **Dockerfile key points:**
 - Multi-stage: `python:3.13-slim` base, `uv` for deps
 - Same pattern as provision-api: copy `docker` CLI binary from `docker:cli` if needed (for subprocess fallback), but prefer `docker-py` SDK
+- `git config --global --add safe.directory '*'` — allows git subprocesses (`ls-files`, status/diff, recipe discovery) to run on cloned repos regardless of directory ownership (multi-recipe support, commit 9f12b57)
 - `CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8770"]`
 
 ### 2.2 provision-dashboard
@@ -323,7 +324,7 @@ _provision_gateway/
 │   │   │   └── proxy_service.py        # Proxy config CRUD + env injection
 │   │   │
 │   │   ├── middleware/
-│   │   │   └── __init__.py             # JWT verification (get_current_admin, get_current_user)
+│   │   │   └── __init__.py             # JWT verification — require_gateway_token, require_admin (gateway_token cookie / Bearer, 24h) gate every /api/* route; legacy get_current_admin/get_current_user/require_admin_role retained for reference
 │   │   │
 │   │   └── utils/
 │   │       ├── __init__.py
@@ -617,7 +618,7 @@ $PROVISION_DIR/provision_nginx_state.json
 ### 5.1 Conventions
 
 - Base path: `http://provision-gateway:8770`
-- All endpoints except `/health` and `/api/auth/*` require `Authorization: Bearer <JWT>`
+- Authentication: since commit 0ef9584 every `/api/*` route is gated by the shared `require_gateway_token` dependency (`app/middleware/__init__.py`), which accepts either the `gateway_token` cookie (24h TTL) or `Authorization: Bearer <JWT>`. Admin-only endpoints additionally require `require_admin` (admin role). Only `/health` and the public auth flows — `/api/auth/setup`, `/api/auth/login`, `/api/auth/verify` (nginx `auth_request`) and `/api/auth/users/register` (public end-user signup) — are unauthenticated.
 - Content-Type: `application/json` unless noted
 - SSE endpoints use `text/event-stream`
 
@@ -664,12 +665,12 @@ PUT /api/auth/password
 GET /api/auth/verify
   → Called by provision-nginx as auth_request subrequest
   → Extracts JWT from provision_token cookie or X-Provision-Token header
-  → When ENABLE_ACL=false: always returns 200 (pass-through to auth_basic)
+  → When ENABLE_ACL=false: returns 401 so nginx falls back to auth_basic (Basic dialog)
   → When ENABLE_ACL=true: validates JWT, checks ACL permissions
   → Response (ACL passed): 200 + X-Service-Basic header (base64 user:pass)
-  → Response (ACL denied): 403 + X-Auth-Action: redirect_acl_denied
-  → Response (token expired): 401 + X-Auth-Action: redirect_token_expired
-  → Response (no token): 401 + X-Auth-Action: redirect_login
+  → Response (ACL denied): 403 + X-Auth-Action: acl_denied
+  → Response (token expired): 401 + X-Auth-Action: token_expired
+  → Response (no token): 401 + X-Auth-Action: login_required
 
 GET /go/{hostname}
   → Dashboard service access redirect
@@ -797,6 +798,11 @@ POST /api/system/proxy/test
   }
   → Tests reachability of all configured proxies via TCP handshake.
   → The reachability result is cached and also returned by GET /api/system/proxy
+
+GET /api/system/subnet-pool
+  → Admin-only (Gap G5): subnet pool usage statistics for the dashboard
+  → Proxied to provision-api GET /subnet-pool
+  Response: 200 { ... }  — e.g. total CIDRs, allocated, free (pool usage summary)
 ```
 
 ### 5.5 Services (Project Management)
@@ -811,14 +817,22 @@ GET /api/services
         "files": ["docker-compose.myapp.yml.j2", "myapp.nginx.conf.j2", ".env", "Dockerfile"],
         "generated_files": [],
         "template_files": [],
+        "recipes": [],                 ← new (multi-recipe, commit 9f12b57)
         "has_compose_template": true,
         "has_nginx_template": true,
+        "has_dockerfile": true,
         "active_users": 3,
         "active_instances": ["alice/0", "bob/0", "charlie/0"],
         "created_at": "2026-07-01T10:00:00Z"
       }
     ]
   }
+  → Each service exposes a "recipes" array — auto-discovered deployable
+    subdirectories (service_manager._discover_recipes). A directory is a recipe
+    only if it contains BOTH a Dockerfile AND at least one plain docker-compose*.yml
+    file. Discovery uses the git-tracked file list when git is available, and falls
+    back to a filesystem scan when it is not. The project root is listed first as
+    is_root=true.
 
 POST /api/services
   Request: multipart/form-data or JSON — three creation modes:
@@ -856,6 +870,28 @@ POST /api/services/{name}/convert
   Response: 200 { "compose_template": "docker-compose.myapp.yml.j2",
                   "nginx_template": "myapp.nginx.conf.j2" }
   → Runs the same compose_converter + nginx_converter logic as provision-api
+
+GET /api/services/{name}/check-missing-files?recipe_path=recipes/web
+  → Proxied to provision-api GET /services/{name}/check-missing-files, then
+    enriched with repo scan context (scan_context) for LLM-based file generation.
+  → Optional recipe_path (commit 9f12b57) selects a recipe subdirectory for
+    multi-recipe projects; when omitted, the project root is checked.
+  Response: 200 {
+    "ready": false,
+    "missing": ["docker-compose.yml", "nginx.conf"],
+    "scan_context": { "repo_description": "...", "port": 8000, "has_dockerfile": true, ... }
+  }
+
+POST /api/services/save-generated
+  Request:  {
+    "service_name": "multisvc",
+    "recipe_path": "recipes/web",     // optional — creates the recipe subdir (9f12b57)
+    "files": { "nginx.conf": "...", "docker-compose.yml": "..." }
+  }
+  Response: 200 { "saved": ["nginx.conf", "docker-compose.yml"], "service": "multisvc" }
+  → Writes each file into the project directory (or into the recipe subdirectory
+    when recipe_path is given, creating it if needed) and stamps a `.generated`
+    marker file for LLM-tracking.
 ```
 
 ### 5.6 Users (End-User Provisioning)
@@ -1516,8 +1552,6 @@ Admin clones repo:       POST /api/services
 Gateway runs:            git config --global http.proxy http://squid-proxy:3128
                          git clone ...
                          git config --global --unset http.proxy  (cleanup)
-```
-
 ```
 
 ---

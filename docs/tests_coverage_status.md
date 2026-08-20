@@ -22,7 +22,7 @@
 
 | File | Language | Type | Test Cases | Status |
 |---|---|---|---|---|
-| `test_unit.py` | Python (pytest) | Unit | 94+ | ✅ All passing (prior 87 + coder's GAP-1/2/4 tests — reworked TestUploadModeJSONFormat, reworked TestTemplateMode, new TestLLMConfigDefersLocalAgent, new TestTemplateClassificationGitTracked — plus QA's new TestLLMConfigDefersLocalAgent::test_model_column_default_is_byok) |
+| `test_unit.py` | Python (pytest) | Unit | 94+ | ✅ All passing (prior 87 + coder's GAP-1/2/4 tests — reworked TestUploadModeJSONFormat, reworked TestTemplateMode, new TestLLMConfigDefersLocalAgent, new TestTemplateClassificationGitTracked — plus QA's new TestLLMConfigDefersLocalAgent::test_model_column_default_is_byok, and subnet-acl + multi-recipe coverage: TestAuthVerifyHeaders, TestVerifyAuthStatusCodes, TestGoServiceRedirect, TestApiKeyModel, TestSubnetPoolSystemEndpoint, TestRecipePathMultiRecipe, TestRouteRoleGating) |
 | `test_concurrency.py` | Python (pytest) | Unit (concurrency) | 2 | ✅ Passing (NEW iter-1, GAP-3 — 20 concurrent in-process requests via httpx ASGITransport + Dockerfile `--workers` check; runs in the default pytest suite, no live gateway needed) |
 | `test_proxy.py` | Python (pytest) | Unit | 8 | ✅ Passing |
 | `test_integration.py` | Python (subprocess) | Integration | 9 | 🟡 9 skipped in the default pytest run — host-port probes (conftest curls `localhost:8770/health` from the host; port 8770 is internal-only by compose design). Equivalent live coverage via `test_integration.sh` run in-container → 9/0 passed (iter-6, re-confirmed iter-7 + iter-8 + iter-9 + iter-10 + iter-11 + iter-12 + iter-13 + iter-14 + iter-15 + iter-16 + iter-17 + iter-18 + iter-19 + iter-20 + iter-21) |
@@ -62,10 +62,10 @@ bash tests/test_provision_api.sh
 
 | Service Module | Unit Tests | Integration Tests | Coverage |
 |---|---|---|---|
-| `auth_service.py` | 4 (hash, verify, JWT, end-user auth) | 3 (login, refresh, end-user login) | 🟢 Good |
+| `auth_service.py` | 4 (hash, verify, JWT, end-user auth) + gateway/provision token + API-key helpers (TestGatewayTokenDecode, TestApiKeyModel) | 3 (login, refresh, end-user login) | 🟢 Good |
 | `proxy_service.py` | 3 (env injection, disabled proxy) | 12 (full CRUD, deploy integration) | 🟢 Good |
 | `provision_service.py` | 14 (method existence checks) | 3 (list users, get user, error handling) | 🟢 Good |
-| `service_manager.py` | 5 (create_from_template, scan_for_new_projects, get_new_project_events, project tracking) | 1 (list services) | 🟡 Partial (TestProjectMonitoring, TestTemplateMode in test_unit.py) |
+| `service_manager.py` | 12 (create_from_template, scan_for_new_projects, get_new_project_events, project tracking, recipe-path multi-recipe — TestRecipePathMultiRecipe) | 1 (list services) | 🟡 Partial (TestProjectMonitoring, TestTemplateMode, TestRecipePathMultiRecipe in test_unit.py) |
 | `llm_service.py` | 0 | 0 | 🔴 None |
 | `curl_service.py` | 0 | 0 | 🔴 None |
 | `audit_service.py` | 0 | 2 (list audit, filter by action) | 🟡 Partial |
@@ -79,9 +79,9 @@ bash tests/test_provision_api.sh
 
 | Router | Unit Tests | Integration Tests | Coverage |
 |---|---|---|---|
-| `auth.py` | 0 | 5 (setup, login, me, refresh, end-user login) | 🟡 Partial |
-| `system.py` | 0 | 4 (status, proxy CRUD, SSL certs) | 🟡 Partial |
-| `services.py` | 0 | 1 (list) | 🔴 Minimal |
+| `auth.py` | 36 (verify headers/status codes, gateway-token decode, go redirect, API-key model) | 5 (setup, login, me, refresh, end-user login) | 🟡 Partial |
+| `system.py` | 1 (subnet-pool route registered) | 4 (status, proxy CRUD, SSL certs) | 🟡 Partial |
+| `services.py` | 7 (TestRecipePathMultiRecipe — check-missing-files recipe_path forwarding, save-generated recipe subdir) | 1 (list) | 🟡 Partial |
 | `users.py` | 0 | 7 (deploy, up/down, password, container logs, error cases) | 🟡 Partial |
 | `tasks.py` | 0 | 5 (list, SSE log streaming, cancel, invalid task handling) | 🟡 Partial |
 | `llm.py` | 0 | 0 | 🔴 None |
@@ -115,12 +115,17 @@ bash tests/test_provision_api.sh
 | `/api/auth/login` | POST | ✅ | integration.py, integration.sh |
 | `/api/auth/refresh` | POST | ✅ | integration.py |
 | `/api/auth/me` | GET | ✅ | integration.sh |
+| `/api/auth/verify` | GET | ✅ | test_unit.py (TestAuthVerifyHeaders, TestVerifyAuthStatusCodes) |
 | `/api/auth/password` | PUT | ❌ | — |
+| `/api/auth/keys` | POST | ✅ | test_unit.py (TestApiKeyModel, TestGatewayTokenDecode) |
+| `/api/auth/keys` | GET | ✅ | test_unit.py (TestGatewayTokenDecode) |
+| `/api/auth/keys/{id}` | DELETE | ✅ | test_unit.py (TestGatewayTokenDecode) |
 | `/api/auth/users` | GET | ❌ | — |
 | `/api/auth/users/register` | POST | ❌ | — |
 | `/api/auth/users/{id}/approve` | PUT | ❌ | — |
 | `/api/auth/users/{id}` | PUT/DELETE | ❌ | — |
 | `/api/auth/users/deployable` | GET | ❌ | — |
+| `/go/{hostname}` | GET | ✅ | test_unit.py (TestGoServiceRedirect) |
 | `/api/system/status` | GET | ✅ | integration.py, integration.sh |
 | `/api/system/stats` | GET | ❌ | — |
 | `/api/system/reconcile` | POST | ❌ | — |
@@ -131,14 +136,16 @@ bash tests/test_provision_api.sh
 | `/api/system/proxy/{id}/activate` | PUT | ✅ | proxy.sh |
 | `/api/system/proxy/test` | POST | ✅ | proxy.sh |
 | `/api/system/config` | GET/PUT | ❌ | — |
+| `/api/system/subnet-pool` | GET | ✅ | test_unit.py (TestSubnetPoolSystemEndpoint) |
 | `/api/services` | GET/POST | ✅ | deploy.sh (list only) |
 | `/api/services/{name}` | GET/DELETE | ❌ | — |
 | `/api/services/{name}/files/{file}` | GET/PUT | ❌ | — |
 | `/api/services/{name}/convert` | POST | ❌ | — |
+| `/api/services/{name}/check-missing-files` | GET | ✅ | test_unit.py (TestRecipePathMultiRecipe — recipe_path forwarding) |
 | `/api/services/templates` | GET | ✅ | test_unit.py (TestTemplateMode) |
 | `/api/services/notifications` | GET | ✅ | test_unit.py (TestProjectMonitoring) |
 | `/api/services/scan` | POST | ❌ | — |
-| `/api/services/save-generated` | POST | ❌ | — |
+| `/api/services/save-generated` | POST | ✅ | test_unit.py (TestRecipePathMultiRecipe — creates recipe subdir when recipe_path given) |
 | `/api/services/check-deploy` | POST | ❌ | — |
 | `/api/services/{name}/git/status` | GET | ❌ | — |
 | `/api/services/{name}/git/diff` | GET | ❌ | — |
@@ -165,7 +172,7 @@ bash tests/test_provision_api.sh
 | `/api/llm/generate` | POST | ❌ | — |
 | `/api/audit` | GET | ✅ | integration.py, deploy.sh, proxy.sh |
 
-**Summary:** 14 of 50 endpoints tested (28.0%)
+**Summary:** 26 of 62 endpoints tested (41.9%)
 
 ---
 
@@ -173,10 +180,10 @@ bash tests/test_provision_api.sh
 
 | Feature Category | Test Coverage | Status |
 |---|---|---|
-| **Authentication** | Login, setup, token refresh, me | 🟡 Partial (missing: register, password change, user management, deployable users) |
-| **System Monitoring** | Status endpoint | 🟡 Partial (missing: stats, config) |
+| **Authentication** | Login, setup, token refresh, me, auth verify (`/api/auth/verify`), service-access redirect (`/go/{hostname}`), API-key CRUD (`/api/auth/keys*`) | 🟡 Partial (missing: register, password change, user management, deployable users) |
+| **System Monitoring** | Status endpoint, subnet-pool (`/api/system/subnet-pool`) | 🟡 Partial (missing: stats, config) |
 | **Proxy Management** | Full CRUD, enable/disable, credentials, reachability test, deploy integration, audit | 🟢 Good |
-| **Service Projects** | List only | 🔴 Minimal (missing: CRUD, files, git, convert, scan, check-deploy) |
+| **Service Projects** | List, check-missing-files + save-generated with `recipe_path` (multi-recipe) | 🟡 Partial (missing: CRUD, files, git, convert, scan, check-deploy) |
 | **User Deployment** | Deploy with variations, error cases, proxy integration | 🟡 Partial (missing: delete, rebuild, up/down, password, url, test-curl, clone) |
 | **Tasks** | List only | 🔴 Minimal (missing: detail, cancel, log streaming) |
 | **LLM** | None | 🔴 None |

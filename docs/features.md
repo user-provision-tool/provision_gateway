@@ -1,7 +1,7 @@
 # Provision Gateway — Features Status
 
-> **Version**: 2.0
-> **Date**: 2026-08-01 (updated — Cycle 20260801T165901Z Iteration 1: GAP-1 "From Template" tab removed, GAP-2 backend local-agent deferral, GAP-3 concurrency regression test, GAP-4 git-tracked template classification)
+> **Version**: 2.1
+> **Date**: 2026-08-19 (updated — subnet-acl ACL/role-gating/API-keys/alerts (2026-08-14) + multi-recipe recipe_path support merged from main (2026-08-19))
 > **Purpose**: Quick reference and implementation status tracker for all features.
 
 ---
@@ -175,6 +175,7 @@
 | M4 | Per-container stats | ✅ | `GET /api/system/stats?detail=true` |
 | M5 | Gateway self-health | ✅ | `GET /health` with DB status |
 | M6 | Disk usage on PROVISION_DIR | ✅ | `shutil.disk_usage` |
+| M7 | Subnet pool usage (Dashboard card) | ✅ | `GET /api/system/subnet-pool` (require_admin) — proxied to provision-api `/subnet-pool`; pool free/total/exhausted + allocations displayed on Dashboard |
 
 ---
 
@@ -239,8 +240,9 @@
 |---|---|---|---|
 | ACL1 | ENABLE_ACL environment variable | ✅ | Toggle ACL-based service access control at gateway level |
 | ACL2 | /api/auth/verify endpoint | ✅ | NGINX auth_request subrequest; validates JWT from provision_token cookie or X-Provision-Token header |
-| ACL3 | gateway_token cookie (admin session) | ✅ | HTTP-only cookie set on admin login for dashboard auth |
-| ACL4 | provision_token cookie (service access) | ✅ | HTTP-only cookie set on /go/{hostname} redirect for service access |
+| ACL3 | gateway_token cookie (admin session) | ✅ | HTTP-only cookie set on admin login for dashboard auth — 24h TTL (`JWT_EXPIRE_SEC`) |
+| ACL4 | provision_token cookie (service access) | ✅ | HTTP-only cookie set on /go/{hostname} redirect for service access — 1y TTL (`PROVISION_COOKIE_TTL`) |
+| ACL11 | Two-token login model | ✅ | `POST /api/auth/login` sets both `gateway_token` (24h) and `provision_token` (1y) HTTP-only cookies; Bearer `access_token`/`refresh_token` also returned for API clients |
 | ACL5 | HostnameIndex | ✅ | In-memory hostname-to-registry-entry lookup; maps service URLs to registry entries |
 | ACL6 | Registry (user_registry.yml) | ✅ | Read-only registry wrapper; reads provision-api registry via shared filesystem |
 | ACL7 | /go/{hostname} service redirect | ✅ | Dashboard redirect to service URL with provision_token cookie |
@@ -271,6 +273,19 @@
 
 ---
 
+## RC. Multi-Recipe Services (recipe_path)
+
+| # | Feature | Status | Notes |
+|---|---|---|---|
+| RC1 | Recipe auto-discovery | ✅ | `service_manager._discover_recipes` finds subdirs with both a `Dockerfile` and a plain `docker-compose*.yml`; git-tracked list when git available, filesystem fallback when not |
+| RC2 | DeployForm `name@@recipe_path` selection | ✅ | Service dropdown lists each recipe as `name @ recipe_path`; value = `name@@recipe_path`; `project_root` = `{base}/{recipe_path}`, template paths are bare filenames inside the recipe |
+| RC3 | `recipe_path` in check-missing-files | ✅ | `GET /api/services/{name}/check-missing-files?recipe_path=...` (gateway forwards to provision-api); 404 message includes the recipe |
+| RC4 | `recipe_path` in save-generated | ✅ | `POST /api/services/save-generated` accepts `recipe_path` and creates the target recipe subdir |
+| RC5 | ServicesPage per-recipe readiness | ✅ | Readiness (robot) buttons track per-recipe missing-files + checking state |
+| RC6 | git safe.directory in gateway image | ✅ | `provision-gateway/Dockerfile` runs `git config --global --add safe.directory '*'` so recipe discovery works on untrusted repos |
+
+---
+
 ## Summary Statistics
 
 | Category | Total | Implemented | Verified | Gaps |
@@ -283,15 +298,16 @@
 | LLM Integration | 16 | 15 | 15 | 1 |
 | Real-Time Operations | 7 | 7 | 7 | 0 |
 | Reconciliation | 7 | 7 | 7 | 0 |
-| System Monitoring | 6 | 6 | 6 | 0 |
+| System Monitoring | 7 | 7 | 7 | 0 |
 | Audit & Logging | 5 | 5 | 5 | 0 |
 | Proxy Management | 9 | 9 | 9 | 0 |
 | User Management | 7 | 7 | 7 | 0 |
 | MCP Server | 6 | 6 | 6 | 0 |
-| ACL & Access Control | 10 | 10 | 10 | 0 |
+| ACL & Access Control | 11 | 11 | 11 | 0 |
 | API Key Management | 5 | 5 | 5 | 0 |
 | Alerts Page | 2 | 2 | 2 | 0 |
-| **TOTAL** | **141** | **138** | **138** | **3** |
+| Multi-Recipe Services | 6 | 6 | 6 | 0 |
+| **TOTAL** | **149** | **146** | **146** | **3** |
 
-**Implementation Rate:** 138/141 = **97.9%**
-**Verified Rate:** 138/141 = **97.9%**
+**Implementation Rate:** 146/149 = **98.0%**
+**Verified Rate:** 146/149 = **98.0%**

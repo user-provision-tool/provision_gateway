@@ -387,6 +387,61 @@ URESP=$(curl -s "$API/users/alice/example-service/0/url" -H "$AUTH")
 check "service URL uses port 8766" 'http://example-service-alice-0.localhost:8766' "$URESP"
 
 
+# ─── 13. ACL verify / API keys / subnet-pool / /go/ (subnet-acl features) ──
+
+echo "── 13. ACL verify, API keys, subnet-pool, /go/ redirect ──"
+
+echo -n "  13.1 GET /auth/verify without token → 401 login_required: "
+VSTAT=$(curl -s -o /dev/null -w "%{http_code}" "$API/auth/verify")
+VAUTH=$(curl -s -D - -o /dev/null "$API/auth/verify" | grep -i x-auth-action | tr -d '\r' | cut -d' ' -f2)
+if [ "$VSTAT" = "401" ] && [ "$VAUTH" = "login_required" ]; then
+    echo "  ✅ 401 + login_required"
+    PASS=$((PASS + 1))
+else
+    echo "  ❌ got status=$VSTAT action=$VAUTH"
+    FAIL=$((FAIL + 1))
+fi
+
+echo -n "  13.2 POST /auth/keys (create API key): "
+KRESP=$(curl -s -X POST "$API/auth/keys" -H "$AUTH" -H "Content-Type: application/json" -d '{"label":"sh-acl-key"}')
+KID=$(echo "$KRESP" | python3 -c "import sys,json; d=json.load(sys.stdin); k=d.get('key') or {}; print(k.get('id',''))" 2>/dev/null)
+if [ -n "$KID" ]; then
+    echo "  ✅ key created id=$KID"
+    PASS=$((PASS + 1))
+else
+    echo "  ❌ $(echo "$KRESP" | head -c 150)"
+    FAIL=$((FAIL + 1))
+fi
+
+echo -n "  13.3 GET /auth/keys lists the new key: "
+KLIST=$(curl -s "$API/auth/keys" -H "$AUTH")
+check "new key in list" "sh-acl-key" "$KLIST"
+
+echo -n "  13.4 DELETE /auth/keys/{id} revokes: "
+if [ -n "$KID" ]; then
+    KDEL=$(curl -s -X DELETE "$API/auth/keys/$KID" -H "$AUTH")
+    check "revoke returns ok" '"revoked":true' "$KDEL"
+else
+    echo "  ⚠️ skipping (no key id)"
+fi
+
+echo -n "  13.5 GET /system/subnet-pool (admin) 200: "
+SPOOL=$(curl -s -o /dev/null -w "%{http_code}" "$API/system/subnet-pool" -H "$AUTH")
+if [ "$SPOOL" = "200" ]; then echo "  ✅ 200"; PASS=$((PASS + 1)); else echo "  ❌ got $SPOOL"; FAIL=$((FAIL + 1)); fi
+
+echo -n "  13.6 GET /system/subnet-pool returns enabled pools: "
+SPBODY=$(curl -s "$API/system/subnet-pool" -H "$AUTH")
+check "subnet-pool enabled" '"enabled":true' "$SPBODY"
+
+echo -n "  13.7 GET /auth/go/{hostname} redirects via _set_token on :8766: "
+GO=$(curl -s -D - -o /dev/null "$API/auth/go/example-service-alice-0.localhost" -H "$AUTH")
+GOLOC=$(echo "$GO" | grep -i "^location:" | tr -d '\r')
+case "$GOLOC" in
+    *:8766/_set_token?token=*) echo "  ✅ redirect OK"; PASS=$((PASS + 1));;
+    *) echo "  ❌ got: $GOLOC"; FAIL=$((FAIL + 1));;
+esac
+
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 
 echo ""

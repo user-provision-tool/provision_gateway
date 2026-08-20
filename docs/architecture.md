@@ -97,7 +97,8 @@ Provision Gateway is a **management layer** that wraps the existing `provision-a
 - File operations on shared `PROVISION_DIR` volume
 - LLM client for config generation (BYOK mode only; local agent deferred to future — GAP-2, iter-1)
 - Proxy configuration management
-- Git operations for service source management
+- Git operations for service source management (the Dockerfile runs `git config --global --add safe.directory '*'` so git `ls-files`/recipe discovery work regardless of repo ownership — commit 9f12b57)
+- Multi-recipe project support — `service_manager._discover_recipes` auto-detects deployable subdirectories (each must contain a Dockerfile + plain docker-compose*.yml)
 - Async HTTP proxy to provision-api for all user provisioning operations
 - SSL certificate management (proxied to provision-api)
 
@@ -158,19 +159,21 @@ When `ENABLE_ACL=true` (disabled by default), the gateway enforces fine-grained 
 
 **How it works:**
 
-1. **Cookie-based authentication**: Two HTTP-only cookies carry access tokens:
-   - `gateway_token` — Admin/end-user JWT set on dashboard login; used to authenticate dashboard API requests.
-   - `provision_token` — Short-lived JWT set on `/go/{hostname}` redirect; used by nginx `auth_request` to authorize end-user service access.
+1. **Cookie-based authentication**: Two HTTP-only cookies carry access tokens (both are set at login; `provision_token` is re-issued on `/go/{hostname}` redirects):
+   - `gateway_token` — **Short-lived (24h)** JWT set on dashboard login; gates every `/api/*` dashboard request via the `require_gateway_token` / `require_admin` dependencies in `app/middleware/__init__.py` (commit 0ef9584).
+   - `provision_token` — **Long-lived (1-year)** JWT set on login and refreshed on `/go/{hostname}` redirect; used by nginx `auth_request` to authorize end-user service access.
 
 2. **`/api/auth/verify` endpoint**: Called by provision-nginx as an `auth_request` subrequest before serving any end-user service traffic. The endpoint:
    - Extracts JWT from `provision_token` cookie or `X-Provision-Token` header.
-   - If ACL is disabled (`ENABLE_ACL=false`): always returns 200 (pass-through to auth_basic).
+   - If ACL is disabled (`ENABLE_ACL=false`): returns 401 so nginx falls back to `auth_basic` (Basic auth dialog).
    - If ACL is enabled: validates the JWT, looks up the target service by hostname, and checks whether the authenticated user is authorized to access that service.
 
 3. **Authorization rules**:
    - **Admins**: Have unrestricted access to all services.
    - **Viewers**: Can only access their own services (where `target_user == viewer's username`) plus services belonging to users in their `allowed_special_users` list.
-   - **Denied**: Returns 403 with `X-Auth-Action: redirect_acl_denied` header.
+   - **Denied**: Returns 403 with `X-Auth-Action: acl_denied` header.
+   - **Token missing**: Returns 401 with `X-Auth-Action: login_required`.
+   - **Token expired**: Returns 401 with `X-Auth-Action: token_expired`.
 
 4. **Credential injection**: On successful verification, the endpoint returns an `X-Service-Basic` header containing the base64-encoded `username:password` for the target service's auth_basic. Nginx uses this to authenticate against the service's htpasswd.
 
@@ -222,9 +225,9 @@ app/
 │   └── auth.py          # SetupRequest, LoginRequest, TokenResponse, etc.
 │
 ├── routers/             # FastAPI Route Handlers
-│   ├── auth.py          # /api/auth/* (login, register, users, approve)
-│   ├── system.py        # /api/system/* (status, stats, reconcile, proxy)
-│   ├── services.py      # /api/services/* (CRUD, files, git, convert)
+│   ├── auth.py          # /api/auth/* (login, register, users, approve, verify, keys, /go)
+│   ├── system.py        # /api/system/* (status, stats, reconcile, proxy, subnet-pool)
+│   ├── services.py      # /api/services/* (CRUD, files, git, convert, check-missing-files, save-generated, scan)
 │   ├── users.py         # /api/users/* (deploy, up/down, rebuild, clone)
 │   ├── tasks.py         # /api/tasks/* (list, status, log SSE, cancel)
 │   ├── llm.py           # /api/llm/* (configs, test, generate)
@@ -242,7 +245,8 @@ app/
 │   └── proxy_service.py     # Proxy config CRUD + env injection
 │
 ├── middleware/           # Middleware
-│   ├── __init__.py          # JWT verification (get_current_admin, get_current_user, require_admin_role)
+│   ├── __init__.py          # JWT verification — require_gateway_token, require_admin (gateway_token cookie or Bearer, 24h TTL) gate every /api/* route;
+│   │                        #   they replaced the legacy get_current_admin / get_current_user / require_admin_role (Bearer access_token, 1h TTL — retained for reference)
 │
 ├── lib/                 # Shared utilities (no converters — delegated to provision-api)
 │
@@ -292,21 +296,21 @@ gateway.db
 
 ```
 Request → FastAPI Router
-    → get_db()           (DB session)
-    → get_current_admin() OR get_current_user() (JWT verification → lookup)
-    → require_admin_role()(role check: admin vs viewer)
-    → Service Layer      (business logic)
+    → get_db()                     (DB session)
+    → require_gateway_token()      (JWT verification → unified user lookup; gateway_token cookie or Bearer, 24h TTL)
+    → require_admin()              (role check: admin vs viewer — replaces legacy require_admin_role)
+    → Service Layer                (business logic)
     → Response
 ```
 
-`get_current_user()` supports both admin (gateway admins) and end-user (portal users) tokens. It returns a unified dict with keys: `id`, `email`, `role`, `user_type`. The JWT `user_type` claim (`admin` or `end_user`) determines which table is queried.
+`require_gateway_token()` (the replacement for the legacy `get_current_admin()`/`get_current_user()` on `/api/*` routes) supports both admin (gateway admins) and end-user (portal users) tokens via the `gateway_token` cookie or `Authorization: Bearer`. It returns a unified dict with keys: `id`, `email`, `role`, `user_type`. The JWT `user_type` claim (`admin` or `end_user`) determines which table is queried; special users (role=special) are blocked with 403. `require_admin()` layers the admin-only role check on top.
 
 ### 4.4 Singleton Services
 
 | Service | Singleton | Purpose |
 |---|---|---|
 | `provision_service` | Yes | HTTP client for provision-api (all Docker, reconciliation, SSL, user ops) |
-| `service_manager` | Yes | File operations on PROVISION_DIR |
+| `service_manager` | Yes | File operations on PROVISION_DIR; multi-recipe discovery (`_discover_recipes`) — subdirectories containing a Dockerfile + plain docker-compose*.yml are recipes; uses the git-tracked file list when git is available, filesystem fallback when not (commit 9f12b57) |
 | `llm_service` | Yes | LLM client and config generation |
 | `_project_monitor_loop` | Task | Background asyncio task in main.py lifespan; polls source_projects every 10s for new directories, accessible via GET /api/services/notifications |
 
@@ -328,35 +332,44 @@ main.tsx (Entry Point)
             ├── /login → LoginPage
             ├── /setup → SetupWizard
             └── / → ProtectedRoute → AppLayout
-                ├── Sidebar (collapsible, role-based menu)
+                ├── Sidebar (collapsible, role-based menu — admins see all 9 items;
+                │   viewers see only "Services" (/users) and "API Keys" (/api-keys))
                 ├── Header (health bar, user dropdown, chat)
                 └── Outlet
-                    ├── /dashboard → DashboardPage
+                    ├── /dashboard → AdminRoute → DashboardPage
                     │   └── StatCards, Gauges, SystemComponents, UserCards
-                    ├── /services[/:name] → ServicesPage
+                    ├── /services[/:name] → AdminRoute → ServicesPage
                     │   ├── ServiceTable (list view)
                     │   ├── Add Project modal (Git / Upload Zip tabs — "From Template"
                     │   │   tab removed and orphan AddServiceModal.tsx deleted, GAP-1 iter-1)
                     │   └── ServiceDetailPage (file tree, Monaco editor, git diff)
-                    ├── /users[/:name] → UsersPage
+                    ├── /users[/:name] → UsersPage (viewer-accessible)
                     │   ├── DeployForm (modal)
                     │   ├── ServiceInstanceCards (expandable)
                     │   └── CloneUserModal
-                    ├── /tasks → TasksPage
+                    ├── /tasks → AdminRoute → TasksPage
                     │   ├── TaskTable (with auto-polling)
                     │   └── LogDrawer (SSE streaming)
-                    ├── /settings → SettingsPage
+                    ├── /settings → AdminRoute → SettingsPage
                     │   ├── LlmPanel (multi-config CRUD)
                     │   ├── ProxyPanel (multi-proxy CRUD, reachability)
                     │   └── SpecialUsersPanel
-                    ├── /audit → AuditPage
+                    ├── /audit → AdminRoute → AuditPage
                     │   └── FilterableTable + CSV export
-                    ├── /users/manage → UserManagementPage
+                    ├── /users/manage → AdminRoute → UserManagementPage
                     │   ├── UserTable (register, approve, delete)
                     │   └── SpecialUsersModal (per-user assignment)
-                    └── /ssl → SSLPage
-                        ├── CertTable (domain, cert, key, expiry, actions)
-                        └── AddCertModal (domain + ssl path upload)
+                    ├── /ssl → AdminRoute → SSLPage
+                    │   ├── CertTable (domain, cert, key, expiry, actions)
+                    │   └── AddCertModal (domain + ssl path upload)
+                    ├── /api-keys → ApiKeysPage (viewer-accessible)
+                    │   └── ApiKeyTable (create/list/revoke, shows raw token once)
+                    └── /alert → AlertPage (viewer-accessible)
+                        └── Reason card (token_expired / acl_denied → login / back)
+
+                AdminRoute (`src/App.tsx`) redirects non-admin viewers to `/users`,
+                so admin-only pages are not reachable by direct URL (Gap 10 / G3).
+                Viewers reach only Services, API Keys, and alerts.
 ```
 
 ### 5.2 State Management
@@ -440,7 +453,7 @@ provision-mcp (FastAPI :8780)
 Browser → GET /api/users (JWT)
     → Dashboard nginx → /api/* proxy
         → provision-gateway:8770
-            → get_current_admin() (verify JWT)
+            → require_gateway_token() (verify gateway_token / JWT)
             → provision_service.list_users()
                 → httpx GET http://provision-api:8765/users
                     → provision-api response

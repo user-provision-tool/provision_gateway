@@ -237,6 +237,124 @@ class TestCheckMissingFiles:
         )
 
 
+class TestRecipePathMultiRecipe:
+    """Tests for the recipe_path multi-recipe feature (merged from main 9f12b57)."""
+
+    def test_provision_service_check_missing_files_forwards_recipe_path(self, monkeypatch):
+        """check_missing_files must forward recipe_path as a query param."""
+        from app.services.provision_service import ProvisionService
+        captured: dict = {}
+
+        async def fake_request(self, method, path, json_data=None, params=None, timeout=300.0):
+            captured["path"] = path
+            captured["params"] = params
+            return {"ready": True, "missing": []}
+
+        monkeypatch.setattr(ProvisionService, "_request", fake_request)
+        import asyncio
+        result = asyncio.run(
+            ProvisionService().check_missing_files("multisvc", "recipes/web")
+        )
+        assert result["ready"] is True
+        assert captured["path"] == "/services/multisvc/check-missing-files"
+        assert captured["params"] == {"recipe_path": "recipes/web"}
+
+    def test_provision_service_check_missing_files_no_recipe_path(self, monkeypatch):
+        """Without recipe_path, no query param is forwarded."""
+        from app.services.provision_service import ProvisionService
+        captured: dict = {}
+
+        async def fake_request(self, method, path, json_data=None, params=None, timeout=300.0):
+            captured["params"] = params
+            return {"ready": True, "missing": []}
+
+        monkeypatch.setattr(ProvisionService, "_request", fake_request)
+        import asyncio
+        asyncio.run(
+            ProvisionService().check_missing_files("myapp")
+        )
+        assert captured["params"] == {}
+
+    def test_save_generated_creates_recipe_subdir(self, tmp_path, monkeypatch):
+        """save_generated with recipe_path writes into the recipe subdirectory."""
+        from app.config import settings
+        from app.routers import services as services_router
+        import asyncio
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        (tmp_path / "multisvc").mkdir()
+
+        # Patch log_action so no DB session is needed
+        monkeypatch.setattr("app.routers.services.log_action", lambda db, **kw: None)
+
+        req = {
+            "service_name": "multisvc",
+            "recipe_path": "recipes/web",
+            "files": {"docker-compose.yml": "services: {}"},
+        }
+        asyncio.run(
+            services_router.save_generated_files(req, current_admin={"id": 1}, db=None)
+        )
+
+        written = tmp_path / "multisvc" / "recipes" / "web" / "docker-compose.yml"
+        assert written.read_text() == "services: {}"
+        assert (tmp_path / "multisvc" / "recipes" / "web" / "docker-compose.yml.generated").exists()
+
+    def test_discover_recipes_detects_multi_recipe(self, tmp_path):
+        """_discover_recipes finds subdirectories with Dockerfile + docker-compose.yml."""
+        from app.services.service_manager import ServiceManager
+        project = tmp_path / "multisvc"
+        (project / "recipes" / "web").mkdir(parents=True)
+        (project / "recipes" / "api").mkdir(parents=True)
+        (project / "recipes" / "web" / "Dockerfile").write_text("FROM python:3.12")
+        (project / "recipes" / "web" / "docker-compose.yml").write_text("services: {}")
+        (project / "recipes" / "api" / "Dockerfile").write_text("FROM python:3.12")
+        (project / "recipes" / "api" / "docker-compose.yml").write_text("services: {}")
+
+        # git_tracked = all files (filesystem-fallback style input)
+        all_files = {
+            "recipes/web/Dockerfile", "recipes/web/docker-compose.yml",
+            "recipes/api/Dockerfile", "recipes/api/docker-compose.yml",
+        }
+        recipes = ServiceManager._discover_recipes(project, all_files)
+        paths = {r["path"] for r in recipes}
+        assert "recipes/web" in paths
+        assert "recipes/api" in paths
+        assert all(r["is_root"] is False for r in recipes)
+
+    def test_deploy_form_parses_recipe_path(self):
+        """DeployForm must parse the name@@recipe_path service value format."""
+        from pathlib import Path
+        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
+        content = deploy_form.read_text()
+        # parseServiceValue helper splits on '@@'; project_root folds the recipe in
+        assert "parseServiceValue" in content, "DeployForm should define parseServiceValue"
+        assert "indexOf('@@')" in content or "includes('@@')" in content, (
+            "DeployForm should split service values on '@@'"
+        )
+        assert "project_root: recipePath ? `${baseName}/${recipePath}` : baseName" in content, (
+            "DeployForm should fold recipePath into project_root"
+        )
+
+    def test_dockerfile_git_safe_directory(self):
+        """Gateway Dockerfile must mark the repo as a git safe.directory (recipe discovery)."""
+        from pathlib import Path
+        dockerfile = Path(__file__).parent.parent.parent / "provision-gateway" / "Dockerfile"
+        content = dockerfile.read_text()
+        assert "safe.directory" in content, (
+            "Dockerfile should run `git config --global --add safe.directory '*'`"
+        )
+
+    def test_subnet_pool_route_requires_admin(self):
+        """GET /api/system/subnet-pool must be gated on require_admin (G5)."""
+        import inspect
+        from app.routers.system import get_subnet_pool
+        src = inspect.getsource(get_subnet_pool)
+        assert "Depends(require_admin)" in src, (
+            "subnet-pool endpoint should use Depends(require_admin)"
+        )
+
+
 class TestDeploymentFileFallback:
     """Tests for deployment file source fallback (task 1.3)."""
 

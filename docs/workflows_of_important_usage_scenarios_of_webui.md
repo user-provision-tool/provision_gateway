@@ -1,7 +1,7 @@
 # Provision Gateway — Workflows of Important Usage Scenarios (WebUI)
 
-> **Version**: 2.1
-> **Date**: 2026-08-01 (updated — Cycle 20260801T165901Z Iteration 2: Upload Zip section — local .zip file picker wording fix (DOC-1); task-notification polling 15s→2s (DOC-3))
+> **Version**: 3.0
+> **Date**: 2026-08-19 (updated — merged webui feature work: API Keys page, Alert page, viewer role-gating (AdminRoute), /go/{hostname} service access, multi-recipe DeployForm, two-token login, Dashboard Subnet Pool card)
 > **Purpose**: Step-by-step WebUI workflows verified against the actual dashboard at `http://localhost:8771`.
 
 ---
@@ -13,20 +13,23 @@
 3. [Dashboard — System Overview](#3-dashboard--system-overview)
 4. [Source Projects — Add Service from Git](#4-source-projects--add-service-from-git)
 5. [Source Projects — Upload Service Files](#5-source-projects--upload-service-files)
-6. [Source Projects — File Editor with Git Diff](#6-source-projects--file-editor-with-git-diff)
-7. [Source Projects — Convert to Templates](#7-source-projects--convert-to-templates)
-8. [Services — Deploy to User](#8-services--deploy-to-user)
-9. [Services — Play/Pause/Rebuild/Redeploy/Delete](#9-services--playpauserebuildredeploydelete)
-10. [Services — Clone All Between Users](#10-services--clone-all-between-users)
-11. [Services — Change Password & Test Connectivity](#11-services--change-password--test-connectivity)
-12. [Tasks — Monitor & View Logs](#12-tasks--monitor--view-logs)
-13. [SSL Certificates — Upload & Manage](#13-ssl-certificates--upload--manage)
+6. [Source Projects — Add Service from Template](#6-source-projects--add-service-from-template)
+7. [Source Projects — File Editor with Git Diff](#7-source-projects--file-editor-with-git-diff)
+8. [Source Projects — Convert to Templates](#8-source-projects--convert-to-templates)
+9. [Services — Deploy to User](#9-services--deploy-to-user)
+10. [Services — Play/Pause/Rebuild/Redeploy/Delete](#10-services--playpauserebuildredeploydelete)
+11. [Services — Clone All Between Users](#11-services--clone-all-between-users)
+12. [Services — Change Password & Test Connectivity](#12-services--change-password--test-connectivity)
+13. [Tasks — Monitor & View Logs](#13-tasks--monitor--view-logs)
 14. [Settings — LLM Configuration](#14-settings--llm-configuration)
 15. [Settings — Global Proxy](#15-settings--global-proxy)
 16. [Settings — Special Functional Users](#16-settings--special-functional-users)
 17. [Audit — Query & Export](#17-audit--query--export)
 18. [User Management — Register, Approve, Assign Roles](#18-user-management--register-approve-assign-roles)
 19. [Troubleshoot Chat](#19-troubleshoot-chat)
+20. [API Keys — Create, Copy, List, Revoke](#20-api-keys--create-copy-list-revoke)
+21. [Alert Page — Access Denied & Token Expired](#21-alert-page--access-denied--token-expired)
+22. [Services — Open a Service via /go Redirect](#22-services--open-a-service-via-go-redirect)
 
 ---
 
@@ -63,7 +66,7 @@
 2. Enter email and password
 3. Click **"Log In"**
 4. Redirected to `/dashboard`
-5. JWT tokens stored in browser `localStorage`
+5. JWT tokens (`access_token`/`refresh_token`) stored in browser `localStorage`; the server ALSO sets two httponly cookies: `gateway_token` (24h — dashboard/gateway API access) and `provision_token` (1y — service access via provision-nginx)
 
 ### Register New Account Flow
 1. On login page, click **"Register new account"**
@@ -96,8 +99,9 @@
 3. **System Components Table:** Status of provision-api, provision-nginx, provision-gateway, provision-dashboard
 4. **Global Proxy Status Card:** Shows proxy enabled/disabled and reachability
 5. **User Summary Cards:** Per-user healthy/unhealthy service counts
-6. **Welcome Card:** Greeting with admin email
-7. **Live Indicator:** Spinning "Live" tag when 10s polling is active
+6. **Subnet Pool Card:** Per-pool usage panels (CIDR, used %, progress bar, used/total slots) from `GET /api/system/subnet-pool`
+7. **Welcome Card:** Greeting with admin email
+8. **Live Indicator:** Spinning "Live" tag when 10s polling is active
 
 **Actions:**
 - Click **"Refresh"** → Manual refresh of all data
@@ -109,6 +113,7 @@
 - `GET /api/system/stats` → Container stats
 - `GET /api/system/proxy` → Proxy status
 - `GET /api/users` → User summary
+- `GET /api/system/subnet-pool` → Subnet pool usage (Dashboard Subnet Pool card)
 
 ---
 
@@ -253,7 +258,7 @@
 1. Click **"Deploy"** button (rocket icon, top-right)
 2. **DeployForm Modal** opens:
    - **User Name:** Dropdown of deployable users (from `GET /api/auth/users/deployable`)
-   - **Service:** Dropdown of services with templates (from `GET /api/services`)
+   - **Service:** Dropdown of source projects (from `GET /api/services`). For multi-recipe projects, each recipe appears as `name @ recipe_path` (option value `name@@recipe_path`); selecting one triggers `GET /api/services/{name}/check-missing-files?recipe_path=...` and deploys with `project_root = {base}/{recipe_path}` (template paths scoped to the recipe subdirectory)
    - **Label:** Auto-computed from existing instances (display-only disabled input, fetched via `GET /api/users/{user}/{service}/next-label`)
    - **Domain:** Text input (e.g., `snaprovision.com`)
    - **Password:** Password input (for HTTP basic auth)
@@ -307,7 +312,7 @@
 **Service Card Expansion (click to expand):**
 - Status badge (Running / N up, M down)
 - Per-container status tags
-- URL (clickable) with **Test** button
+- URL (clickable → `/go/{service}-{user}-{label}.localhost`) with **Test** button
 - Deployment file links (plain text with directory context)
 - Volume info
 - SSL file info (if HTTPS enabled)
@@ -568,9 +573,9 @@
 - `DELETE /api/auth/users/{id}` → Delete
 
 **Role-Based Access Control:**
-- **viewer:** Can see Dashboard, Services, Tasks, Audit only. Cannot perform mutating actions.
-- **special:** Can deploy/manage only their assigned special users' services
-- **admin:** Full access to all pages and actions
+- **viewer:** Sees only **Services** and **API Keys** in the sidebar. Dashboard, Source Projects, Tasks, Settings, Audit, Users, and SSL are wrapped in `AdminRoute` — a viewer hitting one of those URLs is redirected to `/users`. Viewers can start/stop/test their own (and granted special-user) services but cannot perform admin mutating actions (deploy, clone, rebuild, delete, password, etc.).
+- **special:** Blocked at login ("Special users cannot access the dashboard") — they authenticate for service access via API key / provision token only.
+- **admin:** Full access to all pages and actions.
 
 ---
 
@@ -595,26 +600,105 @@
 
 ---
 
+## 20. API Keys — Create, Copy, List, Revoke
+
+**Goal:** Manage long-lived API keys (provision tokens) for programmatic / service access.
+
+**Page:** `/api-keys` (accessible to admins AND viewers)
+
+**Steps:**
+1. Click **"Create Key"** (top-right)
+2. **Create Key Modal:**
+   - **Label:** Required (e.g. "Production", "CI/CD")
+   - **User ID (admins only):** Optional numeric user id; blank creates the key for yourself
+3. Click **"Create"** → `POST /api/auth/keys`
+4. **One-time token display:** the modal switches to a success state showing the raw token in a read-only textarea with warning *"Copy this token now — it will not be shown again."* Click **"Copy Token"** to copy it to the clipboard
+5. **Key table:**
+   - **Admins:** see all users' keys, including a **User ID** column
+   - **Viewers:** see only their own keys (no User ID column)
+   - Columns: ID, Label, Created, Expires, Status (Active/Revoked), Actions
+6. **Revoke:** click **"Revoke"** on an active key → Popconfirm → `DELETE /api/auth/keys/{id}` → tag turns red "Revoked"
+
+**API calls:**
+- `POST /api/auth/keys` → Create (returns `token` exactly once)
+- `GET /api/auth/keys` → List (admin: all; viewer: own)
+- `DELETE /api/auth/keys/{id}` → Revoke
+
+**Effect:**
+- Each key is a provision token embedded with `api_key_id`, used by provision-nginx for service access; revoking a key invalidates its token.
+
+---
+
+## 21. Alert Page — Access Denied & Token Expired
+
+**Goal:** Display clear error screens when the subnet-acl nginx ACL layer blocks or expires a user.
+
+**Page:** `/alert` (public route)
+
+### 21.1 `?reason=acl_denied` — Access Denied
+1. subnet-acl nginx `@auth_403` (browser request to a service the user has no access to) redirects to `http://{dashboard}/alert?reason=acl_denied&service={host}`
+2. Alert page reads `reason` and `service` from the URL
+3. Shows **"Access Denied"** — *"You do not have access to {service}. Contact your administrator if you believe this is an error."*
+4. **"Back to Dashboard"** button
+
+### 21.2 `?reason=token_expired` — API Token Expired
+1. Reached by direct URL `/alert?reason=token_expired`
+2. Shows **"API Token Expired"** — *"Your API token has expired. Please log in again to get a new token."*
+3. **"Go to Login"** button
+
+> **Note:** The nginx `@auth_401` redirect currently sends expired-token browsers to `/login` (Option B, acl-enforcement-design-v2.md §12); the `token_expired` alert is only reachable directly.
+
+**API calls:** none (reads query params only)
+
+---
+
+## 22. Services — Open a Service via /go Redirect
+
+**Goal:** Open a deployed service from the dashboard in a new tab, using the gateway as a token-exchange hop.
+
+**Page:** `/users` → expand a service card
+
+**Steps:**
+1. Expand a service card on the Services page
+2. Click the URL link — it points to `/go/{service}-{user}-{label}.localhost` (hostname resolved from the registry)
+3. Browser navigates to the gateway `GET /api/auth/go/{hostname}`:
+   - Validates the `gateway_token` cookie / Bearer
+   - Looks up the service by hostname in the HostnameIndex (404 if unknown)
+   - For viewers: ACL check — target user must equal the viewer's own user or be in `allowed_special_users` (403 otherwise)
+4. Gateway 302-redirects to `http://{host}:{NGINX_HTTP_PORT}/_set_token?token={provision_token}&redirect=/`
+5. `_set_token` on the service domain sets the `provision_token` cookie and redirects to `/` → service loads silently
+6. The `Auth` tag on the card indicates the service has HTTP basic auth; the cookie exchange bypasses the need to type credentials
+
+**Why:** the login cookie is host-scoped (`localhost:8771`) and is NOT sent to the service hostname, so a cookie exchange through `/go` is required.
+
+**API calls:**
+- `GET /api/auth/go/{hostname}` → 302 to `{host}/_set_token?token=...&redirect=/`
+
+---
+
 ## Appendix: Page Summary
 
 | Page | Route | Access | Key Features |
 |---|---|---|---|
 | Login | `/login` | Public | Email+password, register link |
 | Setup | `/setup` | First-run only | Admin account creation |
-| Dashboard | `/dashboard` | Authenticated | Stats, gauges, system components, user cards, reconcile |
-| Source Projects | `/services` | Authenticated | Project table, add (git/upload — template creation is API-only, GAP-1), file editor, git diff, convert |
-| Services | `/users` | Authenticated | Per-user service cards, deploy, up/down, rebuild, clone, password, test |
-| Tasks | `/tasks` | Authenticated | Task table, SSE log viewer, cancel/delete |
-| Settings | `/settings` | Admin | LLM config, proxy config, special users |
-| Audit | `/audit` | Authenticated | Filterable audit table, CSV export |
-| User Management | `/users/manage` | Admin | Register, approve, role assignment, special users |
+| Dashboard | `/dashboard` | Admin (AdminRoute) | Stats, gauges, system components, subnet pool, user cards, reconcile |
+| Source Projects | `/services` | Admin (AdminRoute) | Project table, add (git/upload — template creation is API-only, GAP-1), file editor, git diff, convert |
+| Services | `/users` | Authenticated (admins + viewers) | Per-user service cards, `/go/{hostname}` access links, deploy, up/down, rebuild, clone, password, test |
+| Tasks | `/tasks` | Admin (AdminRoute) | Task table, SSE log viewer, cancel/delete |
+| Settings | `/settings` | Admin (AdminRoute) | LLM config, proxy config, special users |
+| Audit | `/audit` | Admin (AdminRoute) | Filterable audit table, CSV export |
+| User Management | `/users/manage` | Admin (AdminRoute) | Register, approve, role assignment, special users |
+| SSL Certs | `/ssl` | Admin (AdminRoute) | Upload & manage certificates |
+| API Keys | `/api-keys` | Authenticated (admins + viewers) | Create key (label; admin can set User ID), one-time token + Copy, list (admin sees all + User ID column; viewer sees own), Revoke |
+| Alert | `/alert` | Public | `acl_denied` / `token_expired` variants |
 
 ## Appendix: Known UI Behaviors
 
 1. **Sidebar highlight:** Active menu item is highlighted; "Users" correctly highlights on `/users/manage`
 2. **Sidebar collapse:** Menu-fold/menu-unfold button toggles sidebar width (220px ↔ 80px)
 3. **User dropdown:** Click admin email → Change Password / Logout options
-4. **Non-admin restrictions:** Viewer role sees only Dashboard, Services, Tasks, Audit in sidebar
+4. **Non-admin restrictions:** Viewer sees only Services + API Keys in the sidebar; admin-only routes (Dashboard, Source Projects, Tasks, Settings, Audit, Users, SSL) are guarded by `AdminRoute` and redirect a viewer to `/users`
 5. **Auto-polling:** Dashboard (10s), Tasks (5s), Audit (30s)
 6. **Loading states:** Spin indicators shown while data loads; "Loading..." text for gauges
 7. **Empty states:** Appropriate messages when no data (e.g., "No services yet")

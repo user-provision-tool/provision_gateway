@@ -1,7 +1,7 @@
 # Provision Gateway — Workflows of Important Usage Scenarios (APIs)
 
-> **Version**: 2.0
-> **Date**: 2026-08-01 (updated — Cycle 20260801T165901Z Iteration 1: Add Service from Template is now API-only (GAP-1); local-agent fields deferred at API level (GAP-2); prior: label auto-increment, project notifications, deploy validation)
+> **Version**: 3.0
+> **Date**: 2026-08-19 (updated — new features: API key management (create/list/revoke), `/api/auth/go/{hostname}` service-access redirect + ACL verify, two-token login cookies (gateway_token 24h / provision_token 1y), multi-recipe deploy `project_root`, `/api/system/subnet-pool`)
 > **Purpose**: Step-by-step API workflows for the most important usage scenarios, directly usable with `curl` or any HTTP client.
 
 ---
@@ -30,6 +30,8 @@
 20. [Generate Config via LLM](#20-generate-config-via-llm)
 21. [Query Audit Logs](#21-query-audit-logs)
 22. [End-User Management](#22-end-user-management)
+23. [API Key Management](#23-api-key-management)
+24. [Service Access Redirect & ACL Verify](#24-service-access-redirect--acl-verify)
 
 ---
 
@@ -76,6 +78,11 @@ RESP=$(curl -s -X POST http://localhost:8771/api/auth/login \
 
 ACCESS_TOKEN=$(echo $RESP | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 REFRESH_TOKEN=$(echo $RESP | python3 -c "import sys,json; print(json.load(sys.stdin)['refresh_token'])")
+
+# NOTE: login ALSO sets two httponly cookies (relevant for browser flows):
+#   - gateway_token   (24h) — dashboard/gateway API access
+#   - provision_token (1y)  — service access via provision-nginx
+# All /api/* gateway routes accept the gateway_token cookie OR a Bearer header.
 
 # --- Use token for authenticated requests ---
 curl -s http://localhost:8771/api/auth/me \
@@ -139,6 +146,9 @@ END_RESP=$(curl -s -X POST http://localhost:8771/api/auth/login \
 END_TOKEN=$(echo $END_RESP | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
 # Response includes: "user_type": "end_user", "user": {"id": 1, "username": "alice", "role": "viewer"}
+# Login also sets gateway_token (24h) + provision_token (1y) httponly cookies, and
+# auto-creates a default API key for end-users who have none.
+# Special-role users are rejected at login (403 "Special users cannot access the dashboard").
 
 # --- Access with end-user token ---
 curl -s http://localhost:8771/api/auth/me \
@@ -385,6 +395,11 @@ curl -s -X POST http://localhost:8771/api/users/deploy \
 
 # Save the task_id for monitoring
 TASK_ID="abc123def456"
+
+# Multi-recipe projects (DeployForm): the Service dropdown value is `name@@recipe_path`.
+#   - check-missing-files: GET /api/services/{name}/check-missing-files?recipe_path=...
+#   - deploy payload: project_root = "{base}/{recipe_path}" (e.g. "siyuan/recipe-a"),
+#     with compose/nginx template paths scoped to that recipe subdirectory.
 ```
 
 ---
@@ -594,6 +609,12 @@ curl -s -X POST http://localhost:8771/api/system/reconcile \
 # Step 5: Check reconciliation result
 curl -s http://localhost:8771/api/system/reconcile/status \
   -H "Authorization: Bearer $TOKEN"
+
+# Step 6: Subnet pool usage (Dashboard "Subnet Pool" card)
+curl -s http://localhost:8771/api/system/subnet-pool \
+  -H "Authorization: Bearer $TOKEN"
+# Expected: {"enabled": true, "pools": [{"cidr": "172.30.0.0/16", "used_slots": 3,
+#             "total_slots": 8, "used_pct": 38}, ...]}
 ```
 
 ---
@@ -854,3 +875,79 @@ curl -s -X PUT http://localhost:8771/api/auth/users/2 \
 curl -s -X DELETE http://localhost:8771/api/auth/users/2 \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
+
+---
+
+## 23. API Key Management
+
+**Goal:** Create, list, and revoke long-lived API keys (provision tokens). Viewers manage their own keys; admins manage any user's.
+
+```bash
+TOKEN="your-jwt-token"
+
+# --- Create a key (viewer: for self; admin: optional user_id for another user) ---
+curl -s -X POST http://localhost:8771/api/auth/keys \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label": "CI/CD",
+    "user_id": 1        # admin only; omit to create for yourself
+  }'
+
+# Expected 201: {"key": {...}, "token": "eyJ...", "provision_token": "...",
+#                "message": "Save this token — it will not be shown again."}
+# The raw `token` is shown ONLY once — save it immediately.
+
+# --- List keys (admin: all users; viewer: own only) ---
+curl -s http://localhost:8771/api/auth/keys \
+  -H "Authorization: Bearer $TOKEN"
+# Expected: {"keys": [{"id": 1, "user_id": 1, "label": "CI/CD",
+#                      "created_at": "...", "expires_at": "...", "is_revoked": false}]}
+
+# --- Revoke a key ---
+curl -s -X DELETE http://localhost:8771/api/auth/keys/1 \
+  -H "Authorization: Bearer $TOKEN"
+# Expected: {"revoked": true, "key_id": 1}
+
+# --- Use the raw token as a provision token for service access ---
+curl -s http://<service-host> \
+  -H "X-Provision-Token: <token>"
+```
+
+**Notes:**
+- The API-key token embeds `api_key_id` in a 1-year provision token; revoking the key invalidates it (enforced by `GET /api/auth/verify`).
+- A viewer creating/revoking a key for another user id → `403`.
+- End-users automatically get a `Default` key on first login if they have none.
+
+---
+
+## 24. Service Access Redirect & ACL Verify
+
+**Goal:** Open a deployed service through the gateway and understand the nginx ACL deny/redirect responses.
+
+### 24.1 Gateway service-access redirect
+
+```bash
+# The Services page URL links point here: /go/{service}-{user}-{label}.localhost
+curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" \
+  http://localhost:8771/api/auth/go/siyuan-alice-0.localhost \
+  -H "Authorization: Bearer $TOKEN"
+
+# Expected: 302 → http://siyuan-alice-0.localhost:8766/_set_token?token={provision_token}&redirect=/
+# The browser follows this; _set_token sets the provision_token cookie for the
+# service domain, then redirects to / to load the service.
+```
+
+### 24.2 nginx ACL verify (auth_request subrequest)
+
+`GET /api/auth/verify` is called by provision-nginx (`auth_request`) with no auth. It returns the status + `X-Auth-Action` header that nginx's `error_page` + `map $http_accept` turns into browser redirects or API status codes:
+
+| Gateway response | X-Auth-Action | Browser redirect | API result |
+|---|---|---|---|
+| 200 + X-Service-Basic | — | allowed (credential injected) | 200 |
+| 401, no/invalid token | `login_required` | `302 /login` | 401 |
+| 401, expired token | `token_expired` | `302 /login` (Option B) | 401 |
+| 401, user inactive/not approved | `login_required` | `302 /login` | 401 |
+| 403, ACL denied | `acl_denied` | `302 /alert?reason=acl_denied&service={host}` | 403 |
+
+**Alert page targets:** `?reason=acl_denied` → "Access Denied — You do not have access to {service}"; `?reason=token_expired` → "API Token Expired". Both are served by the dashboard SPA at `/alert`.

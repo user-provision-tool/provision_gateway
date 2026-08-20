@@ -1,7 +1,7 @@
 # Provision Gateway — WebUI Operation Sequences
 
-> Version: 2.1
-> Date: 2026-08-01 (updated — Cycle 20260801T165901Z Iteration 2: Upload Zip wording fix — local .zip file picker (DOC-2))
+> Version: 3.0
+> Date: 2026-08-19 (updated — merged webui feature work: API Keys page, Alert page, viewer role-gating (AdminRoute), /go/{hostname} service access, multi-recipe DeployForm, two-token login, Dashboard Subnet Pool card)
 > Purpose: Document all operation sequences defined by each button on the webui, verified for correctness.
 > Verified against: actual running dashboard at http://localhost:8771
 
@@ -44,6 +44,11 @@
 ### 1.7 User Card Click (alice)
 - **Trigger**: Click alice card
 - **Sequence**: Navigate to /users (Services page filtered to alice)
+- **Status**: ✅ Working
+
+### 1.8 Subnet Pool Card
+- **Trigger**: Dashboard renders on load / after Refresh
+- **Sequence**: GET /api/system/subnet-pool → renders a "Subnet Pool" card with one panel per pool (CIDR, used %, progress bar, used/total slots). Colors: green ≤70%, orange 71–90%, red >90%. If subnet management is disabled (SUBNET_POOLS unset), shows "Subnet management is disabled" hint.
 - **Status**: ✅ Working
 
 ---
@@ -112,6 +117,7 @@
 ### 3.1 Deploy Button
 - **Trigger**: Click "Deploy" button (rocket icon, top-right)
 - **Sequence**: Opens DeployForm modal → select user, service → label is auto-computed (GET /api/users/{user}/{service}/next-label) and shown as disabled input → fill domain, password → POST /api/users/deploy → async task created
+- **Multi-recipe projects**: When a source project has more than one recipe, the Service dropdown lists each recipe as `name @ recipe_path` (option value `name@@recipe_path`). Selecting one runs `GET /api/services/{name}/check-missing-files?recipe_path=...` and deploys with `project_root = {base}/{recipe_path}` (template paths scoped to the recipe subdirectory).
 - **Deploy validation**: When the selected service is missing essential files (compose, nginx conf) and no LLM-generated files exist, the Deploy button is disabled and a warning is shown. User must either configure LLM to generate missing files or provide them manually.
 - **Auto-generated templates flow**: When service is missing essential files (docker-compose, nginx.conf, .env, Dockerfile), an alert shows with "Auto Templates Completion" checkbox.
   - **Auto mode (checked)**: LLM generates missing files → auto-submits deploy after 500ms delay
@@ -183,12 +189,14 @@ Each service card shows these buttons:
 ### 3.6 Service Card Expansion
 - **Trigger**: Click collapsed service card
 - **Sequence**: Expands to show:
-  - URL (clickable link)
+  - URL (clickable link → `/go/{service}-{user}-{label}.localhost`)
   - Test button (POST /api/users/{user}/{service}/{label}/test-curl)
   - Container names + status
   - Deployment files (compose, nginx, env - clickable links to editor)
   - Volumes (if available)
 - **Status**: ✅ Working
+
+**Service-access redirect (`/go/{hostname}`)** — clicking the URL link opens `/go/{service}-{user}-{label}.localhost` on the gateway. `GET /api/auth/go/{hostname}` validates the `gateway_token`, looks up the hostname in the HostnameIndex, checks the viewer's ACL (own service or `allowed_special_users`), then 302-redirects to `http://{host}:{NGINX_HTTP_PORT}/_set_token?token={provision_token}&redirect=/`. That endpoint sets the `provision_token` cookie for the service domain and loads the service root. A cookie exchange is required because the login cookie is host-scoped and is NOT sent to the service hostname directly.
 
 ### 3.7 Test Button
 - **Trigger**: Click "Test" link next to URL
@@ -303,7 +311,7 @@ Each service card shows these buttons:
 
 ### 8.1 Login
 - **Trigger**: Fill email + password → click "Log In"
-- **Sequence**: POST /api/auth/login → JWT tokens → redirect to /dashboard
+- **Sequence**: POST /api/auth/login → JWT tokens (`access_token`/`refresh_token` saved in localStorage) PLUS two httponly cookies: `gateway_token` (24h, dashboard/gateway API access) and `provision_token` (1y, service access via provision-nginx) → redirect to /dashboard
 - **Status**: ✅ Working
 
 ### 8.2 Register New Account
@@ -313,24 +321,72 @@ Each service card shows these buttons:
 
 ---
 
+## 9. API Keys Page (`/api-keys`)
+
+> Accessible by admins AND viewers (NOT admin-only). Admins see all users' keys; viewers see only their own.
+
+### 9.1 Create Key Button
+- **Trigger**: Click "Create Key" button
+- **Sequence**: Opens modal → enter Label (required) → admins also see an optional "User ID" input (blank = own key, or pick a target user id) → POST /api/auth/keys → returns the one-time raw token
+- **Status**: ✅ Working
+
+### 9.2 One-Time Token Display + Copy
+- **Trigger**: After creating a key
+- **Sequence**: Modal switches to success state → shows the raw token in a read-only textarea with warning "Copy this token now — it will not be shown again" → "Copy Token" button copies to clipboard (navigator.clipboard.writeText)
+- **Status**: ✅ Working
+
+### 9.3 Refresh Button
+- **Trigger**: Click "Refresh"
+- **Sequence**: GET /api/auth/keys → re-render key table
+- **Status**: ✅ Working
+
+### 9.4 Revoke Button
+- **Trigger**: Click "Revoke" on an active key row
+- **Sequence**: Popconfirm → DELETE /api/auth/keys/{id} → key marked Revoked (red tag), no further actions shown
+- **Status**: ✅ Working
+
+### 9.5 Key Table
+- **Columns**: ID, Label, (User ID — admins only), Created, Expires, Status (Active/Revoked tag), Actions (Revoke)
+- **Viewer scope**: A viewer's table omits the User ID column and lists only the viewer's own keys (server-side filtered in GET /api/auth/keys)
+- **Status**: ✅ Working
+
+---
+
+## 10. Alert Page (`/alert`)
+
+> Reached from the subnet-acl-nginx ACL redirect, or by direct URL. Public route (no auth guard).
+
+### 10.1 `?reason=acl_denied` (Access Denied)
+- **Trigger**: subnet-acl nginx `@auth_403` redirect — browser hits a service the user has no access to → `302 http://{dashboard}/alert?reason=acl_denied&service={host}`
+- **Sequence**: Reads `reason` and `service` from the URL → shows "Access Denied" with "You do not have access to {service}. Contact your administrator..." → "Back to Dashboard" button
+- **Status**: ✅ Working
+
+### 10.2 `?reason=token_expired` (API Token Expired)
+- **Trigger**: Direct URL `/alert?reason=token_expired`
+- **Sequence**: Shows "API Token Expired" — "Your API token has expired. Please log in again to get a new token." → "Go to Login" button
+- **Note**: The subnet-acl nginx `@auth_401` redirect currently sends expired-token browsers to `/login` (Option B, acl-enforcement-design-v2.md §12), so this variant is only reached by direct URL.
+- **Status**: ✅ Working
+
+---
+
 ## Summary
 
 | Page | Operations | Status |
 |---|---|---|
-| Dashboard | 7 operations | All ✅ |
+| Dashboard | 8 operations (incl. Subnet Pool card) | All ✅ |
 | Source Projects | 10 operation groups (2 tabs in Add Project — From Git / Upload Zip; "From Template" removed, GAP-1) | All ✅ |
-| Services (Users) | 10 operation groups | All ✅ (Up/Down fixed) |
+| Services (Users) | 10 operation groups (incl. /go/{hostname} access, multi-recipe DeployForm) | All ✅ (Up/Down fixed) |
 | Tasks | 4 operations + 1 global notification | ✅ (SSE log per-task ⚠️ reads global log file, filters by task context); global 2s task notification with toast + browser Notification API |
 | Settings | 3 panels (LLM, Proxy, Special Users) | All ✅ |
 | Audit | 3 operations (filter, CSV export, auto-refresh) | All ✅ |
 | User Management | 5 operations (register, approve, special users, delete, role change) | All ✅ |
 | Login | 2 operations (login, register) | All ✅ |
-| User Management | 5 operations (register, approve, special users, delete, role change) | All ✅ |
-| Login | 2 operations (login, register) | All ✅ |
+| API Keys | 5 operations (create, token copy, refresh, revoke, table) | All ✅ |
+| Alert | 2 variants (acl_denied, token_expired) | All ✅ |
 
 ### Known Issues:
 1. **Task SSE log reads global file** — The log endpoint reads `DOCKER_OPS_LOG` and filters by task context. Per-task log files would improve isolation (see Task 10 in tasks-20260705-3.md).
-2. **New user registration flow** — Viewer/admin role switching and page access control needs debugging (see Task 9 in tasks-20260705-3.md).
+2. **Expired-token alert variant** — The Alert page supports `?reason=token_expired`, but the subnet-acl nginx `@auth_401` redirect currently sends expired-token browsers to `/login` (Option B, acl-enforcement-design-v2.md §12), so this variant is reached only by direct URL.
 3. **Task log persistence** — Task logs should be configurable and per-task (see Task 10.2 in tasks-20260705-3.md).
 4. **Redeploy button flow** — Full e2e verification needed.
 
@@ -341,6 +397,15 @@ Each service card shows these buttons:
 3. ✅ **G13-G16 — Dead code cleanup** — Removed 12 unused API exports from `services.ts`; kept only `createServiceGit`.
 4. ✅ **GAP-005 — Route ordering fix (CRITICAL)** — Moved `/templates` and `/notifications` route definitions before the `/{name}` catch-all in services.py. GET /api/services/templates and GET /api/services/notifications no longer return 404. Verified by 6 new route ordering tests.
 5. ✅ **GAP-006 — Missing Select import** — Added `Select` to antd import in ServicesPage.tsx TemplateForm component. Resolves TypeScript error TS2552.
+
+**ITERATION 3 (2026-08-19):**
+1. ✅ **Viewer role-gating (AdminRoute)** — App.tsx now wraps Dashboard/Source Projects/Tasks/Settings/Audit/Users/SSL in `AdminRoute` (non-admins → redirect `/users`); `/users`, `/api-keys`, `/alert` remain viewer-accessible. Sidebar hides admin items for viewers (Services + API Keys only).
+2. ✅ **API Keys page (`/api-keys`)** — Create Key (label; admin may set User ID), one-time token display + Copy, list (admin sees all + User ID column, viewer sees own), Revoke. Endpoints: POST/GET `/api/auth/keys`, DELETE `/api/auth/keys/{id}`.
+3. ✅ **Alert page (`/alert`)** — `?reason=acl_denied` (Access Denied — no access to {service}) and `?reason=token_expired` (API Token Expired) variants; reached from subnet-acl nginx `@auth_403` → `/alert?reason=acl_denied&service={host}` (expired token → `/login`).
+4. ✅ **`/go/{hostname}` service access** — Services page URL links use `/go/{service}-{user}-{label}.localhost`; gateway `GET /api/auth/go/{hostname}` 302s to `http://{host}:{port}/_set_token?token={provision_token}&redirect=/` to set the service-domain cookie.
+5. ✅ **Multi-recipe DeployForm** — Service dropdown lists `name @ recipe_path` (value `name@@recipe_path`); `check-missing-files?recipe_path=...` scopes readiness checks; deploy `project_root = {base}/{recipe_path}`.
+6. ✅ **Two-token login** — login sets `gateway_token` (24h) + `provision_token` (1y) httponly cookies in addition to the JWT JSON body.
+7. ✅ **Dashboard Subnet Pool card** — renders `GET /api/system/subnet-pool` pools (CIDR, used %, slots used/total).
 
 **ITERATION 1 (2026-07-05):**
 1. ✅ **siyuan-mcp always down** — Root cause: container_name template had `{{ container_prefix }}server` but should be `{{ container_prefix }}siyuan-mcp-server`. Fixed template, regenerated compose, restarted container.

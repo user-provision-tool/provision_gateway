@@ -24,9 +24,12 @@
 
 ### 1.1 Authentication
 
-- All endpoints except `/health`, `/api/auth/setup`, `/api/auth/login`, `/api/auth/refresh`, and `/api/auth/users/register` require `Authorization: Bearer <JWT>` header
-- JWT access tokens expire after 1 hour (configurable via `JWT_EXPIRE_SEC`)
-- Refresh tokens expire after 7 days (`JWT_REFRESH_EXPIRE_SEC`)
+- All endpoints except `/health`, `/api/auth/setup`, `/api/auth/login`, `/api/auth/refresh`, and `/api/auth/users/register` require a valid gateway token, sent either as the `gateway_token` cookie or as `Authorization: Bearer <JWT>`
+- **Two-token login:** `POST /api/auth/login` sets two `HttpOnly` cookies:
+  - `gateway_token` — 24h TTL (configurable via `JWT_EXPIRE_SEC`), used for dashboard/gateway API auth
+  - `provision_token` — **1 year** TTL (configurable via `PROVISION_COOKIE_TTL`), used for service access via provision-nginx
+- **Bearer tokens for API clients:** `POST /api/auth/login` also returns an `access_token` (1 hour, `JWT_EXPIRE_SEC`) and a `refresh_token` (7 days, `JWT_REFRESH_EXPIRE_SEC`) in the response body
+- `/api/*` routes are gated by the `require_gateway_token` dependency, which accepts either the `gateway_token` cookie or `Authorization: Bearer <JWT>`; admin-only routes additionally use `require_admin` (`require_gateway_token` + `role == admin`). These replace the legacy `get_current_admin` / `require_admin_role` dependencies
 - JWT tokens carry a `user_type` claim: `admin` (gateway admin) or `end_user` (portal user)
 - Non-admin users (role=`viewer`) have read-only access; mutating endpoints require `admin` role
 - The SSE log endpoint (`GET /api/tasks/{id}/log`) also supports `?token=` query parameter for EventSource (which cannot set headers)
@@ -124,7 +127,7 @@ Create additional admin/portal user. Requires `admin` role to create another adm
 
 ### `POST /api/auth/login`
 
-Authenticate and receive tokens. Supports both gateway admin accounts (by email) and end-user portal accounts (by username).
+Authenticate and receive tokens. Supports both gateway admin accounts (by email) and end-user portal accounts (by username). Sets two `HttpOnly` cookies (`gateway_token`, `provision_token`) for browser/dashboard auth and returns Bearer `access_token`/`refresh_token` in the body for API clients.
 
 **Request:**
 ```json
@@ -166,8 +169,18 @@ Authenticate and receive tokens. Supports both gateway admin accounts (by email)
 }
 ```
 
+**Cookies set (admin and end-user logins):**
+
+| Cookie | Value | TTL | Purpose |
+|---|---|---|---|
+| `gateway_token` | JWT (`type=gateway`) | 24 hours (`JWT_EXPIRE_SEC`) | Dashboard/gateway API auth — accepted by `require_gateway_token` |
+| `provision_token` | JWT (`type=provision`) | **1 year** (`PROVISION_COOKIE_TTL`) | Service access via provision-nginx — consumed by `GET /api/auth/verify` |
+
+Both cookies are `HttpOnly`, `SameSite=Lax`, `Path=/`. The response body additionally carries Bearer `access_token` (1 hour, `JWT_EXPIRE_SEC`) and `refresh_token` (7 days, `JWT_REFRESH_EXPIRE_SEC`) for API clients that cannot use cookies.
+
 **Errors:**
 - `401` — "Invalid email/username or password"
+- `403` — Special users (role=`special`) cannot access the dashboard
 
 ---
 
@@ -873,20 +886,41 @@ Delete SSL certificates for a domain.
 
 ### `GET /api/system/subnet-pool`
 
-Get subnet pool usage statistics for the dashboard (proxied to provision-api).
+Get subnet pool usage statistics for the dashboard. **Admin only (requires `require_admin`)** — subnet CIDRs and usage are an admin-dashboard concern (Gap G5). Proxied to provision-api `/subnet-pool`.
 
-**Response 200:**
+**Response 200 (enabled):**
 ```json
 {
-  "subnets": [
+  "enabled": true,
+  "pools": [
     {
-      "subnet": "10.90.0.0/16",
-      "used_ips": 42,
-      "total_ips": 65534,
-      "usage_percent": 0.06
+      "cidr": "10.90.0.0/16",
+      "total_slots": 65534,
+      "used_slots": 42,
+      "free_slots": 65492,
+      "used_pct": 0.1,
+      "exhausted": false
     }
   ],
-  "total_subnets": 1
+  "overall": {
+    "total_slots": 65534,
+    "used_slots": 42,
+    "free_slots": 65492
+  },
+  "allocations": [
+    {"user": "alice", "service": "siyuan", "label": "0", "subnet": "10.90.0.2"}
+  ],
+  "headroom": 256
+}
+```
+
+**Response 200 (disabled — `SUBNET_POOLS` not set):**
+```json
+{
+  "enabled": false,
+  "pools": [],
+  "headroom": 256,
+  "message": "Subnet management disabled"
 }
 ```
 
@@ -1042,6 +1076,53 @@ Get service project details with file list.
   "active_instances": ["alice/0"]
 }
 ```
+
+---
+
+### `GET /api/services/{name}/check-missing-files`
+
+Check which essential deployment files are missing for a service project. **Admin only.** Proxied to provision-api (`/services/{name}/check-missing-files`), then enriched with repo scan context for LLM-based file generation.
+
+**Path Parameters:**
+| Param | Description |
+|---|---|
+| `name` | Service project name (e.g., `myapp`) |
+
+**Query Parameters:**
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `recipe_path` | string | `""` | Optional subdirectory for multi-recipe projects. When provided, files are checked inside `source_projects/{name}/{recipe_path}/`. The gateway forwards `recipe_path` to provision-api. |
+
+**Response 200:**
+```json
+{
+  "service_name": "myapp",
+  "project_root": "/srv/provision/source_projects/myapp",
+  "ready": false,
+  "missing": ["docker-compose", "nginx.conf"],
+  "existing": ["Dockerfile", ".env"],
+  "scan_context": {
+    "repo_description": "A Python FastAPI application with Redis caching",
+    "repo_files": ["Dockerfile", "requirements.txt", "main.py"],
+    "port": 8000,
+    "needs_db": false,
+    "needs_cache": true,
+    "needs_volume": false,
+    "language": "Python",
+    "framework": "FastAPI",
+    "has_dockerfile": true,
+    "has_compose": false,
+    "has_nginx_conf": false,
+    "compose_services": []
+  }
+}
+```
+
+`missing`/`existing` values: `docker-compose`, `nginx.conf`, `Dockerfile`, `.env`. `scan_context` is present only when the (recipe) directory exists and a repo scan succeeds; it provides context for the LLM to auto-generate the missing files.
+
+**Errors:**
+- `404` — Service `{name}` not found (or recipe `{recipe_path}` not found when provided)
+- `502` — provision-api error
 
 ---
 
@@ -1207,12 +1288,19 @@ Save LLM-generated files to a service project.
 ```json
 {
   "service_name": "myapp",
+  "recipe_path": "recipes/ollama",
   "files": {
     "docker-compose.yml": "services:\n  web:\n    ...",
     "nginx.conf": "server { ... }"
   }
 }
 ```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `service_name` | string | yes | Service project name |
+| `recipe_path` | string | no | Optional subdirectory for multi-recipe projects. When present, files are written into `source_projects/{service_name}/{recipe_path}/` (the directory is created if it does not exist). |
+| `files` | object | yes | Map of `{filename: content}` to save |
 
 **Response 200:**
 ```json
