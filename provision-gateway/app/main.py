@@ -140,6 +140,17 @@ async def lifespan(app: FastAPI):
     app.state.hostname_index = HostnameIndex(settings.REGISTRY_FILE)
     print(f"[gateway] Registry + HostnameIndex initialized (registry: {settings.REGISTRY_FILE})")
 
+    # v4 §6.1.5: backfill is_default for existing users on startup (GAP-25).
+    # Log failures (schema drift / migration gaps) instead of swallowing them —
+    # a silently-failed backfill hides the default-key feature being broken.
+    try:
+        from .services import auth_service
+        backfilled = auth_service.backfill_default_keys(SessionLocal())
+        if backfilled:
+            print(f"[gateway] Backfilled default API key for {backfilled} user(s)")
+    except Exception as exc:
+        print(f"[gateway] WARNING: default-key backfill failed: {exc}")
+
     _reconcile_task = asyncio.create_task(_reconcile_loop())
     print("[gateway] Scheduled reconciliation background task started")
     _docker_events_task = asyncio.create_task(_docker_events_monitor())

@@ -18,8 +18,12 @@ security_scheme = HTTPBearer(auto_error=False)
 
 
 def _extract_gateway_token(request: Request) -> str | None:
-    """Extract gateway_token from cookie or Authorization header."""
-    cookie = request.cookies.get("gateway_token")
+    """Extract the auth token from the provision_token cookie or Authorization header.
+
+    v4 §11.2 (N5): the provision_token cookie is the single credential the
+    dashboard carries; the old gateway_token cookie is kept as a fallback.
+    """
+    cookie = request.cookies.get("provision_token") or request.cookies.get("gateway_token")
     if cookie:
         return cookie
     # Fall back to Authorization header
@@ -33,7 +37,7 @@ async def require_gateway_token(
     request: Request,
     db: Session = Depends(get_db),
 ) -> dict:
-    """FastAPI dependency: validates gateway_token cookie or Bearer token.
+    """FastAPI dependency: validates the provision_token cookie or Bearer token.
 
     Returns a user dict with keys: id, email, role, user_type.
     Blocks special users entirely (403).
@@ -41,12 +45,12 @@ async def require_gateway_token(
     """
     token = _extract_gateway_token(request)
     if token is None:
-        raise HTTPException(status_code=401, detail="Missing gateway token (cookie or Authorization header)")
+        raise HTTPException(status_code=401, detail="Missing provision token (cookie or Authorization header)")
 
     try:
         payload = decode_gateway_token(token)
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired gateway token")
+        raise HTTPException(status_code=401, detail="Invalid or expired provision token")
 
     user_id_str: str | None = payload.get("sub")
     if user_id_str is None:

@@ -20,7 +20,7 @@ services:
       - DOCKER_OPS_LOG=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/docker_ops.log
       - ENABLE_ACL=${ENABLE_ACL:-false}
       - REGISTRY_FILE=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/user_registry.yml
-      - PROVISION_COOKIE_TTL=${PROVISION_COOKIE_TTL:-86400}
+      - PROVISION_COOKIE_TTL=${PROVISION_COOKIE_TTL:-604800}
     networks:
       - subnet_acl_shared
     restart: unless-stopped

@@ -17,8 +17,6 @@ export interface AdminUser {
 }
 
 export interface TokenResponse {
-  access_token: string
-  refresh_token: string
   token_type: string
   expires_in: number
   admin?: AdminUser
@@ -38,6 +36,11 @@ export async function login(params: LoginParams): Promise<TokenResponse> {
 
 export async function getMe(): Promise<AdminUser> {
   const { data } = await client.get('/auth/me')
+  return data
+}
+
+export async function logout() {
+  const { data } = await client.post('/auth/logout')
   return data
 }
 

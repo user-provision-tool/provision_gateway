@@ -1,8 +1,12 @@
 #!/bin/bash
 # Integration tests for Deploy Form feature
+#
+# v4 auth (F4/N5): login sets a HttpOnly provision_token cookie; all
+# authenticated calls use the cookie jar.
 set -e
 
 GW="${GATEWAY_URL:-http://localhost:8870}"
+COOKIE_JAR="$(mktemp)"
 PASS=0
 FAIL=0
 
@@ -26,28 +30,26 @@ echo "Deploy Form Integration Tests"
 echo "Gateway: $GW"
 echo "============================================"
 
-# Login
-TOKEN=$(curl -s -X POST "$GW/api/auth/login" \
+# Login (v4: provision_token cookie)
+LOGIN=$(curl -s -c "$COOKIE_JAR" -X POST "$GW/api/auth/login" \
     -H "Content-Type: application/json" \
-    -d '{"email":"admin@subnet-acl.local","password":"admin-pass-123"}' \
-    | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+    -d '{"email":"admin@subnet-acl.local","password":"admin-pass-123"}')
 
-if [ -z "$TOKEN" ]; then
-    echo "✗ Could not obtain auth token"
+if ! grep -q "provision_token" "$COOKIE_JAR"; then
+    echo "✗ Could not obtain auth cookie: $(echo "$LOGIN" | head -c 200)"
     exit 1
 fi
 
 # ---- Test 1: List source projects (for deploy form dropdown) ----
 echo ""
 echo "--- Test 1: Source projects available for deploy ---"
-R=$(curl -s "$GW/api/services" -H "Authorization: Bearer $TOKEN")
+R=$(curl -s -b "$COOKIE_JAR" "$GW/api/services")
 check "Source projects list returns services" '"services"' "$R"
 
 # ---- Test 2: Deploy with all fields ----
 echo ""
 echo "--- Test 2: Deploy with user_name, service_name, label, domain, passwd ---"
-R=$(curl -s -X POST "$GW/api/users/deploy" \
-    -H "Authorization: Bearer $TOKEN" \
+R=$(curl -s -X POST -b "$COOKIE_JAR" "$GW/api/users/deploy" \
     -H "Content-Type: application/json" \
     -d '{
       "user_name":"testdeploy",
@@ -68,17 +70,15 @@ echo ""
 echo "--- Test 3: Deploy with use_global_proxy=true ---"
 # Ensure proxy is enabled first: create a config pointing at the reachable
 # local proxy (172.18.0.1:7897) and activate it by ID.
-curl -s -X POST "$GW/api/system/proxy" \
-    -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST -b "$COOKIE_JAR" "$GW/api/system/proxy" \
     -H "Content-Type: application/json" \
     -d '{"name":"global-proxy","protocol":"http","host":"172.18.0.1","port":7897}' > /dev/null
-GPROXY_ID=$(curl -s "$GW/api/system/proxy" -H "Authorization: Bearer $TOKEN" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+GPROXY_ID=$(curl -s -b "$COOKIE_JAR" "$GW/api/system/proxy" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
 if [ -n "$GPROXY_ID" ]; then
-    curl -s -X PUT "$GW/api/system/proxy/$GPROXY_ID/activate" -H "Authorization: Bearer $TOKEN" > /dev/null
+    curl -s -X PUT -b "$COOKIE_JAR" "$GW/api/system/proxy/$GPROXY_ID/activate" > /dev/null
 fi
 
-R=$(curl -s -X POST "$GW/api/users/deploy" \
-    -H "Authorization: Bearer $TOKEN" \
+R=$(curl -s -X POST -b "$COOKIE_JAR" "$GW/api/users/deploy" \
     -H "Content-Type: application/json" \
     -d '{
       "user_name":"testproxy",
@@ -96,8 +96,7 @@ check "Deploy with proxy returns task_id" '"task_id"' "$R"
 # ---- Test 4: Deploy with build_args ----
 echo ""
 echo "--- Test 4: Deploy with build_args ---"
-R=$(curl -s -X POST "$GW/api/users/deploy" \
-    -H "Authorization: Bearer $TOKEN" \
+R=$(curl -s -X POST -b "$COOKIE_JAR" "$GW/api/users/deploy" \
     -H "Content-Type: application/json" \
     -d '{
       "user_name":"testbuild",
@@ -116,8 +115,7 @@ check "Deploy with build_args returns task_id" '"task_id"' "$R"
 # ---- Test 5: Deploy with volumes ----
 echo ""
 echo "--- Test 5: Deploy with volumes ---"
-R=$(curl -s -X POST "$GW/api/users/deploy" \
-    -H "Authorization: Bearer $TOKEN" \
+R=$(curl -s -X POST -b "$COOKIE_JAR" "$GW/api/users/deploy" \
     -H "Content-Type: application/json" \
     -d '{
       "user_name":"testvol",
@@ -136,8 +134,7 @@ check "Deploy with volumes returns task_id" '"task_id"' "$R"
 # ---- Test 6: Deploy missing required field user_name ----
 echo ""
 echo "--- Test 6: Deploy without user_name ---"
-R=$(curl -s -X POST "$GW/api/users/deploy" \
-    -H "Authorization: Bearer $TOKEN" \
+R=$(curl -s -X POST -b "$COOKIE_JAR" "$GW/api/users/deploy" \
     -H "Content-Type: application/json" \
     -d '{
       "service_name":"example-mcp",
@@ -153,11 +150,9 @@ check "Deploy without user_name returns error" '"detail"' "$R"
 # ---- Test 7: Deploy use_global_proxy with proxy disabled ----
 echo ""
 echo "--- Test 7: Disable proxy, try deploy with use_global_proxy=true ---"
-curl -s -X POST "$GW/api/system/proxy/deactivate" \
-    -H "Authorization: Bearer $TOKEN" > /dev/null
+curl -s -X POST -b "$COOKIE_JAR" "$GW/api/system/proxy/deactivate" > /dev/null
 
-R=$(curl -s -X POST "$GW/api/users/deploy" \
-    -H "Authorization: Bearer $TOKEN" \
+R=$(curl -s -X POST -b "$COOKIE_JAR" "$GW/api/users/deploy" \
     -H "Content-Type: application/json" \
     -d '{
       "user_name":"testdisabled",
@@ -172,25 +167,24 @@ R=$(curl -s -X POST "$GW/api/users/deploy" \
 check "Deploy with disabled proxy returns 400" "400\|not enabled" "$R"
 
 # Re-enable proxy (create config + activate by ID)
-curl -s -X POST "$GW/api/system/proxy" \
-    -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST -b "$COOKIE_JAR" "$GW/api/system/proxy" \
     -H "Content-Type: application/json" \
     -d '{"name":"global-proxy","protocol":"http","host":"172.18.0.1","port":7897}' > /dev/null
-GPROXY_ID=$(curl -s "$GW/api/system/proxy" -H "Authorization: Bearer $TOKEN" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+GPROXY_ID=$(curl -s -b "$COOKIE_JAR" "$GW/api/system/proxy" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
 if [ -n "$GPROXY_ID" ]; then
-    curl -s -X PUT "$GW/api/system/proxy/$GPROXY_ID/activate" -H "Authorization: Bearer $TOKEN" > /dev/null
+    curl -s -X PUT -b "$COOKIE_JAR" "$GW/api/system/proxy/$GPROXY_ID/activate" > /dev/null
 fi
 
 # ---- Test 8: List users after deploys ----
 echo ""
 echo "--- Test 8: Users list shows deploys ---"
-R=$(curl -s "$GW/api/users" -H "Authorization: Bearer $TOKEN")
+R=$(curl -s -b "$COOKIE_JAR" "$GW/api/users")
 check "Users list has entries" '"users"' "$R"
 
 # ---- Test 9: Audit log has deploy entries ----
 echo ""
 echo "--- Test 9: Audit log records deploy actions ---"
-R=$(curl -s "$GW/api/audit?action=register" -H "Authorization: Bearer $TOKEN")
+R=$(curl -s -b "$COOKIE_JAR" "$GW/api/audit?action=register")
 check "Audit has register entries" '"entries"' "$R"
 
 # ---- Summary ----
@@ -198,6 +192,8 @@ echo ""
 echo "============================================"
 echo "Deploy Form Tests: $PASS passed, $FAIL failed"
 echo "============================================"
+
+rm -f "$COOKIE_JAR"
 
 if [ "$FAIL" -gt 0 ]; then
     echo "Some tests FAILED"

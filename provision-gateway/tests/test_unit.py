@@ -2380,3 +2380,427 @@ class TestAdminRoutesMigratedToGatewayToken:
         assert "decode_gateway_token" in src
         assert 'gateway_token' in src
 
+
+
+class TestV4ExchangeCode:
+    """v4 §6.2 (F7/GAP-10): 30s exchange code for /go/ service handoff."""
+
+    def test_exchange_code_ttl_constant(self):
+        from app.config import settings
+        assert settings.EXCHANGE_CODE_TTL_SEC == 30
+
+    def test_create_and_verify_exchange_code_roundtrip(self):
+        from app.services import auth_service
+        code = auth_service.create_exchange_code(
+            1, "alice@example.com", "viewer", "end_user", "svc.example.com", redirect="/x"
+        )
+        payload = auth_service.verify_exchange_code(code)
+        assert payload["type"] == "code"
+        assert payload["sub"] == "1"
+        assert payload["svc_host"] == "svc.example.com"
+        assert payload["redirect"] == "/x"
+
+    def test_verify_exchange_code_rejects_non_code_token(self):
+        import pytest
+        from jose import JWTError
+        from app.services import auth_service
+        prov = auth_service.create_provision_token(1, "a@b.c", "viewer", "end_user")
+        with pytest.raises(JWTError):
+            auth_service.verify_exchange_code(prov)
+
+    def test_verify_exchange_code_rejects_garbage(self):
+        import pytest
+        from jose import JWTError
+        from app.services import auth_service
+        with pytest.raises(JWTError):
+            auth_service.verify_exchange_code("not-a-token")
+
+    def test_go_to_service_uses_code_not_jwt_in_url(self):
+        """GAP-10: the /go/ redirect URL must never contain a JWT — only the code."""
+        from pathlib import Path
+        p = Path(__file__).parent.parent / "app" / "routers" / "auth.py"
+        content = p.read_text()
+        assert "create_exchange_code" in content
+        assert '_set_token_url = f"{service_url}/_set_token?code={code}"' in content
+        assert "RedirectResponse(url=_set_token_url, status_code=303)" in content
+
+
+class TestV4ApiKeyTokenModel:
+    """v4 §6.1.1-6.1.3: API key IS a 1-year provision JWT with own api_key_id."""
+
+    def test_provision_token_ttl_week(self):
+        from app.services import auth_service
+        assert auth_service.PROVISION_TOKEN_TTL_SEC == 604800
+
+    def test_api_key_ttl_year(self):
+        from app.services import auth_service
+        assert auth_service.API_KEY_TTL_SEC == 31536000
+
+    def test_create_api_key_token_carries_own_api_key_id(self):
+        from app.services import auth_service
+        tok = auth_service.create_api_key_token(3, "bob@x.io", "admin", "admin", api_key_id=42)
+        payload = auth_service.decode_token(tok)
+        assert payload["api_key_id"] == 42
+        assert payload["type"] == "provision"
+        assert payload["user_type"] == "admin"
+
+    def test_create_api_key_stores_hash_and_mask(self):
+        from unittest.mock import MagicMock, patch
+        from app.services import auth_service
+        key = MagicMock()
+        key.id = 7
+        db = MagicMock()
+        db.query.return_value.filter.return_value.count.return_value = 0
+        with patch("app.services.auth_service._target_identity", return_value=("end_user", "carol", "viewer")), \
+             patch("app.services.auth_service.ApiKey", return_value=key):
+            created, raw = auth_service.create_api_key(db, 5, "My Key")
+        assert raw.endswith(created.mask)
+        assert created.token_hash == auth_service._hash_token(raw)
+        assert created.expires_at is not None
+
+    def test_create_api_key_cap_1000(self):
+        import pytest
+        from unittest.mock import MagicMock, patch
+        from app.services import auth_service
+        db = MagicMock()
+        db.query.return_value.filter.return_value.count.return_value = auth_service.MAX_API_KEYS_PER_USER
+        with patch("app.services.auth_service._lazy_evict_api_keys", return_value=0):
+            with pytest.raises(ValueError):
+                auth_service.create_api_key(db, 5, "x")
+
+    def test_revoke_default_key_raises(self):
+        import pytest
+        from unittest.mock import MagicMock
+        from app.services import auth_service
+        key = MagicMock()
+        key.is_default = True
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = key
+        with pytest.raises(ValueError):
+            auth_service.revoke_api_key(db, 9)
+
+    def test_revoke_non_default_ok(self):
+        from unittest.mock import MagicMock
+        from app.services import auth_service
+        key = MagicMock()
+        key.is_default = False
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = key
+        assert auth_service.revoke_api_key(db, 9) is True
+        assert key.is_revoked is True
+
+
+class TestV4DefaultKey:
+    """v4 §6.1.3/6.1.5 (D7): default key auto-create/promote, backfill."""
+
+    def test_get_or_create_default_key_returns_existing(self):
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import MagicMock
+        from app.services import auth_service
+        key = MagicMock()
+        key.is_default = True
+        key.is_revoked = False
+        key.expires_at = datetime.now(timezone.utc) + timedelta(days=1)
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = key
+        got = auth_service.get_or_create_default_key(db, 1)
+        assert got is key
+        # No new key created
+        assert db.add.call_count == 0
+
+    def test_get_or_create_default_key_autocreates(self):
+        from unittest.mock import MagicMock, patch
+        from app.services import auth_service
+        db = MagicMock()
+        # No default, no valid keys (valid chain uses .filter().filter().order_by().all())
+        db.query.return_value.filter.return_value.first.return_value = None
+        db.query.return_value.filter.return_value.filter.return_value.order_by.return_value.all.return_value = []
+        new_key = MagicMock()
+        with patch("app.services.auth_service.create_api_key", return_value=(new_key, "raw")):
+            got = auth_service.get_or_create_default_key(db, 2)
+        assert got is new_key
+
+    def test_backfill_default_keys_exists(self):
+        import inspect
+        from app.services import auth_service
+        src = inspect.getsource(auth_service.backfill_default_keys)
+        assert "is_default" in src
+
+
+class TestV4ClientTypeHybrid:
+    """v4 §6 / review GAP-11/A3: X-Client-Type hybrid rule."""
+
+    @staticmethod
+    def _req(header=None, cookie=None, accept="*/*"):
+        from unittest.mock import MagicMock
+        req = MagicMock()
+        hdrs = {"Accept": accept}
+        if header:
+            hdrs["X-Provision-Token"] = header
+        req.headers = hdrs
+        req.cookies = {"provision_token": cookie} if cookie else {}
+        return req
+
+    def test_header_wins_as_api(self):
+        from app.routers.auth import _resolve_client_type
+        assert _resolve_client_type(self._req(header="tok", cookie="c", accept="text/html")) == "api"
+
+    def test_cookie_means_browser(self):
+        from app.routers.auth import _resolve_client_type
+        assert _resolve_client_type(self._req(cookie="c", accept="*/*")) == "browser"
+
+    def test_accept_text_html_means_browser(self):
+        from app.routers.auth import _resolve_client_type
+        assert _resolve_client_type(self._req(accept="text/html,application/xhtml+xml")) == "browser"
+
+    def test_else_means_api(self):
+        from app.routers.auth import _resolve_client_type
+        assert _resolve_client_type(self._req(accept="application/json")) == "api"
+
+    def test_verify_response_carries_x_client_type(self):
+        from unittest.mock import MagicMock
+        from app.routers.auth import verify_auth
+        from app.config import settings
+        settings.ENABLE_ACL = False
+        resp = verify_auth(self._req(accept="application/json"), MagicMock())
+        assert resp.headers.get("X-Client-Type") == "api"
+        assert resp.status_code == 401
+
+
+class TestV4AuthEndpoints:
+    """v4 §6.1/F4: three-credential model endpoints."""
+
+    def test_login_sets_provision_cookie_only(self):
+        from unittest.mock import MagicMock, patch
+        from app.routers.auth import login
+        from app.schemas.auth import LoginRequest
+        req = LoginRequest(email="a@b.c", password="pw")
+        default_key = MagicMock()
+        default_key.id = 11
+        result = ("admin", {"id": 1, "email": "a@b.c", "role": "admin"})
+        with patch("app.routers.auth.auth_service.authenticate_user", return_value=result), \
+             patch("app.routers.auth.auth_service.create_provision_token", return_value="TOK"), \
+             patch("app.routers.auth.settings.PROVISION_COOKIE_TTL", 604800):
+            from unittest.mock import MagicMock as M
+            request = M()
+            resp = login(req, request, MagicMock())
+        body = resp.body.decode()
+        assert "access_token" not in body and "refresh_token" not in body and "gateway_token" not in body
+        assert resp.headers["set-cookie"].startswith("provision_token=TOK")
+
+    def test_logout_endpoint_clears_cookie(self):
+        from unittest.mock import MagicMock
+        from app.routers.auth import logout
+        response = MagicMock()
+        logout(response)
+        response.delete_cookie.assert_called_once_with("provision_token", path="/")
+
+    def test_no_refresh_endpoint(self):
+        """v4 §6.1: /api/auth/refresh removed — the dashboard never refreshes tokens."""
+        from app.routers.auth import router
+        paths = [r.path for r in router.routes]
+        assert "/api/auth/refresh" not in paths
+        assert "/api/auth/logout" in paths
+        assert "/api/auth/exchange" in paths
+
+    def test_exchange_endpoint_requires_code(self):
+        import pytest
+        from fastapi import HTTPException
+        from unittest.mock import MagicMock
+        from app.routers.auth import exchange
+        req = MagicMock()
+        req.query_params = {}
+        with pytest.raises(HTTPException) as ei:
+            exchange(req, MagicMock())
+        assert ei.value.status_code == 401
+
+    def test_exchange_endpoint_sets_cookie_on_valid_code(self):
+        from unittest.mock import MagicMock, patch
+        from app.routers.auth import exchange
+        req = MagicMock()
+        req.query_params = {"code": "CODEX"}
+        payload = {"sub": "2", "role": "viewer", "user_type": "end_user", "email": "b@b.c",
+                   "svc_host": "svc.host", "redirect": "/"}
+        with patch("app.routers.auth.auth_service.verify_exchange_code", return_value=payload), \
+             patch("app.routers.auth.auth_service.get_or_create_default_key", return_value=MagicMock(id=5)), \
+             patch("app.routers.auth.auth_service.create_provision_token", return_value="NEWTOK"), \
+             patch("app.routers.auth.settings.PROVISION_COOKIE_TTL", 604800):
+            from unittest.mock import MagicMock as M
+            req.app = M()
+            req.app.state.hostname_index = M()
+            req.app.state.hostname_index.get_by_hostname.return_value = {"https": False}
+            resp = exchange(req, MagicMock())
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "/"
+        assert resp.headers["set-cookie"].startswith("provision_token=NEWTOK")
+
+
+class TestV4VerifyOrdering:
+    """v4 §6.1.4 / review R1: revocation-before-admin-bypass, token_expired check."""
+
+    def test_admin_with_revoked_key_denied(self):
+        from unittest.mock import MagicMock, patch
+        from jose import JWTError
+        from app.routers.auth import verify_auth
+        from app.config import settings
+        settings.ENABLE_ACL = True
+        req = MagicMock()
+        req.cookies = {"provision_token": "t"}
+        req.headers = {"Accept": "text/html", "Host": "svc.host"}
+        with patch("app.routers.auth.auth_service.verify_provision_token", side_effect=JWTError("revoked")):
+            resp = verify_auth(req, MagicMock())
+        assert resp.status_code == 401
+        assert resp.headers["X-Auth-Action"] == "login_required"
+
+    def test_provision_token_verifier_checks_expires_at(self):
+        """R1/GAP-06: verify_provision_token must check key.expires_at."""
+        import inspect
+        from app.services import auth_service
+        src = inspect.getsource(auth_service.verify_provision_token)
+        assert "expires_at" in src
+        assert "is_revoked" in src
+
+    def test_provision_token_ttl_week_payload(self):
+        from app.services import auth_service
+        tok = auth_service.create_provision_token(1, "a@b.c", "viewer", "end_user", api_key_id=3)
+        payload = auth_service.decode_token(tok)
+        assert payload["type"] == "provision"
+        assert payload["api_key_id"] == 3
+        exp = payload["exp"]
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        delta = exp - now.timestamp()
+        assert 600_000 < delta < 700_000  # ~1 week (604800)
+
+
+class TestV4SpecialUsersTrim:
+    """Review N1: allowed_special_users entries must be trimmed on parse."""
+
+    def test_parse_allowed_special_users_trims(self):
+        from app.routers.auth import _parse_allowed_special_users
+        assert _parse_allowed_special_users(" alice , bob ,") == ["alice", "bob"]
+        assert _parse_allowed_special_users("") == []
+        assert _parse_allowed_special_users(None) == []
+
+
+class TestV4ServiceBasicCredential:
+    """Review N2: _get_service_basic_credential never falls back to a hardcoded
+    guessable credential — a missing passwd_plain yields empty (passwd-less)."""
+
+    def test_missing_passwd_plain_returns_empty(self, monkeypatch):
+        from app.routers.auth import _get_service_basic_credential
+        from unittest.mock import MagicMock, patch
+        req = MagicMock()
+        req.headers.get.return_value = "myapp.example.com"
+        with patch("app.routers.auth._lookup_by_hostname",
+                   return_value={"user_name": "bob"}):
+            assert _get_service_basic_credential(req, MagicMock()) == ""
+
+    def test_empty_passwd_plain_returns_empty(self, monkeypatch):
+        from app.routers.auth import _get_service_basic_credential
+        from unittest.mock import MagicMock, patch
+        req = MagicMock()
+        req.headers.get.return_value = "myapp.example.com"
+        with patch("app.routers.auth._lookup_by_hostname",
+                   return_value={"user_name": "bob", "passwd_plain": ""}):
+            assert _get_service_basic_credential(req, MagicMock()) == ""
+
+    def test_passwd_plain_returns_base64(self, monkeypatch):
+        import base64
+        from app.routers.auth import _get_service_basic_credential
+        from unittest.mock import MagicMock, patch
+        req = MagicMock()
+        req.headers.get.return_value = "myapp.example.com"
+        with patch("app.routers.auth._lookup_by_hostname",
+                   return_value={"user_name": "bob", "passwd_plain": "secret"}):
+            got = _get_service_basic_credential(req, MagicMock())
+        assert got == base64.b64encode(b"bob:secret").decode()
+
+
+class TestV4TasksCookie:
+    """v4 §11.2 (N5): SSE task-log reads provision_token cookie."""
+
+    def test_stream_task_log_reads_provision_cookie(self):
+        from pathlib import Path
+        p = Path(__file__).parent.parent / "app" / "routers" / "tasks.py"
+        content = p.read_text()
+        assert 'request.cookies.get("provision_token", "")' in content
+
+
+class TestV4DefaultEndpoint:
+    """v4 §6.1.5: PUT /keys/{id}/default sets a user's default key."""
+
+    def test_set_default_endpoint_exists(self):
+        from app.routers.auth import router
+        paths = [r.path for r in router.routes if getattr(r, "methods", None)]
+        assert any("/keys/{key_id}/default" in p and "PUT" in r.methods for p, r in
+                   ((r.path, r) for r in router.routes if hasattr(r, "methods")))
+
+
+class TestDbMigration:
+    """QA1: existing gateway.db must be migrated — create_all never alters
+    existing tables, so an old api_keys table (no mask/is_default) must get the
+    new columns via _ensure_schema before end-user login works."""
+
+    def _make_old_schema(self, path):
+        from sqlalchemy import create_engine, text
+        eng = create_engine(f"sqlite:///{path}")
+        with eng.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE api_keys ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " user_id INTEGER NOT NULL,"
+                " label VARCHAR(255) NOT NULL,"
+                " token_hash VARCHAR(255) NOT NULL,"
+                " created_at DATETIME,"
+                " expires_at DATETIME NOT NULL,"
+                " is_revoked BOOLEAN NOT NULL DEFAULT 0,"
+                " last_used_at DATETIME)"
+            ))
+        return eng
+
+    def test_ensure_schema_adds_mask_and_is_default(self, tmp_path):
+        db_path = tmp_path / "old.db"
+        eng = self._make_old_schema(str(db_path))
+
+        from app.database import _ensure_schema
+        from sqlalchemy import inspect, text
+
+        # Before: no mask/is_default columns
+        cols_before = {c["name"] for c in inspect(eng).get_columns("api_keys")}
+        assert "mask" not in cols_before and "is_default" not in cols_before
+
+        _ensure_schema(eng)
+
+        cols_after = {c["name"] for c in inspect(eng).get_columns("api_keys")}
+        assert "mask" in cols_after
+        assert "is_default" in cols_after
+        # Inserting a row with only the old fields still works (columns nullable/defaulted).
+        with eng.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO api_keys (user_id, label, token_hash, expires_at) "
+                "VALUES (1, 'k', 'h', '2030-01-01 00:00:00')"
+            ))
+        with eng.begin() as conn:
+            row = conn.execute(text("SELECT mask, is_default FROM api_keys")).fetchone()
+        assert row.mask is None
+        assert row.is_default == 0
+
+    def test_ensure_schema_idempotent(self, tmp_path):
+        db_path = tmp_path / "old.db"
+        eng = self._make_old_schema(str(db_path))
+        from app.database import _ensure_schema
+        from sqlalchemy import inspect
+        _ensure_schema(eng)
+        _ensure_schema(eng)
+        cols = {c["name"] for c in inspect(eng).get_columns("api_keys")}
+        assert "mask" in cols and "is_default" in cols
+
+    def test_ensure_schema_noop_on_fresh(self, tmp_path):
+        from sqlalchemy import create_engine
+        from app.database import Base, _ensure_schema
+        from sqlalchemy import inspect
+        eng = create_engine(f"sqlite:///{tmp_path/'fresh.db'}")
+        Base.metadata.create_all(bind=eng)
+        _ensure_schema(eng)
+        cols = {c["name"] for c in inspect(eng).get_columns("api_keys")}
+        assert "mask" in cols and "is_default" in cols

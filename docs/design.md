@@ -1,7 +1,7 @@
 # Provision Gateway — Product Design Document
 
-> **Version**: 1.3
-> **Date**: 2026-07-20 (updated — post comprehensive gap analysis)
+> **Version**: 1.4
+> **Date**: 2026-08-22 (updated — v4 Service-ACL enforcement: three-credential token model dropped, `/api/auth/refresh` removed, `/go/` 30s exchange code with no JWT in URL, env.d mode switch)
 > **Status**: Implemented — reflects current codebase
 > **See also**: [architecture.md](./architecture.md) | [api_references.md](./api_references.md) | [tests_coverage_status.md](./tests_coverage_status.md)
 
@@ -324,7 +324,7 @@ _provision_gateway/
 │   │   │   └── proxy_service.py        # Proxy config CRUD + env injection
 │   │   │
 │   │   ├── middleware/
-│   │   │   └── __init__.py             # JWT verification — require_gateway_token, require_admin (gateway_token cookie / Bearer, 24h) gate every /api/* route; legacy get_current_admin/get_current_user/require_admin_role retained for reference
+│   │   │   └── __init__.py             # JWT verification — require_gateway_token, require_admin (v4 provision_token cookie, 1-week TTL) gate every /api/* route; legacy gateway_token/Bearer model removed in v4
 │   │   │
 │   │   └── utils/
 │   │       ├── __init__.py
@@ -618,7 +618,7 @@ $PROVISION_DIR/provision_nginx_state.json
 ### 5.1 Conventions
 
 - Base path: `http://provision-gateway:8770`
-- Authentication: since commit 0ef9584 every `/api/*` route is gated by the shared `require_gateway_token` dependency (`app/middleware/__init__.py`), which accepts either the `gateway_token` cookie (24h TTL) or `Authorization: Bearer <JWT>`. Admin-only endpoints additionally require `require_admin` (admin role). Only `/health` and the public auth flows — `/api/auth/setup`, `/api/auth/login`, `/api/auth/verify` (nginx `auth_request`) and `/api/auth/users/register` (public end-user signup) — are unauthenticated.
+- Authentication: every `/api/*` route is gated by the shared `require_gateway_token` dependency (`app/middleware/__init__.py`), which validates the v4 `provision_token` cookie (1-week TTL). Admin-only endpoints additionally require `require_admin` (admin role). Only `/health` and the public auth flows — `/api/auth/setup`, `/api/auth/login`, `/api/auth/verify` (nginx `auth_request`) and `/api/auth/users/register` (public end-user signup) — are unauthenticated. **v4:** the legacy `gateway_token` cookie and Bearer `access_token`/`refresh_token` model was dropped, and `POST /api/auth/refresh` no longer exists.
 - Content-Type: `application/json` unless noted
 - SSE endpoints use `text/event-stream`
 
@@ -644,12 +644,12 @@ POST /api/auth/register
 
 POST /api/auth/login
   Request:  { "email": "...", "password": "..." }
-  Response: 200 { "access_token": "eyJ...", "refresh_token": "...", "token_type": "bearer",
-                  "expires_in": 3600, "admin": { "id": 1, "email": "...", "role": "admin" } }
+  Response: 200 { "token_type": "cookie", "expires_in": 604800,
+                  "admin": { "id": 1, "email": "...", "role": "admin" } }
+  (sets the provision_token cookie — v4; Bearer access_token/refresh_token removed)
 
-POST /api/auth/refresh
-  Request:  { "refresh_token": "..." }
-  Response: 200 { "access_token": "eyJ...", "expires_in": 3600 }
+POST /api/auth/logout
+  (v4) Clears the provision_token cookie. POST /api/auth/refresh no longer exists.
 
 GET /api/auth/me
   Response: 200 { "id": 1, "email": "...", "role": "admin", "created_at": "...", "last_login_at": "..." }
@@ -663,19 +663,20 @@ PUT /api/auth/password
 
 ```
 GET /api/auth/verify
-  → Called by provision-nginx as auth_request subrequest
+  → Called by provision-nginx as auth_request subrequest (ACL mode only)
   → Extracts JWT from provision_token cookie or X-Provision-Token header
-  → When ENABLE_ACL=false: returns 401 so nginx falls back to auth_basic (Basic dialog)
-  → When ENABLE_ACL=true: validates JWT, checks ACL permissions
+  → Applies the v4 hybrid X-Client-Type rule (header ⇒ api / cookie ⇒ browser / text/html ⇒ browser / else ⇒ api); X-Client-Type on every response
+  → Basic mode ($auth_mode empty): nginx short-circuits via /__basic__/ (0 subrequests) — verify not called
+  → ACL mode: validates JWT, checks ACL (revocation before admin bypass; expires_at/active approved — F3 ordering)
   → Response (ACL passed): 200 + X-Service-Basic header (base64 user:pass)
   → Response (ACL denied): 403 + X-Auth-Action: acl_denied
   → Response (token expired): 401 + X-Auth-Action: token_expired
   → Response (no token): 401 + X-Auth-Action: login_required
 
 GET /go/{hostname}
-  → Dashboard service access redirect
-  → Validates gateway_token, checks ACL, creates provision_token
-  → Redirects to service URL via /_set_token?token=...&redirect=/
+  → Dashboard service access redirect (v4)
+  → Validates the provision_token session, checks ACL, issues a 30s HMAC exchange code + Location header (no JWT in URL)
+  → Service-side /_set_token is a plain proxy to /api/auth/exchange, which swaps the code for the provision_token cookie via 302+Set-Cookie
 
 POST /api/auth/keys
   → Create API key for end-user programmatic access

@@ -16,7 +16,6 @@ from ..models.api_key import ApiKey
 from ..schemas.auth import (
     LoginRequest,
     PasswordChangeRequest,
-    RefreshRequest,
     RegisterRequest,
     SetupRequest,
 )
@@ -77,14 +76,13 @@ def register_admin(
 
 @router.post("/login")
 def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
-    """Authenticate and return JWT tokens with cookie support.
+    """Authenticate and set the provision_token cookie.
 
-    Sets two cookies:
-      - gateway_token: short-lived (24h), for dashboard/gateway API access
-      - provision_token: long-lived (1yr), for service access via provision-nginx
-
+    v4 §6.1/F4 (three-credential model): the ONLY credential set here is the
+    1-week provision_token, bound to the user's default API key's api_key_id
+    (so it dies with that key). access_token / refresh_token / gateway_token
+    are no longer minted. Cookie Max-Age = PROVISION_COOKIE_TTL (604800).
     Special users (role=special) are blocked with 403.
-    If no existing API key, a default key is created.
     """
     result = auth_service.authenticate_user(db, req.email, req.password)
     if result is None:
@@ -99,26 +97,21 @@ def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
     if role == "special":
         raise HTTPException(status_code=403, detail="Special users cannot access the dashboard")
 
-    # Create access and refresh tokens
-    access_token = auth_service.create_access_token(user_id, email, role, user_type)
-    refresh_token = auth_service.create_refresh_token(user_id, email, user_type)
-
-    # Create gateway token (24h) and provision token (1yr)
-    gateway_token = auth_service.create_gateway_token(user_id, email, role, user_type)
-    provision_token = auth_service.create_provision_token(user_id, email, role, user_type)
-
-    # Create default API key if none exists for end-users
+    # Bind the provision token to the user's default key (D7: auto-create/promote).
     if user_type == "end_user":
-        existing_keys = auth_service.list_api_keys(db, user_id)
-        if not existing_keys:
-            auth_service.create_default_api_key(db, user_id)
+        default_key = auth_service.get_or_create_default_key(db, user_id)
+        api_key_id = default_key.id
+    else:
+        api_key_id = None
 
-    # Build JSON response body
+    provision_token = auth_service.create_provision_token(
+        user_id, email, role, user_type, api_key_id=api_key_id
+    )
+
+    # Build JSON response body (no access/refresh tokens).
     body = {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-        "expires_in": settings.JWT_EXPIRE_SEC,
+        "token_type": "cookie",
+        "expires_in": settings.PROVISION_COOKIE_TTL,
         "user_type": user_type,
     }
 
@@ -131,17 +124,8 @@ def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
             "role": user_info.get("role", "viewer"),
         }
 
-    # Set cookies
+    # Set the provision_token cookie (the dashboard reads this, not localStorage).
     resp = JSONResponse(content=body)
-    resp.set_cookie(
-        key="gateway_token",
-        value=gateway_token,
-        httponly=True,
-        secure=False,
-        samesite="lax",
-        max_age=86400,
-        path="/",
-    )
     resp.set_cookie(
         key="provision_token",
         value=provision_token,
@@ -155,45 +139,15 @@ def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# POST /api/auth/refresh
+# POST /api/auth/logout — unauthenticated, clears provision_token cookie
+# (v4 §6.1.6 / review G14)
 # ---------------------------------------------------------------------------
 
-@router.post("/refresh")
-def refresh_token(req: RefreshRequest, db: Session = Depends(get_db)):
-    """Use a refresh token to get a new access token."""
-    try:
-        payload = auth_service.decode_token(req.refresh_token)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
-
-    if payload.get("type") != "refresh":
-        raise HTTPException(status_code=401, detail="Not a refresh token")
-
-    user_id = int(payload.get("sub", 0))
-    user_type = payload.get("user_type", "admin")
-    email = payload.get("email", "")
-    role = payload.get("role", "viewer")
-    
-    if user_type == "admin":
-        admin = auth_service.get_admin_by_id(db, user_id)
-        if admin is None or not admin.is_active:
-            raise HTTPException(status_code=401, detail="Admin not found or inactive")
-        role = admin.role
-        email = admin.email
-    else:
-        end_user = auth_service.get_end_user_by_id(db, user_id)
-        if end_user is None or not end_user.is_active or not end_user.is_approved:
-            raise HTTPException(status_code=401, detail="User not found, inactive, or not approved")
-        role = end_user.role
-        email = end_user.username
-
-    access_token = auth_service.create_access_token(user_id, email, role, user_type)
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "expires_in": settings.JWT_EXPIRE_SEC,
-        "user_type": user_type,
-    }
+@router.post("/logout")
+def logout(response: Response):
+    """Clear the provision_token cookie, even if it is expired/invalid."""
+    response.delete_cookie("provision_token", path="/")
+    return {"message": "Logged out."}
 
 
 # ---------------------------------------------------------------------------
@@ -223,34 +177,45 @@ def verify_auth(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    """Verify JWT for provision-nginx auth_request subrequest.
+    """Verify provision token for the nginx auth_request subrequest (v4 §6/F3).
 
-    Returns the FINAL HTTP status that nginx consumes:
+    Returns the FINAL HTTP status nginx consumes:
       - 200 + ``X-Service-Basic``  → allowed (nginx injects the credential)
-      - 401 + ``X-Auth-Action``    → login_required / token_expired
+      - 401 + ``X-Auth-Action``    → login_required / unauthorized / token_expired
       - 403 + ``X-Auth-Action``    → acl_denied
 
-    The browser-vs-API distinction is handled by nginx (``error_page`` +
-    ``map $http_accept``), not here. This matches acl-enforcement-design-v2.md §5.
+    EVERY response carries ``X-Client-Type`` (hybrid rule, review GAP-11/A3):
+    header ⇒ api, cookie ⇒ browser, Accept text/html ⇒ browser, else ⇒ api.
+    Client type is decided HERE — nginx no longer uses an Accept map.
+
+    Ordering (v4 §6.1.4, review R1): revocation check (key exists / not
+    revoked / expires_at not passed) runs first via verify_provision_token —
+    it applies to admins too — then the admin bypass, then user active/approved,
+    then ACL.
     """
+    client_type = _resolve_client_type(request)
+
+    def _respond(status: int, headers: dict, content: dict | None = None) -> Response:
+        headers = dict(headers)
+        headers["X-Client-Type"] = client_type
+        return JSONResponse(status_code=status, headers=headers, content=content)
+
+    def _deny(action: str, status: int, detail: str) -> Response:
+        return _respond(status, {"X-Auth-Action": action}, {"detail": detail})
+
     if not settings.ENABLE_ACL:
-        # ACL disabled → 401 so nginx falls back to auth_basic (Basic dialog)
-        return Response(status_code=401)
+        # ACL disabled → 401 + X-Auth-Action + X-Client-Type (GAP-08 fix), so
+        # nginx's @auth_401 can still act on the client type.
+        return _deny("login_required", 401, "ACL disabled")
 
     cookie_token = request.cookies.get("provision_token")
     header_token = request.headers.get("X-Provision-Token", "")
     token = cookie_token or header_token
 
-    def _deny(action: str, status: int, detail: str) -> Response:
-        """Deny with a status code + X-Auth-Action for nginx's map to read."""
-        return JSONResponse(
-            status_code=status,
-            headers={"X-Auth-Action": action},
-            content={"detail": detail},
-        )
-
     if not token:
-        return _deny("login_required", 401, "No provision token")
+        # header ⇒ API gets "unauthorized"; cookie/browser gets "login_required"
+        action = "unauthorized" if client_type == "api" else "login_required"
+        return _deny(action, 401, "No provision token")
 
     try:
         payload = auth_service.verify_provision_token(token)
@@ -270,9 +235,9 @@ def verify_auth(
     user_type = payload.get("user_type", "end_user")
 
     if user_type == "admin":
-        # Admins have access to everything
+        # Admins have access to everything (revocation already checked above)
         svc_basic = _get_service_basic_credential(request, db)
-        return Response(status_code=200, headers={"X-Service-Basic": svc_basic})
+        return _respond(200, {"X-Service-Basic": svc_basic}, None)
 
     # End-user: must be active + approved
     end_user = db.query(EndUser).filter(EndUser.id == user_id).first()
@@ -288,16 +253,39 @@ def verify_auth(
         # Check if viewer is accessing their own service
         if target_user == end_user.username:
             svc_basic = _get_service_basic_credential(request, db)
-            return Response(status_code=200, headers={"X-Service-Basic": svc_basic})
+            return _respond(200, {"X-Service-Basic": svc_basic}, None)
 
-        # Check allowed_special_users
-        allowed = (end_user.allowed_special_users or "").split(",")
+        # Check allowed_special_users (trimmed on parse — N1)
+        allowed = _parse_allowed_special_users(end_user.allowed_special_users)
         if target_user in allowed:
             svc_basic = _get_service_basic_credential(request, db)
-            return Response(status_code=200, headers={"X-Service-Basic": svc_basic})
+            return _respond(200, {"X-Service-Basic": svc_basic}, None)
 
     # ACL denied
     return _deny("acl_denied", 403, "ACL denied")
+
+
+def _resolve_client_type(request: Request) -> str:
+    """Hybrid client-type rule (v4 §6, review GAP-11/A3).
+
+    X-Provision-Token header present ⇒ api; else provision_token cookie ⇒
+    browser; else Accept contains text/html ⇒ browser; else ⇒ api.
+    """
+    if request.headers.get("X-Provision-Token"):
+        return "api"
+    if request.cookies.get("provision_token"):
+        return "browser"
+    accept = request.headers.get("Accept", "") or ""
+    if "text/html" in accept:
+        return "browser"
+    return "api"
+
+
+def _parse_allowed_special_users(raw: str | None) -> list[str]:
+    """Parse a comma-separated allowed_special_users list, trimming each entry (N1)."""
+    if not raw:
+        return []
+    return [u.strip() for u in raw.split(",") if u.strip()]
 
 
 def _lookup_by_hostname(host: str, request: Request) -> dict | None:
@@ -312,14 +300,17 @@ def _lookup_by_hostname(host: str, request: Request) -> dict | None:
 def _get_service_basic_credential(request: Request, db: Session) -> str:
     """Get the X-Service-Basic credential for a service.
 
-    Returns the base64-encoded username:password for auth_basic on the target service.
-    Falls back to looking up the registry entry's passwd_plain.
+    Returns the base64-encoded username:password for auth_basic on the target
+    service. When ``passwd_plain`` is missing/empty (a supported passwd-less
+    state), returns empty — never a guessable default (review N2).
     """
     host = request.headers.get("Host", "")
     entry = _lookup_by_hostname(host, request)
     if entry:
         user_name = entry.get("user_name", "")
-        passwd = entry.get("passwd_plain", "123456")
+        passwd = entry.get("passwd_plain") or ""
+        if passwd == "":
+            return ""
         import base64
         return base64.b64encode(f"{user_name}:{passwd}".encode()).decode()
     return ""
@@ -338,6 +329,10 @@ def create_key(
     """Generate a new API key. Admin can create for any user; viewer for self.
 
     Request body: {"label": "my-key", "user_id": 1}  (user_id is optional for viewers)
+
+    The API key IS the provision token — a 1-year JWT carrying its own
+    api_key_id and the target's real user_type (GAP-07) — so the returned
+    ``token`` is directly usable as a Bearer/X-Provision-Token credential.
     """
     label = req.get("label", "Default").strip()
     if not label:
@@ -351,17 +346,10 @@ def create_key(
         raise HTTPException(403, "Viewers can only create keys for themselves")
 
     key, raw_token = auth_service.create_api_key(db, target_user_id, label)
-    # Create a provision token embedding this api_key_id
-    end_user = db.query(EndUser).filter(EndUser.id == target_user_id).first()
-    email = end_user.username if end_user else ""
-    role = end_user.role if end_user else "viewer"
-    provision_token = auth_service.create_provision_token(target_user_id, email, role,
-                                                          api_key_id=key.id)
 
     return {
         "key": key.to_dict(),
         "token": raw_token,
-        "provision_token": provision_token,
         "message": "Save this token — it will not be shown again.",
     }
 
@@ -385,8 +373,12 @@ def list_keys(
 
 
 def _get_gateway_user_safe(request: Request, db: Session) -> dict | None:
-    """Extract gateway user from cookie/header without raising."""
-    token = request.cookies.get("gateway_token") or ""
+    """Extract the authenticated user from the provision_token cookie/header.
+
+    v4 §11.2 (N5): the provision_token cookie is the single credential. We
+    keep the gateway_token cookie + Bearer as backward-compatible fallbacks.
+    """
+    token = request.cookies.get("provision_token") or request.cookies.get("gateway_token") or ""
     if not token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -413,8 +405,7 @@ def delete_key(
 ):
     """Revoke an API key. Admin can revoke any; viewer own.
 
-    Uses the shared ``require_gateway_token`` dependency for consistency with
-    the other key routes (see ``list_keys``).
+    Rejects revoking the user's default key with 400 (v4 §6.1.5).
     """
     key = auth_service.get_api_key_by_id(db, key_id)
     if key is None:
@@ -424,8 +415,31 @@ def delete_key(
     if not is_admin and key.user_id != current_user["id"]:
         raise HTTPException(403, "You can only revoke your own keys")
 
-    auth_service.revoke_api_key(db, key_id)
+    try:
+        auth_service.revoke_api_key(db, key_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return {"revoked": True, "key_id": key_id}
+
+
+@router.put("/keys/{key_id}/default")
+def set_default_key(
+    key_id: int,
+    current_user: dict = Depends(require_gateway_token),
+    db: Session = Depends(get_db),
+):
+    """Mark an API key as the user's default (v4 §6.1.5)."""
+    key = auth_service.get_api_key_by_id(db, key_id)
+    if key is None:
+        raise HTTPException(404, "Key not found")
+
+    is_admin = current_user["role"] == "admin"
+    if not is_admin and key.user_id != current_user["id"]:
+        raise HTTPException(403, "You can only manage your own keys")
+
+    if not auth_service.set_default_api_key(db, key_id):
+        raise HTTPException(404, "Key not found")
+    return {"default": True, "key_id": key_id}
 
 
 # ---------------------------------------------------------------------------
@@ -438,10 +452,12 @@ def go_to_service(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    """Redirect to a service URL, setting the provision_token cookie.
+    """Redirect to a service URL using a 30s exchange code (v4 §6.2 / F7).
 
-    Validates gateway_token, checks ACL, then redirects to the service
-    with a 302, setting the provision_token cookie for the service domain.
+    Validates the provision_token cookie, checks ACL, then 303-redirects to
+    ``{scheme}://{svc-host}:{port}/_set_token?code=...``. No provision_token
+    JWT ever appears in a URL (GAP-10); the code is exchanged for the cookie
+    by ``/api/auth/exchange`` via the service's ``_set_token`` plain proxy.
     """
     current_user = _get_gateway_user_safe(request, db)
     if current_user is None:
@@ -461,30 +477,92 @@ def go_to_service(
     if current_user["role"] != "admin":
         target_user = entry.get("user_name", "")
         if target_user != current_user["email"]:
-            # Check allowed_special_users
+            # Check allowed_special_users (trimmed — N1)
             eu = db.query(EndUser).filter(EndUser.id == current_user["id"]).first()
-            allowed = (eu.allowed_special_users or "").split(",") if eu else []
+            allowed = _parse_allowed_special_users(eu.allowed_special_users) if eu else []
             if target_user not in allowed:
                 raise HTTPException(403, "Access denied: service not in your allowed list")
 
-    # Get provision token for this user
-    email = current_user["email"]
-    role = current_user["role"]
-    user_type = current_user["user_type"]
-    provision_token = auth_service.create_provision_token(current_user["id"], email, role, user_type)
-
-    # Build service URL (with the nginx host port so the browser reaches the
-    # subnet-acl nginx, not the default :80).
+    # Scheme/port from the service's https flag (GAP-19): https services get
+    # https + NGINX_HTTPS_PORT; http services get http + NGINX_HTTP_PORT.
     domain = entry.get("hostname", hostname)
-    nginx_http_port = request.app.state.config_http_port if hasattr(request.app.state, "config_http_port") else settings.NGINX_HTTP_PORT
-    service_url = f"http://{domain}"
-    if nginx_http_port != 80:
-        service_url += f":{nginx_http_port}"
+    https = bool(entry.get("https", False))
+    port = settings.NGINX_HTTPS_PORT if https else settings.NGINX_HTTP_PORT
+    scheme = "https" if https else "http"
 
-    # Redirect with cookie via _set_token
-    # We redirect to the service at /_set_token first, which sets the cookie and redirects to /
-    _set_token_url = f"{service_url}/_set_token?token={provision_token}&redirect=/"
-    return RedirectResponse(url=_set_token_url, status_code=302)
+    service_url = f"{scheme}://{domain}"
+    if not (scheme == "http" and port == 80) and not (scheme == "https" and port == 443):
+        service_url += f":{port}"
+
+    # Mint a 30s code and 303 the browser to the service's _set_token
+    code = auth_service.create_exchange_code(
+        current_user["id"], current_user["email"], current_user["role"],
+        current_user["user_type"], domain, redirect="/",
+    )
+    _set_token_url = f"{service_url}/_set_token?code={code}"
+    return RedirectResponse(url=_set_token_url, status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/auth/exchange — internal 30s-code → provision_token cookie relay
+# (reached via the per-service `location = /_set_token` plain proxy; v4 §6.2)
+# ---------------------------------------------------------------------------
+
+@router.get("/exchange")
+def exchange(request: Request, db: Session = Depends(get_db)):
+    """Verify a 30s code and set the provision_token cookie via a 302 relay.
+
+    Returns ``302 Location: /`` + ``Set-Cookie: provision_token=...``.
+    ``; Secure`` is added only for https services (from the registry flag).
+    nginx relays the 302 + Set-Cookie verbatim (A1).
+    """
+    code = request.query_params.get("code", "")
+    if not code:
+        raise HTTPException(401, "Missing exchange code")
+
+    try:
+        payload = auth_service.verify_exchange_code(code)
+    except JWTError:
+        raise HTTPException(401, "Invalid or expired exchange code")
+
+    user_id = int(payload["sub"])
+    role = payload.get("role", "viewer")
+    user_type = payload.get("user_type", "end_user")
+    email = payload.get("email", "")
+    svc_host = payload.get("svc_host", "")
+
+    # `; Secure` only for https services — resolved from the registry flag.
+    https = False
+    if svc_host:
+        try:
+            hostname_index = request.app.state.hostname_index
+            entry = hostname_index.get_by_hostname(svc_host)
+            https = bool(entry and entry.get("https", False))
+        except Exception:
+            https = False
+
+    # Bind the fresh 1-week provision token to the user's default key (D7).
+    if user_type == "end_user":
+        default_key = auth_service.get_or_create_default_key(db, user_id)
+        api_key_id = default_key.id
+    else:
+        api_key_id = None
+
+    provision_token = auth_service.create_provision_token(
+        user_id, email, role, user_type, api_key_id=api_key_id
+    )
+
+    resp = RedirectResponse(url=payload.get("redirect", "/"), status_code=302)
+    resp.set_cookie(
+        key="provision_token",
+        value=provision_token,
+        httponly=True,
+        secure=https,
+        samesite="lax",
+        max_age=settings.PROVISION_COOKIE_TTL,
+        path="/",
+    )
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +637,12 @@ def register_end_user(
         is_active=True,
     )
     db.add(user)
+    db.flush()
+    # v4 §6.1.3: default key created at registration (not first login).
+    try:
+        auth_service.create_api_key(db, user.id, "Default", is_default=True)
+    except Exception:
+        pass
     db.commit()
     db.refresh(user)
     return {"created": True, "user": user.to_dict(), "message": "Registration submitted. Awaiting admin approval."}

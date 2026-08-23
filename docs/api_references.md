@@ -1,7 +1,7 @@
 # Provision Gateway — API Reference
 
-> **Version**: 2.0
-> **Date**: 2026-08-01 (updated — Cycle 20260801T165901Z Iteration 1: From Template tab removed from UI / mode=template API-only (GAP-1), local-agent fields deferred at API level (GAP-2); prior: /templates, /notifications, /next-label endpoints)
+> **Version**: 2.1
+> **Date**: 2026-08-22 (updated — v4 Service-ACL enforcement: three-credential token model dropped — `access_token`/`refresh_token`/`gateway_token` removed, `POST /api/auth/refresh` no longer exists, `POST /api/auth/logout` added, `/go/` issues a 30s exchange code with no JWT in URL; prior: From Template tab removed from UI / mode=template API-only (GAP-1), local-agent fields deferred at API level (GAP-2))
 > **Base URL**: `http://provision-gateway:8770` (internal) / `http://localhost:8771/api` (via dashboard proxy)
 
 ---
@@ -24,14 +24,12 @@
 
 ### 1.1 Authentication
 
-- All endpoints except `/health`, `/api/auth/setup`, `/api/auth/login`, `/api/auth/refresh`, and `/api/auth/users/register` require a valid gateway token, sent either as the `gateway_token` cookie or as `Authorization: Bearer <JWT>`
-- **Two-token login:** `POST /api/auth/login` sets two `HttpOnly` cookies:
-  - `gateway_token` — 24h TTL (configurable via `JWT_EXPIRE_SEC`), used for dashboard/gateway API auth
-  - `provision_token` — **1 year** TTL (configurable via `PROVISION_COOKIE_TTL`), used for service access via provision-nginx
-- **Bearer tokens for API clients:** `POST /api/auth/login` also returns an `access_token` (1 hour, `JWT_EXPIRE_SEC`) and a `refresh_token` (7 days, `JWT_REFRESH_EXPIRE_SEC`) in the response body
-- `/api/*` routes are gated by the `require_gateway_token` dependency, which accepts either the `gateway_token` cookie or `Authorization: Bearer <JWT>`; admin-only routes additionally use `require_admin` (`require_gateway_token` + `role == admin`). These replace the legacy `get_current_admin` / `require_admin_role` dependencies
+- All endpoints except `/health`, `/api/auth/setup`, `/api/auth/login`, and `/api/auth/users/register` require a valid session, carried as the `provision_token` cookie (`token_type=cookie`)
+- **v4 cookie model (three-credential tokens dropped):** `POST /api/auth/login` mints a single `provision_token` cookie. The Bearer `access_token`/`refresh_token` pair and the legacy `gateway_token` cookie are **removed in v4**; `POST /api/auth/refresh` no longer exists — `POST /api/auth/logout` (new in v4) clears the session cookie
+- `provision_token` — **1 week** TTL (604800s, `PROVISION_COOKIE_TTL`), set at login and re-issued by `/go/{hostname}` → `/api/auth/exchange`; used for both dashboard/gateway API auth and service access via provision-nginx
+- `/api/*` routes are gated by the `require_gateway_token` dependency, which validates the `provision_token` cookie; admin-only routes additionally use `require_admin` (`require_gateway_token` + `role == admin`)
 - JWT tokens carry a `user_type` claim: `admin` (gateway admin) or `end_user` (portal user)
-- Non-admin users (role=`viewer`) have read-only access; mutating endpoints require `admin` role
+- Non-admin users (role=`viewer`) have read-only access; mutating endpoints require `admin` role; special users (role=`special`) are blocked from dashboard login (403) and cannot receive provision tokens
 - The SSE log endpoint (`GET /api/tasks/{id}/log`) also supports `?token=` query parameter for EventSource (which cannot set headers)
 
 ### 1.2 Request/Response
@@ -127,7 +125,7 @@ Create additional admin/portal user. Requires `admin` role to create another adm
 
 ### `POST /api/auth/login`
 
-Authenticate and receive tokens. Supports both gateway admin accounts (by email) and end-user portal accounts (by username). Sets two `HttpOnly` cookies (`gateway_token`, `provision_token`) for browser/dashboard auth and returns Bearer `access_token`/`refresh_token` in the body for API clients.
+Authenticate and receive a session cookie. Supports both gateway admin accounts (by email) and end-user portal accounts (by username). Sets a single `provision_token` `HttpOnly` cookie (`token_type=cookie`, `Max-Age=604800`); the Bearer `access_token`/`refresh_token` pair and the legacy `gateway_token` cookie were **removed in v4**.
 
 **Request:**
 ```json
@@ -140,10 +138,8 @@ Authenticate and receive tokens. Supports both gateway admin accounts (by email)
 **Response 200 (admin):**
 ```json
 {
-  "access_token": "eyJhbGciOi...",
-  "refresh_token": "eyJhbGciOi...",
-  "token_type": "bearer",
-  "expires_in": 3600,
+  "token_type": "cookie",
+  "expires_in": 604800,
   "user_type": "admin",
   "admin": {
     "id": 1,
@@ -156,10 +152,8 @@ Authenticate and receive tokens. Supports both gateway admin accounts (by email)
 **Response 200 (end-user):**
 ```json
 {
-  "access_token": "eyJhbGciOi...",
-  "refresh_token": "eyJhbGciOi...",
-  "token_type": "bearer",
-  "expires_in": 3600,
+  "token_type": "cookie",
+  "expires_in": 604800,
   "user_type": "end_user",
   "user": {
     "id": 5,
@@ -169,14 +163,13 @@ Authenticate and receive tokens. Supports both gateway admin accounts (by email)
 }
 ```
 
-**Cookies set (admin and end-user logins):**
+**Cookie set (admin and end-user logins):**
 
 | Cookie | Value | TTL | Purpose |
 |---|---|---|---|
-| `gateway_token` | JWT (`type=gateway`) | 24 hours (`JWT_EXPIRE_SEC`) | Dashboard/gateway API auth — accepted by `require_gateway_token` |
-| `provision_token` | JWT (`type=provision`) | **1 year** (`PROVISION_COOKIE_TTL`) | Service access via provision-nginx — consumed by `GET /api/auth/verify` |
+| `provision_token` | JWT (`type=provision`) | **1 week** (604800s, `PROVISION_COOKIE_TTL`) | Dashboard/gateway API auth (accepted by `require_gateway_token`) AND service access via provision-nginx — consumed by `GET /api/auth/verify` |
 
-Both cookies are `HttpOnly`, `SameSite=Lax`, `Path=/`. The response body additionally carries Bearer `access_token` (1 hour, `JWT_EXPIRE_SEC`) and `refresh_token` (7 days, `JWT_REFRESH_EXPIRE_SEC`) for API clients that cannot use cookies.
+The cookie is `HttpOnly`, `SameSite=Lax`, `Path=/`. The legacy `gateway_token` cookie and the Bearer `access_token`/`refresh_token` body fields were **removed in v4** — the only credential minted by login is the `provision_token` cookie.
 
 **Errors:**
 - `401` — "Invalid email/username or password"
@@ -184,26 +177,22 @@ Both cookies are `HttpOnly`, `SameSite=Lax`, `Path=/`. The response body additio
 
 ---
 
-### `POST /api/auth/refresh`
+### `POST /api/auth/logout`
 
-Exchange refresh token for a new access token.
-
-**Request:**
-```json
-{
-  "refresh_token": "eyJhbGciOi..."
-}
-```
+End the current session (added in v4). Clears the `provision_token` cookie.
 
 **Response 200:**
 ```json
 {
-  "access_token": "eyJhbGciOi...",
-  "token_type": "bearer",
-  "expires_in": 3600,
-  "user_type": "admin"
+  "message": "Logged out."
 }
 ```
+
+---
+
+### `POST /api/auth/refresh`
+
+> **Removed in v4.** The three-credential token model (Bearer `access_token`/`refresh_token` plus the `gateway_token` cookie) was dropped in v4, so this endpoint no longer exists. Auth is carried solely by the `provision_token` cookie; use `POST /api/auth/logout` to end a session.
 
 ---
 
@@ -385,9 +374,10 @@ NGINX `auth_request` subrequest endpoint for ACL-based service access control. N
 | `Cookie: provision_token=<JWT>` | Provision token from `/go/{hostname}` redirect |
 | `X-Provision-Token: <JWT>` | Alternative to cookie (for non-browser clients) |
 
-**Response 200 (ACL disabled or passed):**
-- When `ENABLE_ACL=false`: returns empty 200 (pass-through to auth_basic).
-- When `ENABLE_ACL=true` and JWT valid + ACL passed:
+**Response 200 (ACL passed):**
+- The v4 hybrid `X-Client-Type` rule (X-Provision-Token header ⇒ api / provision_token cookie ⇒ browser / Accept text/html ⇒ browser / else ⇒ api) determines the client type; `X-Client-Type` is set on every response, and `X-Auth-Action` is always present (incl. `unauthorized`).
+- When the per-service conf is in Basic mode (`$auth_mode` empty), nginx short-circuits via `/__basic__/` and never calls verify (0 subrequests) — verify is only invoked in ACL mode.
+- When the token is valid and ACL passed:
   ```
   Headers: X-Service-Basic: <base64-encoded user:pass>
   ```
@@ -426,7 +416,7 @@ Headers: `X-Auth-Action: redirect_acl_denied`
 
 ### `GET /go/{hostname}`
 
-Dashboard service access redirect. Validates `gateway_token`, checks ACL permissions, creates a `provision_token`, and redirects the browser to the service URL.
+Dashboard service access redirect (v4). Validates the `provision_token` session, checks ACL permissions, and issues a **30s HMAC-signed exchange code** plus a `Location` header — **no JWT ever appears in a URL** (F7). The service-side `location = /_set_token` is a plain variable proxy to `/api/auth/exchange`, which swaps the code for the `provision_token` cookie via `302` + `Set-Cookie`.
 
 **Path Parameters:**
 | Param | Description |
@@ -434,10 +424,10 @@ Dashboard service access redirect. Validates `gateway_token`, checks ACL permiss
 | `hostname` | Service hostname (e.g., `myapp-alice-0.localhost`) |
 
 **Response 302:**
-Redirects to `http://{hostname}/_set_token?token={provision_token}&redirect=/`
+Redirects to `http://{hostname}/_set_token?code={code}&redirect=/` (the `code` is the 30s HMAC exchange code, not a live bearer JWT)
 
 **Errors:**
-- `401` — No valid gateway_token
+- `401` — No valid session (provision_token cookie missing/invalid)
 - `403` — ACL denied (viewer cannot access that service)
 - `404` — Service not found for given hostname
 
@@ -517,7 +507,7 @@ Revoke an API key (soft delete — sets `is_active=false`).
 ```
 
 **Errors:**
-- `401` — No valid gateway_token
+- `401` — No valid session (provision_token cookie missing/invalid)
 - `403` — Viewer attempting to revoke another user's key
 - `404` — Key not found
 

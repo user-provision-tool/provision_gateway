@@ -1,7 +1,7 @@
 # Provision Gateway — Workflows of Important Usage Scenarios (APIs)
 
-> **Version**: 3.0
-> **Date**: 2026-08-19 (updated — new features: API key management (create/list/revoke), `/api/auth/go/{hostname}` service-access redirect + ACL verify, two-token login cookies (gateway_token 24h / provision_token 1y), multi-recipe deploy `project_root`, `/api/system/subnet-pool`)
+> **Version**: 3.1
+> **Date**: 2026-08-22 (updated — v4 Service-ACL enforcement: cookie-only login (provision_token, token_type=cookie), Bearer access_token/refresh_token and gateway_token removed, no token-refresh flow, `/api/auth/logout` added; prior: API key management, `/api/auth/go/{hostname}` service-access redirect + ACL verify, two-token login cookies, multi-recipe deploy `project_root`, `/api/system/subnet-pool`)
 > **Purpose**: Step-by-step API workflows for the most important usage scenarios, directly usable with `curl` or any HTTP client.
 
 ---
@@ -53,59 +53,54 @@ curl -s -X POST http://localhost:8771/api/auth/setup \
 
 # Expected: 201 {"message": "Initial admin created. Please login."}
 
-# Step 3: Login with the new admin
-TOKEN=$(curl -s -X POST http://localhost:8771/api/auth/login \
+# Step 3: Login with the new admin (v4: sets the provision_token cookie; no Bearer body tokens)
+curl -s -X POST http://localhost:8771/api/auth/login \
   -H "Content-Type: application/json" \
+  -c /tmp/gw.cookies \
   -d '{
     "email": "admin@example.com",
     "password": "securePassword123"
-  }' | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+  }'
+# → 200 {"token_type": "cookie", "expires_in": 604800, "user_type": "admin", "admin": {...}}
 
-echo "Token: $TOKEN"
+echo "provision_token cookie stored in /tmp/gw.cookies"
 ```
 
 ---
 
 ## 2. Admin Authentication Flow
 
-**Goal:** Login, use token, refresh when expired.
+**Goal:** Login, use the session cookie, logout.
 
 ```bash
-# --- Login ---
-RESP=$(curl -s -X POST http://localhost:8771/api/auth/login \
+# --- Login (v4 cookie model) ---
+curl -s -X POST http://localhost:8771/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email": "admin@example.com", "password": "securePassword123"}')
+  -c /tmp/gw.cookies \
+  -d '{"email": "admin@example.com", "password": "securePassword123"}'
+# → 200 {"token_type": "cookie", "expires_in": 604800, "user_type": "admin", ...}
+# The response body carries NO access_token/refresh_token — the session is the
+# provision_token cookie (1-week). The legacy gateway_token cookie and the Bearer
+# access_token/refresh_token pair were REMOVED in v4.
 
-ACCESS_TOKEN=$(echo $RESP | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
-REFRESH_TOKEN=$(echo $RESP | python3 -c "import sys,json; print(json.load(sys.stdin)['refresh_token'])")
-
-# NOTE: login ALSO sets two httponly cookies (relevant for browser flows):
-#   - gateway_token   (24h) — dashboard/gateway API access
-#   - provision_token (1y)  — service access via provision-nginx
-# All /api/* gateway routes accept the gateway_token cookie OR a Bearer header.
-
-# --- Use token for authenticated requests ---
+# --- Use the cookie for authenticated requests ---
 curl -s http://localhost:8771/api/auth/me \
-  -H "Authorization: Bearer $ACCESS_TOKEN"
+  -b /tmp/gw.cookies
 
-# --- Refresh token when expired ---
-NEW_RESP=$(curl -s -X POST http://localhost:8771/api/auth/refresh \
-  -H "Content-Type: application/json" \
-  -d "{\"refresh_token\": \"$REFRESH_TOKEN\"}")
-
-ACCESS_TOKEN=$(echo $NEW_RESP | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+# (v4: there is no token-refresh endpoint — POST /api/auth/refresh no longer exists.)
 
 # --- Change password ---
 curl -s -X PUT http://localhost:8771/api/auth/password \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "current_password": "securePassword123",
     "new_password": "evenMoreSecure456"
   }'
 
-# --- Logout (client-side: discard tokens) ---
-# No server endpoint needed — just remove tokens from storage
+# --- Logout (v4: clears the provision_token cookie server-side) ---
+curl -s -X POST http://localhost:8771/api/auth/logout \
+  -b /tmp/gw.cookies -c /tmp/gw.cookies
 ```
 
 ---
@@ -138,30 +133,26 @@ ADMIN_TOKEN="..."
 curl -s -X PUT http://localhost:8771/api/auth/users/1/approve \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 
-# --- Login as approved end-user ---
-END_RESP=$(curl -s -X POST http://localhost:8771/api/auth/login \
+# --- Login as approved end-user (v4 cookie model) ---
+curl -s -X POST http://localhost:8771/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email": "alice", "password": "userpass123"}')
+  -c /tmp/end-user.cookies \
+  -d '{"email": "alice", "password": "userpass123"}'
 
-END_TOKEN=$(echo $END_RESP | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
-
-# Response includes: "user_type": "end_user", "user": {"id": 1, "username": "alice", "role": "viewer"}
-# Login also sets gateway_token (24h) + provision_token (1y) httponly cookies, and
-# auto-creates a default API key for end-users who have none.
+# Response includes: "token_type": "cookie", "user_type": "end_user",
+#   "user": {"id": 1, "username": "alice", "role": "viewer"}
+# Login sets the provision_token cookie (1-week) and auto-creates a default API key
+# for end-users who have none. The legacy gateway_token cookie and the Bearer
+# access_token/refresh_token pair were REMOVED in v4.
 # Special-role users are rejected at login (403 "Special users cannot access the dashboard").
 
-# --- Access with end-user token ---
+# --- Access with the session cookie ---
 curl -s http://localhost:8771/api/auth/me \
-  -H "Authorization: Bearer $END_TOKEN"
+  -b /tmp/end-user.cookies
 
 # Expected: {"id": 1, "email": "alice", "role": "viewer", "user_type": "end_user"}
 
-# --- Refresh end-user token ---
-curl -s -X POST http://localhost:8771/api/auth/refresh \
-  -H "Content-Type: application/json" \
-  -d "{\"refresh_token\": \"$REFRESH_TOKEN\"}"
-
-# Response includes: "user_type": "end_user"
+# (v4: there is no refresh endpoint — POST /api/auth/refresh no longer exists.)
 ```
 
 ---
@@ -840,23 +831,24 @@ curl -s -X POST http://localhost:8771/api/auth/users/register \
 
 # Expected: 201 with is_approved: false
 
-# Step 2: Login as admin
-ADMIN_TOKEN=$(curl -s -X POST http://localhost:8771/api/auth/login \
+# Step 2: Login as admin (v4 cookie model — no Bearer body token)
+curl -s -X POST http://localhost:8771/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email": "admin@example.com", "password": "securePassword123"}' \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+  -c /tmp/admin.cookies \
+  -d '{"email": "admin@example.com", "password": "securePassword123"}'
+# → 200 {"token_type": "cookie", "expires_in": 604800, ...}; session = provision_token cookie
 
 # Step 3: List all end-users
 curl -s http://localhost:8771/api/auth/users \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
+  -b /tmp/admin.cookies
 
 # Step 4: Approve the new user
 curl -s -X PUT http://localhost:8771/api/auth/users/2/approve \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
+  -b /tmp/admin.cookies
 
 # Step 5: Assign special users access
 curl -s -X PUT http://localhost:8771/api/auth/users/2 \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -b /tmp/admin.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "role": "viewer",
@@ -865,7 +857,7 @@ curl -s -X PUT http://localhost:8771/api/auth/users/2 \
 
 # Step 6: Promote to admin
 curl -s -X PUT http://localhost:8771/api/auth/users/2 \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -b /tmp/admin.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "role": "admin"
@@ -929,18 +921,20 @@ curl -s http://<service-host> \
 
 ```bash
 # The Services page URL links point here: /go/{service}-{user}-{label}.localhost
+# (v4: session is the provision_token cookie, not a Bearer header)
 curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" \
   http://localhost:8771/api/auth/go/siyuan-alice-0.localhost \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
-# Expected: 302 → http://siyuan-alice-0.localhost:8766/_set_token?token={provision_token}&redirect=/
-# The browser follows this; _set_token sets the provision_token cookie for the
-# service domain, then redirects to / to load the service.
+# Expected: 302 → http://siyuan-alice-0.localhost:8766/_set_token?code={30s HMAC exchange code}&redirect=/
+# v4: the code is a 30s HMAC exchange code, NEVER a live bearer JWT in the URL. The
+# service-side /_set_token is a plain variable proxy to /api/auth/exchange, which swaps
+# the code for the provision_token cookie via 302+Set-Cookie, then redirects to /.
 ```
 
 ### 24.2 nginx ACL verify (auth_request subrequest)
 
-`GET /api/auth/verify` is called by provision-nginx (`auth_request`) with no auth. It returns the status + `X-Auth-Action` header that nginx's `error_page` + `map $http_accept` turns into browser redirects or API status codes:
+`GET /api/auth/verify` is called by provision-nginx (`auth_request`) with no auth. It returns the status + `X-Auth-Action` header (and `X-Client-Type`, v4) that nginx's `error_page` + the v4 hybrid `X-Client-Type` rule turns into browser redirects or API status codes. The legacy `map $http_accept $is_browser` discriminator was removed in v4 (QA2):
 
 | Gateway response | X-Auth-Action | Browser redirect | API result |
 |---|---|---|---|

@@ -63,16 +63,15 @@ async def stream_task_log(
 ):
     """Stream task build log via Server-Sent Events (proxied to provision-api).
 
-    Authentication: accepts the ``gateway_token`` cookie, the
-    ``Authorization: Bearer`` header, OR the ``?token=`` query parameter
-    (for EventSource which cannot set headers). Uses ``decode_gateway_token``
-    so both ``type='gateway'`` (cookie) and ``type='access'`` (header/query)
-    credentials are honoured, per gateway-acl-architecture.md §5.
+    Authentication: accepts the ``provision_token`` cookie (v4 §11.2 / N5),
+    the legacy ``gateway_token`` cookie, the ``Authorization: Bearer`` header,
+    OR the ``?token=`` query parameter (EventSource fallback). Uses
+    ``decode_gateway_token`` which honours all these credential types.
     """
-    # Authenticate: gateway_token cookie first, then Authorization header,
-    # then query param token.
+    # Authenticate: provision_token cookie first, then gateway_token cookie,
+    # Authorization header, then query param token.
     admin = None
-    actual_token = request.cookies.get("gateway_token", "")
+    actual_token = request.cookies.get("provision_token", "") or request.cookies.get("gateway_token", "")
     if not actual_token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):

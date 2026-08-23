@@ -1,9 +1,14 @@
 #!/bin/bash
 # Integration test script for provision-gateway
 # Tests the gateway API against the running provision-api stack.
+#
+# v4 auth (F4/N5): login sets a HttpOnly provision_token cookie; there is no
+# access_token/refresh_token in the body. All authenticated calls use a cookie
+# jar (-c to save on login, -b to send on each request).
 set -e
 
 GATEWAY_URL="${GATEWAY_URL:-http://localhost:8870}"
+COOKIE_JAR="$(mktemp)"
 PASS=0
 FAIL=0
 
@@ -49,50 +54,51 @@ else
     FAIL=$((FAIL + 1))
 fi
 
-# ---- Auth: Login ----
+# ---- Auth: Login (v4: provision_token cookie) ----
 echo ""
 echo "3. Auth Login"
-LOGIN_RESP=$(curl -s -X POST "$GATEWAY_URL/api/auth/login" \
+LOGIN_RESP=$(curl -s -c "$COOKIE_JAR" -X POST "$GATEWAY_URL/api/auth/login" \
     -H "Content-Type: application/json" \
     -d '{"email":"admin@subnet-acl.local","password":"admin-pass-123"}')
-check "Login returns access_token" '"access_token"' "$LOGIN_RESP"
+check "Login returns cookie auth" '"token_type":"cookie"' "$LOGIN_RESP"
 
-# Extract token
-TOKEN=$(echo "$LOGIN_RESP" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
-if [ -z "$TOKEN" ]; then
-    echo "  ✗ Could not extract token"
-    exit 1
+# Verify the cookie jar actually contains provision_token
+if grep -q "provision_token" "$COOKIE_JAR"; then
+    echo "  ✓ provision_token cookie saved"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ no provision_token cookie in jar"
+    FAIL=$((FAIL + 1))
 fi
-echo "  Token obtained: ${TOKEN:0:20}..."
 
 # ---- Auth: Me ----
 echo ""
 echo "4. Auth Me"
-ME_RESP=$(curl -s "$GATEWAY_URL/api/auth/me" -H "Authorization: Bearer $TOKEN")
+ME_RESP=$(curl -s -b "$COOKIE_JAR" "$GATEWAY_URL/api/auth/me")
 check "GET /me returns email" '"email"' "$ME_RESP"
 
 # ---- Users ----
 echo ""
 echo "5. Users Proxy"
-USERS_RESP=$(curl -s "$GATEWAY_URL/api/users" -H "Authorization: Bearer $TOKEN")
+USERS_RESP=$(curl -s -b "$COOKIE_JAR" "$GATEWAY_URL/api/users")
 check "GET /users returns users" '"users"' "$USERS_RESP"
 
 # ---- Tasks ----
 echo ""
 echo "6. Tasks Proxy"
-TASKS_RESP=$(curl -s "$GATEWAY_URL/api/tasks" -H "Authorization: Bearer $TOKEN")
+TASKS_RESP=$(curl -s -b "$COOKIE_JAR" "$GATEWAY_URL/api/tasks")
 check "GET /tasks returns tasks" '"tasks"' "$TASKS_RESP"
 
 # ---- Audit ----
 echo ""
 echo "7. Audit Logs"
-AUDIT_RESP=$(curl -s "$GATEWAY_URL/api/audit" -H "Authorization: Bearer $TOKEN")
+AUDIT_RESP=$(curl -s -b "$COOKIE_JAR" "$GATEWAY_URL/api/audit")
 check "GET /audit returns entries" '"entries"' "$AUDIT_RESP"
 
 # ---- System ----
 echo ""
 echo "8. System Status"
-SYS_RESP=$(curl -s "$GATEWAY_URL/api/system/status" -H "Authorization: Bearer $TOKEN")
+SYS_RESP=$(curl -s -b "$COOKIE_JAR" "$GATEWAY_URL/api/system/status")
 check "GET /system/status returns gateway" '"gateway"' "$SYS_RESP"
 
 # ---- Unauthorized ----
@@ -106,6 +112,8 @@ echo ""
 echo "============================================"
 echo "Results: $PASS passed, $FAIL failed"
 echo "============================================"
+
+rm -f "$COOKIE_JAR"
 
 if [ "$FAIL" -gt 0 ]; then
     exit 1

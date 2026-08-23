@@ -13,10 +13,9 @@ export function useSSE(url: string | null) {
       return
     }
 
-    const token = localStorage.getItem('access_token')
-    // For SSE, we pass token as query param since EventSource doesn't support custom headers
-    const urlWithAuth = `${url}${url.includes('?') ? '&' : '?'}token=${token}`
-    const es = new EventSource(urlWithAuth)
+    // v4 §11.2 (N5): auth is the provision_token cookie, auto-sent by
+    // EventSource for same-origin requests. No query-param token.
+    const es = new EventSource(url)
     eventSourceRef.current = es
 
     es.onopen = () => setIsConnected(true)

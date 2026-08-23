@@ -1,7 +1,7 @@
 # Provision Gateway — WebUI Operation Sequences
 
-> Version: 3.0
-> Date: 2026-08-19 (updated — merged webui feature work: API Keys page, Alert page, viewer role-gating (AdminRoute), /go/{hostname} service access, multi-recipe DeployForm, two-token login, Dashboard Subnet Pool card)
+> Version: 3.1
+> Date: 2026-08-22 (updated — v4 Service-ACL enforcement: cookie-only login (provision_token), two-token/JWT-body login model removed, /go/ issues a 30s exchange code with no JWT in URL; prior: API Keys page, Alert page, viewer role-gating (AdminRoute), /go/{hostname} service access, multi-recipe DeployForm, two-token login, Dashboard Subnet Pool card)
 > Purpose: Document all operation sequences defined by each button on the webui, verified for correctness.
 > Verified against: actual running dashboard at http://localhost:8771
 
@@ -196,7 +196,7 @@ Each service card shows these buttons:
   - Volumes (if available)
 - **Status**: ✅ Working
 
-**Service-access redirect (`/go/{hostname}`)** — clicking the URL link opens `/go/{service}-{user}-{label}.localhost` on the gateway. `GET /api/auth/go/{hostname}` validates the `gateway_token`, looks up the hostname in the HostnameIndex, checks the viewer's ACL (own service or `allowed_special_users`), then 302-redirects to `http://{host}:{NGINX_HTTP_PORT}/_set_token?token={provision_token}&redirect=/`. That endpoint sets the `provision_token` cookie for the service domain and loads the service root. A cookie exchange is required because the login cookie is host-scoped and is NOT sent to the service hostname directly.
+**Service-access redirect (`/go/{hostname}`)** — clicking the URL link opens `/go/{service}-{user}-{label}.localhost` on the gateway. `GET /api/auth/go/{hostname}` validates the `provision_token` session, looks up the hostname in the HostnameIndex, checks the viewer's ACL (own service or `allowed_special_users`), then issues a **30s HMAC exchange code** + `Location` header — **no JWT in the URL** (v4 F7). The service-side `/_set_token` is a plain variable proxy to `/api/auth/exchange`, which swaps the code for the `provision_token` cookie via `302`+`Set-Cookie` and loads the service root. A cookie exchange is required because the login cookie is host-scoped and is NOT sent to the service hostname directly.
 
 ### 3.7 Test Button
 - **Trigger**: Click "Test" link next to URL
@@ -311,7 +311,7 @@ Each service card shows these buttons:
 
 ### 8.1 Login
 - **Trigger**: Fill email + password → click "Log In"
-- **Sequence**: POST /api/auth/login → JWT tokens (`access_token`/`refresh_token` saved in localStorage) PLUS two httponly cookies: `gateway_token` (24h, dashboard/gateway API access) and `provision_token` (1y, service access via provision-nginx) → redirect to /dashboard
+- **Sequence**: POST /api/auth/login → sets a single `provision_token` httponly cookie (1-week, token_type=cookie; the Bearer `access_token`/`refresh_token` body pair and the legacy `gateway_token` cookie were removed in v4) → redirect to /dashboard
 - **Status**: ✅ Working
 
 ### 8.2 Register New Account
@@ -402,9 +402,9 @@ Each service card shows these buttons:
 1. ✅ **Viewer role-gating (AdminRoute)** — App.tsx now wraps Dashboard/Source Projects/Tasks/Settings/Audit/Users/SSL in `AdminRoute` (non-admins → redirect `/users`); `/users`, `/api-keys`, `/alert` remain viewer-accessible. Sidebar hides admin items for viewers (Services + API Keys only).
 2. ✅ **API Keys page (`/api-keys`)** — Create Key (label; admin may set User ID), one-time token display + Copy, list (admin sees all + User ID column, viewer sees own), Revoke. Endpoints: POST/GET `/api/auth/keys`, DELETE `/api/auth/keys/{id}`.
 3. ✅ **Alert page (`/alert`)** — `?reason=acl_denied` (Access Denied — no access to {service}) and `?reason=token_expired` (API Token Expired) variants; reached from subnet-acl nginx `@auth_403` → `/alert?reason=acl_denied&service={host}` (expired token → `/login`).
-4. ✅ **`/go/{hostname}` service access** — Services page URL links use `/go/{service}-{user}-{label}.localhost`; gateway `GET /api/auth/go/{hostname}` 302s to `http://{host}:{port}/_set_token?token={provision_token}&redirect=/` to set the service-domain cookie.
+4. ✅ **`/go/{hostname}` service access** — Services page URL links use `/go/{service}-{user}-{label}.localhost`; gateway `GET /api/auth/go/{hostname}` issues a 30s HMAC exchange code and 302s to `http://{host}:{port}/_set_token?code={code}&redirect=/`; `/_set_token` proxies to `/api/auth/exchange`, which sets the service-domain `provision_token` cookie (v4 — no JWT in any URL).
 5. ✅ **Multi-recipe DeployForm** — Service dropdown lists `name @ recipe_path` (value `name@@recipe_path`); `check-missing-files?recipe_path=...` scopes readiness checks; deploy `project_root = {base}/{recipe_path}`.
-6. ✅ **Two-token login** — login sets `gateway_token` (24h) + `provision_token` (1y) httponly cookies in addition to the JWT JSON body.
+6. ✅ **Cookie-only login (v4)** — login sets a single `provision_token` (1-week) httponly cookie; the legacy two-token (`gateway_token` + `provision_token`) and the JWT JSON body (`access_token`/`refresh_token`) model was removed in v4.
 7. ✅ **Dashboard Subnet Pool card** — renders `GET /api/system/subnet-pool` pools (CIDR, used %, slots used/total).
 
 **ITERATION 1 (2026-07-05):**

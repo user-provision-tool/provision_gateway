@@ -8,18 +8,23 @@ import sys
 import json
 import time
 import os
+import tempfile
 
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8870")
 PROVISION_API_URL = os.environ.get("PROVISION_API_URL", "http://127.0.0.1:8875")
 
 def run_curl(method, path, data=None, token=None):
-    """Make a curl request and return (status_code, response_body)."""
+    """Make a curl request and return (status_code, response_body).
+
+    ``token`` is a v4 cookie-jar path. Login saves the HttpOnly provision_token
+    cookie with ``-c``; every request sends it with ``-b``.
+    """
     url = f"{GATEWAY_URL}{path}"
     cmd = ["curl", "-s", "-w", "\n%{http_code}", "-X", method, url]
     if data:
         cmd.extend(["-H", "Content-Type: application/json", "-d", json.dumps(data)])
     if token:
-        cmd.extend(["-H", f"Authorization: Bearer {token}"])
+        cmd.extend(["-c", token, "-b", token])
     
     result = subprocess.run(cmd, capture_output=True, text=True)
     output = result.stdout.strip()
@@ -54,15 +59,22 @@ def test_health():
     print("  ✓ Health check passed")
 
 
-def test_auth_flow():
-    """Test full auth flow: setup, login, refresh, me."""
+def test_auth_flow(tmp_path):
+    """Test full auth flow: setup, login (cookie), me, logout (v4).
+
+    Pytest supplies ``tmp_path`` (pathlib.Path); ``main()`` supplies a plain
+    cookie-jar path string. Both are accepted.
+    """
     print("\nTesting auth flow...")
-    
-    # Clean up: login to check if admin exists
+
+    if isinstance(tmp_path, str):
+        cookie_jar = tmp_path
+    else:
+        cookie_jar = str(tmp_path / "cookies.txt")
     login_data = {"email": "gw-test@example.com", "password": "testpass123"}
-    
+
     # Try setup
-    status, body = run_curl("POST", "/api/auth/setup", login_data)
+    status, body = run_curl("POST", "/api/auth/setup", login_data, token=cookie_jar)
     if status == 409:
         print("  Admin already exists, using existing credentials")
         # Use the existing admin
@@ -71,29 +83,29 @@ def test_auth_flow():
         print("  Created test admin")
     else:
         print(f"  Setup response: {status} {body}")
-    
-    # Login
-    status, body = run_curl("POST", "/api/auth/login", login_data)
+
+    # Login (v4: cookie auth, no access_token in body)
+    status, body = run_curl("POST", "/api/auth/login", login_data, token=cookie_jar)
     assert status == 200, f"Login failed: {body}"
-    token = body.get("access_token")
-    refresh_token = body.get("refresh_token")
-    assert token is not None
+    assert body.get("token_type") == "cookie", f"expected cookie auth, got: {body}"
     assert body.get("admin") is not None
-    print("  ✓ Login successful")
-    
+    # HttpOnly provision_token cookie must be present in the jar
+    with open(cookie_jar) as f:
+        assert "provision_token" in f.read(), "no provision_token cookie saved"
+    print("  ✓ Login successful (provision_token cookie)")
+
     # Get me
-    status, me = run_curl("GET", "/api/auth/me", token=token)
+    status, me = run_curl("GET", "/api/auth/me", token=cookie_jar)
     assert status == 200
     assert me.get("email") is not None
     print("  ✓ GET /me works")
-    
-    # Refresh token
-    status, refresh_body = run_curl("POST", "/api/auth/refresh", {"refresh_token": refresh_token})
+
+    # Logout (v4 removed the refresh endpoint; logout clears the cookie)
+    status, logout_body = run_curl("POST", "/api/auth/logout", token=cookie_jar)
     assert status == 200
-    assert refresh_body.get("access_token") is not None
-    print("  ✓ Token refresh works")
-    
-    return token
+    print("  ✓ Logout works")
+
+    return cookie_jar
 
 
 def test_users_proxy(token):
@@ -165,7 +177,7 @@ def test_tasks_log_sse_endpoint(token):
     url = f"{GATEWAY_URL}/api/tasks/nonexistent_task_id_12345/log?tail=5&follow=false"
     cmd = [
         "curl", "-s", "-w", "\n%{http_code}",
-        "-H", f"Authorization: Bearer {token}",
+        "-c", token, "-b", token,
         "--max-time", "5",
         url,
     ]
@@ -225,7 +237,12 @@ def main():
     token = None
     for test_fn in tests:
         try:
-            result = test_fn()
+            if test_fn is test_auth_flow:
+                # tmp_path is a pytest fixture; main() supplies a temp dir.
+                tmp = tempfile.mkdtemp(prefix="gw-int-")
+                result = test_auth_flow(os.path.join(tmp, "cookies.txt"))
+            else:
+                result = test_fn()
             if result:
                 token = result
         except AssertionError as e:

@@ -113,7 +113,7 @@ bash tests/test_provision_api.sh
 | `/api/auth/setup` | POST | ✅ | integration.py, integration.sh |
 | `/api/auth/register` | POST | ❌ | — |
 | `/api/auth/login` | POST | ✅ | integration.py, integration.sh |
-| `/api/auth/refresh` | POST | ✅ | integration.py |
+| `/api/auth/refresh` | POST | — (removed in v4) | v4 dropped the three-credential token model — endpoint no longer exists; covered by `TestV4AuthEndpoints` |
 | `/api/auth/me` | GET | ✅ | integration.sh |
 | `/api/auth/verify` | GET | ✅ | test_unit.py (TestAuthVerifyHeaders, TestVerifyAuthStatusCodes) |
 | `/api/auth/password` | PUT | ❌ | — |

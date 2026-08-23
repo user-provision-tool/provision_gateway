@@ -1,7 +1,7 @@
 # Provision Gateway — Features Status
 
-> **Version**: 2.1
-> **Date**: 2026-08-19 (updated — subnet-acl ACL/role-gating/API-keys/alerts (2026-08-14) + multi-recipe recipe_path support merged from main (2026-08-19))
+> **Version**: 2.2
+> **Date**: 2026-08-22 (updated — v4 Service-ACL enforcement merged and live-verified: three-credential token model, hybrid X-Client-Type verify, byte-identical per-service nginx confs + env.d mode switch, unified nginx assembly + portal mode, `/__basic__/` Basic short-circuit, default API key; live-deployment QA fixes QA1–QA4)
 > **Purpose**: Quick reference and implementation status tracker for all features.
 
 ---
@@ -23,19 +23,19 @@
 | # | Feature | Status | Notes |
 |---|---|---|---|
 | A1 | Admin registration (first-run setup) | ✅ | `/api/auth/setup`, SetupWizard page |
-| A2 | Admin login (email + password → JWT) | ✅ | Access token (1h) + Refresh token (7d) |
-| A3 | Token auto-refresh | ✅ | Axios interceptor in `client.ts` |
+| A2 | Admin login (email + password) | ✅ | v4 cookie-jar auth — `POST /api/auth/login` returns a `provision_token` cookie (token_type=cookie, Max-Age=604800); Bearer access_token/refresh_token removed |
+| A3 | Token auto-refresh | 🔴 | Removed in v4 — `/api/auth/refresh` dropped (three-credential model); auth via provision_token cookie; `POST /api/auth/logout` clears it |
 | A4 | Role-based access (admin/viewer) | ✅ | `require_admin_role()` dependency |
 | A5 | Password change | ✅ | `PUT /api/auth/password` |
 | A6 | End-user registration (portal users) | ✅ | `POST /api/auth/users/register` |
 | A7 | End-user approval workflow | ✅ | `PUT /api/auth/users/{id}/approve` |
 | A8 | End-user role management | ✅ | `PUT /api/auth/users/{id}` — roles: viewer, special, admin |
-| A9 | Special users per-user assignment | ✅ | Per-user `allowed_special_users` via toggleable tags modal in Users page |
+| A9 | Special users per-user assignment | ✅ | Per-user `allowed_special_users` via toggleable tags modal in Users page; v4 F8 B11 — special users blocked at dashboard (login 403 special; middleware blocks role=special) |
 | A10 | Deployable users list | ✅ | `GET /api/auth/users/deployable` — DB-driven, returns approved+active users |
-| A11 | End-user login (JWT with user_type) | ✅ | `POST /api/auth/login` supports both admin and end-user tokens |
+| A11 | End-user login (JWT with user_type) | ✅ | `POST /api/auth/login` supports both admin and end-user tokens; role=special → 403 at login, middleware blocks role=special (F8 B11) |
 | A12 | Role-based sidebar filtering | ✅ | End-user viewers see only Services page |
 | A13 | Auto-register deployed users | ✅ | `GET /api/users` syncs provision-api users into gateway `end_users` table on each list |
-| A14 | Special users as DB records | ✅ | Special users registered via Users page (role="special"), not via Settings textarea |
+| A14 | Special users as DB records | ✅ | Special users registered via Users page (role="special"), not via Settings textarea; role=special blocked at dashboard (login 403, F8 B11) |
 
 ---
 
@@ -238,17 +238,22 @@
 
 | # | Feature | Status | Notes |
 |---|---|---|---|
-| ACL1 | ENABLE_ACL environment variable | ✅ | Toggle ACL-based service access control at gateway level |
-| ACL2 | /api/auth/verify endpoint | ✅ | NGINX auth_request subrequest; validates JWT from provision_token cookie or X-Provision-Token header |
-| ACL3 | gateway_token cookie (admin session) | ✅ | HTTP-only cookie set on admin login for dashboard auth — 24h TTL (`JWT_EXPIRE_SEC`) |
-| ACL4 | provision_token cookie (service access) | ✅ | HTTP-only cookie set on /go/{hostname} redirect for service access — 1y TTL (`PROVISION_COOKIE_TTL`) |
-| ACL11 | Two-token login model | ✅ | `POST /api/auth/login` sets both `gateway_token` (24h) and `provision_token` (1y) HTTP-only cookies; Bearer `access_token`/`refresh_token` also returned for API clients |
+| ACL1 | ENABLE_ACL environment variable | ✅ | v4: env.d one-liner mode switch — `write_env_d` writes `set $auth_mode acl;|basic;`; per-service conf is byte-identical across modes (never regenerated on mode switch); defaults `false` (N8) |
+| ACL2 | /api/auth/verify endpoint | ✅ | NGINX auth_request subrequest; v4 hybrid X-Client-Type rule (X-Provision-Token header ⇒ api / provision_token cookie ⇒ browser / Accept text/html ⇒ browser / else ⇒ api); X-Client-Type on every response; X-Auth-Action always incl. unauthorized; nginx Accept `is_browser` map removed; F3 ordering — revocation check runs before admin bypass (R1), provision_token validated for `expires_at` and active/approved |
+| ACL3 | gateway_token cookie (admin session) | 🔴 | Removed in v4 — gateway mints only `provision_token` (+ 30s exchange code); middleware no longer validates `gateway_token` |
+| ACL4 | provision_token cookie (service access) | ✅ | HTTP-only cookie; v4 1-week TTL (604800s via `create_provision_token`) bound to the default key's `api_key_id`; cookie Max-Age=604800 (compose default `PROVISION_COOKIE_TTL` fixed in QA3) |
+| ACL11 | Login token model | ✅ | v4 three credentials: `provision_token` + 30s exchange code; Bearer `access_token`/`refresh_token` dropped; `POST /api/auth/logout` added (clears cookie) |
 | ACL5 | HostnameIndex | ✅ | In-memory hostname-to-registry-entry lookup; maps service URLs to registry entries |
 | ACL6 | Registry (user_registry.yml) | ✅ | Read-only registry wrapper; reads provision-api registry via shared filesystem |
-| ACL7 | /go/{hostname} service redirect | ✅ | Dashboard redirect to service URL with provision_token cookie |
-| ACL8 | Viewer ACL: own services only | ✅ | Viewers can only access their own services + allowed_special_users |
+| ACL7 | /go/{hostname} service redirect | ✅ | v4: issues 30s HMAC-signed exchange code + `Location` header; `/api/auth/exchange` swaps code→provision_token via 302+Set-Cookie (`; Secure` per registry flag); no JWT in URL (F7) |
+| ACL8 | Viewer ACL: own services only | ✅ | Viewers access own services + allowed_special_users; v4 N1 trims each allowed_special_users element |
 | ACL9 | Admin unrestricted access | ✅ | Admins have unrestricted access to all services |
-| ACL10 | X-Service-Basic credential injection | ✅ | Base64-encoded username:password header for nginx auth_basic on target service |
+| ACL10 | X-Service-Basic credential injection | ✅ | Base64 user:password header for nginx auth_basic on target service; v4 N2 — no "123456" fallback (passwd-less returns empty credential) |
+| ACL12 | Byte-identical per-service conf + env.d mode switch | ✅ | `render_nginx_conf` always injects the v4 scaffolding (no ENABLE_ACL branch); per-service conf byte-identical across ENABLE_ACL/modes (test `test_render_nginx_conf_byte_identical_across_enable_acl`) |
+| ACL13 | `/__basic__/` Basic short-circuit | ✅ | internal `location /__basic__/` holds the only `auth_basic`/`auth_basic_user_file`; empty env.d ⇒ `$auth_mode ""` ⇒ `/__basic__/` with 0 gateway subrequests (B5/B12) |
+| ACL14 | Minimal deployment (empty dirs ⇒ Basic) | ✅ | unified `nginx.provision.conf` + `default_server 444` catch-all; docker `nginx -t` clean with empty env.d/portal.d/services.d and minimal+services (F5) |
+| ACL15 | Portal mode + unified assembly | ✅ | portal.d + services.d + env.d includes; `PORTAL_MODE` http/https (443 ssl + 80 301); portal verify/exchange return 404; compose env plumbing (F6) |
+| ACL16 | API-first 401/403 | ✅ | `@auth_401/@auth_403` return 401/403 for non-browser client_type; `WWW-Authenticate` always on 401; no `?redirect=` param (GAP-14) |
 
 ---
 
@@ -259,8 +264,10 @@
 | AK1 | Create API key | ✅ | `POST /api/auth/keys`; admin for any user, viewer for self |
 | AK2 | List API keys | ✅ | `GET /api/auth/keys`; admin sees all, viewer sees own |
 | AK3 | Revoke/delete API key | ✅ | `DELETE /api/auth/keys/{id}`; admin revokes any, viewer own |
-| AK4 | API key with provision token | ✅ | Key creation returns raw token, provision_token for service access |
+| AK4 | API key with provision token | ✅ | Key creation returns raw token; v4 provision_token for service access is 1-week (604800s) bound to the default key |
 | AK5 | ApiKeysPage frontend | ✅ | Admin page at /api-keys for managing end-user API keys |
+| AK6 | Default key (is_default) | ✅ | `ApiKey.is_default` + partial unique index; `PUT /keys/{id}/default`; `DELETE /keys` rejects revoking the default (400); default created at registration and for admins; 1000-key cap / lazy eviction; live DB migrated via `_ensure_schema` (QA1) |
+| AK7 | API key = JWT + mask + real user_type | ✅ | Keys minted as 1-year JWT provision tokens with own `api_key_id` + `mask`; key-targeted tokens carry the target's real `user_type` (GAP-07) |
 
 ---
 
@@ -290,9 +297,9 @@
 
 | Category | Total | Implemented | Verified | Gaps |
 |---|---|---|---|---|
-| Authentication | 14 | 14 | 14 | 0 |
+| Authentication | 14 | 13 | 13 | 1 |
 | Dashboard | 8 | 8 | 8 | 0 |
-| Service Management | 19 | 17 | 17 | 0 |
+| Service Management | 19 | 17 | 17 | 2 |
 | User Provisioning | 15 | 15 | 15 | 0 |
 | Service URL & Connectivity | 5 | 5 | 5 | 0 |
 | LLM Integration | 16 | 15 | 15 | 1 |
@@ -303,11 +310,11 @@
 | Proxy Management | 9 | 9 | 9 | 0 |
 | User Management | 7 | 7 | 7 | 0 |
 | MCP Server | 6 | 6 | 6 | 0 |
-| ACL & Access Control | 11 | 11 | 11 | 0 |
-| API Key Management | 5 | 5 | 5 | 0 |
+| ACL & Access Control | 16 | 15 | 15 | 1 |
+| API Key Management | 7 | 7 | 7 | 0 |
 | Alerts Page | 2 | 2 | 2 | 0 |
 | Multi-Recipe Services | 6 | 6 | 6 | 0 |
-| **TOTAL** | **149** | **146** | **146** | **3** |
+| **TOTAL** | **156** | **151** | **151** | **5** |
 
-**Implementation Rate:** 146/149 = **98.0%**
-**Verified Rate:** 146/149 = **98.0%**
+**Implementation Rate:** 151/156 = **96.8%**
+**Verified Rate:** 151/156 = **96.8%**

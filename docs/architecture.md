@@ -1,7 +1,7 @@
 # Provision Gateway — Architecture Document
 
-> **Version**: 1.2
-> **Date**: 2026-08-01 (updated — Cycle 20260801T165901Z Iteration 1: LLM client BYOK-only / llm_config mode default 'byok' (GAP-2), Add Project modal 2 tabs (GAP-1), test-suite counts)
+> **Version**: 1.3
+> **Date**: 2026-08-22 (updated — v4 Service-ACL enforcement: three-credential token model dropped (access_token/refresh_token/gateway_token), `/api/auth/refresh` removed, `/go/` 30s exchange code with no JWT in URL, env.d mode-switch; prior: LLM client BYOK-only / llm_config mode default 'byok' (GAP-2), Add Project modal 2 tabs (GAP-1), test-suite counts)
 > **Status**: Current (reflects implemented codebase, post-deduplication refactor)
 
 ---
@@ -147,48 +147,49 @@ Per-User Networks (isolated)
 | Access Path | Protocol | Authentication | Restriction |
 |---|---|---|---|
 | Browser → Dashboard | HTTP | None (network) | `127.0.0.1:8771` only |
-| Dashboard → Gateway | HTTP | JWT Bearer | Internal Docker DNS |
+| Dashboard → Gateway | HTTP | `provision_token` cookie (v4) | Internal Docker DNS |
 | MCP → Gateway | HTTP | JWT Bearer | Internal Docker DNS |
 | Gateway → provision-api | HTTP | None | Internal Docker DNS |
-| End User → provision-nginx | HTTP/HTTPS | HTTP Basic Auth (htpasswd) | Public |
+| End User → provision-nginx | HTTP/HTTPS | v4 mode switch: `$auth_mode=acl` → gateway `/api/auth/verify` (provision_token cookie / X-Provision-Token); `$auth_mode=basic` → htpasswd via `/__basic__/` | Public |
 | End User → Service Container | HTTP | Service-specific | Via provision-nginx proxy |
 
 ### 3.3 ACL (Access Control List)
 
-When `ENABLE_ACL=true` (disabled by default), the gateway enforces fine-grained service access control through nginx `auth_request` subrequests.
+The gateway enforces fine-grained service access control through nginx `auth_request` subrequests. **v4 model:** `ENABLE_ACL` only switches the env.d mode one-liner (`set $auth_mode acl;|basic;`) — the per-service nginx conf is **byte-identical** across modes (never regenerated on mode switch; F1/ACL12).
 
 **How it works:**
 
-1. **Cookie-based authentication**: Two HTTP-only cookies carry access tokens (both are set at login; `provision_token` is re-issued on `/go/{hostname}` redirects):
-   - `gateway_token` — **Short-lived (24h)** JWT set on dashboard login; gates every `/api/*` dashboard request via the `require_gateway_token` / `require_admin` dependencies in `app/middleware/__init__.py` (commit 0ef9584).
-   - `provision_token` — **Long-lived (1-year)** JWT set on login and refreshed on `/go/{hostname}` redirect; used by nginx `auth_request` to authorize end-user service access.
+1. **Cookie-based authentication**: a single HTTP-only cookie carries the session:
+   - `provision_token` — **1-week (604800s, `PROVISION_COOKIE_TTL`)** JWT set at login (token_type=cookie). Gates every `/api/*` dashboard request via the `require_gateway_token` / `require_admin` dependencies in `app/middleware/__init__.py`, and is consumed by nginx `auth_request` to authorize end-user service access. The legacy `gateway_token` cookie and the Bearer `access_token`/`refresh_token` pair were **removed in v4** (three-credential model dropped; `POST /api/auth/refresh` removed, `POST /api/auth/logout` added).
 
-2. **`/api/auth/verify` endpoint**: Called by provision-nginx as an `auth_request` subrequest before serving any end-user service traffic. The endpoint:
+2. **`/api/auth/verify` endpoint**: Called by provision-nginx as an `auth_request` subrequest in ACL mode. The endpoint:
    - Extracts JWT from `provision_token` cookie or `X-Provision-Token` header.
-   - If ACL is disabled (`ENABLE_ACL=false`): returns 401 so nginx falls back to `auth_basic` (Basic auth dialog).
-   - If ACL is enabled: validates the JWT, looks up the target service by hostname, and checks whether the authenticated user is authorized to access that service.
+   - Applies the v4 **hybrid `X-Client-Type` rule** (X-Provision-Token header ⇒ api / provision_token cookie ⇒ browser / Accept text/html ⇒ browser / else ⇒ api); `X-Client-Type` on every response, `X-Auth-Action` always.
+   - In Basic mode (`$auth_mode` empty), nginx short-circuits via `/__basic__/` with **0 gateway subrequests** — verify is not called at all.
+   - In ACL mode: validates the JWT, looks up the target service by hostname, and checks whether the authenticated user is authorized (revocation check runs before admin bypass; `expires_at` and active/approved validated — F3 ordering).
 
 3. **Authorization rules**:
    - **Admins**: Have unrestricted access to all services.
    - **Viewers**: Can only access their own services (where `target_user == viewer's username`) plus services belonging to users in their `allowed_special_users` list.
+   - **Special users** (role=special): blocked at dashboard login (403) and cannot receive provision tokens (F8 B11).
    - **Denied**: Returns 403 with `X-Auth-Action: acl_denied` header.
    - **Token missing**: Returns 401 with `X-Auth-Action: login_required`.
    - **Token expired**: Returns 401 with `X-Auth-Action: token_expired`.
 
-4. **Credential injection**: On successful verification, the endpoint returns an `X-Service-Basic` header containing the base64-encoded `username:password` for the target service's auth_basic. Nginx uses this to authenticate against the service's htpasswd.
+4. **Credential injection**: On successful verification, the endpoint returns an `X-Service-Basic` header containing the base64-encoded `username:password` for the target service's auth_basic. Nginx uses this to authenticate against the service's htpasswd (v4 N2 — no "123456" fallback).
 
 5. **Hostname-to-service resolution**: Two in-memory services read `user_registry.yml` from the shared filesystem:
    - **HostnameIndex** (`app/services/hostname_index.py`): Maps hostnames (e.g., `myapp-alice-0.localhost`) to registry entries for O(1) lookup.
    - **Registry** (`app/services/registry.py`): Read-only registry wrapper for listing all entries.
 
-6. **Service access redirect (`/go/{hostname}`)**: Dashboard endpoint that validates the `gateway_token`, checks ACL, creates a `provision_token`, and redirects the browser to the service URL with the provision token set via `/_set_token`.
+6. **Service access redirect (`/go/{hostname}`)**: Dashboard endpoint that validates the `provision_token` session, checks ACL, and issues a **30s HMAC-signed exchange code** + `Location` header — **no JWT in any URL** (F7). The service-side `/_set_token` is a plain variable proxy to `/api/auth/exchange`, which swaps the code for the `provision_token` cookie via `302`+`Set-Cookie`.
 
 **ACL-related environment variables:**
 | Variable | Default | Description |
 |---|---|---|
-| `ENABLE_ACL` | `false` | Enable ACL-based access control |
+| `ENABLE_ACL` | `false` | v4 env.d mode switch: `true` → `set $auth_mode acl;`; `false` → `set $auth_mode basic;` (per-service conf byte-identical) |
 | `REGISTRY_FILE` | `generated/user_registry.yml` | Path to the registry YAML file |
-| `PROVISION_COOKIE_TTL` | `86400` | Provision token cookie TTL in seconds |
+| `PROVISION_COOKIE_TTL` | `604800` | Provision token cookie TTL in seconds (compose default; QA3) |
 
 ### 3.4 API Key Authentication
 
@@ -245,8 +246,8 @@ app/
 │   └── proxy_service.py     # Proxy config CRUD + env injection
 │
 ├── middleware/           # Middleware
-│   ├── __init__.py          # JWT verification — require_gateway_token, require_admin (gateway_token cookie or Bearer, 24h TTL) gate every /api/* route;
-│   │                        #   they replaced the legacy get_current_admin / get_current_user / require_admin_role (Bearer access_token, 1h TTL — retained for reference)
+│   ├── __init__.py          # JWT verification — require_gateway_token, require_admin (provision_token cookie, 1-week TTL) gate every /api/* route;
+│   │                        #   v4: the legacy gateway_token cookie / Bearer access_token model was dropped (three-credential removal)
 │
 ├── lib/                 # Shared utilities (no converters — delegated to provision-api)
 │
@@ -297,13 +298,13 @@ gateway.db
 ```
 Request → FastAPI Router
     → get_db()                     (DB session)
-    → require_gateway_token()      (JWT verification → unified user lookup; gateway_token cookie or Bearer, 24h TTL)
+    → require_gateway_token()      (JWT verification → unified user lookup; provision_token cookie, 1-week TTL)
     → require_admin()              (role check: admin vs viewer — replaces legacy require_admin_role)
     → Service Layer                (business logic)
     → Response
 ```
 
-`require_gateway_token()` (the replacement for the legacy `get_current_admin()`/`get_current_user()` on `/api/*` routes) supports both admin (gateway admins) and end-user (portal users) tokens via the `gateway_token` cookie or `Authorization: Bearer`. It returns a unified dict with keys: `id`, `email`, `role`, `user_type`. The JWT `user_type` claim (`admin` or `end_user`) determines which table is queried; special users (role=special) are blocked with 403. `require_admin()` layers the admin-only role check on top.
+`require_gateway_token()` (the replacement for the legacy `get_current_admin()`/`get_current_user()` on `/api/*` routes) supports both admin (gateway admins) and end-user (portal users) sessions via the v4 `provision_token` cookie (the legacy `gateway_token` cookie and Bearer tokens were removed in v4). It returns a unified dict with keys: `id`, `email`, `role`, `user_type`. The JWT `user_type` claim (`admin` or `end_user`) determines which table is queried; special users (role=special) are blocked at login with 403 and blocked in middleware with 403. `require_admin()` layers the admin-only role check on top.
 
 ### 4.4 Singleton Services
 
@@ -395,9 +396,8 @@ main.tsx (Entry Point)
 ### 5.4 API Client (`src/api/client.ts`)
 
 - Axios instance with base URL `/api`, 30s timeout
-- Request interceptor: attaches `Authorization: Bearer <token>`
-- Response interceptor: on 401, attempts token refresh via `POST /api/auth/refresh`
-- On refresh failure: clears tokens, redirects to `/login`
+- v4: auth is cookie-based — the client relies on the `provision_token` cookie set at login (no Bearer token in storage; the `access_token`/`refresh_token` localStorage model was removed in v4)
+- On 401 from the dashboard, the client redirects to `/login` (there is no token-refresh endpoint in v4 — `POST /api/auth/refresh` was removed; `POST /api/auth/logout` clears the cookie)
 
 ---
 
@@ -450,10 +450,10 @@ provision-mcp (FastAPI :8780)
 ### 7.1 Dashboard → Gateway → provision-api (Read)
 
 ```
-Browser → GET /api/users (JWT)
+Browser → GET /api/users (provision_token cookie)
     → Dashboard nginx → /api/* proxy
         → provision-gateway:8770
-            → require_gateway_token() (verify gateway_token / JWT)
+            → require_gateway_token() (verify provision_token cookie)
             → provision_service.list_users()
                 → httpx GET http://provision-api:8765/users
                     → provision-api response

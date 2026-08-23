@@ -22,11 +22,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [needsSetup, setNeedsSetup] = useState(false)
 
   const refreshAdmin = useCallback(async () => {
-    const token = localStorage.getItem('access_token')
-    if (!token) {
-      setIsLoading(false)
-      return
-    }
+    // v4 §11.2 (N5): auth comes from the provision_token cookie, auto-sent by
+    // the browser. No localStorage tokens are consulted.
     try {
       const user = await authApi.getMe()
       setAdmin(user)
@@ -39,8 +36,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       } catch {
         setNeedsSetup(true)
       }
-      localStorage.removeItem('access_token')
-      localStorage.removeItem('refresh_token')
     } finally {
       setIsLoading(false)
     }
@@ -52,9 +47,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const login = useCallback(async (email: string, password: string) => {
     const response = await authApi.login({ email, password })
-    localStorage.setItem('access_token', response.access_token)
-    localStorage.setItem('refresh_token', response.refresh_token)
-    // Handle both admin and end-user responses
+    // v4 §11.2 (N5): the provision_token is an HttpOnly cookie set by the
+    // backend — nothing is stored in localStorage.
     const userData = response.admin || response.user
     if (userData) {
       userData.user_type = response.user_type || 'admin'
@@ -70,8 +64,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [])
 
   const logout = useCallback(() => {
-    localStorage.removeItem('access_token')
-    localStorage.removeItem('refresh_token')
+    // v4 §6.1.6 (G14): POST /api/auth/logout clears the provision_token cookie.
+    authApi.logout().catch(() => {})
     setAdmin(null)
   }, [])
 

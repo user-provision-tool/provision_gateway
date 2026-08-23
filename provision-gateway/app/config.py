@@ -70,7 +70,10 @@ class Settings:
             "REGISTRY_FILE",
             str(self.PROVISION_DIR / "generated" / "user_registry.yml"),
         )
-        self.PROVISION_COOKIE_TTL: int = int(os.environ.get("PROVISION_COOKIE_TTL", "86400"))
+        self.PROVISION_COOKIE_TTL: int = int(os.environ.get("PROVISION_COOKIE_TTL", "604800"))
+
+        # ---- Exchange code (v4 §6.2) ----
+        self.EXCHANGE_CODE_TTL_SEC: int = int(os.environ.get("EXCHANGE_CODE_TTL_SEC", "30"))
 
         # ---- Logging ----
         self.LOG_LEVEL: str = os.environ.get("GATEWAY_LOG_LEVEL", "INFO")

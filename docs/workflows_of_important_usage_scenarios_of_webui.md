@@ -1,7 +1,7 @@
 # Provision Gateway — Workflows of Important Usage Scenarios (WebUI)
 
-> **Version**: 3.0
-> **Date**: 2026-08-19 (updated — merged webui feature work: API Keys page, Alert page, viewer role-gating (AdminRoute), /go/{hostname} service access, multi-recipe DeployForm, two-token login, Dashboard Subnet Pool card)
+> **Version**: 3.1
+> **Date**: 2026-08-22 (updated — v4 Service-ACL enforcement: cookie-only login (provision_token, token_type=cookie), two-token/JWT-body login model removed, /go/ issues a 30s exchange code with no JWT in URL; prior: API Keys page, Alert page, viewer role-gating (AdminRoute), /go/{hostname} service access, multi-recipe DeployForm, two-token login, Dashboard Subnet Pool card)
 > **Purpose**: Step-by-step WebUI workflows verified against the actual dashboard at `http://localhost:8771`.
 
 ---
@@ -66,7 +66,7 @@
 2. Enter email and password
 3. Click **"Log In"**
 4. Redirected to `/dashboard`
-5. JWT tokens (`access_token`/`refresh_token`) stored in browser `localStorage`; the server ALSO sets two httponly cookies: `gateway_token` (24h — dashboard/gateway API access) and `provision_token` (1y — service access via provision-nginx)
+5. v4: the server sets a single `provision_token` httponly cookie (1-week, token_type=cookie). The Bearer `access_token`/`refresh_token` localStorage model and the legacy `gateway_token` cookie were **removed in v4**
 
 ### Register New Account Flow
 1. On login page, click **"Register new account"**
@@ -76,7 +76,7 @@
 5. Admin must approve before the new user can login
 
 **API calls:**
-- `POST /api/auth/login` → JWT tokens
+- `POST /api/auth/login` → provision_token cookie (v4; no Bearer body tokens)
 - `POST /api/auth/users/register` → New user registration (pending approval)
 
 **UI Elements:**
@@ -662,17 +662,17 @@
 1. Expand a service card on the Services page
 2. Click the URL link — it points to `/go/{service}-{user}-{label}.localhost` (hostname resolved from the registry)
 3. Browser navigates to the gateway `GET /api/auth/go/{hostname}`:
-   - Validates the `gateway_token` cookie / Bearer
+   - Validates the `provision_token` session cookie (v4; the legacy `gateway_token` cookie / Bearer model was removed)
    - Looks up the service by hostname in the HostnameIndex (404 if unknown)
    - For viewers: ACL check — target user must equal the viewer's own user or be in `allowed_special_users` (403 otherwise)
-4. Gateway 302-redirects to `http://{host}:{NGINX_HTTP_PORT}/_set_token?token={provision_token}&redirect=/`
-5. `_set_token` on the service domain sets the `provision_token` cookie and redirects to `/` → service loads silently
+4. Gateway issues a **30s HMAC exchange code** + `Location` header — **no JWT in any URL** (v4 F7)
+5. The service-domain `_set_token` is a plain variable proxy to `/api/auth/exchange`, which swaps the code for the `provision_token` cookie via `302`+`Set-Cookie` and redirects to `/` → service loads silently
 6. The `Auth` tag on the card indicates the service has HTTP basic auth; the cookie exchange bypasses the need to type credentials
 
 **Why:** the login cookie is host-scoped (`localhost:8771`) and is NOT sent to the service hostname, so a cookie exchange through `/go` is required.
 
 **API calls:**
-- `GET /api/auth/go/{hostname}` → 302 to `{host}/_set_token?token=...&redirect=/`
+- `GET /api/auth/go/{hostname}` → 302 to `{host}/_set_token?code={30s HMAC code}&redirect=/` (never a live bearer JWT in the URL)
 
 ---
 
