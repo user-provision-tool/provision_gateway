@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useNavigate, Link } from 'react-router-dom'
+import { Link } from 'react-router-dom'
 import { Form, Input, Button, Typography, message, Card, Divider, Modal } from 'antd'
 import { UserOutlined, LockOutlined, MailOutlined } from '@ant-design/icons'
 import { useAuth } from '../hooks/useAuth'
@@ -12,14 +12,14 @@ export default function LoginPage() {
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
   const [registerLoading, setRegisterLoading] = useState(false)
   const { login } = useAuth()
-  const navigate = useNavigate()
 
   const handleSubmit = async (values: { email: string; password: string }) => {
     setLoading(true)
     try {
       await login(values.email, values.password)
       message.success('Login successful')
-      navigate('/dashboard')
+      // Post-login navigation (incl. the service handoff for ?next=) is owned
+      // by the LoginRoute in App.tsx — do not navigate here.
     } catch (err: any) {
       message.error(err.response?.data?.detail || 'Login failed')
     } finally {

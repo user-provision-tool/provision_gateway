@@ -1,5 +1,7 @@
+import { useEffect, useState } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import { useAuth } from './hooks/useAuth'
+import { startServiceHandoff } from './utils/serviceHandoff'
 import AppLayout from './components/layout/AppLayout'
 import LoginPage from './pages/LoginPage'
 import SetupWizard from './pages/SetupWizard'
@@ -29,6 +31,34 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
+// The /login route: unauthenticated → the login form. Authenticated → if the
+// request came from the ACL gate redirect (next=<service-url>), complete the
+// /go/ handoff so the provision_token cookie lands on the SERVICE host
+// (a plain redirect back would loop: the portal cookie is host-scoped).
+function LoginRoute() {
+  const { isAuthenticated } = useAuth()
+  const [handoffState, setHandoffState] = useState<'pending' | 'fallback' | 'navigating'>('pending')
+
+  useEffect(() => {
+    if (!isAuthenticated) return
+    let cancelled = false
+    startServiceHandoff().then((result) => {
+      if (cancelled) return
+      // 'service'/'denied' already triggered a full-page navigation.
+      setHandoffState(result === 'fallback' ? 'fallback' : 'navigating')
+    })
+    return () => { cancelled = true }
+  }, [isAuthenticated])
+
+  if (!isAuthenticated) return <LoginPage />
+  if (handoffState === 'fallback') return <Navigate to="/dashboard" replace />
+  return (
+    <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh' }}>
+      Loading...
+    </div>
+  )
+}
+
 // Admin-only route guard (Gap 10 / G3): viewers may only reach Services + API Keys.
 // The sidebar hides admin nav items, but without this the routes themselves were
 // reachable by direct URL (e.g. /dashboard, /audit, /users/manage), leaking admin
@@ -52,9 +82,7 @@ export default function App() {
 
   return (
     <Routes>
-      <Route path="/login" element={
-        isAuthenticated ? <Navigate to="/dashboard" replace /> : <LoginPage />
-      } />
+      <Route path="/login" element={<LoginRoute />} />
       <Route path="/setup" element={
         isAuthenticated ? <Navigate to="/dashboard" replace /> : <SetupWizard />
       } />

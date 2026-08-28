@@ -69,7 +69,7 @@ http {
         # /api/ → gateway with the fixed SSE task-log timeout (U3).
         location /api/  { proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s; }
         location /go/   { rewrite ^/go/(.*) /api/auth/go/$1 break; proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
-        location /login { proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+        location /login { proxy_pass http://subnet-acl-dashboard:80; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
         location /alert { proxy_pass http://subnet-acl-dashboard:80; }
         location /     { proxy_pass http://subnet-acl-dashboard:80; }
     }
@@ -83,7 +83,7 @@ http {
         location = /api/auth/exchange { return 404; }
         location /api/  { proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s; }
         location /go/   { rewrite ^/go/(.*) /api/auth/go/$1 break; proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
-        location /login { proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+        location /login { proxy_pass http://subnet-acl-dashboard:80; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
         location /alert { proxy_pass http://subnet-acl-dashboard:80; }
         location /     { proxy_pass http://subnet-acl-dashboard:80; }
     }

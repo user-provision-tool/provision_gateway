@@ -77,7 +77,7 @@ services:
       - ${PROVISION_DIR:-/srv/provision_subnet_acl}/ssl:/certs:ro
     environment:
       - PORTAL_MODE=${PORTAL_MODE:-http}
-      - PORTAL_HOSTNAME=${PORTAL_HOSTNAME:-localhost}
+      - PORTAL_HOSTNAME=${PORTAL_HOSTNAME:-portal.localhost}
       - PORTAL_SCHEME=${PORTAL_SCHEME:-http}
       - PORTAL_REDIRECT_PORT=${PORTAL_REDIRECT_PORT:-}
       - HTTPS_REDIRECT_PORT=${HTTPS_REDIRECT_PORT:-}
