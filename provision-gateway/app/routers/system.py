@@ -34,7 +34,7 @@ async def system_status(
 
     # Per-component status from Docker (via provision-api)
     components = {}
-    for name in ["subnet-acl-provision-api", "subnet-acl-nginx", "subnet-acl-gateway", "subnet-acl-dashboard"]:
+    for name in ["subnet-acl-provision-api", "subnet-acl-nginx", "subnet-acl-gateway", "subnet-acl-dashboard", "subnet-acl-nginx-acl"]:
         try:
             running = await provision_service.container_running(name)
             exists = await provision_service.container_exists(name)
@@ -113,6 +113,23 @@ async def system_status(
     except Exception:
         pass
 
+    # ACL state: the gateway setting AND the edge container env must BOTH be on
+    # for ACL to be effective — a gateway-on/edge-off drift (the 2026-08-28 G3
+    # outage) silently exposes native Basic on the internal nginx.
+    acl = {
+        "gateway": bool(settings.ENABLE_ACL),
+        "edge": False,
+        "enabled": False,
+        "consistent": False,
+    }
+    try:
+        edge_env = await provision_service.container_env("subnet-acl-nginx-acl")
+        acl["edge"] = edge_env.get("ENABLE_ACL", "false").lower() == "true"
+    except Exception:
+        acl["edge"] = None  # edge env unreadable → unknown
+    acl["enabled"] = bool(acl["gateway"] and acl["edge"])
+    acl["consistent"] = acl["gateway"] == acl["edge"]
+
     return {
         "provision_api": provision_api_status,
         "subnet_acl_nginx": {"status": components["subnet-acl-nginx"]["status"]},
@@ -127,6 +144,7 @@ async def system_status(
         "container_stats": container_stats,
         "nginx_http_port": settings.NGINX_HTTP_PORT,
         "nginx_https_port": settings.NGINX_HTTPS_PORT,
+        "acl": acl,
     }
 
 
@@ -260,14 +278,26 @@ async def add_proxy_config(
     current_user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Add a new proxy config. Auto-tests reachability after save."""
-    config = create_config(db, req)
-    reachability = await test_config_reachability(db, config["id"])
-    config = db.query(ProxyConfigModel).filter(ProxyConfigModel.id == config["id"]).first().to_dict()
+    """Add a new proxy config. Auto-tests reachability after save.
 
+    The DB connection is released before the reachability probe and re-opened
+    briefly afterwards, so the (up to 5s) connect never holds a pool connection.
+    """
+    config = create_config(db, req)
+    db.close()  # release the connection before the probe
+
+    reachability = await test_config_reachability(config["id"])
+
+    from ..database import SessionLocal
     from ..services.audit_service import log_action
-    log_action(db, action="proxy_config_create", admin_id=current_user["id"],
-               status="success", detail={"host": config["host"]})
+    audit_db = SessionLocal()
+    try:
+        row = audit_db.query(ProxyConfigModel).filter(ProxyConfigModel.id == config["id"]).first()
+        config = row.to_dict() if row else config
+        log_action(audit_db, action="proxy_config_create", admin_id=current_user["id"],
+                   status="success", detail={"host": config["host"]})
+    finally:
+        audit_db.close()
 
     return {"config": config, "reachability": reachability}
 
@@ -279,12 +309,26 @@ async def update_proxy_config(
     current_user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Update a proxy config. Re-tests reachability."""
+    """Update a proxy config. Re-tests reachability.
+
+    The DB connection is released before the reachability probe and re-opened
+    briefly afterwards, so the (up to 5s) connect never holds a pool connection.
+    """
     config = update_config(db, config_id, req)
     if not config:
         raise HTTPException(404, "Config not found")
-    reachability = await test_config_reachability(db, config_id)
-    config = db.query(ProxyConfigModel).filter(ProxyConfigModel.id == config_id).first().to_dict()
+    db.close()  # release the connection before the probe
+
+    reachability = await test_config_reachability(config_id)
+
+    from ..database import SessionLocal
+    audit_db = SessionLocal()
+    try:
+        row = audit_db.query(ProxyConfigModel).filter(ProxyConfigModel.id == config_id).first()
+        config = row.to_dict() if row else config
+    finally:
+        audit_db.close()
+
     return {"config": config, "reachability": reachability}
 
 
@@ -301,7 +345,7 @@ async def delete_proxy_config(
 
 
 @router.put("/proxy/{config_id}/activate")
-async def activate_proxy_config(
+def activate_proxy_config(
     config_id: int,
     current_user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
@@ -335,10 +379,9 @@ async def deactivate_proxy(
 @router.post("/proxy/test")
 async def test_proxy_reachability_endpoint(
     current_user: dict = Depends(require_gateway_token),
-    db: Session = Depends(get_db),
 ):
     """Test reachability of all proxy configs."""
-    results = await test_all_configs(db)
+    results = await test_all_configs()
     return {"results": results}
 
 

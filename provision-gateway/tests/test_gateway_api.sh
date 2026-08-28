@@ -376,15 +376,15 @@ fi
 
 # ─── 12. Service URL port (Gap 2) ───────────────────────────────────────────
 
-echo "── 12. Service URL uses subnet-acl port 8766 (Gap 2) ──"
+echo "── 12. Service URL uses the EDGE port 8767 (Gap 2, decision 10) ──"
 
-echo -n "  12.1 GET /system/status nginx_http_port=8766: "
+echo -n "  12.1 GET /system/status nginx_http_port=8767: "
 SRESP=$(curl -s -b "$COOKIE_JAR" "$API/system/status")
-check "nginx_http_port is 8766" '"nginx_http_port":8766' "$SRESP"
+check "nginx_http_port is 8767" '"nginx_http_port":8767' "$SRESP"
 
-echo -n "  12.2 GET /users/alice/example-service/0/url uses :8766: "
+echo -n "  12.2 GET /users/alice/example-service/0/url uses :8767: "
 URESP=$(curl -s -b "$COOKIE_JAR" "$API/users/alice/example-service/0/url")
-check "service URL uses port 8766" 'http://example-service-alice-0.localhost:8766' "$URESP"
+check "service URL uses port 8767" 'http://example-service-alice-0.localhost:8767' "$URESP"
 
 
 # ─── 13. ACL verify / API keys / subnet-pool / /go/ (subnet-acl features) ──
@@ -437,13 +437,34 @@ echo -n "  13.6 GET /system/subnet-pool returns enabled pools: "
 SPBODY=$(curl -s -b "$COOKIE_JAR" "$API/system/subnet-pool")
 check "subnet-pool enabled" '"enabled":true' "$SPBODY"
 
-echo -n "  13.7 GET /auth/go/{hostname} redirects via _set_token on :8766: "
+echo -n "  13.7 GET /auth/go/{hostname} redirects via _set_token on the EDGE :8767: "
 GO=$(curl -s -b "$COOKIE_JAR" -D - -o /dev/null "$API/auth/go/example-service-alice-0.localhost")
 GOLOC=$(echo "$GO" | grep -i "^location:" | tr -d '\r')
 case "$GOLOC" in
-    *:8766/_set_token?code=*) echo "  ✅ redirect OK"; PASS=$((PASS + 1));;
+    *:8767/_set_token?code=*) echo "  ✅ redirect OK (edge :8767)"; PASS=$((PASS + 1));;
     *) echo "  ❌ got: $GOLOC"; FAIL=$((FAIL + 1));;
 esac
+
+echo -n "  13.8 Follow the /go/ exchange through the EDGE /_set_token relay (Gap 1): "
+GOLOC=$(echo "$GOLOC" | tr -d '\r')
+CODE=$(echo "$GOLOC" | sed -n 's/.*code=//p')
+if [ -n "$CODE" ]; then
+    EXCH=$(curl -s -D - -o /dev/null --max-time 10 \
+        --resolve "example-service-alice-0.localhost:8767:127.0.0.1" \
+        "http://example-service-alice-0.localhost:8767/_set_token?code=$CODE")
+    EXCH_STATUS=$(echo "$EXCH" | grep -i "^HTTP/" | tr -d '\r' | tail -1)
+    EXCH_COOKIE=$(echo "$EXCH" | grep -i "^set-cookie:" | tr -d '\r')
+    if echo "$EXCH_STATUS" | grep -q "302" && echo "$EXCH_COOKIE" | grep -qi "provision_token="; then
+        echo "  ✅ exchange relay OK ($EXCH_STATUS + Set-Cookie provision_token)"
+        PASS=$((PASS + 1))
+    else
+        echo "  ❌ got status=[$EXCH_STATUS] cookie=[$EXCH_COOKIE]"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo "  ❌ could not extract exchange code from $GOLOC"
+    FAIL=$((FAIL + 1))
+fi
 
 
 # ─── Summary ────────────────────────────────────────────────────────────────

@@ -48,6 +48,17 @@ export default function DashboardPage() {
   const ramPct = sysStatus?.docker_host?.mem_percent ?? null
   const diskPct = sysStatus?.docker_host?.disk_percent ?? null
 
+  // ACL indicator: enabled only when BOTH the gateway and the edge are on
+  // (a gateway-on/edge-off mismatch was the 2026-08-28 outage).
+  const aclTag = (() => {
+    if (!sysStatus?.acl) return null
+    const a = sysStatus.acl
+    if (a.edge === null) return <Tag color="default">ACL: unknown</Tag>
+    if (a.enabled) return <Tag icon={<CheckCircleOutlined/>} color="green">ACL: Enabled</Tag>
+    if (!a.consistent) return <Tag icon={<CloseCircleOutlined/>} color="orange">ACL: Mismatch</Tag>
+    return <Tag icon={<CloseCircleOutlined/>} color="red">ACL: Disabled</Tag>
+  })()
+
   // Registry-based stats (from provision-api, not docker ps)
   const cStats = sysStatus?.container_stats || {}
   const sStats = sysStatus?.service_stats || {}
@@ -60,6 +71,7 @@ export default function DashboardPage() {
       <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16,flexWrap:'wrap',gap:8}}>
         <Title level={3} style={{margin:0}}>Dashboard</Title>
         <Space>
+          {aclTag}
           {refreshing && <Tag icon={<SyncOutlined spin/>} color="processing">Live</Tag>}
           <Button icon={<ReloadOutlined/>} size="small" onClick={fetchAll}>Refresh</Button>
         </Space>

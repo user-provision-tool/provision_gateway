@@ -22,17 +22,11 @@ def list_configs(db: Session) -> list[dict]:
         ProxyConfigModel.is_active.desc(),
         ProxyConfigModel.created_at,
     ).all()
-    # Dedupe by (protocol, host, port) so accumulated duplicate rows (BUG-3)
-    # render as exactly one entry, with the active config preferred first.
-    seen: set[tuple[str, str, int]] = set()
-    unique: list[dict] = []
-    for c in configs:
-        key = (c.protocol, c.host, c.port)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(c.to_dict())
-    return unique
+    # No endpoint dedup: the BUG-3 duplicate rows were cleaned (one row per
+    # named config), and create_config now dedups on (protocol, host, port,
+    # name) — so multiple distinctly-named configs for the same endpoint each
+    # render, while genuine re-saves of the same config stay a single row.
+    return [c.to_dict() for c in configs]
 
 
 def get_active_config(db: Session) -> dict | None:
@@ -49,22 +43,21 @@ def create_config(db: Session, data: dict) -> dict:
     host = data.get("host", "")
     port = int(data.get("port", 8080))
 
-    # Prevent duplicate rows for the same endpoint (BUG-3): return the
-    # existing config instead of accumulating a new row on every save.
+    # Dedup only a genuine re-save of the SAME named config (BUG-3): match
+    # (protocol, host, port, name). A differently-named config for the same
+    # endpoint is a distinct config and creates a new row — the old endpoint-only
+    # match silently returned the existing row and made "Add" appear to do nothing.
     existing = (
         db.query(ProxyConfigModel)
         .filter(
             ProxyConfigModel.protocol == protocol,
             ProxyConfigModel.host == host,
             ProxyConfigModel.port == port,
+            ProxyConfigModel.name == data.get("name", ""),
         )
         .first()
     )
     if existing:
-        if data.get("name") and not existing.name:
-            existing.name = data["name"]
-            db.commit()
-            db.refresh(existing)
         return existing.to_dict()
 
     config = ProxyConfigModel(
@@ -131,40 +124,69 @@ def deactivate_all(db: Session) -> None:
 # Reachability testing
 # ---------------------------------------------------------------------------
 
-async def test_config_reachability(db: Session, config_id: int) -> dict:
-    config = db.query(ProxyConfigModel).filter(ProxyConfigModel.id == config_id).first()
-    if not config:
-        return {"reachable": None, "error": "Config not found"}
-    checked_at = datetime.now(timezone.utc)
+async def test_config_reachability(config_id: int) -> dict:
+    """Test reachability of a proxy config without holding a DB connection.
+
+    Reads the target (host/port) with a short-lived session and releases the
+    connection BEFORE the (up to 5s) connect probe, then writes the result back
+    with a fresh short-lived session. A probe must not keep a pool connection
+    checked out for its whole duration — holding one across a long await is what
+    exhausted the gateway pool (Aug 2026 outage).
+    """
+    from ..database import SessionLocal
+
+    # Read the config, then release the connection before the network probe.
+    db = SessionLocal()
+    try:
+        config = db.query(ProxyConfigModel).filter(ProxyConfigModel.id == config_id).first()
+        if config is None:
+            return {"reachable": None, "error": "Config not found"}
+        host, port, checked_at = config.host, config.port, datetime.now(timezone.utc)
+    finally:
+        db.close()
+
+    latency_ms = 0
     try:
         start = time.monotonic()
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(config.host, config.port), timeout=5.0)
+            asyncio.open_connection(host, port), timeout=5.0)
         latency_ms = round((time.monotonic() - start) * 1000, 1)
         writer.close()
         await writer.wait_closed()
-        config.reachable = "true"
-        config.last_checked_at = checked_at
-        config.last_error = None
-        db.commit()
-        return {"reachable": True, "latency_ms": latency_ms, "error": None, "checked_at": checked_at.isoformat()}
+        reachable, last_error = "true", None
     except asyncio.TimeoutError:
-        config.reachable = "false"; config.last_checked_at = checked_at
-        config.last_error = "Connection timed out"; db.commit()
-        return {"reachable": False, "latency_ms": 0, "error": "Connection timed out", "checked_at": checked_at.isoformat()}
+        reachable, last_error = "false", "Connection timed out"
     except ConnectionRefusedError:
-        config.reachable = "false"; config.last_checked_at = checked_at
-        config.last_error = "Connection refused"; db.commit()
-        return {"reachable": False, "latency_ms": 0, "error": "Connection refused", "checked_at": checked_at.isoformat()}
+        reachable, last_error = "false", "Connection refused"
     except OSError as e:
-        config.reachable = "false"; config.last_checked_at = checked_at
-        config.last_error = str(e); db.commit()
-        return {"reachable": False, "latency_ms": 0, "error": str(e), "checked_at": checked_at.isoformat()}
+        reachable, last_error = "false", str(e)
+
+    # Write the result back with a fresh short-lived session.
+    db = SessionLocal()
+    try:
+        config = db.query(ProxyConfigModel).filter(ProxyConfigModel.id == config_id).first()
+        if config is not None:
+            config.reachable = reachable
+            config.last_checked_at = checked_at
+            config.last_error = last_error
+            db.commit()
+    finally:
+        db.close()
+
+    if last_error is None:
+        return {"reachable": True, "latency_ms": latency_ms, "error": None, "checked_at": checked_at.isoformat()}
+    return {"reachable": False, "latency_ms": latency_ms, "error": last_error, "checked_at": checked_at.isoformat()}
 
 
-async def test_all_configs(db: Session) -> list[dict]:
-    configs = db.query(ProxyConfigModel).all()
-    return [await test_config_reachability(db, c.id) for c in configs]
+async def test_all_configs() -> list[dict]:
+    """Probe reachability of every proxy config (no connection held across probes)."""
+    from ..database import SessionLocal
+    db = SessionLocal()
+    try:
+        ids = [c.id for c in db.query(ProxyConfigModel).all()]
+    finally:
+        db.close()
+    return [await test_config_reachability(cid) for cid in ids]
 
 
 # ---------------------------------------------------------------------------

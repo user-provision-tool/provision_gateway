@@ -107,13 +107,14 @@ def decode_access_token(token: str) -> dict[str, Any]:
 def decode_gateway_token(token: str) -> dict[str, Any]:
     """Decode a token used for dashboard & gateway API access.
 
-    Accepts ``type='provision'`` (the v4 provision_token cookie), and the
-    legacy ``type='access'`` (Bearer header) / ``type='gateway'``
-    (old gateway_token cookie) for backward compatibility.
+    v4 §6.1 (three-credential model): only ``type='provision'`` is accepted —
+    the login//go/ provision_token cookie and the API-key header are both
+    ``type='provision'``. Legacy ``type='access'`` (Bearer) / ``type='gateway'``
+    (old gateway_token cookie) tokens are REJECTED (G5) — they no longer exist.
     """
     payload = decode_token(token)
-    if payload.get("type") not in ("provision", "gateway", "access"):
-        raise JWTError("Token is not a gateway/provision token")
+    if payload.get("type") != "provision":
+        raise JWTError("Token is not a provision token")
     return payload
 
 
@@ -142,13 +143,24 @@ def create_admin(
     password: str,
     role: str = "admin",
 ) -> AdminUser:
-    """Create a new admin user."""
+    """Create a new admin user.
+
+    G4 (v4 §6.1.5): admins get a default API key at registration too, so login
+    can bind their provision_token to a revocable key. The default key is
+    created best-effort; if it fails the admin is still created and the key is
+    auto-created on first login (get_or_create_default_key).
+    """
     admin = AdminUser(
         email=email,
         password_hash=hash_password(password),
         role=role,
     )
     db.add(admin)
+    db.flush()
+    try:
+        create_api_key(db, admin.id, "Default", is_default=True)
+    except Exception:
+        pass
     db.commit()
     db.refresh(admin)
     return admin
@@ -424,6 +436,15 @@ def create_api_key(db: Session, user_id: int, label: str,
         if count >= MAX_API_KEYS_PER_USER:
             raise ValueError("API key limit reached (1000 keys per user)")
 
+    # G2: when creating a DEFAULT key, clear any (stale) existing default for
+    # the user first — the partial unique index on (user_id) WHERE is_default
+    # would otherwise reject the insert (e.g. a re-registered user inheriting a
+    # default orphaned by SQLite id-reuse).
+    if is_default:
+        db.query(ApiKey).filter(
+            ApiKey.user_id == user_id, ApiKey.is_default.is_(True)
+        ).update({"is_default": False})
+
     # Resolve the target's real identity for the token (GAP-07).
     user_type, email, role = _target_identity(db, user_id)
 
@@ -524,6 +545,31 @@ def revoke_api_key(db: Session, key_id: int, allow_default: bool = False) -> boo
 def get_api_key_by_id(db: Session, key_id: int) -> ApiKey | None:
     """Get an API key by its ID."""
     return db.query(ApiKey).filter(ApiKey.id == key_id).first()
+
+
+def user_has_default_key(db: Session, user_id: int) -> bool:
+    """Return True if *user_id* currently owns a default key (v4 §6.1.6)."""
+    return (
+        db.query(ApiKey)
+        .filter(ApiKey.user_id == user_id, ApiKey.is_default.is_(True))
+        .first()
+    ) is not None
+
+
+def delete_api_keys_for_user(db: Session, user_id: int) -> int:
+    """Delete every API key owned by *user_id* (used when deleting the user).
+
+    v4 §6.1.3 / G2: user deletion must cascade to api_keys, otherwise SQLite
+    id-reuse orphans stale ``is_default=1`` rows onto the next user. Returns the
+    number of keys deleted.
+    """
+    keys = db.query(ApiKey).filter(ApiKey.user_id == user_id).all()
+    count = len(keys)
+    for key in keys:
+        db.delete(key)
+    if count:
+        db.commit()
+    return count
 
 
 def create_default_api_key(db: Session, user_id: int) -> tuple[ApiKey, str]:

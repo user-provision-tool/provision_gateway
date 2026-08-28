@@ -121,18 +121,19 @@ def _make_config(id_, host, port, active=False, name="global-proxy"):
 
 
 class TestProxyDedupe:
-    """BUG-3: Settings Global Proxy list must show exactly one entry."""
+    """BUG-3: duplicate-row handling. The duplicate pile is cleaned (one row per
+    named config) and create_config dedups on (protocol, host, port, name), so a
+    differently-named config for the same endpoint is a distinct config."""
 
-    def test_list_configs_dedupes_duplicate_rows(self):
-        """~30 accumulated identical rows collapse to exactly one (active preferred)."""
-        active = _make_config(30, "172.18.0.1", 7897, active=True)
-        inactive = [_make_config(i, "172.18.0.1", 7897) for i in range(1, 30)]
+    def test_list_configs_returns_all_named_configs(self):
+        """Distinctly-named configs for the same endpoint all render (no endpoint dedup)."""
+        a = _make_config(30, "172.18.0.1", 7897, active=True, name="proxy-a")
+        b = _make_config(31, "172.18.0.1", 7897, name="proxy-b")
         db = MagicMock()
-        # order_by(is_active.desc(), created_at) puts active first in real DB
-        db.query.return_value.order_by.return_value.all.return_value = [active] + inactive
+        db.query.return_value.order_by.return_value.all.return_value = [a, b]
         result = list_configs(db)
-        assert len(result) == 1
-        assert result[0]["id"] == 30
+        assert len(result) == 2
+        assert {r["id"] for r in result} == {30, 31}
 
     def test_list_configs_preserves_distinct_endpoints(self):
         """Distinct (host, port) endpoints are all retained."""
@@ -144,12 +145,23 @@ class TestProxyDedupe:
         assert len(result) == 2
 
     def test_create_config_returns_existing_duplicate(self):
-        """Re-saving the same endpoint must not create a new row."""
+        """Re-saving the same named config must not create a new row."""
         existing = MagicMock()
-        existing.name = ""
+        existing.name = "global-proxy"
         existing.to_dict.return_value = {"id": 5}
         db = MagicMock()
         db.query.return_value.filter.return_value.first.return_value = existing
-        result = create_config(db, {"protocol": "http", "host": "172.18.0.1", "port": "7897"})
+        result = create_config(db, {"name": "global-proxy", "protocol": "http",
+                                    "host": "172.18.0.1", "port": "7897"})
         assert result["id"] == 5
         db.add.assert_not_called()
+
+    def test_create_config_different_name_same_endpoint_creates_new_row(self):
+        """A differently-named config for the same endpoint is distinct and added
+        (the dedup only short-circuits when the name matches too)."""
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = None
+        result = create_config(db, {"name": "proxy-b", "protocol": "http",
+                                    "host": "172.18.0.1", "port": "7897"})
+        assert db.add.called
+        assert result["name"] == "proxy-b"

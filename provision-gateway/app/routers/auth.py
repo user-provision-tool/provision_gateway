@@ -98,11 +98,11 @@ def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Special users cannot access the dashboard")
 
     # Bind the provision token to the user's default key (D7: auto-create/promote).
-    if user_type == "end_user":
-        default_key = auth_service.get_or_create_default_key(db, user_id)
-        api_key_id = default_key.id
-    else:
-        api_key_id = None
+    # G4 (v4 §6.1.5): admins get a default key too — their token binds to it so
+    # it is revocable (R1); get_or_create_default_key auto-creates one on login
+    # for pre-G4 admins that never got a key at registration.
+    default_key = auth_service.get_or_create_default_key(db, user_id)
+    api_key_id = default_key.id
 
     provision_token = auth_service.create_provision_token(
         user_id, email, role, user_type, api_key_id=api_key_id
@@ -347,6 +347,10 @@ def create_key(
 
     key, raw_token = auth_service.create_api_key(db, target_user_id, label)
 
+    # G8 (v4 §6.1.6): a new key becomes default only if the user has no default.
+    if not auth_service.user_has_default_key(db, target_user_id):
+        auth_service.set_default_api_key(db, key.id)
+
     return {
         "key": key.to_dict(),
         "token": raw_token,
@@ -375,14 +379,15 @@ def list_keys(
 def _get_gateway_user_safe(request: Request, db: Session) -> dict | None:
     """Extract the authenticated user from the provision_token cookie/header.
 
-    v4 §11.2 (N5): the provision_token cookie is the single credential. We
-    keep the gateway_token cookie + Bearer as backward-compatible fallbacks.
+    v4 §11.2 (N5): the provision_token cookie is the single credential (the API
+    key is presented as the X-Provision-Token header). The legacy gateway_token
+    cookie + Bearer fallbacks are REMOVED (G5).
     """
-    token = request.cookies.get("provision_token") or request.cookies.get("gateway_token") or ""
-    if not token:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
+    token = (
+        request.cookies.get("provision_token")
+        or request.headers.get("X-Provision-Token")
+        or ""
+    )
     if not token:
         return None
     try:
@@ -542,11 +547,9 @@ def exchange(request: Request, db: Session = Depends(get_db)):
             https = False
 
     # Bind the fresh 1-week provision token to the user's default key (D7).
-    if user_type == "end_user":
-        default_key = auth_service.get_or_create_default_key(db, user_id)
-        api_key_id = default_key.id
-    else:
-        api_key_id = None
+    # G4: admins bind to their default key too (revocable, R1).
+    default_key = auth_service.get_or_create_default_key(db, user_id)
+    api_key_id = default_key.id
 
     provision_token = auth_service.create_provision_token(
         user_id, email, role, user_type, api_key_id=api_key_id
@@ -691,10 +694,15 @@ def delete_end_user(
     current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Delete an end-user."""
+    """Delete an end-user.
+
+    G2 (v4 §6.1.3): user deletion cascades to api_keys — leaving orphaned keys
+    behind lets SQLite id-reuse attach a stale default to the next user.
+    """
     user = db.query(EndUser).filter(EndUser.id == user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
+    auth_service.delete_api_keys_for_user(db, user.id)
     db.delete(user)
     db.commit()
     return {"deleted": True}

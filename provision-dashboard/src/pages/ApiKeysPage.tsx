@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Typography, Card, Table, Button, Space, Tag, Modal, Input, message, Popconfirm, Tooltip } from 'antd'
-import { PlusOutlined, DeleteOutlined, KeyOutlined, CopyOutlined } from '@ant-design/icons'
+import { PlusOutlined, DeleteOutlined, KeyOutlined, CopyOutlined, StarOutlined } from '@ant-design/icons'
 import { useAuth } from '../hooks/useAuth'
 import client from '../api/client'
 
@@ -10,6 +10,8 @@ interface ApiKey {
   id: number
   user_id: number
   label: string
+  mask: string | null
+  is_default: boolean
   created_at: string | null
   expires_at: string | null
   is_revoked: boolean
@@ -72,22 +74,47 @@ export default function ApiKeysPage() {
     }
   }
 
+  const handleSetDefault = async (keyId: number) => {
+    try {
+      await client.put(`/auth/keys/${keyId}/default`)
+      message.success('Default key updated')
+      fetchKeys()
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || 'Failed to set default key')
+    }
+  }
+
   const columns = [
     { title: 'ID', dataIndex: 'id', key: 'id', width: 60 },
     { title: 'Label', dataIndex: 'label', key: 'label' },
     ...(isAdmin ? [{ title: 'User ID', dataIndex: 'user_id', key: 'user_id', width: 80 }] : []),
+    { title: 'Mask', dataIndex: 'mask', key: 'mask', width: 90,
+      render: (v: string | null) => v ? <Text code>{v}</Text> : '-' },
+    { title: 'Default', dataIndex: 'is_default', key: 'is_default', width: 90,
+      render: (v: boolean) => v
+        ? <Tag color="gold" icon={<StarOutlined />}>Default</Tag>
+        : <Text type="secondary">-</Text> },
     { title: 'Created', dataIndex: 'created_at', key: 'created_at',
       render: (v: string | null) => v ? new Date(v).toLocaleString() : '-' },
     { title: 'Expires', dataIndex: 'expires_at', key: 'expires_at',
       render: (v: string | null) => v ? new Date(v).toLocaleString() : '-' },
     { title: 'Status', dataIndex: 'is_revoked', key: 'is_revoked',
       render: (v: boolean) => v ? <Tag color="red">Revoked</Tag> : <Tag color="green">Active</Tag> },
-    { title: 'Actions', key: 'actions', width: 100,
+    { title: 'Actions', key: 'actions', width: 220,
       render: (_: any, record: ApiKey) => (
         !record.is_revoked ? (
-          <Popconfirm title="Revoke this key?" onConfirm={() => handleRevoke(record.id)}>
-            <Button size="small" danger icon={<DeleteOutlined />}>Revoke</Button>
-          </Popconfirm>
+          <Space>
+            {!record.is_default && (
+              <Tooltip title="Use this key by default for new sessions">
+                <Button size="small" icon={<StarOutlined />} onClick={() => handleSetDefault(record.id)}>
+                  Set as Default
+                </Button>
+              </Tooltip>
+            )}
+            <Popconfirm title="Revoke this key?" onConfirm={() => handleRevoke(record.id)}>
+              <Button size="small" danger icon={<DeleteOutlined />}>Revoke</Button>
+            </Popconfirm>
+          </Space>
         ) : null
       ),
     },

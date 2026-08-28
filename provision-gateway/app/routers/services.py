@@ -35,11 +35,15 @@ async def list_services(
 
 
 @router.get("/templates")
-async def list_templates(
+def list_templates(
     current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """List all available service templates."""
+    """List all available service templates.
+
+    Synchronous endpoint: runs in a worker thread so the DB query cannot block
+    the event loop (same rationale as the auth middleware deps).
+    """
     templates = db.query(ServiceTemplate).order_by(ServiceTemplate.name).all()
     return {"templates": [t.to_dict() for t in templates]}
 

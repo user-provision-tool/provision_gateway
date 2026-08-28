@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, ForeignKey
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, ForeignKey, Index, text
 
 from ..database import Base
 
@@ -15,9 +15,21 @@ class ApiKey(Base):
     Multiple named keys per user with user-defined labels.
     Keys are revocable individually.
     Default expiry: 1 year from creation.
+
+    Exactly one default key per user is enforced at the DB level by a partial
+    unique index on ``user_id`` WHERE ``is_default`` (v4 §6.1.3/§6.1.5).
     """
 
     __tablename__ = "api_keys"
+
+    __table_args__ = (
+        Index(
+            "uq_api_keys_one_default",
+            "user_id",
+            unique=True,
+            sqlite_where=text("is_default = 1"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("end_users.id"), nullable=False, index=True)

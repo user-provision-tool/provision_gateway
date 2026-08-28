@@ -140,6 +140,11 @@ class ProvisionService:
         r = await self._request("GET", f"/docker/container/{container}/running")
         return r.get("running", False)
 
+    async def container_env(self, container: str) -> dict[str, str]:
+        """Read a container's environment (e.g. ENABLE_ACL on the edge)."""
+        r = await self._request("GET", f"/docker/container/{container}/env")
+        return r.get("env", {})
+
     async def network_connect(self, network: str, container: str) -> dict[str, Any]:
         return await self._request("POST", f"/docker/network/{network}/connect/{container}")
 

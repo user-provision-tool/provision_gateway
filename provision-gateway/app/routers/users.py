@@ -17,16 +17,32 @@ from ..services.provision_service import provision_service
 router = APIRouter(prefix="/api/users", tags=["users"])
 
 
+def _log_action_short(action: str, admin_id: int | None = None, **kw) -> None:
+    """Record an audit log entry with a fresh short-lived session.
+
+    Used for audit logging that happens after a long ``await`` so no DB
+    connection is held across the external call.
+    """
+    from ..database import SessionLocal
+    db = SessionLocal()
+    try:
+        audit_service.log_action(db, action=action, admin_id=admin_id, **kw)
+    finally:
+        db.close()
+
+
 @router.get("")
 async def list_users(
     request: Request = None,
     current_user: dict = Depends(require_gateway_token),
-    db: Session = Depends(get_db),
 ):
     """List all end-users from provision-api, syncing missing users to gateway DB.
 
     Viewers: results are filtered to own services + allowed_special_users.
     Admins: see all services.
+
+    The EndUser sync/filter uses a short-lived session opened AFTER the
+    provision-api await, so no DB connection is held during the call.
     """
     try:
         result = await provision_service.list_users()
@@ -35,40 +51,45 @@ async def list_users(
     users = result.get("user_status", [])
 
     # Sync: ensure all users from provision-api exist in gateway end_users DB
+    from ..database import SessionLocal
     from ..models.end_user import EndUser
     import bcrypt as _bcrypt
     import secrets
 
-    gateway_users = {u.username for u in db.query(EndUser).all()}
-    for u in users:
-        user_name = u.get("user_name", "").strip()
-        if user_name and user_name not in gateway_users:
-            random_pw = secrets.token_hex(16)
-            new_user = EndUser(
-                username=user_name,
-                password_hash=_bcrypt.hashpw(random_pw.encode(), _bcrypt.gensalt()).decode(),
-                role="viewer",
-                is_approved=True,
-                is_active=True,
-            )
-            db.add(new_user)
-    db.commit()
+    db = SessionLocal()
+    try:
+        gateway_users = {u.username for u in db.query(EndUser).all()}
+        for u in users:
+            user_name = u.get("user_name", "").strip()
+            if user_name and user_name not in gateway_users:
+                random_pw = secrets.token_hex(16)
+                new_user = EndUser(
+                    username=user_name,
+                    password_hash=_bcrypt.hashpw(random_pw.encode(), _bcrypt.gensalt()).decode(),
+                    role="viewer",
+                    is_approved=True,
+                    is_active=True,
+                )
+                db.add(new_user)
+        db.commit()
 
-    # Filter for viewers: own services + allowed_special_users only
-    if current_user["role"] != "admin":
-        viewer_name = current_user.get("email", "")
-        allowed_users = set()
-        if viewer_name:
-            allowed_users.add(viewer_name)
-        # Get allowed_special_users from the current user
-        if current_user.get("user_type") == "end_user":
-            eu = db.query(EndUser).filter(EndUser.id == current_user["id"]).first()
-            if eu and eu.allowed_special_users:
-                for name in eu.allowed_special_users.split(","):
-                    name = name.strip()
-                    if name:
-                        allowed_users.add(name)
-        users = [u for u in users if u.get("user_name") in allowed_users]
+        # Filter for viewers: own services + allowed_special_users only
+        if current_user["role"] != "admin":
+            viewer_name = current_user.get("email", "")
+            allowed_users = set()
+            if viewer_name:
+                allowed_users.add(viewer_name)
+            # Get allowed_special_users from the current user
+            if current_user.get("user_type") == "end_user":
+                eu = db.query(EndUser).filter(EndUser.id == current_user["id"]).first()
+                if eu and eu.allowed_special_users:
+                    for name in eu.allowed_special_users.split(","):
+                        name = name.strip()
+                        if name:
+                            allowed_users.add(name)
+            users = [u for u in users if u.get("user_name") in allowed_users]
+    finally:
+        db.close()
 
     return {"users": users, "count": len(users)}
 
@@ -78,23 +99,29 @@ async def get_user(
     user_name: str,
     request: Request = None,
     current_user: dict = Depends(require_gateway_token),
-    db: Session = Depends(get_db),
 ):
     """Get a single end-user's services from provision-api.
 
     Viewers may only see their own services; admins can see anyone's.
+    The ACL check uses a short-lived session, closed before the provision-api
+    call so no DB connection is held during the await.
     """
     # ACL check for viewers
     if current_user["role"] != "admin":
         viewer_name = current_user.get("email", "")
         allowed = {viewer_name}
         if current_user.get("user_type") == "end_user":
-            eu = db.query(EndUser).filter(EndUser.id == current_user["id"]).first()
-            if eu and eu.allowed_special_users:
-                for name in eu.allowed_special_users.split(","):
-                    name = name.strip()
-                    if name:
-                        allowed.add(name)
+            from ..database import SessionLocal
+            db = SessionLocal()
+            try:
+                eu = db.query(EndUser).filter(EndUser.id == current_user["id"]).first()
+                if eu and eu.allowed_special_users:
+                    for name in eu.allowed_special_users.split(","):
+                        name = name.strip()
+                        if name:
+                            allowed.add(name)
+            finally:
+                db.close()
         if user_name not in allowed:
             raise HTTPException(403, "Access denied: you can only view your own services")
 
@@ -110,12 +137,13 @@ async def deploy_user(
     req: dict[str, Any],
     request: Request,
     current_admin: dict = Depends(require_admin),
-    db: Session = Depends(get_db),
 ):
     """Deploy a service to a user (proxied to provision-api POST /users).
 
     Validates that essential file paths are provided before proxying.
     Returns 400 if deploy would fail due to missing compose/nginx paths.
+    All DB work uses short-lived sessions so no connection is held during the
+    (potentially long) provision-api deploy call.
     """
     # Validate that compose/nginx paths are provided (GAP-002)
     service_name = req.get("service_name", "")
@@ -150,36 +178,45 @@ async def deploy_user(
     use_global_proxy = req.pop("use_global_proxy", False)
     if use_global_proxy:
         from ..services.proxy_service import inject_proxy_build_args, has_active_proxy
-        if not has_active_proxy(db):
-            raise HTTPException(400, "Global proxy is not enabled. Configure it in Settings first.")
-        build_args = req.get("build_args") or {}
-        req["build_args"] = inject_proxy_build_args(db, build_args, True)
+        from ..database import SessionLocal
+        db = SessionLocal()
+        try:
+            if not has_active_proxy(db):
+                raise HTTPException(400, "Global proxy is not enabled. Configure it in Settings first.")
+            build_args = req.get("build_args") or {}
+            req["build_args"] = inject_proxy_build_args(db, build_args, True)
+        finally:
+            db.close()
 
     # Auto-register the user in gateway end_users if not already present
     user_name = req.get("user_name", "").strip()
     if user_name:
         from ..models.end_user import EndUser
+        from ..database import SessionLocal
         import bcrypt as _bcrypt
-        existing = db.query(EndUser).filter(EndUser.username == user_name).first()
-        if not existing:
-            # Auto-register with a random password (not used for login by default)
-            import secrets
-            random_pw = secrets.token_hex(16)
-            new_user = EndUser(
-                username=user_name,
-                password_hash=_bcrypt.hashpw(random_pw.encode(), _bcrypt.gensalt()).decode(),
-                role="viewer",
-                is_approved=True,
-                is_active=True,
-            )
-            db.add(new_user)
-            db.commit()
+        db = SessionLocal()
+        try:
+            existing = db.query(EndUser).filter(EndUser.username == user_name).first()
+            if not existing:
+                # Auto-register with a random password (not used for login by default)
+                import secrets
+                random_pw = secrets.token_hex(16)
+                new_user = EndUser(
+                    username=user_name,
+                    password_hash=_bcrypt.hashpw(random_pw.encode(), _bcrypt.gensalt()).decode(),
+                    role="viewer",
+                    is_approved=True,
+                    is_active=True,
+                )
+                db.add(new_user)
+                db.commit()
+        finally:
+            db.close()
 
     try:
         result = await provision_service.register_user(**req)
     except Exception as e:
-        audit_service.log_action(
-            db,
+        _log_action_short(
             action="register",
             admin_id=current_admin["id"],
             target_user=req.get("user_name"),
@@ -191,8 +228,7 @@ async def deploy_user(
         )
         raise HTTPException(502, f"provision-api error: {e}")
 
-    audit_service.log_action(
-        db,
+    _log_action_short(
         action="register",
         admin_id=current_admin["id"],
         target_user=req.get("user_name"),

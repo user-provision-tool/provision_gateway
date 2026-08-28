@@ -1669,10 +1669,17 @@ class TestNewMiddleware:
         assert _extract_gateway_token is not None
 
     def test_new_middleware_not_in_old_get_current_admin_via_depends(self):
-        """require_gateway_token should be async-callable (a coroutine function)."""
+        """Auth deps must be SYNCHRONOUS (not coroutines) so their DB queries run in a worker thread.
+
+        Regression guard for the Aug 2026 outage: async auth deps that ran
+        blocking SQLAlchemy directly on the event loop would freeze the loop the
+        moment the DB pool was exhausted, wedging every in-flight request forever.
+        Sync deps block a thread instead, so the system degrades gracefully.
+        """
         import inspect
-        from app.middleware import require_gateway_token
-        assert inspect.iscoroutinefunction(require_gateway_token)
+        from app.middleware import require_gateway_token, require_admin
+        assert not inspect.iscoroutinefunction(require_gateway_token)
+        assert not inspect.iscoroutinefunction(require_admin)
 
 
 # ---------------------------------------------------------------------------
@@ -1831,10 +1838,11 @@ class TestAuthVerifyHeaders:
 
 
 class TestGatewayTokenDecode:
-    """BUG-2: valid admin gateway_token cookie must authenticate API key routes."""
+    """BUG-2 + G5: only provision-type tokens authenticate; legacy gateway_token
+    cookie / Bearer access tokens are REJECTED (three-credential model)."""
 
-    def test_get_gateway_user_safe_accepts_gateway_token(self):
-        """A type='gateway' cookie decodes to a user dict (not None)."""
+    def test_get_gateway_user_safe_rejects_gateway_token_cookie(self):
+        """G5: a legacy type='gateway' cookie must NOT authenticate (returns None)."""
         from unittest.mock import MagicMock
         from app.routers.auth import _get_gateway_user_safe
         from app.services.auth_service import create_gateway_token
@@ -1846,14 +1854,10 @@ class TestGatewayTokenDecode:
         db = MagicMock()
 
         user = _get_gateway_user_safe(request, db)
-        assert user is not None
-        assert user["id"] == 42
-        assert user["email"] == "admin@test.com"
-        assert user["role"] == "admin"
-        assert user["user_type"] == "admin"
+        assert user is None
 
-    def test_get_gateway_user_safe_rejects_access_only_legacy_is_still_ok(self):
-        """decode_gateway_token also accepts access tokens (Bearer fallback)."""
+    def test_get_gateway_user_safe_rejects_bearer_access_token(self):
+        """G5: a legacy Bearer access token must NOT authenticate (returns None)."""
         from unittest.mock import MagicMock
         from app.routers.auth import _get_gateway_user_safe
         from app.services.auth_service import create_access_token
@@ -1865,8 +1869,68 @@ class TestGatewayTokenDecode:
         db = MagicMock()
 
         user = _get_gateway_user_safe(request, db)
+        assert user is None
+
+    def test_get_gateway_user_safe_accepts_provision_cookie(self):
+        """The provision_token cookie still authenticates."""
+        from unittest.mock import MagicMock
+        from app.routers.auth import _get_gateway_user_safe
+        from app.services.auth_service import create_provision_token
+
+        token = create_provision_token(42, "admin@test.com", "admin", "admin")
+        request = MagicMock()
+        request.cookies = {"provision_token": token}
+        request.headers = {}
+        db = MagicMock()
+
+        user = _get_gateway_user_safe(request, db)
         assert user is not None
-        assert user["id"] == 7
+        assert user["id"] == 42
+        assert user["role"] == "admin"
+
+    def test_decode_gateway_token_rejects_legacy_types(self):
+        """G5: decode_gateway_token accepts only type='provision'."""
+        import pytest
+        from jose import JWTError
+        from app.services import auth_service
+        for token in (
+            auth_service.create_gateway_token(1, "a@b.c", "admin", "admin"),
+            auth_service.create_access_token(1, "a@b.c", "admin", "admin"),
+            auth_service.create_refresh_token(1, "a@b.c", "admin"),
+        ):
+            with pytest.raises(JWTError):
+                auth_service.decode_gateway_token(token)
+
+    def test_extract_gateway_token_rejects_legacy_fallbacks(self):
+        """G5: _extract_gateway_token ignores gateway_token cookie and Bearer."""
+        from unittest.mock import MagicMock
+        from app.middleware import _extract_gateway_token
+        from app.services.auth_service import create_gateway_token, create_access_token
+
+        # gateway_token cookie alone → no token
+        req = MagicMock()
+        req.cookies = {"gateway_token": create_gateway_token(1, "a@b.c", "admin", "admin")}
+        req.headers = {}
+        assert _extract_gateway_token(req) is None
+
+        # Bearer header alone → no token
+        req = MagicMock()
+        req.cookies = {}
+        req.headers = {"Authorization": f"Bearer {create_access_token(1, 'a@b.c', 'admin', 'admin')}"}
+        assert _extract_gateway_token(req) is None
+
+        # provision_token cookie still wins
+        from app.services.auth_service import create_provision_token
+        req = MagicMock()
+        req.cookies = {"provision_token": create_provision_token(1, "a@b.c", "admin", "admin")}
+        req.headers = {}
+        assert _extract_gateway_token(req) is not None
+
+        # X-Provision-Token header (API key) authenticates
+        req = MagicMock()
+        req.cookies = {}
+        req.headers = {"X-Provision-Token": create_provision_token(1, "a@b.c", "admin", "admin")}
+        assert _extract_gateway_token(req) is not None
 
     def test_create_key_uses_depends_require_gateway_token(self):
         """create_key must inject require_gateway_token via Depends (not a bare call)."""
@@ -2014,21 +2078,30 @@ class TestRouteRoleGating:
 
 
 # ---------------------------------------------------------------------------
-# Tests for Gap 2 — the service-card URL must use the subnet-acl nginx host port
-# (8766), not the stale 8080, so the "go to" link is reachable.
+# Tests for Gap 2 — the gateway NGINX_* ports must be the EDGE's published
+# client-facing ports (decision 10, v5 §10.2): the edge -nginx-acl publishes
+# NGINX_HTTP_PORT/NGINX_HTTPS_PORT, and the gateway reads the SAME values for
+# /go/, service-URL display, and system-info. The internal -nginx keeps its own
+# remapped ports (8766/8443) in _users_provision/.env.
 # ---------------------------------------------------------------------------
 
 
 class TestServiceUrlPort:
-    """Gap 2: NGINX_HTTP_PORT must be 8766 (subnet-acl isolation), not stale 8080."""
+    """Gap 2: gateway NGINX_HTTP_PORT must be the edge's published port (8767),
+    not the internal nginx port (8766) — decision 10."""
 
     def test_provision_gateway_env_port(self):
         from pathlib import Path
         env_path = Path(__file__).parent.parent.parent / ".env"
         content = env_path.read_text()
-        assert "NGINX_HTTP_PORT=8766" in content, (
-            "_provision_gateway/.env NGINX_HTTP_PORT must be 8766 (not stale 8080) so the "
-            "dashboard card URL matches the running subnet-acl-nginx host port (Gap 2)."
+        assert "NGINX_HTTP_PORT=8767" in content, (
+            "_provision_gateway/.env NGINX_HTTP_PORT must be 8767 (the edge -nginx-acl "
+            "published port, decision 10) so the gateway /go/ 303 + service-URL display "
+            "target the client-facing edge, not the internal nginx (Gap 2)."
+        )
+        assert "NGINX_HTTPS_PORT=8768" in content, (
+            "_provision_gateway/.env NGINX_HTTPS_PORT must be 8768 (the edge -nginx-acl "
+            "published https port, decision 10)."
         )
 
     def test_users_provision_env_port(self):
@@ -2037,7 +2110,52 @@ class TestServiceUrlPort:
         content = env_path.read_text()
         assert "NGINX_HTTP_PORT=8766" in content, (
             "_users_provision/.env NGINX_HTTP_PORT must be 8766 (not stale 8080) to match the "
-            "docker-compose.provision.yml nginx binding (Gap 2)."
+            "docker-compose.provision.yml internal nginx binding (Gap 2)."
+        )
+
+
+class TestEdgeSetTokenReachable:
+    """Gap 1 (F7 /go/ handoff): the edge's `location = /_set_token` must NOT be
+    `internal;` — the /go/ 303 lands the browser directly on
+    {svc-host}/_set_token?code=<30s> and a design-required browser-reachable
+    relay (v5 §4.3 helper sketch + §8.8). `internal;` makes it return 404 at the
+    edge. The gateway-direct /api/auth/exchange was already correct."""
+
+    def test_set_token_location_not_internal(self):
+        from pathlib import Path
+        template = (
+            Path(__file__).parent.parent.parent
+            / "nginx.acl" / "acl-helpers.conf.template"
+        )
+        content = template.read_text()
+        # Isolate the exact-match block so an unrelated `internal;` (e.g. the
+        # /_auth_jwt auth_request subrequest) cannot satisfy this assertion.
+        block = content.split("location = /_set_token {", 1)[1].split("}", 1)[0]
+        assert "internal" not in block, (
+            "edge `location = /_set_token` must be browser-reachable (no `internal;`) "
+            "for the F7 /go/ handoff — v5 §4.3/§8.8 (Gap 1)."
+        )
+        # The relay must still forward the full query string to the exchange.
+        assert "proxy_pass http://subnet-acl-gateway:8770/api/auth/exchange$is_args$args" in block, (
+            "edge `/_set_token` must relay `$is_args$args` to the gateway exchange (F12)."
+        )
+
+    def test_set_token_kept_outside_auth_request_location(self):
+        from pathlib import Path
+        edge = (
+            Path(__file__).parent.parent.parent
+            / "nginx.acl" / "edge.conf.template"
+        )
+        content = edge.read_text()
+        # F11: the ACL gate lives in `location /` ONLY, never server-level, so the
+        # exact-match `/_set_token` location stays token-less.
+        assert "auth_request /_auth_jwt;" in content
+        # The gate must be inside `location /` blocks, not at server level.
+        import re
+        gate_locations = re.findall(r"location /\s*\{[^}]*auth_request /_auth_jwt;", content)
+        assert gate_locations, (
+            "the ACL gate (auth_request /_auth_jwt) must live inside `location /` "
+            "only (F11) so `location = /_set_token` is never gated."
         )
 
 
@@ -2210,14 +2328,45 @@ class TestGetMeUsesGatewayToken:
         assert "Depends(require_gateway_token)" in src
         assert "Depends(get_current_user)" not in src
 
-    def test_require_gateway_token_accepts_gateway_token_cookie(self):
-        """A gateway_token cookie (type='gateway', 24h) authenticates /me."""
-        import asyncio
-        from unittest.mock import MagicMock, patch
+    def test_require_gateway_token_rejects_gateway_token_cookie(self):
+        """G5: a legacy gateway_token cookie (type='gateway') is REJECTED (401)."""
+        from unittest.mock import MagicMock
+        from fastapi import HTTPException
         from app.middleware import require_gateway_token
         from app.services.auth_service import create_gateway_token
 
         token = create_gateway_token(42, "admin@test.com", "admin", "admin")
+        req = MagicMock()
+        req.cookies = {"gateway_token": token}
+        req.headers = {}
+
+        with pytest.raises(HTTPException) as exc_info:
+            require_gateway_token(request=req)
+        assert exc_info.value.status_code == 401
+
+    def test_require_gateway_token_rejects_bearer_gateway_token(self):
+        """G5: a legacy Bearer gateway token is REJECTED (401)."""
+        from unittest.mock import MagicMock
+        from fastapi import HTTPException
+        from app.middleware import require_gateway_token
+        from app.services.auth_service import create_gateway_token
+
+        token = create_gateway_token(7, "viewer@test.com", "viewer", "end_user")
+        req = MagicMock()
+        req.cookies = {}
+        req.headers = {"Authorization": f"Bearer {token}"}
+
+        with pytest.raises(HTTPException) as exc_info:
+            require_gateway_token(request=req)
+        assert exc_info.value.status_code == 401
+
+    def test_require_gateway_token_accepts_provision_cookie(self):
+        """A provision_token cookie (the v4 single credential) authenticates."""
+        from unittest.mock import MagicMock, patch
+        from app.middleware import require_gateway_token
+        from app.services.auth_service import create_provision_token
+
+        token = create_provision_token(42, "admin@test.com", "admin", "admin")
         admin = MagicMock()
         admin.id = 42
         admin.email = "admin@test.com"
@@ -2225,46 +2374,16 @@ class TestGetMeUsesGatewayToken:
         admin.is_active = True
 
         req = MagicMock()
-        req.cookies = {"gateway_token": token}
+        req.cookies = {"provision_token": token}
         req.headers = {}
-        db = MagicMock()
 
         with patch("app.middleware.get_admin_by_id", return_value=admin):
-            user = asyncio.run(require_gateway_token(request=req, db=db))
+            user = require_gateway_token(request=req)
 
         assert user["id"] == 42
         assert user["email"] == "admin@test.com"
         assert user["role"] == "admin"
         assert user["user_type"] == "admin"
-
-    def test_require_gateway_token_accepts_bearer_gateway_token(self):
-        """A Bearer gateway token (type='gateway') also authenticates /me."""
-        import asyncio
-        from unittest.mock import MagicMock, patch
-        from app.middleware import require_gateway_token
-        from app.services.auth_service import create_gateway_token
-
-        token = create_gateway_token(7, "viewer@test.com", "viewer", "end_user")
-        end_user = MagicMock()
-        end_user.id = 7
-        end_user.username = "viewer@test.com"
-        end_user.role = "viewer"
-        end_user.is_active = True
-        end_user.is_approved = True
-        end_user.allowed_special_users = ""
-
-        req = MagicMock()
-        req.cookies = {}
-        req.headers = {"Authorization": f"Bearer {token}"}
-        db = MagicMock()
-
-        with patch("app.middleware.get_end_user_by_id", return_value=end_user):
-            user = asyncio.run(require_gateway_token(request=req, db=db))
-
-        assert user["id"] == 7
-        assert user["email"] == "viewer@test.com"
-        assert user["role"] == "viewer"
-        assert user["user_type"] == "end_user"
 
 
 class TestAdminRoutesMigratedToGatewayToken:
@@ -2272,14 +2391,13 @@ class TestAdminRoutesMigratedToGatewayToken:
     cookie/Bearer, 24h TTL) instead of ``get_current_admin``/``require_admin_role``
     (Bearer ``access_token``, 1h TTL), per gateway-acl-architecture.md §5."""
 
-    def test_require_admin_accepts_admin_gateway_token_cookie(self):
-        """An admin gateway_token cookie (type='gateway') satisfies require_admin."""
-        import asyncio
+    def test_require_admin_accepts_admin_provision_cookie(self):
+        """An admin provision_token cookie satisfies require_admin."""
         from unittest.mock import MagicMock, patch
         from app.middleware import require_admin
-        from app.services.auth_service import create_gateway_token
+        from app.services.auth_service import create_provision_token
 
-        token = create_gateway_token(42, "admin@test.com", "admin", "admin")
+        token = create_provision_token(42, "admin@test.com", "admin", "admin")
         admin = MagicMock()
         admin.id = 42
         admin.email = "admin@test.com"
@@ -2287,26 +2405,24 @@ class TestAdminRoutesMigratedToGatewayToken:
         admin.is_active = True
 
         req = MagicMock()
-        req.cookies = {"gateway_token": token}
+        req.cookies = {"provision_token": token}
         req.headers = {}
-        db = MagicMock()
 
         with patch("app.middleware.get_admin_by_id", return_value=admin):
-            user = asyncio.run(require_admin(request=req, db=db))
+            user = require_admin(request=req)
 
         assert user["id"] == 42
         assert user["role"] == "admin"
         assert user["user_type"] == "admin"
 
     def test_require_admin_rejects_viewer_role_403(self):
-        """A viewer (non-admin role) gateway_token is rejected with 403."""
-        import asyncio
+        """A viewer (non-admin role) provision token is rejected with 403."""
         from unittest.mock import MagicMock, patch
         from fastapi import HTTPException
         from app.middleware import require_admin
-        from app.services.auth_service import create_gateway_token
+        from app.services.auth_service import create_provision_token
 
-        token = create_gateway_token(7, "viewer@test.com", "viewer", "end_user")
+        token = create_provision_token(7, "viewer@test.com", "viewer", "end_user")
         end_user = MagicMock()
         end_user.id = 7
         end_user.username = "viewer@test.com"
@@ -2316,13 +2432,12 @@ class TestAdminRoutesMigratedToGatewayToken:
         end_user.allowed_special_users = ""
 
         req = MagicMock()
-        req.cookies = {}
-        req.headers = {"Authorization": f"Bearer {token}"}
-        db = MagicMock()
+        req.cookies = {"provision_token": token}
+        req.headers = {}
 
         with patch("app.middleware.get_end_user_by_id", return_value=end_user):
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(require_admin(request=req, db=db))
+                require_admin(request=req)
 
         assert exc_info.value.status_code == 403
 
@@ -2769,20 +2884,24 @@ class TestDbMigration:
         cols_before = {c["name"] for c in inspect(eng).get_columns("api_keys")}
         assert "mask" not in cols_before and "is_default" not in cols_before
 
-        _ensure_schema(eng)
-
-        cols_after = {c["name"] for c in inspect(eng).get_columns("api_keys")}
-        assert "mask" in cols_after
-        assert "is_default" in cols_after
-        # Inserting a row with only the old fields still works (columns nullable/defaulted).
+        # A pre-migration row exists BEFORE the migration runs, so the mask
+        # backfill (G7) must fill it.
         with eng.begin() as conn:
             conn.execute(text(
                 "INSERT INTO api_keys (user_id, label, token_hash, expires_at) "
                 "VALUES (1, 'k', 'h', '2030-01-01 00:00:00')"
             ))
+
+        _ensure_schema(eng)
+
+        cols_after = {c["name"] for c in inspect(eng).get_columns("api_keys")}
+        assert "mask" in cols_after
+        assert "is_default" in cols_after
         with eng.begin() as conn:
             row = conn.execute(text("SELECT mask, is_default FROM api_keys")).fetchone()
-        assert row.mask is None
+        # G7: mask backfilled from the stored token_hash (raw token is hashed);
+        # is_default stays 0 for a non-default key.
+        assert row.mask == "h"[-8:]
         assert row.is_default == 0
 
     def test_ensure_schema_idempotent(self, tmp_path):
@@ -2804,3 +2923,329 @@ class TestDbMigration:
         _ensure_schema(eng)
         cols = {c["name"] for c in inspect(eng).get_columns("api_keys")}
         assert "mask" in cols and "is_default" in cols
+
+
+# ---------------------------------------------------------------------------
+# G2 — one-default-per-user (partial unique index) + cascade delete
+# ---------------------------------------------------------------------------
+
+
+class TestG2OneDefaultPerUser:
+    """v4 §6.1.3 (G2): exactly one default per user at the DB level, and user
+    deletion cascades to api_keys so SQLite id-reuse can't orphan stale defaults."""
+
+    def _make_drifted_schema(self, path):
+        from sqlalchemy import create_engine, text
+        eng = create_engine(f"sqlite:///{path}")
+        with eng.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE api_keys ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " user_id INTEGER NOT NULL,"
+                " label VARCHAR(255) NOT NULL,"
+                " token_hash VARCHAR(255) NOT NULL UNIQUE,"
+                " mask VARCHAR(255),"
+                " is_default BOOLEAN NOT NULL DEFAULT 0,"
+                " created_at DATETIME,"
+                " expires_at DATETIME NOT NULL,"
+                " is_revoked BOOLEAN NOT NULL DEFAULT 0,"
+                " last_used_at DATETIME)"
+            ))
+            i = 0
+            for uid in (1, 1, 1, 2, 2):  # user 1 has 3 defaults, user 2 has 2
+                i += 1
+                conn.execute(text(
+                    "INSERT INTO api_keys (user_id, label, token_hash, mask, is_default, expires_at) "
+                    "VALUES (:uid, 'Default', :th, NULL, 1, '2030-01-01 00:00:00')"
+                ), {"uid": uid, "th": f"hash-{i}"})
+        return eng
+
+    def test_ensure_schema_repairs_multi_default_drift(self, tmp_path):
+        """Migration must de-duplicate drifted is_default rows, then install the
+        partial unique index (a plain CREATE UNIQUE would fail on the drift)."""
+        from app.database import _ensure_schema
+        from sqlalchemy import inspect, text
+        eng = self._make_drifted_schema(str(tmp_path / "drift.db"))
+
+        _ensure_schema(eng)
+
+        # No user may have >1 default (DB-drift scan regression).
+        with eng.begin() as conn:
+            bad = conn.execute(text(
+                "SELECT user_id, COUNT(*) FROM api_keys "
+                "WHERE is_default = 1 GROUP BY user_id HAVING COUNT(*) > 1"
+            )).fetchall()
+        assert bad == []
+
+        # The partial unique index now exists.
+        idx_names = {i["name"] for i in inspect(eng).get_indexes("api_keys")}
+        assert "uq_api_keys_one_default" in idx_names
+
+    def test_fresh_db_has_partial_unique_index(self, tmp_path):
+        """create_all on the model installs the partial unique index directly."""
+        from sqlalchemy import create_engine, inspect
+        from app.database import Base
+        from app.models.api_key import ApiKey  # noqa: F401 — registers the model
+        eng = create_engine(f"sqlite:///{tmp_path/'fresh.db'}")
+        Base.metadata.create_all(bind=eng)
+        idx_names = {i["name"] for i in inspect(eng).get_indexes("api_keys")}
+        assert "uq_api_keys_one_default" in idx_names
+
+    def test_index_rejects_second_default_row(self, tmp_path):
+        """Directly inserting a second is_default=1 row for a user violates the
+        partial unique index."""
+        from sqlalchemy import create_engine, text
+        from sqlalchemy.exc import IntegrityError
+        from app.database import Base
+        from app.models.api_key import ApiKey  # noqa: F401
+        eng = create_engine(f"sqlite:///{tmp_path/'idx.db'}")
+        Base.metadata.create_all(bind=eng)
+        # One default for user 1 is fine.
+        with eng.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO api_keys (user_id, label, token_hash, is_default, is_revoked, expires_at) "
+                "VALUES (1, 'Default', 'th1', 1, 0, '2030-01-01 00:00:00')"
+            ))
+        # A SECOND default for the same user violates the partial unique index.
+        import pytest
+        with pytest.raises(IntegrityError):
+            with eng.begin() as conn:
+                conn.execute(text(
+                    "INSERT INTO api_keys (user_id, label, token_hash, is_default, is_revoked, expires_at) "
+                    "VALUES (1, 'Default', 'th-again', 1, 0, '2030-01-01 00:00:00')"
+                ))
+
+    def test_create_api_key_default_unsets_existing(self, tmp_path):
+        """create_api_key(is_default=True) must not create a second default (G2)."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.database import Base
+        from app.models.api_key import ApiKey
+        from app.services import auth_service
+        eng = create_engine(f"sqlite:///{tmp_path/'k.db'}")
+        Base.metadata.create_all(bind=eng)
+        Session = sessionmaker(bind=eng)
+        db = Session()
+        k1, _ = auth_service.create_api_key(db, 1, "a", is_default=True)
+        k2, _ = auth_service.create_api_key(db, 1, "b", is_default=True)
+        count = db.query(ApiKey).filter(
+            ApiKey.user_id == 1, ApiKey.is_default.is_(True)
+        ).count()
+        assert count == 1
+        assert k2.is_default is True
+        db.close()
+
+    def test_delete_api_keys_for_user_cascades(self, tmp_path):
+        """Deleting a user must remove their api_keys (G2)."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.database import Base
+        from app.models.api_key import ApiKey
+        from app.services import auth_service
+        eng = create_engine(f"sqlite:///{tmp_path/'c.db'}")
+        Base.metadata.create_all(bind=eng)
+        Session = sessionmaker(bind=eng)
+        db = Session()
+        auth_service.create_api_key(db, 1, "a", is_default=True)
+        auth_service.create_api_key(db, 1, "b")
+        deleted = auth_service.delete_api_keys_for_user(db, 1)
+        assert deleted == 2
+        assert db.query(ApiKey).filter(ApiKey.user_id == 1).count() == 0
+        db.close()
+
+    def test_register_after_delete_yields_single_default(self, tmp_path):
+        """A user deleted (keys cascaded) then re-registered gets exactly one
+        default — no stale default orphaned by id-reuse."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.database import Base
+        from app.models.api_key import ApiKey
+        from app.services import auth_service
+        eng = create_engine(f"sqlite:///{tmp_path/'r.db'}")
+        Base.metadata.create_all(bind=eng)
+        Session = sessionmaker(bind=eng)
+        db = Session()
+        auth_service.create_api_key(db, 5, "Default", is_default=True)
+        auth_service.delete_api_keys_for_user(db, 5)
+        # new user reuses id 5 (SQLite autoincrement reuse after delete)
+        auth_service.create_api_key(db, 5, "Default", is_default=True)
+        count = db.query(ApiKey).filter(
+            ApiKey.user_id == 5, ApiKey.is_default.is_(True)
+        ).count()
+        assert count == 1
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# G3 — special users blocked at login with 403 (B11) when credentials are valid
+# ---------------------------------------------------------------------------
+
+
+class TestG3SpecialUserLogin403:
+    """v4 §1.2 B11 / §6.1.6: a special-role user with a VALID credential must be
+    rejected at login with 403 (not 401). The 401 the deployed placeholder
+    accounts produce is a *password* failure — the 403 branch fires once
+    authentication actually succeeds."""
+
+    def test_special_user_with_valid_password_login_403(self):
+        import pytest
+        from fastapi import HTTPException
+        from unittest.mock import MagicMock, patch
+        from app.routers.auth import login
+        from app.schemas.auth import LoginRequest
+        req = LoginRequest(email="internal", password="real-bcrypt-pass")
+        result = ("end_user", {
+            "id": 9, "username": "internal", "role": "special",
+            "is_approved": True, "is_active": True,
+        })
+        with patch("app.routers.auth.auth_service.authenticate_user", return_value=result):
+            with pytest.raises(HTTPException) as ei:
+                login(req, MagicMock(), MagicMock())
+        assert ei.value.status_code == 403
+        assert "Special users cannot access the dashboard" in ei.value.detail
+
+    def test_special_user_login_never_mints_token(self):
+        """The 403 fires BEFORE any provision token is minted."""
+        import pytest
+        from fastapi import HTTPException
+        from unittest.mock import MagicMock, patch
+        from app.routers.auth import login
+        from app.schemas.auth import LoginRequest
+        req = LoginRequest(email="internal", password="x")
+        result = ("end_user", {
+            "id": 9, "username": "internal", "role": "special",
+            "is_approved": True, "is_active": True,
+        })
+        with patch("app.routers.auth.auth_service.authenticate_user", return_value=result), \
+             patch("app.routers.auth.auth_service.create_provision_token") as cpt:
+            with pytest.raises(HTTPException):
+                login(req, MagicMock(), MagicMock())
+        cpt.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# G4 — admins get a default key at registration + login binds to it
+# ---------------------------------------------------------------------------
+
+
+class TestG4AdminDefaultKey:
+    """v4 §6.1.5: admins get a default key at registration; login binds their
+    provision_token to it (revocable, R1)."""
+
+    def test_create_admin_creates_default_key(self, tmp_path):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.database import Base
+        from app.models.api_key import ApiKey
+        from app.services import auth_service
+        eng = create_engine(f"sqlite:///{tmp_path/'a.db'}")
+        Base.metadata.create_all(bind=eng)
+        Session = sessionmaker(bind=eng)
+        db = Session()
+        admin = auth_service.create_admin(db, "a@b.c", "pw123", role="admin")
+        keys = db.query(ApiKey).filter(ApiKey.user_id == admin.id).all()
+        assert len(keys) == 1
+        assert keys[0].is_default is True
+        assert keys[0].label == "Default"
+        db.close()
+
+    def test_login_binds_admin_token_to_default_key(self):
+        from unittest.mock import MagicMock, patch
+        from app.routers.auth import login
+        from app.schemas.auth import LoginRequest
+        req = LoginRequest(email="a@b.c", password="pw")
+        default_key = MagicMock()
+        default_key.id = 77
+        result = ("admin", {"id": 1, "email": "a@b.c", "role": "admin"})
+        with patch("app.routers.auth.auth_service.authenticate_user", return_value=result), \
+             patch("app.routers.auth.auth_service.get_or_create_default_key",
+                   return_value=default_key) as goc, \
+             patch("app.routers.auth.auth_service.create_provision_token",
+                   return_value="TOK") as cpt, \
+             patch("app.routers.auth.settings.PROVISION_COOKIE_TTL", 604800):
+            from unittest.mock import MagicMock as M
+            request = M()
+            resp = login(req, request, MagicMock())
+        goc.assert_called_once()
+        _, kwargs = cpt.call_args
+        assert kwargs["api_key_id"] == 77
+        assert resp.headers["set-cookie"].startswith("provision_token=TOK")
+
+
+# ---------------------------------------------------------------------------
+# G7 — mask backfill on migration
+# ---------------------------------------------------------------------------
+
+
+class TestG7MaskBackfill:
+    """v4 §6.1.3 (G7): pre-migration api_keys rows with NULL mask get a display
+    mask backfilled (derived from token_hash — the raw token is hashed at rest)."""
+
+    def test_ensure_schema_backfills_null_masks(self, tmp_path):
+        from app.database import _ensure_schema
+        from sqlalchemy import create_engine, text
+        eng = create_engine(f"sqlite:///{tmp_path/'m.db'}")
+        with eng.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE api_keys ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " user_id INTEGER NOT NULL,"
+                " label VARCHAR(255) NOT NULL,"
+                " token_hash VARCHAR(255) NOT NULL UNIQUE,"
+                " created_at DATETIME,"
+                " expires_at DATETIME NOT NULL,"
+                " is_revoked BOOLEAN NOT NULL DEFAULT 0,"
+                " last_used_at DATETIME)"
+            ))
+            conn.execute(text(
+                "INSERT INTO api_keys (user_id, label, token_hash, expires_at) "
+                "VALUES (1, 'Default', 'abc12345def', '2030-01-01 00:00:00')"
+            ))
+        _ensure_schema(eng)
+        with eng.begin() as conn:
+            row = conn.execute(text(
+                "SELECT mask FROM api_keys WHERE token_hash='abc12345def'"
+            )).fetchone()
+        assert row.mask == "abc12345def"[-8:]
+
+
+# ---------------------------------------------------------------------------
+# G8 — POST /api/auth/keys becomes default only when the user has no default
+# ---------------------------------------------------------------------------
+
+
+class TestG8CreateKeyDefaultFallback:
+    """v4 §6.1.6: a new key becomes default only if the user has no default."""
+
+    def test_create_key_becomes_default_when_user_has_none(self):
+        from unittest.mock import MagicMock, patch
+        from app.routers.auth import create_key
+        key = MagicMock()
+        key.id = 50
+        key.to_dict.return_value = {"id": 50}
+        db = MagicMock()
+        with patch("app.routers.auth.auth_service.create_api_key",
+                   return_value=(key, "RAW")) as cak, \
+             patch("app.routers.auth.auth_service.user_has_default_key",
+                   return_value=False) as uhd, \
+             patch("app.routers.auth.auth_service.set_default_api_key") as sda:
+            out = create_key({"label": "x"}, {"role": "admin", "id": 1}, db)
+        cak.assert_called_once()
+        uhd.assert_called_once()
+        sda.assert_called_once_with(db, 50)
+        assert out["token"] == "RAW"
+
+    def test_create_key_not_default_when_user_has_one(self):
+        from unittest.mock import MagicMock, patch
+        from app.routers.auth import create_key
+        key = MagicMock()
+        key.id = 51
+        key.to_dict.return_value = {"id": 51}
+        db = MagicMock()
+        with patch("app.routers.auth.auth_service.create_api_key",
+                   return_value=(key, "RAW")), \
+             patch("app.routers.auth.auth_service.user_has_default_key",
+                   return_value=True), \
+             patch("app.routers.auth.auth_service.set_default_api_key") as sda:
+            create_key({"label": "x"}, {"role": "viewer", "id": 2}, db)
+        sda.assert_not_called()
