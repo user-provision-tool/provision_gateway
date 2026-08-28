@@ -167,11 +167,13 @@
 
 ---
 
-## 6. Source Projects — Add Service from Template
+## 6. Source Projects — Add Service from Template — DEPRECATED
 
 **Goal:** Create a service project from a pre-built template in the service_templates database table.
 
-> **IMPORTANT (iter-1, GAP-1):** The "From Template" tab has been REMOVED from the Add Source Project modal (UI now offers From Git + Upload Zip only; orphan `AddServiceModal.tsx` deleted). This flow is now **API-only** — the backend `mode: template` path and `GET /api/services/templates` are retained.
+> **IMPORTANT (iter-1, GAP-1):** The "From Template" tab has been REMOVED from the Add Source Project modal (UI now offers From Git + Upload Zip only; orphan `AddServiceModal.tsx` deleted).
+> **DEPRECATED:** the `service_templates` table has no writer/seed in the repo (empty unless seeded
+> manually), so the API-only flow below only works against manually-seeded data. Prefer Git/Upload.
 
 **Page:** `/services`
 
@@ -579,13 +581,17 @@
 
 ---
 
-## 19. Troubleshoot Chat
+## 19. Troubleshoot Chat — 🔜 FUTURE (not implemented)
 
 **Goal:** Get AI-assisted troubleshooting for service issues.
 
+> **Future:** the chat modal UI exists, but the backend troubleshoot contract is not implemented —
+> `POST /api/llm/generate` with `type=troubleshoot` always returns `400 Invalid type: None` (the
+> whitelist accepts only `docker_compose|nginx_conf|env_file|dockerfile`). Needs redesign.
+
 **Access:** Click **"?"** (question-circle) icon in the header (admin only)
 
-**Steps:**
+**Steps (intended, pending backend implementation):**
 1. Click the **"?"** icon in the top header bar
 2. **Chat Modal** opens with message input
 3. Type a question (e.g., "Why is siyuan-mcp for alice down?")
@@ -594,7 +600,7 @@
 6. Chat history is maintained in the modal (cleared on close)
 
 **API calls:**
-- `POST /api/llm/generate` (type=troubleshoot)
+- `POST /api/llm/generate` (type=troubleshoot) — currently 400s
 
 **Precondition:** LLM must be configured and active (Settings page)
 

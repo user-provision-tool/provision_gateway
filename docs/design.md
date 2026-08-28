@@ -1,7 +1,7 @@
 # Provision Gateway — Product Design Document
 
-> **Version**: 1.4
-> **Date**: 2026-08-22 (updated — v4 Service-ACL enforcement: three-credential token model dropped, `/api/auth/refresh` removed, `/go/` 30s exchange code with no JWT in URL, env.d mode switch)
+> **Version**: 1.6
+> **Date**: 2026-08-24 (updated — cycle 20260824T173309Z v5 ACL-enforcement: §5.3b verify/go flow updated to the edge `-nginx-acl` model — verify called by the edge `/_auth_jwt`, `/__basic__/` short-circuit removed, edge-side `/_set_token`; §10 env table `NGINX_HTTP_PORT`/`NGINX_HTTPS_PORT` = published edge `-nginx-acl` ports in fullset (decision 10), not provision-nginx ports; prior: v4 Service-ACL enforcement: three-credential token model dropped, `/api/auth/refresh` removed, `/go/` 30s exchange code with no JWT in URL, env.d mode switch)
 > **Status**: Implemented — reflects current codebase
 > **See also**: [architecture.md](./architecture.md) | [api_references.md](./api_references.md) | [tests_coverage_status.md](./tests_coverage_status.md)
 
@@ -58,7 +58,7 @@
 │  │  ┌──────────────────┐                                        │ │
 │  │  │  provision-mcp   │  ← MCP server for external AI agents   │ │
 │  │  │  FastAPI :8780   │     (SSE streaming, session-based)     │ │
-│  │  └──────────────────┘                                        │ │
+│  │  └──────────────────┘   ⚠ NON-FUNCTIONAL vs v5 (cannot auth) │ │
 │  └──────────────────────────────────────────────────────────────┘ │
 │                                                                    │
 │  ┌─────────────┐                                                   │
@@ -477,11 +477,29 @@ CREATE TABLE end_users (
 );
 
 --------------------------------------------------------------
+-- API Keys (v4/v5: 1-year provision tokens, one default/user)
+--------------------------------------------------------------
+CREATE TABLE api_keys (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL REFERENCES end_users(id),
+    label         TEXT NOT NULL,
+    token_hash    TEXT NOT NULL UNIQUE,       -- SHA-256 of the raw token (raw never stored)
+    mask          TEXT,                       -- last 8 chars, display-only
+    is_default    INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at    TEXT NOT NULL,              -- 1 year
+    is_revoked    INTEGER NOT NULL DEFAULT 0,
+    last_used_at  TEXT
+);
+CREATE UNIQUE INDEX uq_api_keys_one_default
+    ON api_keys (user_id) WHERE is_default = 1;
+
+--------------------------------------------------------------
 -- LLM Configuration (multiple configs, one active)
 --------------------------------------------------------------
 CREATE TABLE llm_config (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    mode             TEXT NOT NULL DEFAULT 'byok',  -- 'local_agent' | 'byok'
+    mode             TEXT NOT NULL DEFAULT 'byok',  -- only 'byok' supported; 'local_agent' is deferred (GAP-2)
     agent_url        TEXT,                     -- e.g. http://localhost:11434/v1
     agent_model      TEXT,                     -- e.g. llama3.1:8b
     byok_api_key_enc TEXT,                     -- AES-256-GCM encrypted
@@ -536,7 +554,8 @@ CREATE INDEX idx_audit_user     ON audit_log(target_user);
 CREATE INDEX idx_audit_created  ON audit_log(created_at);
 
 --------------------------------------------------------------
--- Service Templates (optional — local template library)
+-- Service Templates (DEPRECATED — currently unpopulated: no
+-- writer/seed in the repo; mode=template is dormant)
 --------------------------------------------------------------
 CREATE TABLE service_templates (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -663,10 +682,10 @@ PUT /api/auth/password
 
 ```
 GET /api/auth/verify
-  → Called by provision-nginx as auth_request subrequest (ACL mode only)
+  → Called by the edge -nginx-acl /_auth_jwt as auth_request subrequest (ACL mode only; v5 F3 — internal per-service confs are simple ACL-free, F8)
   → Extracts JWT from provision_token cookie or X-Provision-Token header
   → Applies the v4 hybrid X-Client-Type rule (header ⇒ api / cookie ⇒ browser / text/html ⇒ browser / else ⇒ api); X-Client-Type on every response
-  → Basic mode ($auth_mode empty): nginx short-circuits via /__basic__/ (0 subrequests) — verify not called
+  → ACL-off mode: the edge passes through to internal native Basic (auth_basic) — verify not called (v5 F6; /__basic__/ short-circuit removed)
   → ACL mode: validates JWT, checks ACL (revocation before admin bypass; expires_at/active approved — F3 ordering)
   → Response (ACL passed): 200 + X-Service-Basic header (base64 user:pass)
   → Response (ACL denied): 403 + X-Auth-Action: acl_denied
@@ -674,9 +693,9 @@ GET /api/auth/verify
   → Response (no token): 401 + X-Auth-Action: login_required
 
 GET /go/{hostname}
-  → Dashboard service access redirect (v4)
+  → Dashboard service access redirect (v4/v5, F13)
   → Validates the provision_token session, checks ACL, issues a 30s HMAC exchange code + Location header (no JWT in URL)
-  → Service-side /_set_token is a plain proxy to /api/auth/exchange, which swaps the code for the provision_token cookie via 302+Set-Cookie
+  → Edge-side /_set_token is a plain proxy to /api/auth/exchange, which swaps the code for the provision_token cookie via 302+Set-Cookie (v5 F3)
 
 POST /api/auth/keys
   → Create API key for end-user programmatic access
@@ -847,7 +866,7 @@ POST /api/services
   │   { "mode": "upload", "name": "myapp" }                  │
   │   + multipart files: compose, nginx, env, dockerfile      │
   │                                                          │
-  │ Mode 3: From Template                                    │
+  │ Mode 3: From Template (DEPRECATED — no seed data)        │
   │   { "mode": "template", "template_id": 1, "name": "wp" } │
   └──────────────────────────────────────────────────────────┘
   Response: 201 { "name": "myapp", "path": "...", "files": [...], "llm_generated": ["nginx.conf"] }
@@ -1011,15 +1030,15 @@ DELETE /api/tasks/{task_id}
 ```
 GET /api/llm/config
   Response: 200 {
-    "mode": "local_agent",
-    "agent_url": "http://localhost:11434/v1",
-    "agent_model": "llama3.1:8b",
+    "mode": "byok",
     "byok_configured": true,
     "byok_model": "gpt-4o",
     "byok_api_key_masked": "sk-...xxxx",
     "is_active": true,
     "system_prompt": "You are a DevOps assistant..."
   }
+  → local_agent fields (mode='local_agent', agent_url, agent_model) are DEFERRED (GAP-2):
+    mode is normalized to 'byok' and agent_url/agent_model are never persisted.
 
 PUT /api/llm/config
   Request:  {
@@ -1044,7 +1063,7 @@ POST /api/llm/test
 
 POST /api/llm/generate
   Request:  {
-    "type": "docker_compose" | "nginx_conf" | "env_file" | "dockerfile",
+    "type": "docker_compose" | "nginx_conf" | "env_file" | "dockerfile",  # the only supported types — troubleshoot / service_config are future
     "context": {
       "repo_description": "A Python FastAPI app with Redis caching",
       "repo_files": ["Dockerfile", "requirements.txt", "main.py"],
@@ -1151,7 +1170,7 @@ Step 1: Choose source
   │                                     │
   │  ○ From Git Repository             │
   │  ○ Upload Files                     │
-  │  ○ From Template                    │
+  │  (From Template removed, GAP-1)     │
   │                                     │
   │              [Next →]               │
   └─────────────────────────────────────┘
@@ -1354,33 +1373,21 @@ The gateway's `provision_service.py` proxies the reconciliation call and the das
 - `GET /api/system/reconcile/status` → `GET /reconcile/status` on provision-api
 - `GET /api/system/nginx-state` → `GET /nginx-state` on provision-api
 
-### 7.2 Docker Event Monitor (`app/services/docker_service.py`)
+### 7.2 Docker Event Monitor (`app/main.py`)
 
-```
-class DockerEventMonitor:
-    """
-    Listens to Docker events stream for provision-nginx container.
-    On 'restart' or 'die' + 'start' events for provision-nginx:
-      → triggers ReconciliationService.on_nginx_restart()
-    """
-
-    async def start(self):
-        # docker-py events() with filters: container=provision-nginx
-        ...
-
-    async def stop(self):
-        ...
-```
+The docker event monitor is an asyncio background task (`_docker_events_monitor`) started in the
+gateway lifespan (`app/main.py`). It listens to the Docker events stream (docker-py `events()`) for
+the nginx container; on `restart` / `die` + `start` events it triggers reconciliation.
 
 ### 7.3 LLM Service (`app/services/llm_service.py`)
 
 ```
 class LLMService:
     """
-    Two modes:
-    - local_agent: POST {agent_url}/chat/completions
-    - byok: POST {byok_base_url}/chat/completions with Authorization: Bearer {api_key}
-    
+    Modes:
+    - byok: POST {byok_base_url}/chat/completions with Authorization: Bearer {api_key}   # supported
+    - local_agent: DEFERRED (GAP-2) — mode='local_agent' is normalized to byok; agent_url is never used
+
     Both use OpenAI-compatible request/response format.
     """
 
@@ -1656,7 +1663,7 @@ These features have been implemented in `_users_provision/` to fully support the
 
 ```
 □ provision-gateway/
-  □ app/services/docker_service.py (docker-py: ps, stats, events)
+  □ app/main.py (lifespan: docker event monitor, project monitor, reconcile task)
   □ app/services/monitoring_service.py (health checks)
   □ app/services/reconciliation.py
   □ app/utils/nginx_parser.py
@@ -1689,8 +1696,8 @@ These features have been implemented in `_users_provision/` to fully support the
 | `GATEWAY_DATA_DIR` | — | `$PROVISION_DIR/gateway_data` | Gateway SQLite DB + uploads storage |
 | `GATEWAY_SECRET_KEY` | ✓ | — | 32+ char random string; used for JWT signing + API key encryption |
 | `PROVISION_API_URL` | — | `http://provision-api:8000` | URL of the provision-api container (container port, not host port) |
-| `NGINX_HTTP_PORT` | — | `80` | provision-nginx HTTP port (for URL display) |
-| `NGINX_HTTPS_PORT` | — | `443` | provision-nginx HTTPS port (for URL display) |
+| `NGINX_HTTP_PORT` | — | `80` | Published HTTP port of the edge `-nginx-acl` in fullset (decision 10 — reused by the edge from v4; still the gateway `/go/` URL-display port) |
+| `NGINX_HTTPS_PORT` | — | `443` | Published HTTPS port of the edge `-nginx-acl` in fullset (decision 10 — reused by the edge from v4; still the gateway `/go/` URL-display port) |
 | `DOCKER_OPS_LOG` | — | `$PROVISION_DIR/generated/docker_ops.log` | Build log file path for streaming |
 | `DASHBOARD_PORT` | — | `8771` | Host port for dashboard (mapped to 127.0.0.1 only) |
 | `GATEWAY_LOG_LEVEL` | — | `INFO` | Logging level |

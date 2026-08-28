@@ -1,7 +1,7 @@
 # Provision Gateway — API Reference
 
-> **Version**: 2.1
-> **Date**: 2026-08-22 (updated — v4 Service-ACL enforcement: three-credential token model dropped — `access_token`/`refresh_token`/`gateway_token` removed, `POST /api/auth/refresh` no longer exists, `POST /api/auth/logout` added, `/go/` issues a 30s exchange code with no JWT in URL; prior: From Template tab removed from UI / mode=template API-only (GAP-1), local-agent fields deferred at API level (GAP-2))
+> **Version**: 2.3
+> **Date**: 2026-08-24 (updated — cycle 20260824T173309Z v5 ACL-enforcement: `GET /api/auth/verify` is now invoked by the edge `-nginx-acl` `/_auth_jwt` — internal per-service confs are simple ACL-free and the `/__basic__/` short-circuit is removed (ACL-off = edge pass-through to native Basic); `GET /go/{hostname}` contract unchanged (F13) — the `/_set_token` relay now lives on the edge `-nginx-acl` (not service-side) and the no-JWT-in-URL guarantee is part of F13 (not F7); prior: v4 Service-ACL enforcement: three-credential token model dropped — `access_token`/`refresh_token`/`gateway_token` removed, `POST /api/auth/refresh` no longer exists, `POST /api/auth/logout` added, `/go/` issues a 30s exchange code with no JWT in URL; prior: From Template tab removed from UI / mode=template API-only (GAP-1), local-agent fields deferred at API level (GAP-2))
 > **Base URL**: `http://provision-gateway:8770` (internal) / `http://localhost:8771/api` (via dashboard proxy)
 
 ---
@@ -366,7 +366,7 @@ List users available for deployment (approved + active end-users, plus special u
 
 ### `GET /api/auth/verify`
 
-NGINX `auth_request` subrequest endpoint for ACL-based service access control. No authentication required (called by nginx, not browser).
+NGINX `auth_request` subrequest endpoint for ACL-based service access control. No authentication required (called by the edge `-nginx-acl` `/_auth_jwt`, not the browser — v5 F3; internal per-service confs no longer call verify, they are simple ACL-free, F8).
 
 **Request Headers:**
 | Header | Description |
@@ -376,7 +376,7 @@ NGINX `auth_request` subrequest endpoint for ACL-based service access control. N
 
 **Response 200 (ACL passed):**
 - The v4 hybrid `X-Client-Type` rule (X-Provision-Token header ⇒ api / provision_token cookie ⇒ browser / Accept text/html ⇒ browser / else ⇒ api) determines the client type; `X-Client-Type` is set on every response, and `X-Auth-Action` is always present (incl. `unauthorized`).
-- When the per-service conf is in Basic mode (`$auth_mode` empty), nginx short-circuits via `/__basic__/` and never calls verify (0 subrequests) — verify is only invoked in ACL mode.
+- In ACL-off mode the edge passes traffic through to the internal native Basic (`auth_basic`) — verify is only invoked in ACL mode (the internal per-service confs are simple ACL-free under v5, F6/F8).
 - When the token is valid and ACL passed:
   ```
   Headers: X-Service-Basic: <base64-encoded user:pass>
@@ -416,7 +416,7 @@ Headers: `X-Auth-Action: redirect_acl_denied`
 
 ### `GET /go/{hostname}`
 
-Dashboard service access redirect (v4). Validates the `provision_token` session, checks ACL permissions, and issues a **30s HMAC-signed exchange code** plus a `Location` header — **no JWT ever appears in a URL** (F7). The service-side `location = /_set_token` is a plain variable proxy to `/api/auth/exchange`, which swaps the code for the `provision_token` cookie via `302` + `Set-Cookie`.
+Dashboard service access redirect (F13 — gateway contract unchanged in v5). Validates the `provision_token` session, checks ACL permissions, and issues a **30s HMAC-signed exchange code** plus a `Location` header — **no JWT ever appears in a URL** (part of F13). The edge-side `location = /_set_token` (on `-nginx-acl`) is a plain variable proxy to `/api/auth/exchange`, which swaps the code for the `provision_token` cookie via `302` + `Set-Cookie`.
 
 **Path Parameters:**
 | Param | Description |
@@ -430,6 +430,23 @@ Redirects to `http://{hostname}/_set_token?code={code}&redirect=/` (the `code` i
 - `401` — No valid session (provision_token cookie missing/invalid)
 - `403` — ACL denied (viewer cannot access that service)
 - `404` — Service not found for given hostname
+
+---
+
+### `GET /api/auth/exchange`
+
+Internal — the 30s-code → cookie relay, reached via the edge `location = /_set_token` plain proxy
+(not directly by clients; the edge portal blocks it with `return 404`). Verifies a 30s exchange code,
+mints a fresh 1-week `provision_token` cookie bound to the user's default key, and returns `302` +
+`Set-Cookie`.
+
+**Query Parameters:**
+| Param | Description |
+|---|---|
+| `code` | The 30s HMAC-signed exchange code from `/go/` |
+
+**Errors:**
+- `401` — Missing, invalid, or expired exchange code
 
 ---
 
@@ -509,6 +526,26 @@ Revoke an API key (soft delete — sets `is_active=false`).
 **Errors:**
 - `401` — No valid session (provision_token cookie missing/invalid)
 - `403` — Viewer attempting to revoke another user's key
+- `404` — Key not found
+
+---
+
+### `PUT /api/auth/keys/{key_id}/default`
+
+Mark an API key as the user's default (Set-as-Default). Only one default per user (enforced by the
+partial unique index `uq_api_keys_one_default`).
+
+**Response 200:**
+```json
+{
+  "default": true,
+  "key_id": 1
+}
+```
+
+**Errors:**
+- `401` — No valid session
+- `403` — Viewer attempting to manage another user's key
 - `404` — Key not found
 
 ---
@@ -737,6 +774,19 @@ Activate a proxy (deactivates others). Only succeeds if proxy is reachable.
 
 ---
 
+### `POST /api/system/proxy/deactivate`
+
+Deactivate the currently active proxy (no reachability requirement).
+
+**Response 200:**
+```json
+{
+  "deactivated": true
+}
+```
+
+---
+
 ### `DELETE /api/system/proxy/{id}`
 
 Delete a proxy configuration.
@@ -946,7 +996,7 @@ List all service source projects.
 
 ### `GET /api/services/templates`
 
-List all available service templates from the database (service_templates table). Backend `mode: template` + this endpoint are RETAINED (iter-1); note the "From Template" tab was removed from the Add Project modal (GAP-1), so the endpoint is now consumed via the API only, not the UI.
+List all available service templates from the database (service_templates table). **DEPRECATED/dormant** — the `service_templates` table has no writer/seed in the repo and no behavioral test, so the list is empty unless seeded manually; the "From Template" tab was removed from the Add Project modal (GAP-1), so the endpoint is consumed via the API only, not the UI.
 
 **Response 200:**
 ```json
@@ -1025,7 +1075,7 @@ Create a new service project. Three modes:
 }
 ```
 
-**Mode 4 — From Template (DB):**
+**Mode 4 — From Template (DB) — DEPRECATED:**
 ```json
 {
   "mode": "template",
@@ -1033,7 +1083,10 @@ Create a new service project. Three modes:
   "template_id": 1
 }
 ```
-> Note: supported at the API level and retained by iter-1 (GAP-1). The UI no longer exposes this mode — the "From Template" tab was removed from the Add Project modal; the modal now offers From Git + Upload Zip only.
+> Note: **DEPRECATED** — `service_templates` is unpopulated (no writer/seed in the repo); prefer Git/Upload.
+> The feature creates a **source project** from a DB-saved template, not a deployed service. The UI no
+> longer exposes this mode — the "From Template" tab was removed (GAP-1); the modal offers From Git +
+> Upload Zip only.
 
 **Response 201:**
 ```json
@@ -1948,8 +2001,10 @@ Generate configuration files via LLM.
 - `nginx_conf` — Generate nginx.conf
 - `env_file` — Generate .env file
 - `dockerfile` — Generate Dockerfile
-- `troubleshoot` — Chat-style troubleshooting assistance
-- `service_config` — Generate full service configuration
+
+`troubleshoot` and `service_config` are **not implemented** (future): the `/api/llm/generate` whitelist
+(`llm.py:117`) accepts only the four types above; `troubleshoot` returns `400 Invalid type` and
+`service_config` has no caller.
 
 **Response 200:**
 ```json

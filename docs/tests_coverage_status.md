@@ -1,7 +1,7 @@
 # Provision Gateway — Tests Coverage Status
 
-> **Version**: 1.30
-> **Date**: 2026-08-02 (updated — Cycle 20260801T165901Z Iteration 1: GAP-1/2/3/4 tests added by coder + QA — `test_concurrency.py` NEW, `test_unit.py` extended; full pytest suite now **112 passed / 9 skipped / 0 failed**. Iteration 6: rebuild succeeded via the no-proxy path → shell integration tests ran for the **first time** — **108 passed / 1 failed**. Iteration 7: shell integration tests re-ran a **second time** — **108 passed / 1 failed**, identical to iter-6 (result stable). Iteration 8: shell integration tests re-ran a **third time** — **108 passed / 1 failed**, identical to iter-6/iter-7 (result stable). Iteration 9: shell integration tests re-ran a **fourth time** — **108 passed / 1 failed**, identical to iter-6/iter-7/iter-8 (result stable across all 4 runs). Iteration 10: shell integration tests re-ran a **fifth time** — **108 passed / 1 failed**, identical to iter-6/iter-7/iter-8/iter-9 (result stable across all 5 runs). Iteration 11: shell integration tests re-ran a **sixth time** — **108 passed / 1 failed**, identical to iter-6/iter-7/iter-8/iter-9/iter-10 (result stable across all 6 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (11th consecutive occurrence). Iteration 12: shell integration tests re-ran a **seventh time** — **108 passed / 1 failed**, identical to iter-6/iter-7/iter-8/iter-9/iter-10/iter-11 (result stable across all 7 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (12th consecutive occurrence). Iteration 13: shell integration tests re-ran an **eighth time** — **108 passed / 1 failed**, identical to iter-6/iter-7/iter-8/iter-9/iter-10/iter-11/iter-12 (result stable across all 8 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (13th consecutive occurrence). Iteration 14: shell integration tests re-ran a **ninth time** — **108 passed / 1 failed**, identical to iter-6/iter-7/iter-8/iter-9/iter-10/iter-11/iter-12/iter-13 (result stable across all 9 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (14th consecutive occurrence). Iteration 15: shell integration tests re-ran a **tenth time** — **108 passed / 1 failed**, identical to iter-6 through iter-14 (result stable across all 10 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (15th consecutive occurrence). Iteration 16: shell integration tests re-ran an **eleventh time** — **108 passed / 1 failed**, identical to iter-6 through iter-15 (result stable across all 11 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (16th consecutive occurrence). Iteration 17: shell integration tests re-ran a **twelfth time** — **108 passed / 1 failed**, identical to iter-6 through iter-16 (result stable across all 12 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (17th consecutive occurrence). Iteration 18: shell integration tests re-ran a **thirteenth time** — **108 passed / 1 failed**, identical to iter-6 through iter-17 (result stable across all 13 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (18th consecutive occurrence). Iteration 19: shell integration tests re-ran a **fourteenth time** — **108 passed / 1 failed**, identical to iter-6 through iter-18 (result stable across all 14 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (19th consecutive occurrence). Iteration 20: shell integration tests re-ran a **fifteenth time** — **108 passed / 1 failed**, identical to iter-6 through iter-19 (result stable across all 15 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (20th consecutive occurrence). Iteration 21: shell integration tests re-ran a **sixteenth time** — **108 passed / 1 failed**, identical to iter-6 through iter-20 (result stable across all 16 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (21st consecutive occurrence). Iteration 22: shell integration tests re-ran a **seventeenth time** — **108 passed / 1 failed**, identical to iter-6 through iter-21 (result stable across all 17 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (22nd consecutive occurrence). Iteration 23: shell integration tests re-ran an **eighteenth time** — **108 passed / 1 failed**, identical to iter-6 through iter-22 (result stable across all 18 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (23rd consecutive occurrence). Iteration 24: shell integration tests re-ran a **nineteenth time** — **108 passed / 1 failed**, identical to iter-6 through iter-23 (result stable across all 19 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (24th consecutive occurrence). Iteration 25: shell integration tests re-ran a **twentieth time** — **108 passed / 1 failed**, identical to iter-6 through iter-24 (result stable across all 20 runs); the 1 failure = same pre-existing test_deploy.sh Test 3 script defect, re-confirmed NOT a code regression (25th consecutive occurrence))
+> **Version**: 1.31
+> **Date**: 2026-08-28 (refresh — full pytest suite **242 passed / 0 failed**, verified by live run on 2026-08-28: `test_unit.py` 227 + `test_proxy.py` 12 + `test_concurrency.py` 3. The shell suites (`test_integration.sh`, `test_deploy.sh`, `test_proxy.sh`, `test_gateway_api.sh`, `test_provision_api.sh`) require the live Docker stack and are run in-container; their pass/fail counts are not asserted here.)
 > **Status**: Current state of test coverage
 
 ---
@@ -22,17 +22,17 @@
 
 | File | Language | Type | Test Cases | Status |
 |---|---|---|---|---|
-| `test_unit.py` | Python (pytest) | Unit | 94+ | ✅ All passing (prior 87 + coder's GAP-1/2/4 tests — reworked TestUploadModeJSONFormat, reworked TestTemplateMode, new TestLLMConfigDefersLocalAgent, new TestTemplateClassificationGitTracked — plus QA's new TestLLMConfigDefersLocalAgent::test_model_column_default_is_byok, and subnet-acl + multi-recipe coverage: TestAuthVerifyHeaders, TestVerifyAuthStatusCodes, TestGoServiceRedirect, TestApiKeyModel, TestSubnetPoolSystemEndpoint, TestRecipePathMultiRecipe, TestRouteRoleGating) |
-| `test_concurrency.py` | Python (pytest) | Unit (concurrency) | 2 | ✅ Passing (NEW iter-1, GAP-3 — 20 concurrent in-process requests via httpx ASGITransport + Dockerfile `--workers` check; runs in the default pytest suite, no live gateway needed) |
-| `test_proxy.py` | Python (pytest) | Unit | 8 | ✅ Passing |
+| `test_unit.py` | Python (pytest) | Unit | 227 | ✅ All passing (prior 87 + coder's GAP-1/2/4 tests — reworked TestUploadModeJSONFormat, reworked TestTemplateMode, new TestLLMConfigDefersLocalAgent, new TestTemplateClassificationGitTracked — plus QA's new TestLLMConfigDefersLocalAgent::test_model_column_default_is_byok, and subnet-acl + multi-recipe coverage: TestAuthVerifyHeaders, TestVerifyAuthStatusCodes, TestGoServiceRedirect, TestApiKeyModel, TestSubnetPoolSystemEndpoint, TestRecipePathMultiRecipe, TestRouteRoleGating; **2026-08-28**: middleware robustness regression — `TestNewMiddleware` now asserts auth deps are synchronous `def` (not coroutines), a guard for the DB-pool/event-loop deadlock fix) |
+| `test_concurrency.py` | Python (pytest) | Unit (concurrency) | 3 | ✅ Passing (NEW iter-1, GAP-3 — 20 concurrent in-process requests via httpx ASGITransport + Dockerfile `--workers` check; runs in the default pytest suite, no live gateway needed) |
+| `test_proxy.py` | Python (pytest) | Unit | 12 | ✅ Passing |
 | `test_integration.py` | Python (subprocess) | Integration | 9 | 🟡 9 skipped in the default pytest run — host-port probes (conftest curls `localhost:8770/health` from the host; port 8770 is internal-only by compose design). Equivalent live coverage via `test_integration.sh` run in-container → 9/0 passed (iter-6, re-confirmed iter-7 + iter-8 + iter-9 + iter-10 + iter-11 + iter-12 + iter-13 + iter-14 + iter-15 + iter-16 + iter-17 + iter-18 + iter-19 + iter-20 + iter-21) |
 | `test_integration.sh` | Bash | Integration | 113 lines | ✅ Passing |
 | `test_deploy.sh` | Bash | Integration | 199 lines | 🟡 1 pre-existing failure (Test 3 → 400 "Global proxy is not enabled." — the script's `PUT /system/proxy {"enabled":true}` creates a config but does NOT activate it; the API requires `PUT /proxy/{id}/activate`, which only activates reachable proxies; test host 172.18.0.1:7897 unreachable). Confirmed NOT a code regression (iter-6 + iter-7 + iter-8 + iter-9 + iter-10 + iter-11 + iter-12 + iter-13 + iter-14 + iter-15 + iter-16 + iter-17 + iter-18 + iter-19 + iter-20 + iter-21 + iter-22 + iter-23 + iter-24, git-verified; 25th consecutive occurrence — 20th identical shell run) |
 | `test_proxy.sh` | Bash | Integration | 189 lines | ✅ Passing |
 | `test_gateway_api.sh` | Bash | Integration | 347 lines | ✅ Passing |
 | `test_provision_api.sh` | Bash | Integration | 252 lines | ✅ Passing |
-| `test_load.py` | Python (httpx) | Load/Perf | 5 scenarios | ✅ Working (load test for F1 — 20 concurrent requests) |
-| **Total** | | | **Full pytest suite: 112 passed / 9 skipped / 0 failed** (iter-1, re-verified iter-2..21) — includes test_unit.py + test_concurrency.py + test_proxy.py. **Shell integration tests: 108 passed / 1 failed** (iter-6 first run / iter-7 second run / iter-8 third run / iter-9 fourth run / iter-10 fifth run / iter-11 sixth run / iter-12 seventh run / iter-13 eighth run / iter-14 ninth run / iter-15 tenth run / iter-16 eleventh run / iter-17 twelfth run / iter-18 thirteenth run / iter-19 fourteenth run / iter-20 fifteenth run / iter-21 sixteenth run / iter-22 seventeenth run / iter-23 eighteenth run / iter-24 nineteenth run / iter-25 twentieth run — identical 108/1, result stable across all 20 runs; rebuild unblocked via the no-proxy path; ENV-1/2 no longer blocking): test_provision_api.sh 27/0, test_gateway_api.sh 39/0, test_proxy.sh 24/0, test_integration.sh 9/0 (in-container), test_deploy.sh 9/1 (the 1 = pre-existing Test 3 script defect, see §5.3) | |
+| `test_load.py` | Python (httpx) | Load/Perf | 5 scenarios | 🧟 STALE — reads `access_token` + `Authorization: Bearer`, which the cookie-only v5 gateway rejects; not runnable against the current gateway. Not part of the passing suite |
+| **Total** | | | **Full pytest suite: 242 passed / 0 failed** (verified 2026-08-28 — test_unit 227 + test_proxy 12 + test_concurrency 3). Shell integration suites (test_integration.sh, test_deploy.sh, test_proxy.sh, test_gateway_api.sh, test_provision_api.sh) run in-container against the live stack; counts not asserted here. | |
 
 ### 1.2 Test Execution
 
@@ -62,7 +62,7 @@ bash tests/test_provision_api.sh
 
 | Service Module | Unit Tests | Integration Tests | Coverage |
 |---|---|---|---|
-| `auth_service.py` | 4 (hash, verify, JWT, end-user auth) + gateway/provision token + API-key helpers (TestGatewayTokenDecode, TestApiKeyModel) | 3 (login, refresh, end-user login) | 🟢 Good |
+| `auth_service.py` | 4 (hash, verify, JWT, end-user auth) + gateway/provision token + API-key helpers (TestGatewayTokenDecode, TestApiKeyModel) | 2 (login, end-user login) | 🟢 Good |
 | `proxy_service.py` | 3 (env injection, disabled proxy) | 12 (full CRUD, deploy integration) | 🟢 Good |
 | `provision_service.py` | 14 (method existence checks) | 3 (list users, get user, error handling) | 🟢 Good |
 | `service_manager.py` | 12 (create_from_template, scan_for_new_projects, get_new_project_events, project tracking, recipe-path multi-recipe — TestRecipePathMultiRecipe) | 1 (list services) | 🟡 Partial (TestProjectMonitoring, TestTemplateMode, TestRecipePathMultiRecipe in test_unit.py) |
@@ -79,7 +79,7 @@ bash tests/test_provision_api.sh
 
 | Router | Unit Tests | Integration Tests | Coverage |
 |---|---|---|---|
-| `auth.py` | 36 (verify headers/status codes, gateway-token decode, go redirect, API-key model) | 5 (setup, login, me, refresh, end-user login) | 🟡 Partial |
+| `auth.py` | 36 (verify headers/status codes, gateway-token decode, go redirect, API-key model) | 4 (setup, login, me, end-user login) | 🟡 Partial |
 | `system.py` | 1 (subnet-pool route registered) | 4 (status, proxy CRUD, SSL certs) | 🟡 Partial |
 | `services.py` | 7 (TestRecipePathMultiRecipe — check-missing-files recipe_path forwarding, save-generated recipe subdir) | 1 (list) | 🟡 Partial |
 | `users.py` | 0 | 7 (deploy, up/down, password, container logs, error cases) | 🟡 Partial |
@@ -99,9 +99,12 @@ bash tests/test_provision_api.sh
 
 ### 2.4 MCP Server (provision-mcp)
 
+> **⚠ Non-functional against the v5 gateway** — `verify_admin_token` requires `type=='access'` + Bearer
+> (both removed in v5); needs redesign. Zero test coverage.
+
 | Component | Unit Tests | Integration Tests | Coverage |
 |---|---|---|---|
-| `server.py` | 0 | 0 | 🔴 None |
+| `server.py` | 0 | 0 | 🔴 None (non-functional) |
 
 ---
 
@@ -120,6 +123,8 @@ bash tests/test_provision_api.sh
 | `/api/auth/keys` | POST | ✅ | test_unit.py (TestApiKeyModel, TestGatewayTokenDecode) |
 | `/api/auth/keys` | GET | ✅ | test_unit.py (TestGatewayTokenDecode) |
 | `/api/auth/keys/{id}` | DELETE | ✅ | test_unit.py (TestGatewayTokenDecode) |
+| `/api/auth/keys/{id}/default` | PUT | ❌ | — |
+| `/api/auth/exchange` | GET | ❌ | — (internal — reached via the edge `/_set_token`) |
 | `/api/auth/users` | GET | ❌ | — |
 | `/api/auth/users/register` | POST | ❌ | — |
 | `/api/auth/users/{id}/approve` | PUT | ❌ | — |
@@ -135,6 +140,7 @@ bash tests/test_provision_api.sh
 | `/api/system/proxy/{id}` | PUT/DELETE | ✅ | proxy.sh |
 | `/api/system/proxy/{id}/activate` | PUT | ✅ | proxy.sh |
 | `/api/system/proxy/test` | POST | ✅ | proxy.sh |
+| `/api/system/proxy/deactivate` | POST | ❌ | — |
 | `/api/system/config` | GET/PUT | ❌ | — |
 | `/api/system/subnet-pool` | GET | ✅ | test_unit.py (TestSubnetPoolSystemEndpoint) |
 | `/api/services` | GET/POST | ✅ | deploy.sh (list only) |
@@ -142,7 +148,7 @@ bash tests/test_provision_api.sh
 | `/api/services/{name}/files/{file}` | GET/PUT | ❌ | — |
 | `/api/services/{name}/convert` | POST | ❌ | — |
 | `/api/services/{name}/check-missing-files` | GET | ✅ | test_unit.py (TestRecipePathMultiRecipe — recipe_path forwarding) |
-| `/api/services/templates` | GET | ✅ | test_unit.py (TestTemplateMode) |
+| `/api/services/templates` | GET | 🟡 | presence-only — `TestTemplateMode` checks the route/method exist, not behavior; endpoint is DEPRECATED (no data source) |
 | `/api/services/notifications` | GET | ✅ | test_unit.py (TestProjectMonitoring) |
 | `/api/services/scan` | POST | ❌ | — |
 | `/api/services/save-generated` | POST | ✅ | test_unit.py (TestRecipePathMultiRecipe — creates recipe subdir when recipe_path given) |
@@ -172,7 +178,7 @@ bash tests/test_provision_api.sh
 | `/api/llm/generate` | POST | ❌ | — |
 | `/api/audit` | GET | ✅ | integration.py, deploy.sh, proxy.sh |
 
-**Summary:** 26 of 62 endpoints tested (41.9%)
+**Summary:** 25 of 65 endpoints tested (38.5%)
 
 ---
 
@@ -190,7 +196,7 @@ bash tests/test_provision_api.sh
 | **Audit** | List with filters, action-specific checks | 🟢 Good |
 | **Reconciliation** | None | 🔴 None |
 | **Frontend** | None | 🔴 None |
-| **MCP Server** | None | 🔴 None |
+| **MCP Server** | None | 🔴 None (non-functional vs v5) |
 
 ---
 
@@ -201,7 +207,7 @@ bash tests/test_provision_api.sh
 | Gap | Impact | Recommendation |
 |---|---|---|
 | Frontend (entire) | User-facing UI has zero automated tests | Add React Testing Library + Playwright tests for critical flows (login, deploy, service management) |
-| MCP Server | External AI agent integration has no tests | Add pytest tests for SSE event stream, session management, JWT verification |
+| MCP Server | External AI agent integration has no tests | **Non-functional vs v5** (cannot authenticate) — needs redesign before tests are meaningful; then add pytest tests for SSE, sessions, JWT |
 | LLM Service | Config generation is untested | Add unit tests with mocked HTTP responses; test prompt building and code extraction |
 | Reconciliation | Network recovery logic untested | Add unit tests with mocked docker CLI output; test parsing of nginx conf files |
 | Service Manager | File operations, git clone, template conversion untested | Add unit tests with temp directories; mock git subprocess calls |

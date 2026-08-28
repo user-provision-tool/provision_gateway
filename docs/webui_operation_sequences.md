@@ -21,8 +21,8 @@
 
 ### 1.3 Question-circle (Troubleshoot Chat)
 - **Trigger**: Click "?" icon in header (admin only)
-- **Sequence**: Opens chat modal → user types message → POST /api/llm/generate (type=troubleshoot) → display response
-- **Status**: ✅ Working (requires active LLM config)
+- **Sequence**: Opens chat modal → user types message → POST /api/llm/generate (generate_type=troubleshoot) → always returns `400 Invalid type` (backend reads `type`; troubleshoot not implemented)
+- **Status**: 🔜 Future — the frontend modal exists, but the backend troubleshoot contract is not implemented (needs redesign)
 
 ### 1.4 User Menu Dropdown
 - **Trigger**: Click admin email in header
@@ -60,8 +60,8 @@
 - **Sequence**: Opens modal with 2 tabs (iter-1, GAP-1 — "From Template" tab removed):
   - **From Git**: Fill repo URL, branch, name → POST /api/services (mode=git) → clone repo
   - **Upload Zip**: Fill name, select a local .zip file via the file picker, or paste individual file contents as JSON → POST /api/services (mode=upload)
-- **Backend template mode**: `POST /api/services` (mode=template, template_id=N) and `GET /api/services/templates` are RETAINED at the API level but no longer exposed via the modal (the orphan AddServiceModal.tsx component was deleted).
-- **Status**: ✅ Working (route ordering fixed in Iteration 2 — `/templates` and `/notifications` routes now registered before `/{name}` catch-all. Templates endpoint returns data correctly.)
+- **Backend template mode**: `POST /api/services` (mode=template, template_id=N) and `GET /api/services/templates` remain at the API level but are **DEPRECATED/dormant** — the `service_templates` table has no writer/seed in the repo (empty unless seeded manually), and the "From Template" tab was removed from the modal (orphan `AddServiceModal.tsx` deleted, GAP-1).
+- **Status**: ✅ Working for the Git/Upload flows; template mode 🧟 deprecated (API-only, no data source).
 
 ### 2.2 Project Name Click (folder-open icon)
 - **Trigger**: Click project name

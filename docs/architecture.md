@@ -1,7 +1,7 @@
 # Provision Gateway — Architecture Document
 
-> **Version**: 1.3
-> **Date**: 2026-08-22 (updated — v4 Service-ACL enforcement: three-credential token model dropped (access_token/refresh_token/gateway_token), `/api/auth/refresh` removed, `/go/` 30s exchange code with no JWT in URL, env.d mode-switch; prior: LLM client BYOK-only / llm_config mode default 'byok' (GAP-2), Add Project modal 2 tabs (GAP-1), test-suite counts)
+> **Version**: 1.4
+> **Date**: 2026-08-24 (updated — cycle 20260824T173309Z v5 ACL-enforcement: ACL gate moved to the edge `-nginx-acl` (edge `location /` `auth_request` → gateway verify); internal per-service confs simplified — v4 scaffold / env.d / `/__basic__/` / portal.d removed; `ENABLE_ACL` read by gateway + edge only; prior: v4 Service-ACL enforcement: three-credential token model dropped (access_token/refresh_token/gateway_token), `/api/auth/refresh` removed, `/go/` 30s exchange code with no JWT in URL, env.d mode-switch; prior: LLM client BYOK-only / llm_config mode default 'byok' (GAP-2), Add Project modal 2 tabs (GAP-1), test-suite counts)
 > **Status**: Current (reflects implemented codebase, post-deduplication refactor)
 
 ---
@@ -80,7 +80,7 @@ Provision Gateway is a **management layer** that wraps the existing `provision-a
 |---|---|---|---|---|
 | `provision-gateway` | `python:3.13-slim` + custom | 8770 (internal) | `users_provision_default` | Backend API + business logic |
 | `provision-dashboard` | `nginx:alpine` + React build | 8771→80 (localhost only) | `users_provision_default` | Web UI serving + API proxy |
-| `provision-mcp` | `python:3.13-slim` + custom | 8780 (internal) | `users_provision_default` | MCP server for external AI agents |
+| `provision-mcp` | `python:3.13-slim` + custom | 8780 (internal) | `users_provision_default` | MCP server for external AI agents — **⚠ non-functional vs v5 (cannot authenticate)** |
 | `provision-api` | External dependency | 8765→8000 | `users_provision_default` | User provisioning operations |
 | `provision-nginx` | External dependency | 99→80, 1993→443 | `users_provision_default` + per-user networks | End-user service ingress |
 
@@ -113,6 +113,7 @@ Provision Gateway is a **management layer** that wraps the existing `provision-a
 - SSE streaming deployment workflow
 - Session-based state management (in-memory)
 - JWT verification against gateway secret
+- **⚠ Non-functional against the v5 gateway** — `verify_admin_token` requires `type=='access'` (removed in v5) and `call_gateway` sends `Authorization: Bearer` (rejected by v5 middleware); needs redesign.
 - Proxies deployment requests to gateway
 
 ---
@@ -148,24 +149,24 @@ Per-User Networks (isolated)
 |---|---|---|---|
 | Browser → Dashboard | HTTP | None (network) | `127.0.0.1:8771` only |
 | Dashboard → Gateway | HTTP | `provision_token` cookie (v4) | Internal Docker DNS |
-| MCP → Gateway | HTTP | JWT Bearer | Internal Docker DNS |
+| MCP → Gateway | HTTP | JWT Bearer — **⚠ non-functional vs v5** (Bearer removed in v4/v5; MCP cannot authenticate) | Internal Docker DNS |
 | Gateway → provision-api | HTTP | None | Internal Docker DNS |
-| End User → provision-nginx | HTTP/HTTPS | v4 mode switch: `$auth_mode=acl` → gateway `/api/auth/verify` (provision_token cookie / X-Provision-Token); `$auth_mode=basic` → htpasswd via `/__basic__/` | Public |
-| End User → Service Container | HTTP | Service-specific | Via provision-nginx proxy |
+| End User → edge `-nginx-acl` (fullset) | HTTP/HTTPS | v5 edge ACL gate (F3): `location /` `auth_request` → gateway `/api/auth/verify` (provision_token cookie / X-Provision-Token); ACL-off → pass-through to internal native Basic (`auth_basic`) | Public |
+| End User → Service Container | HTTP | Service-specific | Via edge → internal nginx proxy |
 
 ### 3.3 ACL (Access Control List)
 
-The gateway enforces fine-grained service access control through nginx `auth_request` subrequests. **v4 model:** `ENABLE_ACL` only switches the env.d mode one-liner (`set $auth_mode acl;|basic;`) — the per-service nginx conf is **byte-identical** across modes (never regenerated on mode switch; F1/ACL12).
+The gateway is the auth authority; the edge `-nginx-acl` (fullset) is the gate. **v5 model (cycle 20260824T173309Z, F3/F14):** ACL enforcement moved to the edge — the edge `location /` runs `auth_request /_auth_jwt` → gateway `/api/auth/verify`. Internal per-service confs are SIMPLE and ACL-free (`server_name` + `auth_basic` + variable `proxy_pass`), byte-identical across `ENABLE_ACL` — the v4 env.d mode switch, `/__basic__/` short-circuit and portal.d vhosts are removed (F8/F9). `ENABLE_ACL` is read only by the gateway + edge (F7); toggle = recreate the edge + restart the gateway.
 
 **How it works:**
 
 1. **Cookie-based authentication**: a single HTTP-only cookie carries the session:
    - `provision_token` — **1-week (604800s, `PROVISION_COOKIE_TTL`)** JWT set at login (token_type=cookie). Gates every `/api/*` dashboard request via the `require_gateway_token` / `require_admin` dependencies in `app/middleware/__init__.py`, and is consumed by nginx `auth_request` to authorize end-user service access. The legacy `gateway_token` cookie and the Bearer `access_token`/`refresh_token` pair were **removed in v4** (three-credential model dropped; `POST /api/auth/refresh` removed, `POST /api/auth/logout` added).
 
-2. **`/api/auth/verify` endpoint**: Called by provision-nginx as an `auth_request` subrequest in ACL mode. The endpoint:
+2. **`/api/auth/verify` endpoint**: Called by the EDGE `-nginx-acl` as an `auth_request` subrequest (F3); internal per-service confs no longer call it (simple ACL-free form, F8). The endpoint:
    - Extracts JWT from `provision_token` cookie or `X-Provision-Token` header.
    - Applies the v4 **hybrid `X-Client-Type` rule** (X-Provision-Token header ⇒ api / provision_token cookie ⇒ browser / Accept text/html ⇒ browser / else ⇒ api); `X-Client-Type` on every response, `X-Auth-Action` always.
-   - In Basic mode (`$auth_mode` empty), nginx short-circuits via `/__basic__/` with **0 gateway subrequests** — verify is not called at all.
+   - In ACL-off mode the edge passes traffic through to the internal native Basic (`auth_basic`), so verify is not called (F6/B5).
    - In ACL mode: validates the JWT, looks up the target service by hostname, and checks whether the authenticated user is authorized (revocation check runs before admin bypass; `expires_at` and active/approved validated — F3 ordering).
 
 3. **Authorization rules**:
@@ -182,12 +183,12 @@ The gateway enforces fine-grained service access control through nginx `auth_req
    - **HostnameIndex** (`app/services/hostname_index.py`): Maps hostnames (e.g., `myapp-alice-0.localhost`) to registry entries for O(1) lookup.
    - **Registry** (`app/services/registry.py`): Read-only registry wrapper for listing all entries.
 
-6. **Service access redirect (`/go/{hostname}`)**: Dashboard endpoint that validates the `provision_token` session, checks ACL, and issues a **30s HMAC-signed exchange code** + `Location` header — **no JWT in any URL** (F7). The service-side `/_set_token` is a plain variable proxy to `/api/auth/exchange`, which swaps the code for the `provision_token` cookie via `302`+`Set-Cookie`.
+6. **Service access redirect (`/go/{hostname}`)**: Dashboard endpoint that validates the `provision_token` session, checks ACL, and issues a **30s HMAC-signed exchange code** + `Location` header — **no JWT in any URL** (F13). The edge-side `/_set_token` is a plain variable proxy to `/api/auth/exchange`, which swaps the code for the `provision_token` cookie via `302`+`Set-Cookie` (F3/F13).
 
 **ACL-related environment variables:**
 | Variable | Default | Description |
 |---|---|---|
-| `ENABLE_ACL` | `false` | v4 env.d mode switch: `true` → `set $auth_mode acl;`; `false` → `set $auth_mode basic;` (per-service conf byte-identical) |
+| `ENABLE_ACL` | `false` | v5 (F7): read only by the gateway + the edge `-nginx-acl`; the `-api` no longer reads it; toggle = recreate the edge + restart the gateway |
 | `REGISTRY_FILE` | `generated/user_registry.yml` | Path to the registry YAML file |
 | `PROVISION_COOKIE_TTL` | `604800` | Provision token cookie TTL in seconds (compose default; QA3) |
 
@@ -268,6 +269,11 @@ gateway.db
 │   ├── id (PK), username (UNIQUE), password_hash, role,
 │   │   is_approved, is_active, allowed_special_users, created_at, approved_at
 │
+├── api_keys                # 1-year provision tokens; one default per user
+│   ├── id (PK), user_id (FK→end_users), label, token_hash (UNIQUE), mask,
+│   │   is_default, created_at, expires_at, is_revoked, last_used_at
+│   │   (partial unique index uq_api_keys_one_default on user_id WHERE is_default=1)
+│
 ├── audit_log               # Action audit trail
 │   ├── id (PK), admin_id (FK), action, target_user, target_service,
 │   │   target_label, detail_json, status, error_message, ip_address, created_at
@@ -288,10 +294,36 @@ gateway.db
 ├── system_config           # Key-value system configuration
 │   ├── id (PK), key (UNIQUE), value
 │
-└── service_templates       # Pre-built service templates
+└── service_templates       # Pre-built service templates (DEPRECATED — unpopulated: no writer/seed in the repo; mode=template dormant)
     ├── id (PK), name (UNIQUE), description, category, compose_j2,
     │   nginx_j2, env_template, dockerfile, icon, is_builtin, created_at, updated_at
 ```
+
+### 4.2.1 DB Connection Discipline (no event-loop blocking)
+
+The gateway is an async (FastAPI) app over a synchronous SQLAlchemy/SQLite engine. To prevent
+DB-pool pressure from wedging the service, the following invariants are enforced (hardened
+2026-08-28 after a production-style deadlock: concurrent authenticated load exhausted the
+`QueuePool` (5 + 10 overflow per worker × 4 workers) and an async auth dependency blocking on a
+checkout froze every worker's event loop):
+
+1. **Auth dependencies are synchronous.** `require_gateway_token` / `require_admin` /
+   `get_current_admin` / `get_current_user` / `get_current_admin_optional` are `def` (not
+   `async def`), so FastAPI executes them in a worker thread. A pool checkout that blocks
+   occupies a thread — never the event loop — so in-flight requests awaiting external calls
+   can still complete and release their connections.
+2. **Short-lived auth sessions.** Those dependencies open a `SessionLocal()` internally and close
+   it in `finally`; they no longer depend on the request-lifetime `get_db` session. The auth
+   connection returns to the pool before the endpoint's external awaits.
+3. **Release before external awaits.** Endpoints that `await` a slow external call
+   (provision-api Docker ops, network probes, deploys) close the DB session first and re-open a
+   short-lived one only for post-await DB work (e.g. audit logging) — e.g. `get_user`,
+   `deploy_user`, `list_users`, `add/update_proxy_config`. `proxy_service.test_config_reachability`
+   reads host/port with a short-lived session, releases it before the connect probe, and writes
+   the result back with a fresh session.
+4. **`pool_timeout=2`.** The engine (`database.py`) fails an empty-pool checkout after 2s instead
+   of the 30s SQLAlchemy default, so a sync DB call can never stall the loop for a long time;
+   under pool exhaustion the gateway degrades to fast 500s and recovers without a restart.
 
 ### 4.3 Dependency Injection Chain
 
@@ -402,6 +434,11 @@ main.tsx (Entry Point)
 ---
 
 ## 6. MCP Server Architecture (provision-mcp)
+
+> **⚠ Non-functional against the v5 gateway.** `verify_admin_token` (`provision-mcp/server.py`)
+> requires `type=='access'` (a credential type v5 removed) and `call_gateway` sends
+> `Authorization: Bearer` (which v5 middleware rejects) — the MCP server **cannot authenticate**.
+> Needs redesign. The following describes the intended design.
 
 ### 6.1 Purpose
 
@@ -669,6 +706,8 @@ GATEWAY_DATA_DIR (/data)
 
 ### 9.3 MCP Server (provision-mcp)
 
+> **⚠ Non-functional against the v5 gateway** — see §6.
+
 | Component | Technology | Version |
 |---|---|---|
 | Language | Python | 3.13 |
@@ -687,7 +726,7 @@ GATEWAY_DATA_DIR (/data)
 | 2 | Dashboard on localhost only | Security — no external exposure of management interface |
 | 3 | Separate gateway + dashboard containers | Gateway is stateful (DB, socket, files); dashboard is stateless (nginx + static files) |
 | 4 | OpenAI-compatible LLM protocol | Works with Ollama, OpenAI, DeepSeek, OpenRouter, and any compatible endpoint |
-| 5 | AES-256-GCM for API key storage | Industry standard for at-rest encryption |
+| 5 | Hash what you verify; encrypt what you recover | API keys are stored as SHA-256 `token_hash` + `mask` (never recoverable); AES-256-GCM protects LLM BYOK + proxy credentials, which must be decrypted at call time |
 | 6 | docker CLI over docker-py SDK | Subprocess is more reliable for complex operations (docker compose, network connect) |
 | 7 | Shallow git clone (--depth 1) | Speed and disk efficiency for service source management |
 | 8 | In-memory MCP sessions | Simplicity; sessions are short-lived deployment workflows |

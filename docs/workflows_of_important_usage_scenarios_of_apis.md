@@ -1,7 +1,7 @@
 # Provision Gateway — Workflows of Important Usage Scenarios (APIs)
 
-> **Version**: 3.1
-> **Date**: 2026-08-22 (updated — v4 Service-ACL enforcement: cookie-only login (provision_token, token_type=cookie), Bearer access_token/refresh_token and gateway_token removed, no token-refresh flow, `/api/auth/logout` added; prior: API key management, `/api/auth/go/{hostname}` service-access redirect + ACL verify, two-token login cookies, multi-recipe deploy `project_root`, `/api/system/subnet-pool`)
+> **Version**: 3.3
+> **Date**: 2026-08-24 (updated — cycle 20260824T173309Z v5 ACL-enforcement: §24.2 nginx ACL verify is now invoked by the edge `-nginx-acl` (internal per-service confs simple ACL-free; the `/_set_token` handoff comment updated to the edge-side relay); prior: G5 consistency: the legacy `Authorization: Bearer access_token/refresh_token` and `gateway_token` credentials are **removed** in v4 — every gateway API curl example below now authenticates with the `provision_token` session cookie (`-b /tmp/gw.cookies`, from Section 2/3 login) or the `X-Provision-Token` header (API clients); a Bearer header returns 401 live. Prior: v4 Service-ACL enforcement: cookie-only login (provision_token, token_type=cookie), Bearer access_token/refresh_token and gateway_token removed, no token-refresh flow, `/api/auth/logout` added; prior: API key management, `/api/auth/go/{hostname}` service-access redirect + ACL verify, two-token login cookies, multi-recipe deploy `project_root`, `/api/system/subnet-pool`)
 > **Purpose**: Step-by-step API workflows for the most important usage scenarios, directly usable with `curl` or any HTTP client.
 
 ---
@@ -128,10 +128,9 @@ curl -s -X POST http://localhost:8771/api/auth/login \
 
 # Expected: 401 "User not yet approved"
 
-# --- Admin approves the user ---
-ADMIN_TOKEN="..."
+# --- Admin approves the user (v4: admin session = provision_token cookie from Section 2) ---
 curl -s -X PUT http://localhost:8771/api/auth/users/1/approve \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
+  -b /tmp/gw.cookies
 
 # --- Login as approved end-user (v4 cookie model) ---
 curl -s -X POST http://localhost:8771/api/auth/login \
@@ -162,11 +161,12 @@ curl -s http://localhost:8771/api/auth/me \
 **Goal:** Clone a GitHub repo as a service source project, with optional proxy and LLM auto-generation.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 
 # Step 1: Clone repo as new service
 curl -s -X POST http://localhost:8771/api/services \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "mode": "git",
@@ -180,12 +180,12 @@ curl -s -X POST http://localhost:8771/api/services \
 
 # Step 2: Check what files were created
 curl -s http://localhost:8771/api/services/my-fastapi-app \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 3 (optional): If missing docker-compose.yml or nginx.conf,
 # scan the repo for LLM context
 curl -s -X POST http://localhost:8771/api/services/scan \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "directory": "/srv/provision/source_projects/my-fastapi-app"
@@ -193,13 +193,13 @@ curl -s -X POST http://localhost:8771/api/services/scan \
 
 # Step 4 (optional): Check deploy readiness, auto-generate missing files
 curl -s -X POST http://localhost:8771/api/services/check-deploy \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{"service_name": "my-fastapi-app"}'
 
 # Step 5: Verify the service appears in the list
 curl -s http://localhost:8771/api/services \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 ```
 
 ---
@@ -209,10 +209,11 @@ curl -s http://localhost:8771/api/services \
 **Goal:** Create a service project by uploading individual files.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 
 curl -s -X POST http://localhost:8771/api/services \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "mode": "upload",
@@ -230,27 +231,27 @@ curl -s -X POST http://localhost:8771/api/services \
 
 ---
 
-## 5. Add Service from Template (DB)
+## 5. Add Service from Template (DB) — DEPRECATED
 
 **Goal:** Create a service project from a pre-built template in the service_templates table.
 
+> **DEPRECATED** — the `service_templates` table has no writer/seed in the repo (empty unless seeded
+> manually) and the "From Template" UI tab was removed (GAP-1). Prefer the Git/Upload flows.
+
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 
 # Step 1: List available templates
 curl -s http://localhost:8771/api/services/templates \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
-# Expected:
-# {
-#   "templates": [
-#     {"id": 1, "name": "wordpress", "description": "WordPress with MySQL", ...}
-#   ]
-# }
+# Expected (default): { "templates": [] }  — the table is unpopulated unless seeded manually.
+# If seeded, entries look like: {"id": 1, "name": "wordpress", "description": "WordPress with MySQL", ...}
 
 # Step 2: Create service from template
 curl -s -X POST http://localhost:8771/api/services \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "mode": "template",
@@ -262,7 +263,7 @@ curl -s -X POST http://localhost:8771/api/services \
 
 # Step 3: Verify the service appears in the list
 curl -s http://localhost:8771/api/services \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 ```
 
 ---
@@ -272,20 +273,21 @@ curl -s http://localhost:8771/api/services \
 **Goal:** Read, edit, and review changes to service project files.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 SERVICE="siyuan"
 
 # Step 1: Read a file
 curl -s "http://localhost:8771/api/services/$SERVICE/files/docker-compose.yml.j2" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 2: Get the HEAD (committed) version for comparison
 curl -s "http://localhost:8771/api/services/$SERVICE/git/head-file?file=docker-compose.yml.j2" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 3: Edit the file
 curl -s -X PUT "http://localhost:8771/api/services/$SERVICE/files/docker-compose.yml.j2" \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "content": "services:\n  siyuan:\n    container_name: {{ container_prefix }}siyuan\n    image: siyuan:latest\n    ports:\n      - \"6806:6806\"\n    volumes:\n      - {{ volumes[\"workspace\"] }}:/siyuan/workspace\n    networks:\n      - {{ network_name }}\n"
@@ -293,11 +295,11 @@ curl -s -X PUT "http://localhost:8771/api/services/$SERVICE/files/docker-compose
 
 # Step 4: Check git status to see what changed
 curl -s "http://localhost:8771/api/services/$SERVICE/git/status" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 5: View the diff
 curl -s "http://localhost:8771/api/services/$SERVICE/git/diff?file=docker-compose.yml.j2" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 ```
 
 ---
@@ -307,12 +309,13 @@ curl -s "http://localhost:8771/api/services/$SERVICE/git/diff?file=docker-compos
 **Goal:** Convert plain `docker-compose.yml` and `nginx.conf` to `.j2` templates with provision variables.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 SERVICE="my-custom-app"
 
 # Step 1: Convert compose and nginx files to templates
 curl -s -X POST "http://localhost:8771/api/services/$SERVICE/convert" \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "compose_file": "docker-compose.yml",
@@ -328,11 +331,11 @@ curl -s -X POST "http://localhost:8771/api/services/$SERVICE/convert" \
 
 # Step 2: Verify the generated templates
 curl -s "http://localhost:8771/api/services/$SERVICE/files/docker-compose.my-custom-app.yml.j2" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 3: Verify service now shows has_compose_template and has_nginx_template
 curl -s "http://localhost:8771/api/services/$SERVICE" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 ```
 
 ---
@@ -342,20 +345,21 @@ curl -s "http://localhost:8771/api/services/$SERVICE" \
 **Goal:** Deploy a service template for a user with custom configuration.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 
 # Step 1: Check available deployable users
 curl -s http://localhost:8771/api/auth/users/deployable \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 2: Check services available for deployment
 curl -s http://localhost:8771/api/services \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 # Look for services where has_compose_template is true
 
 # Step 3: Deploy
 curl -s -X POST http://localhost:8771/api/users/deploy \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "user_name": "alice",
@@ -400,16 +404,17 @@ TASK_ID="abc123def456"
 **Goal:** Track deployment progress and view build logs in real-time.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 TASK_ID="abc123def456"
 
 # Step 1: Poll task status
 curl -s "http://localhost:8771/api/tasks/$TASK_ID" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 2: Stream build logs via SSE (run in separate terminal)
 curl -s -N "http://localhost:8771/api/tasks/$TASK_ID/log?tail=50&follow=true" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Expected SSE output:
 # data: {"line": "Step 1/5 : FROM siyuan:latest", "timestamp": "..."}
@@ -419,11 +424,11 @@ curl -s -N "http://localhost:8771/api/tasks/$TASK_ID/log?tail=50&follow=true" \
 
 # Step 3: Cancel if needed
 curl -s -X DELETE "http://localhost:8771/api/tasks/$TASK_ID" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 4: Check all tasks
 curl -s http://localhost:8771/api/tasks \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 ```
 
 ---
@@ -433,15 +438,16 @@ curl -s http://localhost:8771/api/tasks \
 **Goal:** Clone all services from user Alice to user Bob.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 
 # Step 1: Verify source user's services
 curl -s http://localhost:8771/api/users/alice \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 2: Clone all
 curl -s -X POST http://localhost:8771/api/users/clone \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "source_user": "alice",
@@ -463,12 +469,12 @@ curl -s -X POST http://localhost:8771/api/users/clone \
 # Step 3: Monitor all clone tasks
 for TASK in task-001 task-002; do
   curl -s "http://localhost:8771/api/tasks/$TASK" \
-    -H "Authorization: Bearer $TOKEN"
+    -b /tmp/gw.cookies
 done
 
 # Step 4: Verify bob now has the services
 curl -s http://localhost:8771/api/users/bob \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 ```
 
 ---
@@ -478,22 +484,23 @@ curl -s http://localhost:8771/api/users/bob \
 **Goal:** Start, stop, rebuild, and remove deployed services.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 USER="alice"
 SERVICE="siyuan"
 LABEL="0"
 
 # --- Start (docker compose up -d) ---
 curl -s -X POST "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL/up" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # --- Stop (docker compose stop) ---
 curl -s -X POST "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL/down" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # --- Rebuild (with no-cache) ---
 curl -s -X POST "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL/rebuild" \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "no_cache": true,
@@ -504,7 +511,7 @@ curl -s -X POST "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL/rebuild" 
 
 # --- Delete (remove service entirely) ---
 curl -s -X DELETE "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Expected: 202 with task_id
 ```
@@ -516,13 +523,14 @@ curl -s -X DELETE "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL" \
 **Goal:** Update HTTP basic auth password for a user's service.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 USER="alice"
 SERVICE="siyuan"
 LABEL="0"
 
 curl -s -X PUT "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL/password" \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "passwd": "newSecurePassword789"
@@ -543,18 +551,19 @@ curl -s -X PUT "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL/password" 
 **Goal:** Test if a deployed service is reachable from within the gateway.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 USER="alice"
 SERVICE="siyuan"
 LABEL="0"
 
 # Step 1: Get the service URL
 curl -s "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL/url" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 2: Test connectivity
 curl -s -X POST "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL/test-curl" \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "include_auth": true,
@@ -579,31 +588,32 @@ curl -s -X POST "http://localhost:8771/api/users/$USER/$SERVICE/$LABEL/test-curl
 **Goal:** Monitor system health and reconcile nginx state.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 
 # Step 1: Check overall system status
 curl -s http://localhost:8771/api/system/status \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 2: Get detailed container stats
 curl -s "http://localhost:8771/api/system/stats?detail=true" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 3: View current nginx state
 curl -s http://localhost:8771/api/system/nginx-state \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 4: Run reconciliation (fixes nginx network connections)
 curl -s -X POST http://localhost:8771/api/system/reconcile \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 5: Check reconciliation result
 curl -s http://localhost:8771/api/system/reconcile/status \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 6: Subnet pool usage (Dashboard "Subnet Pool" card)
 curl -s http://localhost:8771/api/system/subnet-pool \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 # Expected: {"enabled": true, "pools": [{"cidr": "172.30.0.0/16", "used_slots": 3,
 #             "total_slots": 8, "used_pct": 38}, ...]}
 ```
@@ -615,15 +625,16 @@ curl -s http://localhost:8771/api/system/subnet-pool \
 **Goal:** Set up a global HTTP proxy for git clones and Docker builds.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 
 # Step 1: Check current proxy configuration
 curl -s http://localhost:8771/api/system/proxy \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 2: Add a new proxy (auto-tests reachability)
 curl -s -X POST http://localhost:8771/api/system/proxy \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Office Proxy",
@@ -638,15 +649,15 @@ curl -s -X POST http://localhost:8771/api/system/proxy \
 
 # Step 3: Activate the proxy (only if reachable)
 curl -s -X PUT http://localhost:8771/api/system/proxy/1/activate \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 4: Test connectivity
 curl -s -X POST http://localhost:8771/api/system/proxy/test \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 5: Deploy with proxy enabled
 curl -s -X POST http://localhost:8771/api/users/deploy \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "user_name": "alice",
@@ -662,7 +673,7 @@ curl -s -X POST http://localhost:8771/api/users/deploy \
 
 # Step 6: Delete proxy when no longer needed
 curl -s -X DELETE http://localhost:8771/api/system/proxy/1 \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 ```
 
 ---
@@ -672,15 +683,16 @@ curl -s -X DELETE http://localhost:8771/api/system/proxy/1 \
 **Goal:** Set up Bring-Your-Own-Key LLM for AI-assisted config generation.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 
 # Step 1: Check existing LLM configs
 curl -s http://localhost:8771/api/llm/configs \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 2: Add a new LLM config
 curl -s -X POST http://localhost:8771/api/llm/configs \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "mode": "byok",
@@ -694,11 +706,11 @@ curl -s -X POST http://localhost:8771/api/llm/configs \
 
 # Step 3: Activate the config
 curl -s -X PUT http://localhost:8771/api/llm/configs/1/activate \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 4: Test the connection
 curl -s -X POST http://localhost:8771/api/llm/test \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Expected:
 # {
@@ -716,11 +728,12 @@ curl -s -X POST http://localhost:8771/api/llm/test \
 **Goal:** Use AI to generate docker-compose.yml, nginx.conf, or .env files.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 
 # Step 1: Generate a docker-compose.yml
 curl -s -X POST http://localhost:8771/api/llm/generate \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "type": "docker_compose",
@@ -739,7 +752,7 @@ curl -s -X POST http://localhost:8771/api/llm/generate \
 
 # Step 2: Generate an nginx.conf
 curl -s -X POST http://localhost:8771/api/llm/generate \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "type": "nginx_conf",
@@ -753,7 +766,7 @@ curl -s -X POST http://localhost:8771/api/llm/generate \
 
 # Step 3: Save generated files to a service project
 curl -s -X POST http://localhost:8771/api/services/save-generated \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "service_name": "my-fastapi-app",
@@ -763,9 +776,11 @@ curl -s -X POST http://localhost:8771/api/services/save-generated \
     }
   }'
 
-# Step 4: Use LLM for troubleshooting
+# Step 4: Use LLM for troubleshooting — 🔜 FUTURE (not implemented)
+# The troubleshoot type always returns 400 "Invalid type: None": the /api/llm/generate whitelist
+# accepts only docker_compose|nginx_conf|env_file|dockerfile. Awaiting backend implementation.
 curl -s -X POST http://localhost:8771/api/llm/generate \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "type": "troubleshoot",
@@ -783,31 +798,32 @@ curl -s -X POST http://localhost:8771/api/llm/generate \
 **Goal:** Search and filter the audit trail for compliance and debugging.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 
 # Step 1: Get all audit entries (latest 50)
 curl -s http://localhost:8771/api/audit \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 2: Filter by action type
 curl -s "http://localhost:8771/api/audit?action=register&limit=20" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 3: Filter by target user
 curl -s "http://localhost:8771/api/audit?target_user=alice" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 4: Filter by date range
 curl -s "http://localhost:8771/api/audit?from=2026-07-01&to=2026-07-05" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 5: Combine filters
 curl -s "http://localhost:8771/api/audit?action=deploy&target_user=alice&from=2026-07-01&limit=100&offset=0" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 
 # Step 6: Paginate
 curl -s "http://localhost:8771/api/audit?limit=10&offset=10" \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 ```
 
 ---
@@ -817,7 +833,8 @@ curl -s "http://localhost:8771/api/audit?limit=10&offset=10" \
 **Goal:** Register, approve, and manage end-user accounts for the portal.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 
 # Step 1: Register a new end-user (no auth required)
 curl -s -X POST http://localhost:8771/api/auth/users/register \
@@ -865,7 +882,7 @@ curl -s -X PUT http://localhost:8771/api/auth/users/2 \
 
 # Step 7: Delete a user
 curl -s -X DELETE http://localhost:8771/api/auth/users/2 \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
+  -b /tmp/admin.cookies
 ```
 
 ---
@@ -875,11 +892,12 @@ curl -s -X DELETE http://localhost:8771/api/auth/users/2 \
 **Goal:** Create, list, and revoke long-lived API keys (provision tokens). Viewers manage their own keys; admins manage any user's.
 
 ```bash
-TOKEN="your-jwt-token"
+# (v4: gateway API auth = provision_token session cookie from /tmp/gw.cookies — no Bearer token;
+#      API clients may send `X-Provision-Token: <token>` instead)
 
 # --- Create a key (viewer: for self; admin: optional user_id for another user) ---
 curl -s -X POST http://localhost:8771/api/auth/keys \
-  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/gw.cookies \
   -H "Content-Type: application/json" \
   -d '{
     "label": "CI/CD",
@@ -892,13 +910,13 @@ curl -s -X POST http://localhost:8771/api/auth/keys \
 
 # --- List keys (admin: all users; viewer: own only) ---
 curl -s http://localhost:8771/api/auth/keys \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 # Expected: {"keys": [{"id": 1, "user_id": 1, "label": "CI/CD",
 #                      "created_at": "...", "expires_at": "...", "is_revoked": false}]}
 
 # --- Revoke a key ---
 curl -s -X DELETE http://localhost:8771/api/auth/keys/1 \
-  -H "Authorization: Bearer $TOKEN"
+  -b /tmp/gw.cookies
 # Expected: {"revoked": true, "key_id": 1}
 
 # --- Use the raw token as a provision token for service access ---
@@ -927,14 +945,14 @@ curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" \
   -b /tmp/gw.cookies
 
 # Expected: 302 → http://siyuan-alice-0.localhost:8766/_set_token?code={30s HMAC exchange code}&redirect=/
-# v4: the code is a 30s HMAC exchange code, NEVER a live bearer JWT in the URL. The
-# service-side /_set_token is a plain variable proxy to /api/auth/exchange, which swaps
-# the code for the provision_token cookie via 302+Set-Cookie, then redirects to /.
+# v4/v5: the code is a 30s HMAC exchange code, NEVER a live bearer JWT in the URL. The
+# edge-side /_set_token (v5 F3) is a plain variable proxy to /api/auth/exchange, which
+# swaps the code for the provision_token cookie via 302+Set-Cookie, then redirects to /.
 ```
 
 ### 24.2 nginx ACL verify (auth_request subrequest)
 
-`GET /api/auth/verify` is called by provision-nginx (`auth_request`) with no auth. It returns the status + `X-Auth-Action` header (and `X-Client-Type`, v4) that nginx's `error_page` + the v4 hybrid `X-Client-Type` rule turns into browser redirects or API status codes. The legacy `map $http_accept $is_browser` discriminator was removed in v4 (QA2):
+`GET /api/auth/verify` is called by the edge `-nginx-acl` (`auth_request`, v5 F3) with no auth — internal per-service confs are simple ACL-free (F8). It returns the status + `X-Auth-Action` header (and `X-Client-Type`, v4) that the edge's `error_page` + the v4 hybrid `X-Client-Type` rule turns into browser redirects or API status codes. The legacy `map $http_accept $is_browser` discriminator was removed in v4 (QA2):
 
 | Gateway response | X-Auth-Action | Browser redirect | API result |
 |---|---|---|---|
