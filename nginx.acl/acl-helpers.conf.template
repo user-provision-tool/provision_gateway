@@ -1,0 +1,93 @@
+# v5 edge -nginx-acl ACL helper locations — included by edge.conf.template
+# (both ENABLE_ACL branches, both service servers) via
+# `include /etc/nginx/acl/acl-helpers.conf;`.
+#
+# These are the internal auth machinery of the edge:
+#   /_auth_jwt  — the auth_request subrequest → gateway verify (F13). Always
+#                 located here at `location = /_auth_jwt` so it is NOT
+#                 auth_request-gated itself, and so a URL-encoded `//_auth_jwt`
+#                 variant cannot bypass the gate (GAP-12).
+#   /_set_token — the login-URL exchange endpoint → gateway exchange. Kept
+#                 OUTSIDE `location /` (which carries auth_request) so it stays
+#                 token-less (F7): exchange() swaps the signed login URL token
+#                 for the real cookie set. Present in BOTH modes — the /go/
+#                 handoff still needs it when ENABLE_ACL=false (v5 §8.4).
+#                 Deliberately NOT `internal;`: the F7 sequence lands a browser
+#                 (or curl) directly on {svc-host}/_set_token?code=<30s>, so this
+#                 location must be reachable from the client (design v5 §4.3
+#                 helper sketch + §8.8). The gate is `location /`-only (F11), so
+#                 this exact-match location is never auth_request-gated; the
+#                 exchange validates the 30s one-time code before minting a
+#                 cookie, so the exposure is code-protected by design.
+#   @auth_401   — the challenge: native Basic dialog for API clients, portal
+#                 redirect for browsers. ACL-on only.
+#   @auth_403   — access denied (not in user's ACL / unknown service): API
+#                 clients get 403, browsers get the portal alert page. ACL-on only.
+#
+# ${PORTAL_SCHEME} ${PORTAL_HOSTNAME} ${PORTAL_REDIRECT_PORT} are envsubst'd
+# by entrypoint.sh (allow-list). Everything else is nginx-native.
+
+# The gate machinery is ACL-on ONLY: in ACL-off the service servers are plain
+# pass-throughs and reference no @auth_401/@auth_403, so including them would
+# leave `$client_type` undefined (set only by auth_request_set in the gate).
+# [if ENABLE_ACL=true]
+# --- auth_request target: gateway verify (fail-closed) ---
+location = /_auth_jwt {
+    internal;
+    resolver 127.0.0.11 valid=30s ipv6=off;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Original-URI $request_uri;
+    proxy_set_header X-Provision-Token $cookie_provision_token;
+    proxy_set_header Cookie $http_cookie;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    # Fail-closed (decision 3): if the gateway is unreachable the subrequest
+    # 502s, which makes auth_request return 500 to the client → service
+    # unreachable rather than exposed.
+    proxy_pass http://subnet-acl-gateway:8770/api/auth/verify;
+}
+
+# --- 401: challenge for API / portal redirect for browser ---
+# `add_header` needs `always`: nginx emits add_header only for
+# 200/201/204/206/301/302/303/304/307/308 unless `always` is present — a 401
+# would otherwise reach the client with NO WWW-Authenticate header, breaking
+# the native Basic dialog contract for API clients (F3).
+location @auth_401 {
+    # Browser vs API decided by the gateway in X-Client-Type (F9).
+    if ($client_type = api) {
+        add_header WWW-Authenticate 'Basic realm="subnet-acl"' always;
+        return 401;
+    }
+    if ($client_type = browser) {
+        return 302 ${PORTAL_SCHEME}://${PORTAL_HOSTNAME}${PORTAL_REDIRECT_PORT}/login?next=$scheme://$host$request_uri;
+    }
+    # Unknown client type — challenge as API (fail-closed).
+    add_header WWW-Authenticate 'Basic realm="subnet-acl"' always;
+    return 401;
+}
+
+# --- 403: denied → portal alert for browsers, plain 403 for API ---
+location @auth_403 {
+    if ($client_type = browser) {
+        return 302 ${PORTAL_SCHEME}://${PORTAL_HOSTNAME}${PORTAL_REDIRECT_PORT}/alert?reason=acl_denied&service=$host;
+    }
+    return 403;
+}
+# [endif]
+
+# --- login-URL exchange (F7): token-less by construction; both modes ---
+# Browser-reachable (NOT internal): the /go/ 303 lands the client directly on
+# this URL (design v5 §4.3/§8.8); the 30s one-time code is the credential.
+location = /_set_token {
+    resolver 127.0.0.11 valid=30s ipv6=off;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Original-URI $request_uri;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    # Forward the signed one-time login token as-is: /go/<token>
+    proxy_pass http://subnet-acl-gateway:8770/api/auth/exchange$is_args$args;
+}

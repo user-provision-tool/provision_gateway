@@ -1,0 +1,183 @@
+# v5 edge -nginx-acl nginx.conf — the ONLY externally-exposed nginx in fullset.
+#
+# This is a single static template assembled at container start by
+# entrypoint.sh (shell `if` + envsubst — decision 13, v5 §4.2). NOT Jinja, NOT
+# fragments. The mode blocks are selected by the shell-if markers:
+#   # [if PORTAL_MODE=https]  /  # [else]  /  # [endif]
+#   # [if ENABLE_ACL=true]    /  # [else]  /  # [endif]
+# The ${PORTAL_SCHEME} ${PORTAL_HOSTNAME} ${PORTAL_REDIRECT_PORT}
+# ${HTTPS_REDIRECT_PORT} constants are envsubst'd into both this file and the
+# acl-helpers.conf include by entrypoint.sh. All other $variables (nginx) are
+# left untouched.
+#
+# Responsibilities (v5 §3.1): TLS termination via SNI→SSL_DIR cert map,
+# portal routing (portal host → gateway/dashboard), the L7 ACL gate
+# (auth_request /_auth_jwt → gateway verify, credential injection), and proxy
+# to the internal -nginx mirroring the client scheme.
+
+user nginx;
+worker_processes auto;
+
+error_log  /var/log/nginx/error.log notice;
+pid        /var/run/nginx.pid;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    sendfile        on;
+    keepalive_timeout  65;
+
+    # Docker embedded DNS — resolves subnet-acl-gateway / subnet-acl-dashboard /
+    # subnet-acl-nginx at request time (variable proxy_pass helper locations).
+    resolver 127.0.0.11 valid=30s ipv6=off;
+
+    # ------------------------------------------------------------------
+    # SNI → per-domain cert — DYNAMIC catch-all (decision 9, v5 §4.3/§7).
+    # Any SNI resolves to `SSL_DIR/{domain}/fullchain.pem`; the variable
+    # `ssl_certificate` re-reads the file per handshake, so a newly-added cert
+    # is served immediately and rotation is live. The `default` placeholder
+    # exists ONLY to satisfy nginx's startup requirement (it must load a valid
+    # cert); at request time every SNI matches the regex, so a domain WITHOUT a
+    # cert file fails the TLS handshake (connection dropped — the certless-https
+    # behavior, decision 9). The placeholder lives in the edge IMAGE at
+    # /etc/nginx/acl/placeholder/ (generated at build, decision 11) — NOT under
+    # the read-only SSL_DIR /certs mount.
+    # ------------------------------------------------------------------
+    map $ssl_server_name $cert_pem {
+        default     /etc/nginx/acl/placeholder/fullchain.pem;
+        ~^(?<d>.+)$ /certs/$d/fullchain.pem;
+    }
+    map $ssl_server_name $cert_key {
+        default     /etc/nginx/acl/placeholder/privkey.pem;
+        ~^(?<d>.+)$ /certs/$d/privkey.pem;
+    }
+
+    # ------- Portal (portal host) -------
+    # Portal http — serves when PORTAL_MODE=http; 301→https when PORTAL_MODE=https.
+    server {
+        listen 80;
+        server_name ${PORTAL_HOSTNAME} 127.0.0.1 localhost;
+        # [if PORTAL_MODE=https] return 301 https://$host$request_uri;
+        # Internal-only endpoints must not be reachable via the portal (GAP-31).
+        location = /api/auth/verify   { return 404; }
+        location = /api/auth/exchange { return 404; }
+        # /api/ → gateway with the fixed SSE task-log timeout (U3).
+        location /api/  { proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s; }
+        location /go/   { rewrite ^/go/(.*) /api/auth/go/$1 break; proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+        location /login { proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+        location /alert { proxy_pass http://subnet-acl-dashboard:80; }
+        location /     { proxy_pass http://subnet-acl-dashboard:80; }
+    }
+    # [if PORTAL_MODE=https]
+    server {
+        listen 443 ssl;
+        server_name ${PORTAL_HOSTNAME};
+        ssl_certificate /certs/portal/fullchain.pem;
+        ssl_certificate_key /certs/portal/privkey.pem;
+        location = /api/auth/verify   { return 404; }
+        location = /api/auth/exchange { return 404; }
+        location /api/  { proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s; }
+        location /go/   { rewrite ^/go/(.*) /api/auth/go/$1 break; proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+        location /login { proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+        location /alert { proxy_pass http://subnet-acl-dashboard:80; }
+        location /     { proxy_pass http://subnet-acl-dashboard:80; }
+    }
+    # [endif]
+
+    # ------- Services (ACL gate) -------
+    # NOTE: the services blocks are `default_server` on both ports so that ANY
+    # host that does not match the portal's server_name (i.e. all service
+    # traffic) lands HERE — nginx picks the FIRST server block on a listen
+    # address as the default for unmatched Hosts, and the portal block is
+    # declared first. Without `default_server` a service Host would fall through
+    # to the portal (dashboard) and the gate/force-https would never fire.
+    # [if ENABLE_ACL=true]
+    # HTTP service traffic — terminate (plain), gate, proxy to internal :80.
+    server {
+        listen 80 default_server;
+        server_name _;
+        # Force https for certed services (decision 18; server-level rewrite
+        # before location selection; ${HTTPS_REDIRECT_PORT} = edge https port,
+        # empty for 443).
+        if (-f /certs/$host/fullchain.pem) { return 301 https://$host${HTTPS_REDIRECT_PORT}$request_uri; }
+        # The gate lives in location / ONLY — not server level — so
+        # `location = /_set_token` (in acl-helpers.conf) stays token-less (F7).
+        location / {
+            auth_request /_auth_jwt;
+            auth_request_set $service_basic $upstream_http_x_service_basic;
+            auth_request_set $auth_action  $upstream_http_x_auth_action;
+            auth_request_set $client_type  $upstream_http_x_client_type;
+            error_page 401 = @auth_401;
+            error_page 403 = @auth_403;
+            proxy_set_header Authorization "Basic $service_basic";
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto http;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_pass http://subnet-acl-nginx;
+        }
+        include /etc/nginx/acl/acl-helpers.conf;
+    }
+    # HTTPS service traffic — terminate TLS (SNI cert), gate, then re-encrypt
+    # to internal :443 (double TLS, decision 3/14).
+    server {
+        listen 443 ssl default_server;
+        server_name _;
+        ssl_certificate $cert_pem;
+        ssl_certificate_key $cert_key;
+        # certless/unknown https → the SNI map resolves to a missing file →
+        # TLS handshake fails (decision 9; no 444, no 502).
+        location / {
+            auth_request /_auth_jwt;
+            auth_request_set $service_basic $upstream_http_x_service_basic;
+            auth_request_set $auth_action  $upstream_http_x_auth_action;
+            auth_request_set $client_type  $upstream_http_x_client_type;
+            error_page 401 = @auth_401;
+            error_page 403 = @auth_403;
+            proxy_set_header Authorization "Basic $service_basic";
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_ssl_server_name on;
+            proxy_ssl_verify off;
+            proxy_pass https://subnet-acl-nginx;
+        }
+        include /etc/nginx/acl/acl-helpers.conf;
+    }
+    # [else (ENABLE_ACL=false)]
+    # ACL-off: pass straight through → the internal auth_basic prompts the
+    # native Basic dialog (B5). acl-helpers still included so /_set_token works
+    # for the /go/ exchange in ACL-off too (v5 §4.3/§8.4).
+    server {
+        listen 80 default_server;
+        server_name _;
+        if (-f /certs/$host/fullchain.pem) { return 301 https://$host${HTTPS_REDIRECT_PORT}$request_uri; }
+        location / {
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto http;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_pass http://subnet-acl-nginx;
+        }
+        include /etc/nginx/acl/acl-helpers.conf;
+    }
+    server {
+        listen 443 ssl default_server;
+        server_name _;
+        ssl_certificate $cert_pem;
+        ssl_certificate_key $cert_key;
+        location / {
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_ssl_server_name on;
+            proxy_ssl_verify off;
+            proxy_pass https://subnet-acl-nginx;
+        }
+        include /etc/nginx/acl/acl-helpers.conf;
+    }
+    # [endif]
+}

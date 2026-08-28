@@ -49,6 +49,45 @@ services:
     restart: unless-stopped
     # No host port — internal use only. External agents reach via subnet_acl_shared.
 
+  # v5 edge — the ONLY externally-exposed nginx in fullset (decision 1/6).
+  # TLS termination (SNI→SSL_DIR cert map), portal routing, and the L7 ACL gate.
+  # Spec §4.1; deviation: templates are mounted FILE-level (not whole-dir) so the
+  # image-baked placeholder cert at /etc/nginx/acl/placeholder/ survives the mount
+  # (a whole-dir bind-mount would hide it — decision 11).
+  subnet-acl-nginx-acl:
+    build:
+      context: ./nginx.acl
+      dockerfile: Dockerfile
+    # Pin the image name so `docker compose up` reuses the existing built image
+    # (subnet-acl-nginx-acl:latest) instead of re-building under a
+    # project-prefixed name (needs no network/apk for a no-op recreate).
+    image: subnet-acl-nginx-acl:latest
+    container_name: subnet-acl-nginx-acl
+    ports:
+      # NGINX_* = the client-facing ports, reused for the edge (decision 10) —
+      # the same values the gateway reads for /go/, service-URL display, system-info.
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx.acl/edge.conf.template:/etc/nginx/acl/edge.conf.template:ro
+      - ./nginx.acl/acl-helpers.conf.template:/etc/nginx/acl/acl-helpers.conf.template:ro
+      - ./nginx.acl/entrypoint.sh:/etc/nginx/acl/entrypoint.sh:ro
+      # SSL_DIR → /certs (per-domain certs + portal cert). Read-only: the edge is
+      # the key-holder (decision 17, GAP-15) — certs are the user's concern.
+      - ${PROVISION_DIR:-/srv/provision_subnet_acl}/ssl:/certs:ro
+    environment:
+      - PORTAL_MODE=${PORTAL_MODE:-http}
+      - PORTAL_HOSTNAME=${PORTAL_HOSTNAME:-localhost}
+      - PORTAL_SCHEME=${PORTAL_SCHEME:-http}
+      - PORTAL_REDIRECT_PORT=${PORTAL_REDIRECT_PORT:-}
+      - HTTPS_REDIRECT_PORT=${HTTPS_REDIRECT_PORT:-}
+      - ENABLE_ACL=${ENABLE_ACL:-false}
+    command: /bin/sh /etc/nginx/acl/entrypoint.sh
+    user: nginx  # non-root (decision 17)
+    networks:
+      - subnet_acl_shared
+    restart: unless-stopped
+
 networks:
   subnet_acl_shared:
     external: true
