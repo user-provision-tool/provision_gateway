@@ -1,7 +1,7 @@
 # Provision Gateway — Tests Coverage Status
 
-> **Version**: 1.31
-> **Date**: 2026-08-28 (refresh — full pytest suite **242 passed / 0 failed**, verified by live run on 2026-08-28: `test_unit.py` 227 + `test_proxy.py` 12 + `test_concurrency.py` 3. The shell suites (`test_integration.sh`, `test_deploy.sh`, `test_proxy.sh`, `test_gateway_api.sh`, `test_provision_api.sh`) require the live Docker stack and are run in-container; their pass/fail counts are not asserted here.)
+> **Version**: 1.32
+> **Date**: 2026-08-28 (refresh — full pytest suite **293 passed / 0 failed**, verified by live run on 2026-08-28 (cycle 20260828T190332Z, QA iter-3 r1: pytest 293/293, 11.63s). 32 new tests added iter-1 by the scan-rearchitecture cycle — TestProjectStateModule 7, TestScanRearchitecture 16 (incl. registry TTL cache), TestScanRearchitectureHandlers 8, concurrency scan-in-flight 1 — and 4 old-behavior tests rewritten (marker-only classification, root-only default, direct save_generated_files call, `not iscoroutinefunction`). The shell suites (`test_integration.sh`, `test_deploy.sh`, `test_proxy.sh`, `test_gateway_api.sh`, `test_provision_api.sh`) require the live Docker stack and are run in-container; QA iter-3 r1: shell 124/0 (test_integration 10, test_gateway_api 53, test_deploy 10, test_proxy 24, test_provision_api 27).)
 > **Status**: Current state of test coverage
 
 ---
@@ -22,8 +22,8 @@
 
 | File | Language | Type | Test Cases | Status |
 |---|---|---|---|---|
-| `test_unit.py` | Python (pytest) | Unit | 227 | ✅ All passing (prior 87 + coder's GAP-1/2/4 tests — reworked TestUploadModeJSONFormat, reworked TestTemplateMode, new TestLLMConfigDefersLocalAgent, new TestTemplateClassificationGitTracked — plus QA's new TestLLMConfigDefersLocalAgent::test_model_column_default_is_byok, and subnet-acl + multi-recipe coverage: TestAuthVerifyHeaders, TestVerifyAuthStatusCodes, TestGoServiceRedirect, TestApiKeyModel, TestSubnetPoolSystemEndpoint, TestRecipePathMultiRecipe, TestRouteRoleGating; **2026-08-28**: middleware robustness regression — `TestNewMiddleware` now asserts auth deps are synchronous `def` (not coroutines), a guard for the DB-pool/event-loop deadlock fix) |
-| `test_concurrency.py` | Python (pytest) | Unit (concurrency) | 3 | ✅ Passing (NEW iter-1, GAP-3 — 20 concurrent in-process requests via httpx ASGITransport + Dockerfile `--workers` check; runs in the default pytest suite, no live gateway needed) |
+| `test_unit.py` | Python (pytest) | Unit | 258 | ✅ All passing (prior 87 + coder's GAP-1/2/4 tests — reworked TestUploadModeJSONFormat, reworked TestTemplateMode, new TestLLMConfigDefersLocalAgent, new TestTemplateClassificationMarkerOnly (renamed from TestTemplateClassificationGitTracked, scan-rearchitecture F35) — plus QA's new TestLLMConfigDefersLocalAgent::test_model_column_default_is_byok, and subnet-acl + multi-recipe coverage: TestAuthVerifyHeaders, TestVerifyAuthStatusCodes, TestGoServiceRedirect, TestApiKeyModel, TestSubnetPoolSystemEndpoint, TestRecipePathMultiRecipe, TestRouteRoleGating; **2026-08-28**: middleware robustness regression — `TestNewMiddleware` now asserts auth deps are synchronous `def` (not coroutines), a guard for the DB-pool/event-loop deadlock fix; **2026-08-28 (scan-rearchitecture cycle 20260828T190332Z)**: +31 new tests — TestProjectStateModule 7, TestScanRearchitecture 16 (incl. registry TTL cache), TestScanRearchitectureHandlers 8 — and 4 old-behavior tests rewritten (marker-only classification, root-only default, direct save_generated_files call, `not iscoroutinefunction`) |
+| `test_concurrency.py` | Python (pytest) | Unit (concurrency) | 4 | ✅ Passing (NEW iter-1, GAP-3 — 20 concurrent in-process requests via httpx ASGITransport + Dockerfile `--workers` check; runs in the default pytest suite, no live gateway needed; +1 scan-rearchitecture cycle — `test_health_responds_while_service_scan_in_flight` (F37)) |
 | `test_proxy.py` | Python (pytest) | Unit | 12 | ✅ Passing |
 | `test_integration.py` | Python (subprocess) | Integration | 9 | 🟡 9 skipped in the default pytest run — host-port probes (conftest curls `localhost:8770/health` from the host; port 8770 is internal-only by compose design). Equivalent live coverage via `test_integration.sh` run in-container → 9/0 passed (iter-6, re-confirmed iter-7 + iter-8 + iter-9 + iter-10 + iter-11 + iter-12 + iter-13 + iter-14 + iter-15 + iter-16 + iter-17 + iter-18 + iter-19 + iter-20 + iter-21) |
 | `test_integration.sh` | Bash | Integration | 113 lines | ✅ Passing |
@@ -32,7 +32,7 @@
 | `test_gateway_api.sh` | Bash | Integration | 347 lines | ✅ Passing |
 | `test_provision_api.sh` | Bash | Integration | 252 lines | ✅ Passing |
 | `test_load.py` | Python (httpx) | Load/Perf | 5 scenarios | 🧟 STALE — reads `access_token` + `Authorization: Bearer`, which the cookie-only v5 gateway rejects; not runnable against the current gateway. Not part of the passing suite |
-| **Total** | | | **Full pytest suite: 242 passed / 0 failed** (verified 2026-08-28 — test_unit 227 + test_proxy 12 + test_concurrency 3). Shell integration suites (test_integration.sh, test_deploy.sh, test_proxy.sh, test_gateway_api.sh, test_provision_api.sh) run in-container against the live stack; counts not asserted here. | |
+| **Total** | | | **Full pytest suite: 293 passed / 0 failed** (verified 2026-08-28, cycle 20260828T190332Z — QA iter-3 r1: pytest 293/293, 11.63s; per-file cells above are documented snapshots — this cycle's scan-rearchitecture additions alone are +32: test_unit +31 (TestProjectStateModule 7, TestScanRearchitecture 16, TestScanRearchitectureHandlers 8), test_concurrency +1 (scan-in-flight); prior refresh figures predate those additions). Shell integration suites (test_integration.sh, test_deploy.sh, test_proxy.sh, test_gateway_api.sh, test_provision_api.sh) run in-container against the live stack; QA iter-3 r1: 124/0. | |
 
 ### 1.2 Test Execution
 

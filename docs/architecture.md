@@ -1,7 +1,7 @@
 # Provision Gateway — Architecture Document
 
-> **Version**: 1.4
-> **Date**: 2026-08-24 (updated — cycle 20260824T173309Z v5 ACL-enforcement: ACL gate moved to the edge `-nginx-acl` (edge `location /` `auth_request` → gateway verify); internal per-service confs simplified — v4 scaffold / env.d / `/__basic__/` / portal.d removed; `ENABLE_ACL` read by gateway + edge only; prior: v4 Service-ACL enforcement: three-credential token model dropped (access_token/refresh_token/gateway_token), `/api/auth/refresh` removed, `/go/` 30s exchange code with no JWT in URL, env.d mode-switch; prior: LLM client BYOK-only / llm_config mode default 'byok' (GAP-2), Add Project modal 2 tabs (GAP-1), test-suite counts)
+> **Version**: 1.5
+> **Date**: 2026-08-28 (updated — cycle 20260828T190332Z gateway source-project scan re-architecture: service_manager row + provision-gateway bullets updated — marker-only classification (git `ls-files` deleted; git only for N/M badges), shallow `_scan_recipe_dir` scans, `.provision-state.json` state + fingerprints (`project_state.py`, new module), cache-warm `_get_service_info`, root-only default / explicit `set_recipes` (`_discover_recipes` deleted), `POST /api/services/{name}/recipes` + `GET /api/services/{name}/tree` endpoints; services.py comment extended; prior: 2026-08-24 — cycle 20260824T173309Z v5 ACL-enforcement: ACL gate moved to the edge `-nginx-acl` (edge `location /` `auth_request` → gateway verify); internal per-service confs simplified — v4 scaffold / env.d / `/__basic__/` / portal.d removed; `ENABLE_ACL` read by gateway + edge only; prior: v4 Service-ACL enforcement: three-credential token model dropped (access_token/refresh_token/gateway_token), `/api/auth/refresh` removed, `/go/` 30s exchange code with no JWT in URL, env.d mode-switch; prior: LLM client BYOK-only / llm_config mode default 'byok' (GAP-2), Add Project modal 2 tabs (GAP-1), test-suite counts)
 > **Status**: Current (reflects implemented codebase, post-deduplication refactor)
 
 ---
@@ -97,8 +97,8 @@ Provision Gateway is a **management layer** that wraps the existing `provision-a
 - File operations on shared `PROVISION_DIR` volume
 - LLM client for config generation (BYOK mode only; local agent deferred to future — GAP-2, iter-1)
 - Proxy configuration management
-- Git operations for service source management (the Dockerfile runs `git config --global --add safe.directory '*'` so git `ls-files`/recipe discovery work regardless of repo ownership — commit 9f12b57)
-- Multi-recipe project support — `service_manager._discover_recipes` auto-detects deployable subdirectories (each must contain a Dockerfile + plain docker-compose*.yml)
+- Git operations for service source management (the Dockerfile runs `git config --global --add safe.directory '*'` so git N/M badge computation works regardless of repo ownership — commit 9f12b57; git is never used for template classification — scan-rearchitecture cycle 20260828T190332Z, F1/F2)
+- Source-project scanning (scan-rearchitecture cycle 20260828T190332Z): marker-only template classification (Generated iff sibling `{file}.generated` marker exists), shallow per-recipe-dir `os.scandir` scans (never rglob), per-project `.provision-state.json` state with fingerprints (`app/services/project_state.py`), cache-warm `_get_service_info`, root-only default with explicit recipe paths (`_discover_recipes` deleted; `set_recipes` via `POST /api/services/{name}/recipes`)
 - Async HTTP proxy to provision-api for all user provisioning operations
 - SSL certificate management (proxied to provision-api)
 
@@ -229,7 +229,7 @@ app/
 ├── routers/             # FastAPI Route Handlers
 │   ├── auth.py          # /api/auth/* (login, register, users, approve, verify, keys, /go)
 │   ├── system.py        # /api/system/* (status, stats, reconcile, proxy, subnet-pool)
-│   ├── services.py      # /api/services/* (CRUD, files, git, convert, check-missing-files, save-generated, scan)
+│   ├── services.py      # /api/services/* (CRUD, files, git, convert, check-missing-files, save-generated, scan, recipes, tree)
 │   ├── users.py         # /api/users/* (deploy, up/down, rebuild, clone)
 │   ├── tasks.py         # /api/tasks/* (list, status, log SSE, cancel)
 │   ├── llm.py           # /api/llm/* (configs, test, generate)
@@ -240,7 +240,9 @@ app/
 │   ├── provision_service.py # Async HTTP proxy to provision-api (all ops)
 │   ├── service_manager.py   # File ops, git clone, template conversion (delegated),
 │   │                        #   template-based service creation (create_from_template),
-│   │                        #   project change tracking (scan_for_new_projects, get_new_project_events)
+│   │                        #   project change tracking (scan_for_new_projects, get_new_project_events),
+│   │                        #   marker-only classification, shallow scans, set_recipes, list_tree_children
+│   ├── project_state.py     # NEW (scan-rearchitecture): .provision-state.json state + dir fingerprints
 │   ├── llm_service.py       # LLM client, config generation
 │   ├── curl_service.py      # URL testing via subprocess curl
 │   ├── audit_service.py     # Audit log writer + querier
@@ -343,7 +345,7 @@ Request → FastAPI Router
 | Service | Singleton | Purpose |
 |---|---|---|
 | `provision_service` | Yes | HTTP client for provision-api (all Docker, reconciliation, SSL, user ops) |
-| `service_manager` | Yes | File operations on PROVISION_DIR; multi-recipe discovery (`_discover_recipes`) — subdirectories containing a Dockerfile + plain docker-compose*.yml are recipes; uses the git-tracked file list when git is available, filesystem fallback when not (commit 9f12b57) |
+| `service_manager` | Yes | File operations on PROVISION_DIR; scan-rearchitecture (cycle 20260828T190332Z): marker-only classification (git `ls-files` deleted; git only for N/M badges), shallow `_scan_recipe_dir` scans, `.provision-state.json` state + fingerprints (project_state.py), cache-warm `_get_service_info`, root-only default / explicit `set_recipes` (`_discover_recipes` deleted), `list_tree_children` for the lazy `GET /api/services/{name}/tree` endpoint |
 | `llm_service` | Yes | LLM client and config generation |
 | `_project_monitor_loop` | Task | Background asyncio task in main.py lifespan; polls source_projects every 10s for new directories, accessible via GET /api/services/notifications |
 

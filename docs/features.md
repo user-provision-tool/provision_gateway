@@ -22,6 +22,21 @@
 > DB sessions (closed before the endpoint's external awaits), DB-heavy endpoints release the connection
 > before `await`ing provision-api/network calls, and the engine uses `pool_timeout=2` fail-fast. See
 > `architecture.md` §"DB connection discipline" and the testing plan `MW7`/`DB5` (regression targets).
+> **Updated**: 2026-08-28 — cycle 20260828T190332Z gateway source-project scan re-architecture FINAL
+> verification (supervisor PASSED, openGapCount=0, iteration 3): scan-rearchitecture plan's F1–F37
+> implemented + verified — marker-only template classification (git `ls-files` deleted; git used only
+> for N/M badges), shallow per-recipe-dir scans (os.scandir, never rglob), `.provision-state.json`
+> per-project state with fingerprints (project_state.py), cache-warm `_get_service_info`, root-only
+> default with explicit recipe paths (`_discover_recipes` deleted), `POST /api/services/{name}/recipes`
+> + `GET /api/services/{name}/tree` with 400/404 semantics (ServiceNotFoundError), 15 sync `def`
+> handlers with threadpool wraps, gear-icon recipe editor modal + lazy per-directory tree. DB1
+> large-repo freeze RESOLVED (synthetic 9600-file repo: cold 46ms / warm 6ms / 4.7KB, /health
+> non-blocking). GAP-15 RESOLVED (non-dir → 400, ghost service → 404). Iteration-3 gap list EMPTY
+> (analyzer gaps:[], gap-reviewer r1 failures:[], coder filesChanged=[]) — no further changes after
+> iter-1. S1 holds (0 `_users_provision` edits). Final test evidence (QA iter-3 r1 + supervisor):
+> pytest 293/0 (11.63s), shell 124/0 (10+53+10+24+27), browser 4/0, registry 15/15 RESOLVED 0 OPEN.
+> Rows updated: S5 (marker-only classification + lazy tree), RC1 (root-only default + explicit recipe
+> paths).
 > **Coverage note**: this doc is the capability summary; the complete endpoint reference (including
 > `GET /api/auth/me`, `POST /api/auth/logout`, `DELETE /api/tasks/{task_id}`, per-service container logs,
 > and the DB `_ensure_schema` migration) is in `api_references.md`.
@@ -111,7 +126,7 @@ Traceability from the v5 requirement/design doc's F-IDs to the features below (d
 | S2 | Add service — from file upload | ✅ | `POST /api/services` (mode=upload) |
 | S3 | Add service — from ZIP upload | ✅ | `POST /api/services` (mode=upload, zip_content) |
 | S4 | Add service — from template | 🧟 | Misnamed: template mode is the **DB-template path** (see S18), not LLM; LLM file generation is a separate feature (L5–L8/L13). The "From Template" UI tab was removed (GAP-1); the API path is dormant (no seed data) |
-| S5 | File tree browser | ✅ | Directory structure, .git filtering, git status tags. Template classification uses the git-tracked/original criterion (GAP-4, iter-1): a file enters Templates only if git-tracked when git is available; untracked/LLM-generated deployment-critical files appear ONLY under Generated Files; `.generated` marker files excluded from all listings |
+| S5 | File tree browser | ✅ | Directory structure, .git filtering, git status tags. Template classification is marker-only (scan-rearchitecture cycle 20260828T190332Z, F1/F2): a file is Generated iff a sibling `{file}.generated` marker exists — git is never used for classification (git `ls-files` deleted; git only for N/M badges); `.generated` marker files excluded from all listings. Tree is lazy per-directory (F33): detail page loads children via `GET /api/services/{name}/tree?dir=` on expand, `?file=` deep link auto-expands ancestors |
 | S6 | Monaco code editor | ✅ | YAML/Nginx syntax highlighting, dark theme |
 | S7 | Git diff view | ✅ | Monaco DiffEditor, line-by-line colored comparison |
 | S8 | File save with git tracking | ✅ | `PUT /api/services/{name}/files/{file}` |
@@ -337,7 +352,7 @@ Traceability from the v5 requirement/design doc's F-IDs to the features below (d
 
 | # | Feature | Status | Notes |
 |---|---|---|---|
-| RC1 | Recipe auto-discovery | ✅ | `service_manager._discover_recipes` finds subdirs with both a `Dockerfile` and a plain `docker-compose*.yml`; git-tracked list when git available, filesystem fallback when not |
+| RC1 | Recipe paths — root-only default + explicit set | ✅ | Scan-rearchitecture (cycle 20260828T190332Z, F4/F15): `_discover_recipes` DELETED — no auto-detection; default (auto origin) is root-only `["."]` (`_resolve_recipe_paths`). Recipe paths set explicitly via `POST /api/services/{name}/recipes` (`set_recipes`; rejects `..`/absolute/non-dir → 400, unknown service → 404 ServiceNotFoundError) |
 | RC2 | DeployForm `name@@recipe_path` selection | ✅ | Service dropdown lists each recipe as `name @ recipe_path`; value = `name@@recipe_path`; `project_root` = `{base}/{recipe_path}`, template paths are bare filenames inside the recipe |
 | RC3 | `recipe_path` in check-missing-files | ✅ | `GET /api/services/{name}/check-missing-files?recipe_path=...` (gateway forwards to provision-api); 404 message includes the recipe |
 | RC4 | `recipe_path` in save-generated | ✅ | `POST /api/services/save-generated` accepts `recipe_path` and creates the target recipe subdir |

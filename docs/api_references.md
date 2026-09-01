@@ -1,7 +1,7 @@
 # Provision Gateway — API Reference
 
-> **Version**: 2.3
-> **Date**: 2026-08-24 (updated — cycle 20260824T173309Z v5 ACL-enforcement: `GET /api/auth/verify` is now invoked by the edge `-nginx-acl` `/_auth_jwt` — internal per-service confs are simple ACL-free and the `/__basic__/` short-circuit is removed (ACL-off = edge pass-through to native Basic); `GET /go/{hostname}` contract unchanged (F13) — the `/_set_token` relay now lives on the edge `-nginx-acl` (not service-side) and the no-JWT-in-URL guarantee is part of F13 (not F7); prior: v4 Service-ACL enforcement: three-credential token model dropped — `access_token`/`refresh_token`/`gateway_token` removed, `POST /api/auth/refresh` no longer exists, `POST /api/auth/logout` added, `/go/` issues a 30s exchange code with no JWT in URL; prior: From Template tab removed from UI / mode=template API-only (GAP-1), local-agent fields deferred at API level (GAP-2))
+> **Version**: 2.4
+> **Date**: 2026-08-28 (updated — cycle 20260828T190332Z gateway source-project scan re-architecture: new `POST /api/services/{name}/recipes` (F27) and `GET /api/services/{name}/tree?dir=` (F28) endpoints added (400/404 semantics via ServiceNotFoundError); `GET /api/services/{name}/git/status` filters `.provision-state*`/`*.generated` (F29); prior: 2026-08-24 — cycle 20260824T173309Z v5 ACL-enforcement: `GET /api/auth/verify` is now invoked by the edge `-nginx-acl` `/_auth_jwt` — internal per-service confs are simple ACL-free and the `/__basic__/` short-circuit is removed (ACL-off = edge pass-through to native Basic); `GET /go/{hostname}` contract unchanged (F13) — the `/_set_token` relay now lives on the edge `-nginx-acl` (not service-side) and the no-JWT-in-URL guarantee is part of F13 (not F7); prior: v4 Service-ACL enforcement: three-credential token model dropped — `access_token`/`refresh_token`/`gateway_token` removed, `POST /api/auth/refresh` no longer exists, `POST /api/auth/logout` added, `/go/` issues a 30s exchange code with no JWT in URL; prior: From Template tab removed from UI / mode=template API-only (GAP-1), local-agent fields deferred at API level (GAP-2))
 > **Base URL**: `http://provision-gateway:8770` (internal) / `http://localhost:8771/api` (via dashboard proxy)
 
 ---
@@ -982,6 +982,10 @@ List all service source projects.
       "files": ["Dockerfile", "docker-compose.yml.j2", "nginx.conf.j2"],
       "generated_files": [],
       "template_files": [],
+      "recipes": [
+        {"path": "", "label": ".", "is_root": true, "template_files": ["docker-compose.yml.j2", "nginx.conf.j2"]},
+        {"path": "recipes/api", "label": "recipes/api", "is_root": false, "template_files": []}
+      ],
       "has_compose_template": true,
       "has_nginx_template": true,
       "active_users": 1,
@@ -1119,6 +1123,48 @@ Get service project details with file list.
   "active_instances": ["alice/0"]
 }
 ```
+
+---
+
+### `POST /api/services/{name}/recipes`
+
+Set the recipe paths for a service project (multi-recipe). **Admin only.**
+
+**Request:**
+```json
+{
+  "recipe_paths": ["recipes/api", "recipes/web"]
+}
+```
+or `{"auto": true}` to reset to the root-only default.
+
+**Response 200:** recipes updated. **Errors:** `..`/absolute/non-directory path → `400` (ValueError); unknown service → `404` (`ServiceNotFoundError`).
+> Note: new endpoint (scan-rearchitecture cycle 20260828T190332Z, F27) — replaces the deleted `_discover_recipes` auto-detection; registered before the `/{name}` catch-all.
+
+---
+
+### `GET /api/services/{name}/tree?dir=`
+
+Lazy directory listing for the service file tree. **Admin only.**
+
+**Path/Query Parameters:**
+| Param | Description |
+|---|---|
+| `dir` | Optional subdirectory relative to the project root (e.g. `recipes/api`); empty → project root |
+
+**Response 200:**
+```json
+{
+  "name": "myservice",
+  "dir": "recipes",
+  "children": [
+    {"name": "api", "path": "recipes/api", "type": "dir", "is_generated": false, "is_template": false}
+  ]
+}
+```
+
+**Errors:** `..` traversal or missing directory → `400` (ValueError); unknown service → `404` (`ServiceNotFoundError`).
+> Note: new endpoint (scan-rearchitecture cycle 20260828T190332Z, F28) — immediate children only, powers the lazy detail-page tree; registered before the `/{name}` catch-all.
 
 ---
 
@@ -1380,6 +1426,9 @@ Check if a service is ready for deployment. Auto-generates missing required file
 ### `GET /api/services/{name}/git/status`
 
 Get git status for a service project.
+
+> Note (scan-rearchitecture cycle 20260828T190332Z, F29): entries whose basename starts with
+> `.provision-state` or whose path ends with `.generated` are filtered out of `modified`/`untracked`.
 
 **Response 200:**
 ```json

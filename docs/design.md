@@ -1,7 +1,7 @@
 # Provision Gateway — Product Design Document
 
-> **Version**: 1.6
-> **Date**: 2026-08-24 (updated — cycle 20260824T173309Z v5 ACL-enforcement: §5.3b verify/go flow updated to the edge `-nginx-acl` model — verify called by the edge `/_auth_jwt`, `/__basic__/` short-circuit removed, edge-side `/_set_token`; §10 env table `NGINX_HTTP_PORT`/`NGINX_HTTPS_PORT` = published edge `-nginx-acl` ports in fullset (decision 10), not provision-nginx ports; prior: v4 Service-ACL enforcement: three-credential token model dropped, `/api/auth/refresh` removed, `/go/` 30s exchange code with no JWT in URL, env.d mode switch)
+> **Version**: 1.7
+> **Date**: 2026-08-28 (updated — cycle 20260828T190332Z gateway source-project scan re-architecture: §5.5 recipes array now root-first + explicit recipe paths — `_discover_recipes` auto-detection DELETED, marker-only classification (no git ls-files), shallow scans, `.provision-state.json` fingerprints, `POST /api/services/{name}/recipes` + `GET /api/services/{name}/tree` endpoints, sync `def` handlers + threadpool wraps; prior: 2026-08-24 — cycle 20260824T173309Z v5 ACL-enforcement: §5.3b verify/go flow updated to the edge `-nginx-acl` model — verify called by the edge `/_auth_jwt`, `/__basic__/` short-circuit removed, edge-side `/_set_token`; §10 env table `NGINX_HTTP_PORT`/`NGINX_HTTPS_PORT` = published edge `-nginx-acl` ports in fullset (decision 10), not provision-nginx ports; prior: v4 Service-ACL enforcement: three-credential token model dropped, `/api/auth/refresh` removed, `/go/` 30s exchange code with no JWT in URL, env.d mode switch)
 > **Status**: Implemented — reflects current codebase
 > **See also**: [architecture.md](./architecture.md) | [api_references.md](./api_references.md) | [tests_coverage_status.md](./tests_coverage_status.md)
 
@@ -156,7 +156,7 @@ services:
 **Dockerfile key points:**
 - Multi-stage: `python:3.13-slim` base, `uv` for deps
 - Same pattern as provision-api: copy `docker` CLI binary from `docker:cli` if needed (for subprocess fallback), but prefer `docker-py` SDK
-- `git config --global --add safe.directory '*'` — allows git subprocesses (`ls-files`, status/diff, recipe discovery) to run on cloned repos regardless of directory ownership (multi-recipe support, commit 9f12b57)
+- `git config --global --add safe.directory '*'` — allows git subprocesses (status/diff — N/M badges only; `ls-files` no longer used, classification is marker-only since the scan-rearchitecture cycle 20260828T190332Z) to run on cloned repos regardless of directory ownership (commit 9f12b57)
 - `CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8770"]`
 
 ### 2.2 provision-dashboard
@@ -847,12 +847,13 @@ GET /api/services
       }
     ]
   }
-  → Each service exposes a "recipes" array — auto-discovered deployable
-    subdirectories (service_manager._discover_recipes). A directory is a recipe
-    only if it contains BOTH a Dockerfile AND at least one plain docker-compose*.yml
-    file. Discovery uses the git-tracked file list when git is available, and falls
-    back to a filesystem scan when it is not. The project root is listed first as
-    is_root=true.
+  → Each service exposes a "recipes" array — root-first (path:"" / is_root=true) plus
+    any explicitly configured recipe paths. Scan-rearchitecture (cycle
+    20260828T190332Z, F4/F15): `_discover_recipes` auto-detection is DELETED — recipes
+    are set explicitly via POST /api/services/{name}/recipes (`set_recipes`; rejects
+    `..`/absolute/non-dir → 400, unknown service → 404 ServiceNotFoundError) and the
+    default (auto origin) is root-only `["."]`. Classification is marker-only (F1/F2):
+    a file is Generated iff a sibling {file}.generated marker exists — no git ls-files.
 
 POST /api/services
   Request: multipart/form-data or JSON — three creation modes:
