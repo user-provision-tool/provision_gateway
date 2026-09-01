@@ -6,25 +6,33 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from ..database import get_db
 from ..middleware import require_admin
 from ..models.service_template import ServiceTemplate
 from ..services.audit_service import log_action
-from ..services.service_manager import service_manager
+from ..services.service_manager import service_manager, ServiceNotFoundError
 from ..services.llm_service import llm_service
 from ..config import settings
 from ..utils.file_scanner import scan_directory
 from ..services.provision_service import provision_service
+from ..schemas.services import ServiceRecipesRequest, ServiceTreeResponse
 
 router = APIRouter(prefix="/api/services", tags=["services"])
 
 
 @router.get("")
-async def list_services(
+def list_services(
     current_admin: dict = Depends(require_admin),
 ):
-    """List all service projects in source_projects."""
+    """List all service projects in source_projects.
+
+    Synchronous handler: list_services rescans the (potentially huge)
+    source_projects dir, so it must run in a worker thread and never block
+    the event loop (see DB1/GAP-14). FastAPI runs sync ``def`` handlers in
+    the threadpool.
+    """
     services = service_manager.list_services()
     return {"services": services}
 
@@ -54,7 +62,7 @@ def list_templates(
 
 
 @router.get("/notifications")
-async def get_project_notifications(
+def get_project_notifications(
     current_admin: dict = Depends(require_admin),
 ):
     """Return newly detected project events from background monitoring.
@@ -67,8 +75,53 @@ async def get_project_notifications(
     return {"notifications": events, "count": len(events)}
 
 
+@router.post("/{name}/recipes")
+def set_service_recipes(
+    name: str,
+    req: ServiceRecipesRequest,
+    current_admin: dict = Depends(require_admin),
+):
+    """Set the recipe (template) subdirectories for a service project.
+
+    Body: either ``{"recipe_paths": ["docker"]}`` (explicit; empty list resets
+    to root-only scanning) or ``{"auto": true}`` (re-enable auto-detect of the
+    root directory only). Invalid paths (traversal, absolute, non-directory)
+    are rejected with 400; unknown services with 404.
+    """
+    try:
+        if req.auto:
+            info = service_manager.set_recipes(name, [])
+        else:
+            info = service_manager.set_recipes(name, req.recipe_paths or [])
+    except ServiceNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return info
+
+
+@router.get("/{name}/tree")
+def get_service_tree(
+    name: str,
+    dir: str = Query("", description="Directory relative to project root ('' = root)"),
+    current_admin: dict = Depends(require_admin),
+):
+    """Return the immediate children of a directory in a service project.
+
+    Lazy tree endpoint: one request per expanded directory, never a full
+    recursive walk (see DB1/GAP-14). Traversal attempts yield 400.
+    """
+    try:
+        children = service_manager.list_tree_children(name, dir)
+    except ServiceNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return ServiceTreeResponse(name=name, dir=dir, children=children)
+
+
 @router.get("/{name}")
-async def get_service(
+def get_service(
     name: str,
     current_admin: dict = Depends(require_admin),
 ):
@@ -80,7 +133,7 @@ async def get_service(
 
 
 @router.post("", status_code=201)
-async def create_service(
+def create_service(
     req: dict[str, Any],
     current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
@@ -160,7 +213,7 @@ async def check_missing_files(
         scan_dir = project_dir
     if scan_dir.is_dir():
         try:
-            ctx = scan_directory(scan_dir)
+            ctx = await run_in_threadpool(scan_directory, scan_dir)
             result["scan_context"] = {
                 "repo_description": ctx.repo_description,
                 "repo_files": ctx.repo_files,
@@ -196,7 +249,10 @@ async def check_deploy_readiness(
     if not service_name:
         raise HTTPException(400, "'service_name' is required")
 
-    info = service_manager._get_service_info(service_manager._source_dir / service_name)
+    info = await run_in_threadpool(
+        service_manager._get_service_info,
+        service_manager._source_dir / service_name,
+    )
     files = info.get("files", [])
 
     needed = {
@@ -266,7 +322,7 @@ async def check_deploy_readiness(
 
 
 @router.post("/save-generated")
-async def save_generated_files(
+def save_generated_files(
     req: dict[str, Any],
     current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
@@ -306,7 +362,7 @@ async def save_generated_files(
 
 
 @router.delete("/{name}")
-async def delete_service(
+def delete_service(
     name: str,
     force: bool = Query(False),
     current_admin: dict = Depends(require_admin),
@@ -323,7 +379,7 @@ async def delete_service(
 
 
 @router.get("/{name}/files/{filename:path}")
-async def get_service_file(
+def get_service_file(
     name: str,
     filename: str,
     current_admin: dict = Depends(require_admin),
@@ -336,7 +392,7 @@ async def get_service_file(
 
 
 @router.put("/{name}/files/{filename:path}")
-async def write_service_file(
+def write_service_file(
     name: str,
     filename: str,
     req: dict[str, Any],
@@ -354,7 +410,7 @@ async def write_service_file(
 
 
 @router.post("/{name}/files/{filename:path}", status_code=201)
-async def create_service_file(
+def create_service_file(
     name: str,
     filename: str,
     req: dict[str, Any],
@@ -372,7 +428,7 @@ async def create_service_file(
 
 
 @router.delete("/{name}/files/{filename:path}")
-async def delete_service_file(
+def delete_service_file(
     name: str,
     filename: str,
     current_admin: dict = Depends(require_admin),
@@ -390,7 +446,7 @@ async def delete_service_file(
 
 
 @router.post("/{name}/convert")
-async def convert_service_files(
+def convert_service_files(
     name: str,
     req: dict[str, Any],
     current_admin: dict = Depends(require_admin),
@@ -426,7 +482,7 @@ async def convert_service_files(
 
 
 @router.post("/scan")
-async def scan_repo(
+def scan_repo(
     req: dict[str, Any],
     current_admin: dict = Depends(require_admin),
 ):
@@ -478,11 +534,16 @@ def _git_command(service_name: str, *args: str) -> str:
 
 
 @router.get("/{name}/git/status")
-async def git_status(
+def git_status(
     name: str,
     current_admin: dict = Depends(require_admin),
 ):
-    """Get git status for a service project (git status --porcelain)."""
+    """Get git status for a service project (git status --porcelain).
+
+    State files and generated markers are infrastructure bookkeeping, not
+    user edits — ``.provision-state*`` and ``*.generated`` entries are
+    filtered out of modified/untracked (F9).
+    """
     try:
         output = _git_command(name, "status", "--porcelain")
     except HTTPException:
@@ -496,6 +557,9 @@ async def git_status(
             continue
         status = line[:2].strip()
         filename = line[3:].strip()
+        base = filename.rsplit("/", 1)[-1]
+        if base.startswith(".provision-state") or filename.endswith(".generated"):
+            continue
         if status in ("M", "A", "D", "R"):
             modified.append({"status": status, "file": filename})
         elif status == "??":
@@ -504,7 +568,7 @@ async def git_status(
 
 
 @router.get("/{name}/git/diff")
-async def git_diff(
+def git_diff(
     name: str,
     file: str = Query(None, description="Specific file to diff (relative path)"),
     current_admin: dict = Depends(require_admin),
@@ -521,7 +585,7 @@ async def git_diff(
 
 
 @router.get("/{name}/git/head-file")
-async def git_head_file(
+def git_head_file(
     name: str,
     file: str = Query(..., description="File path relative to project root"),
     current_admin: dict = Depends(require_admin),

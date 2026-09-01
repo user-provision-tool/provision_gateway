@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Typography, Card, Table, Button, Modal, Form, Input,
@@ -9,7 +9,7 @@ import type { UploadProps } from 'antd'
 import {
   PlusOutlined, DeleteOutlined, FolderOpenOutlined,
   GithubOutlined, UploadOutlined, InboxOutlined, FileAddOutlined,
-  RobotOutlined
+  RobotOutlined, SettingOutlined
 } from '@ant-design/icons'
 import Editor, { DiffEditor } from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
@@ -50,6 +50,16 @@ export default function ServicesPage() {
   const [genLoading, setGenLoading] = useState<string | null>(null)
   const [missingFilesMap, setMissingFilesMap] = useState<Record<string, string[]>>({})  // recipeKey → missing file types
   const [checkingMap, setCheckingMap] = useState<Record<string, boolean>>({})  // recipeKey → currently checking
+  // Recipe-directory editor (gear icon in Name column)
+  const [recipesModalFor, setRecipesModalFor] = useState<string | null>(null)
+  const [recipesSaving, setRecipesSaving] = useState(false)
+  const [recipesAuto, setRecipesAuto] = useState(true)
+  const [recipesForm] = Form.useForm()
+  // Recipe-directories section in the Add Project modal — its OWN form store.
+  // (Sharing `form` across two <Form> components broke the git form's submit
+  // on initial mount — antd quirk; values are merged at submit instead.)
+  const [recipesAddForm] = Form.useForm()
+  const addRecipeAuto = Form.useWatch('recipe_auto', recipesAddForm) ?? true
 
   useEffect(() => { loadServices(); loadProxyStatus() }, [])
 
@@ -117,9 +127,11 @@ export default function ServicesPage() {
   const handleAdd = async (values: any) => {
     setAddLoading(true)
     try {
-      await client.post('/services', { ...values, mode: addMode })
+      const { recipe_auto, recipe_paths, ...serviceFields } = values
+      await client.post('/services', { ...serviceFields, mode: addMode })
+      await applyRecipesIfConfigured(recipesAddForm.getFieldsValue(), values.name)
       message.success('Service created!')
-      setAddModalOpen(false); form.resetFields(); loadServices()
+      setAddModalOpen(false); form.resetFields(); recipesAddForm.resetFields(); loadServices()
     } catch (err: any) {
       message.error(err.response?.data?.detail || 'Failed to create service')
     } finally { setAddLoading(false) }
@@ -139,6 +151,32 @@ export default function ServicesPage() {
         }
       },
     })
+  }
+
+  // ---- Recipe directory editor (gear icon) ----
+  const openRecipesModal = (serviceName: string) => {
+    const svc = services.find(s => s.name === serviceName)
+    const paths = (svc?.recipes || []).filter(r => !r.is_root).map(r => r.path)
+    setRecipesAuto(!svc || !svc.recipes || svc.recipes.length <= 1)
+    recipesForm.setFieldsValue({ recipe_paths: paths.length ? paths : [''] })
+    setRecipesModalFor(serviceName)
+  }
+
+  const handleSaveRecipes = async () => {
+    if (!recipesModalFor) return
+    setRecipesSaving(true)
+    try {
+      const values = recipesForm.getFieldsValue()
+      const payload = recipesAuto
+        ? { auto: true }
+        : { recipe_paths: (values.recipe_paths || []).filter((p: string) => p && p.trim()) }
+      await client.post(`/services/${recipesModalFor}/recipes`, payload)
+      message.success('Recipe directories updated')
+      setRecipesModalFor(null)
+      refreshServices()
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || 'Failed to update recipes')
+    } finally { setRecipesSaving(false) }
   }
 
   // Generate missing files via LLM for a service project
@@ -227,7 +265,12 @@ export default function ServicesPage() {
       render: (t: string, r: TableRow) => ({
         children: <Space size={4}>
           <Button type="link" onClick={() => navigate(`/services/${t}`)}><FolderOpenOutlined /> {t}</Button>
-          {isAdmin && r.nameRowSpan > 0 && <Button size="small" danger icon={<DeleteOutlined/>} onClick={()=>handleDelete(r.name)} style={{marginLeft:4}}/>}
+          {isAdmin && r.nameRowSpan > 0 && <>
+            <Tooltip title="Recipe directories">
+              <Button size="small" icon={<SettingOutlined/>} onClick={()=>openRecipesModal(r.name)}/>
+            </Tooltip>
+            <Button size="small" danger icon={<DeleteOutlined/>} onClick={()=>handleDelete(r.name)} style={{marginLeft:4}}/>
+          </>}
         </Space>,
         props: { rowSpan: r.nameRowSpan },
       }) },
@@ -273,11 +316,11 @@ export default function ServicesPage() {
         {loading ? <Spin/> : services.length===0 ? <Empty description="No source projects yet"><Button type="primary" icon={<PlusOutlined/>} onClick={()=>setAddModalOpen(true)}>Add Project</Button></Empty> :
         <Table dataSource={tableData} columns={columns} rowKey={(r: TableRow) => r.recipePath ? `${r.name}@@${r.recipePath}` : r.name} pagination={false}/>}
       </Card>
-      <Modal title="Add Source Project" open={addModalOpen} onCancel={()=>{setAddModalOpen(false);form.resetFields()}} footer={null} width={560}>
+      <Modal title="Add Source Project" open={addModalOpen} onCancel={()=>{setAddModalOpen(false);form.resetFields();recipesAddForm.resetFields()}} footer={null} width={560}>
         <Tabs activeKey={addMode} onChange={(k)=>{setAddMode(k as any);form.resetFields()}} items={[
           { key:'git', label:<span><GithubOutlined/> From Git</span>, children:
             <Form form={form} layout="vertical" onFinish={handleAdd}>
-              <Form.Item name="repo_url" label="Repository URL" rules={[{required:true}]}><Input placeholder="https://github.com/user/repo.git"/></Form.Item>
+              <Form.Item name="repo_url" label="Repository URL" rules={addMode==='git' ? [{required:true}] : []}><Input placeholder="https://github.com/user/repo.git"/></Form.Item>
               <Form.Item name="branch" label="Branch" initialValue="main"><Input placeholder="main"/></Form.Item>
               <Form.Item name="name" label="Service Name" rules={[{required:true}]}><Input placeholder="myapp"/></Form.Item>
               <Form.Item name="use_proxy" valuePropName="checked">
@@ -289,17 +332,95 @@ export default function ServicesPage() {
               <Button type="primary" htmlType="submit" loading={addLoading} block>Clone & Create</Button>
             </Form> },
           { key:'upload', label:<span><UploadOutlined/> Upload Zip</span>, children:
-            <UploadZipForm form={form} addLoading={addLoading} setAddLoading={setAddLoading}
-              onSuccess={()=>{setAddModalOpen(false);form.resetFields();loadServices()}} /> },
+            <UploadZipForm form={form} recipeForm={recipesAddForm} addLoading={addLoading} setAddLoading={setAddLoading}
+              onSuccess={()=>{setAddModalOpen(false);form.resetFields();recipesAddForm.resetFields();loadServices()}} /> },
         ]}/>
+
+        {/* Recipe directories — applies to both Git and Upload (own form store) */}
+        <Form form={recipesAddForm} layout="vertical" style={{marginTop:12}}>
+          <Text type="secondary" strong>Recipe directories (optional)</Text>
+          <Form.Item name="recipe_auto" valuePropName="checked" initialValue={true} style={{marginBottom:8}}>
+            <Checkbox>Auto-detect (root only)</Checkbox>
+          </Form.Item>
+          {!addRecipeAuto && (<>
+            <div style={{fontSize:12,color:'#999',marginBottom:8}}>
+              Scan the listed subdirectories for deployment files (e.g. <code>docker</code> for
+              docker-compose.yml templates). Changeable later via the gear icon on the project row.
+            </div>
+            <Form.List name="recipe_paths" initialValue={['']}>
+              {(fields, { add, remove }) => (<>
+                {fields.map(f => (
+                  <Space key={f.key} style={{display:'flex',marginBottom:8}} align="baseline">
+                    <Form.Item {...f} name={[f.name]} rules={[{required:true,message:'Path required'}]} style={{marginBottom:0,flex:1}}>
+                      <Input placeholder="docker" />
+                    </Form.Item>
+                    <Button size="small" icon={<DeleteOutlined/>} onClick={()=>remove(f.name)}/>
+                  </Space>
+                ))}
+                <Button type="dashed" onClick={()=>add()} block icon={<PlusOutlined/>}>Add recipe dir</Button>
+              </>)}
+            </Form.List>
+          </>)}
+        </Form>
+      </Modal>
+
+      {/* Recipe directories editor */}
+      <Modal
+        title={`Recipe Directories — ${recipesModalFor || ''}`}
+        open={recipesModalFor !== null}
+        onCancel={()=>setRecipesModalFor(null)}
+        onOk={handleSaveRecipes}
+        confirmLoading={recipesSaving}
+        okText="Save"
+      >
+        <div style={{marginBottom:12}}>
+          <Checkbox checked={recipesAuto} onChange={e=>setRecipesAuto(e.target.checked)}>
+            Auto-detect (root only)
+          </Checkbox>
+          <div style={{fontSize:12,color:'#999',marginTop:4}}>
+            Auto mode scans only the project root for deployment files. Turn it off to scan specific
+            recipe subdirectories instead (e.g. <code>docker</code> for docker-compose.yml templates).
+          </div>
+        </div>
+        {!recipesAuto && (
+          <Form form={recipesForm} layout="vertical">
+            <Form.List name="recipe_paths">
+              {(fields, { add, remove }) => (<>
+                {fields.map(f => (
+                  <Space key={f.key} style={{display:'flex',marginBottom:8}} align="baseline">
+                    <Form.Item {...f} name={[f.name]} rules={[{required:true,message:'Path required'}]} style={{marginBottom:0,flex:1}}>
+                      <Input placeholder="docker" />
+                    </Form.Item>
+                    <Button size="small" icon={<DeleteOutlined/>} onClick={()=>remove(f.name)}/>
+                  </Space>
+                ))}
+                <Button type="dashed" onClick={()=>add()} block icon={<PlusOutlined/>}>Add recipe dir</Button>
+              </>)}
+            </Form.List>
+          </Form>
+        )}
       </Modal>
     </div>
   )
 }
 
+// Apply the Add-Project recipe-dir settings to a freshly created project.
+// Auto (root-only) is the default — no call needed. Explicit paths go through
+// POST /services/{name}/recipes (same endpoint as the gear-icon editor).
+async function applyRecipesIfConfigured(values: any, serviceName: string) {
+  if (!serviceName) return
+  const paths = (values.recipe_paths || []).filter((p: string) => p && p.trim())
+  if (values.recipe_auto || paths.length === 0) return
+  try {
+    await client.post(`/services/${serviceName}/recipes`, { recipe_paths: paths.map((p: string) => p.trim()) })
+  } catch (err: any) {
+    message.warning('Project created, but recipe directories failed to apply: ' + (err.response?.data?.detail || err.message))
+  }
+}
+
 // ---- Upload Zip Form (file selector instead of base64 paste) ----
-function UploadZipForm({ form, addLoading, setAddLoading, onSuccess }: {
-  form: any; addLoading: boolean; setAddLoading: (v: boolean) => void; onSuccess: () => void
+function UploadZipForm({ form, recipeForm, addLoading, setAddLoading, onSuccess }: {
+  form: any; recipeForm: any; addLoading: boolean; setAddLoading: (v: boolean) => void; onSuccess: () => void
 }) {
   const [zipBase64, setZipBase64] = useState<string>('')
 
@@ -340,6 +461,7 @@ function UploadZipForm({ form, addLoading, setAddLoading, onSuccess }: {
         try { payload.files = JSON.parse(values.files) } catch { /* not JSON */ }
       }
       await client.post('/services', payload)
+      await applyRecipesIfConfigured(recipeForm.getFieldsValue(), values.name)
       message.success('Service created!')
       onSuccess()
     } catch (err: any) {
@@ -380,8 +502,13 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
   const [saving, setSaving] = useState(false)
   const [gitModifiedFiles, setGitModifiedFiles] = useState<Set<string>>(new Set())
   const [gitNewFiles, setGitNewFiles] = useState<Set<string>>(new Set())
-  const [treeReady, setTreeReady] = useState(false)
   const [selectedRecipe, setSelectedRecipe] = useState('')
+  // Lazy tree: one /tree request per expanded directory (never a full walk)
+  type TreeNode = { name: string; path: string; type: 'file' | 'dir'; is_generated: boolean; is_template: boolean }
+  const [treeNodes, setTreeNodes] = useState<Record<string, TreeNode[]>>({})  // dir-rel-path → children
+  const [loadingDirs, setLoadingDirs] = useState<Set<string>>(new Set())
+  const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set())
+  const openedFileRef = useRef(false)
 
   // Add file modal
   const [addFileOpen, setAddFileOpen] = useState(false)
@@ -390,8 +517,9 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
   const [addFileLoading, setAddFileLoading] = useState(false)
 
   useEffect(() => {
-    client.get(`/services/${name}`).then(r=>{setService(r.data);setTreeReady(true)}).catch(()=>message.error('Failed'))
+    client.get(`/services/${name}`).then(r=>setService(r.data)).catch(()=>message.error('Failed'))
     refreshGitStatus()
+    loadDir('')
   }, [name])
 
   // When recipe selection changes, collapse all then expand the recipe path
@@ -403,7 +531,9 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
     const parts = selectedRecipe.split('/')
     const toExpand = new Set<string>()
     for (let i = 0; i < parts.length; i++) {
-      toExpand.add(parts.slice(0, i + 1).join('/'))
+      const d = parts.slice(0, i + 1).join('/')
+      toExpand.add(d)
+      loadDir(d)
     }
     setExpandedDirs(toExpand)
   }, [selectedRecipe])
@@ -411,23 +541,25 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
   // Auto-load file from URL query param ?file=...
   const fileParam = searchParams.get('file')
   useEffect(() => {
-    if (fileParam && service && treeReady) {
-      loadFile(fileParam)
-      // Auto-expand parent directories
-      const parts = fileParam.split('/')
-      const dirsToExpand = new Set<string>()
-      for (let i = 0; i < parts.length - 1; i++) {
-        dirsToExpand.add(parts.slice(0, i + 1).join('/'))
-      }
-      if (dirsToExpand.size > 0) {
-        setExpandedDirs(prev => {
-          const next = new Set(prev)
-          dirsToExpand.forEach(d => next.add(d))
-          return next
-        })
-      }
+    if (!fileParam || !service || openedFileRef.current) return
+    openedFileRef.current = true
+    loadFile(fileParam)
+    // Auto-expand parent directories (loading them from the lazy tree)
+    const parts = fileParam.split('/')
+    const dirsToExpand = new Set<string>()
+    for (let i = 0; i < parts.length - 1; i++) {
+      const d = parts.slice(0, i + 1).join('/')
+      dirsToExpand.add(d)
+      loadDir(d)
     }
-  }, [fileParam, service, treeReady])
+    if (dirsToExpand.size > 0) {
+      setExpandedDirs(prev => {
+        const next = new Set(prev)
+        dirsToExpand.forEach(d => next.add(d))
+        return next
+      })
+    }
+  }, [fileParam, service])
 
   const refreshGitStatus = async () => {
     try {
@@ -523,101 +655,64 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
   const headLoaded = selectedFile && headContent !== undefined
   const hasDiff = headLoaded && fileContent !== headContent
 
-  // ---- Build directory tree from flat file list ----
-  type TreeNode = { name: string; isDir: boolean; children: Record<string, TreeNode>; hasModified: boolean; hasNew: boolean; fullPath: string }
-  
-  const fileTree = useMemo(() => {
-    if (!service) return [] as TreeNode[]
-    const filtered = service.files.filter((f: string) => {
-      if (f.startsWith('.git/') || f === '.git' || f === '.gitignore' || f === '.gitattributes') return false
-      if (f.startsWith('node_modules/') || f === 'node_modules') return false
-      if (f.startsWith('dist/') && (f.endsWith('.js') || f.endsWith('.map') || f.endsWith('.ts'))) return false
-      if (f.startsWith('.vite/') || f === '.vite') return false
-      return true
-    })
-    
-    const root: Record<string, TreeNode> = {}
-    
-    for (const f of filtered) {
-      const parts = f.split('/')
-      let current: Record<string, TreeNode> = root
-      
-      for (let i = 0; i < parts.length; i++) {
-        const name = parts[i]
-        const isLast = i === parts.length - 1
-        const fullPath = parts.slice(0, i + 1).join('/')
-        
-        if (!current[name]) {
-          current[name] = { name, isDir: !isLast, children: {}, hasModified: false, hasNew: false, fullPath }
-        }
-        
-        if (isLast) {
-          current[name].isDir = false
-          current[name].hasModified = gitModifiedFiles.has(f)
-          current[name].hasNew = gitNewFiles.has(f)
-        }
-        
-        current = current[name].children
-      }
+  // ---- Lazy directory tree (one /tree request per expanded dir) ----
+  const loadDir = async (dir: string) => {
+    setLoadingDirs(prev => { const n = new Set(prev); n.add(dir); return n })
+    try {
+      const { data } = await client.get(`/services/${name}/tree`, { params: dir ? { dir } : {} })
+      setTreeNodes(prev => ({ ...prev, [dir]: data.children || [] }))
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || 'Failed to load directory')
+    } finally {
+      setLoadingDirs(prev => { const n = new Set(prev); n.delete(dir); return n })
     }
-    
-    // Convert dict-based tree to sorted array-based tree for rendering
-    const dictToArray = (dict: Record<string, TreeNode>): TreeNode[] => {
-      const nodes = Object.values(dict)
-      for (const node of nodes) {
-        if (node.isDir) {
-          node.children = dictToArray(node.children) as any
-          const childArr = node.children as unknown as TreeNode[]
-          node.hasModified = childArr.some(c => c.hasModified)
-          node.hasNew = childArr.some(c => c.hasNew)
-        }
-      }
-      nodes.sort((a, b) => {
-        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
-        return a.name.localeCompare(b.name)
-      })
-      return nodes as any
-    }
-    
-    return dictToArray(root)
-  }, [service, gitModifiedFiles, gitNewFiles])
+  }
 
-  // ---- Recursive file tree renderer ----
-  const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set(['app'])) // 'app' expanded by default
-  
-  const renderTreeNode = (node: TreeNode, depth: number): React.ReactNode => {
-    const isSelected = selectedFile === node.fullPath
-    const isGenerated = (service?.generated_files || []).includes(node.fullPath)
-    const isNew = node.hasNew && !node.hasModified
-    const isModified = node.hasModified
-    const statusColor = isSelected ? '#e6f4ff' : isGenerated ? '#f6ffed' : isNew ? '#f6ffed' : isModified ? '#fff7e6' : 'transparent'
-    
-    if (node.isDir) {
-      const expanded = expandedDirs.has(node.fullPath)
-      const childArray = node.children as unknown as TreeNode[]
-      return <div key={node.fullPath}>
-        <div
-          onClick={() => setExpandedDirs(prev => { const next = new Set(prev); if (next.has(node.fullPath)) next.delete(node.fullPath); else next.add(node.fullPath); return next })}
+  const toggleDir = (node: TreeNode) => {
+    setExpandedDirs(prev => {
+      const next = new Set(prev)
+      if (next.has(node.path)) next.delete(node.path)
+      else next.add(node.path)
+      return next
+    })
+    if (!treeNodes[node.path]) loadDir(node.path)
+  }
+
+  const renderDirChildren = (dir: string, depth: number): React.ReactNode => {
+    const nodes = treeNodes[dir] || []
+    return <div key={dir || '__root__'}>
+      {nodes.map(n => {
+        const fullPath = n.path
+        const isSelected = selectedFile === fullPath
+        const isNew = gitNewFiles.has(fullPath) && !gitModifiedFiles.has(fullPath)
+        const isModified = gitModifiedFiles.has(fullPath)
+        const isGenerated = n.is_generated
+        const statusColor = isSelected ? '#e6f4ff' : isGenerated ? '#f6ffed' : isNew ? '#f6ffed' : isModified ? '#fff7e6' : 'transparent'
+        if (n.type === 'dir') {
+          const expanded = expandedDirs.has(fullPath)
+          return <div key={fullPath}>
+            <div onClick={() => toggleDir(n)}
+              style={{padding:'6px 12px',cursor:'pointer',borderRadius:4,background:statusColor,marginBottom:2,fontFamily:'monospace',fontSize:13,display:'flex',alignItems:'center',gap:6,paddingLeft:12+depth*16}}
+            >
+              <span>{expanded ? '📂' : '📁'}</span>
+              <span style={{fontWeight:'bold'}}>{n.name}/</span>
+              {isNew && <Tag color="green" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>N</Tag>}
+              {isModified && <Tag color="orange" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>M</Tag>}
+            </div>
+            {expanded && renderDirChildren(fullPath, depth + 1)}
+          </div>
+        }
+        return <div key={fullPath} onClick={() => loadFile(fullPath)}
           style={{padding:'6px 12px',cursor:'pointer',borderRadius:4,background:statusColor,marginBottom:2,fontFamily:'monospace',fontSize:13,display:'flex',alignItems:'center',gap:6,paddingLeft:12+depth*16}}
         >
-          <span>{expanded ? '📂' : '📁'}</span>
-          <span style={{fontWeight:'bold'}}>{node.name}/</span>
-          {node.hasNew && <Tag color="green" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>N</Tag>}
-          {node.hasModified && <Tag color="orange" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>M</Tag>}
+          <span>{isGenerated?'✨':isNew?'●':'📄'}</span>
+          <span style={{color:isGenerated?'#52c41a':isNew?'#52c41a':isModified?'#faad14':undefined,fontWeight:isGenerated||isNew?'bold':undefined}}>{n.name}</span>
+          {isGenerated && <Tag color="green" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>gen</Tag>}
+          {isNew && <Tag color="green" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>N</Tag>}
+          {isModified && !isNew && <Tag color="orange" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>M</Tag>}
         </div>
-        {expanded && childArray.map(c => renderTreeNode(c, depth + 1))}
-      </div>
-    }
-    
-    // File node
-    return <div key={node.fullPath} onClick={() => loadFile(node.fullPath)}
-      style={{padding:'6px 12px',cursor:'pointer',borderRadius:4,background:statusColor,marginBottom:2,fontFamily:'monospace',fontSize:13,display:'flex',alignItems:'center',gap:6,paddingLeft:12+depth*16}}
-    >
-      <span>{isGenerated?'✨':isNew?'●':'📄'}</span>
-      <span style={{color:isGenerated?'#52c41a':isNew?'#52c41a':isModified?'#faad14':undefined,fontWeight:isGenerated||isNew?'bold':undefined}}>{node.name}</span>
-      {isGenerated && <Tag color="green" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>gen</Tag>}
-      {isNew && <Tag color="green" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>N</Tag>}
-      {isModified && !isNew && <Tag color="orange" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>M</Tag>}
+      })}
+      {loadingDirs.has(dir) && <div style={{padding:'8px 12px'}}><Spin size="small"/></div>}
     </div>
   }
 
@@ -656,7 +751,7 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
               <Tag color="green">N</Tag><Text type="secondary" style={{fontSize:11}}>new</Text>
               <Tag color="orange">M</Tag><Text type="secondary" style={{fontSize:11}}>modified</Text>
             </div>
-            {fileTree.map(n => renderTreeNode(n, 0))}
+            {renderDirChildren('', 0)}
           </div>
           <div style={{flex:1}}>
             {selectedFile ? <div>

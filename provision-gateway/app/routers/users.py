@@ -151,8 +151,9 @@ async def deploy_user(
     nginx_path = req.get("nginx_conf_file_path") or req.get("nginx_conf_template_path")
 
     # Check if service project has compose/nginx files
+    from starlette.concurrency import run_in_threadpool
     from ..services.service_manager import service_manager
-    info = service_manager.get_service(service_name)
+    info = await run_in_threadpool(service_manager.get_service, service_name)
     if info:
         files = info.get("files", [])
         has_compose = any(f.endswith((".yml", ".yaml")) for f in files if not f.endswith(".j2"))

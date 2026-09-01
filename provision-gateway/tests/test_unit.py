@@ -58,6 +58,462 @@ class TestConfig:
 
 
 # ---------------------------------------------------------------------------
+# Tests for scan re-architecture — project_state module (F11-F14)
+# ---------------------------------------------------------------------------
+
+class TestProjectStateModule:
+    """project_state.py: fingerprinting + atomic state persistence (F11-F14)."""
+
+    def test_compute_dir_fingerprint_entries(self, tmp_path):
+        from app.services.project_state import compute_dir_fingerprint
+        (tmp_path / "a.txt").write_text("hello")
+        (tmp_path / "sub").mkdir()
+        fp = compute_dir_fingerprint(tmp_path)
+        assert set(fp.keys()) == {"a.txt", "sub"}
+        a = fp["a.txt"]
+        assert a["size"] == 5
+        assert a["is_dir"] is False
+        assert isinstance(a["mtime_ns"], int) and a["mtime_ns"] > 0
+        assert fp["sub"]["is_dir"] is True
+
+    def test_compute_dir_fingerprint_missing_dir(self, tmp_path):
+        from app.services.project_state import compute_dir_fingerprint
+        assert compute_dir_fingerprint(tmp_path / "nope") == {}
+
+    def test_fingerprints_equal(self):
+        from app.services.project_state import fingerprints_equal
+        assert fingerprints_equal(
+            {"a": {"mtime_ns": 1, "size": 2, "is_dir": False}},
+            {"a": {"mtime_ns": 1, "size": 2, "is_dir": False}},
+        ) is True
+        assert fingerprints_equal(
+            {"a": {"mtime_ns": 1, "size": 2, "is_dir": False}},
+            {"a": {"mtime_ns": 9, "size": 2, "is_dir": False}},
+        ) is False
+        assert fingerprints_equal(None, {}) is False
+
+    def test_state_roundtrip(self, tmp_path):
+        from app.services.project_state import ProjectState
+        state = ProjectState(tmp_path)
+        state.recipe_origin = "user"
+        state.recipe_paths = [".", "docker"]
+        state.recipes = [{"path": "", "label": "(root)", "is_root": True}]
+        state.files = ["a.txt", "docker/b.yml"]
+        state.generated_files = ["docker/b.yml"]
+        state.template_files = ["Dockerfile"]
+        state.dir_scans = {".": {"fingerprint": {"a.txt": {"mtime_ns": 1, "size": 2, "is_dir": False}}}}
+        state.updated_at = "2026-08-28T00:00:00+00:00"
+        state.save()
+        loaded = ProjectState.load(tmp_path)
+        assert loaded is not None
+        assert loaded.schema_version == 1
+        assert loaded.recipe_origin == "user"
+        assert loaded.recipe_paths == [".", "docker"]
+        assert loaded.recipes == [{"path": "", "label": "(root)", "is_root": True}]
+        assert loaded.files == ["a.txt", "docker/b.yml"]
+        assert loaded.generated_files == ["docker/b.yml"]
+        assert loaded.template_files == ["Dockerfile"]
+        assert loaded.dir_scans == state.dir_scans
+        assert loaded.updated_at == state.updated_at
+
+    def test_state_load_missing_and_corrupt(self, tmp_path):
+        from app.services.project_state import ProjectState
+        assert ProjectState.load(tmp_path) is None
+        (tmp_path / ".provision-state.json").write_text("{not json")
+        assert ProjectState.load(tmp_path) is None
+        (tmp_path / ".provision-state.json").write_text('{"schema_version": 99}')
+        assert ProjectState.load(tmp_path) is None
+        (tmp_path / ".provision-state.json").write_text('{"schema_version": 1, "recipe_paths": 5}')
+        assert ProjectState.load(tmp_path) is None
+
+    def test_state_save_is_atomic(self, tmp_path):
+        from app.services.project_state import ProjectState
+        ProjectState(tmp_path).save()
+        assert (tmp_path / ".provision-state.json").is_file()
+        assert not (tmp_path / ".provision-state.json.tmp").exists()
+
+    def test_fingerprint_ignores_state_file_churn(self, tmp_path):
+        """The state file's own mtime must never invalidate the fingerprint
+        (otherwise every save would trigger a rescan on the next listing)."""
+        from app.services.project_state import compute_dir_fingerprint, ProjectState
+        (tmp_path / "a.txt").write_text("hello")
+        fp1 = compute_dir_fingerprint(tmp_path)
+        ProjectState(tmp_path).save()
+        fp2 = compute_dir_fingerprint(tmp_path)
+        assert fp1 == fp2
+
+
+class TestScanRearchitecture:
+    """Scan re-architecture: shallow scan, cache, set_recipes, tree (F3-F8, F20-F22)."""
+
+    @staticmethod
+    def _svc(tmp_path, monkeypatch):
+        from app.services.service_manager import ServiceManager
+        svc = ServiceManager()
+        monkeypatch.setattr(svc, "_source_dir", tmp_path)
+        return svc
+
+    def test_state_file_written_on_first_scan(self, tmp_path, monkeypatch):
+        from app.services.project_state import ProjectState
+        project = tmp_path / "svc1"
+        project.mkdir()
+        (project / "Dockerfile").write_text("FROM python:3.12")
+        svc = self._svc(tmp_path, monkeypatch)
+        info = svc._get_service_info(project)
+        assert info["files"] == ["Dockerfile"]
+        state_file = project / ".provision-state.json"
+        assert state_file.is_file()
+        state = ProjectState.load(project)
+        assert state is not None
+        assert state.schema_version == 1
+        assert state.recipe_origin == "auto"
+        assert state.recipe_paths == ["."]
+        assert state.files == ["Dockerfile"]
+
+    def test_shallow_scan_never_touches_deep_dirs(self, tmp_path, monkeypatch):
+        project = tmp_path / "svc2"
+        (project / "node_modules" / "pkg" / "deep").mkdir(parents=True)
+        (project / "node_modules" / "pkg" / "deep" / "x.py").write_text("x")
+        (project / "src" / "deep").mkdir(parents=True)
+        (project / "src" / "deep" / "y.py").write_text("y")
+        (project / "top.txt").write_text("t")
+        info = self._svc(tmp_path, monkeypatch)._get_service_info(project)
+        assert info["files"] == ["top.txt"]  # neither node_modules/** nor src/** deep files
+
+    def test_cache_avoids_rescan_on_unchanged_fingerprint(self, tmp_path, monkeypatch):
+        from app.services.project_state import ProjectState
+        project = tmp_path / "svc3"
+        project.mkdir()
+        (project / "a.txt").write_text("a")
+        svc = self._svc(tmp_path, monkeypatch)
+        info1 = svc._get_service_info(project)
+        updated1 = ProjectState.load(project).updated_at
+        info2 = svc._get_service_info(project)
+        updated2 = ProjectState.load(project).updated_at
+        assert info1 == info2
+        assert updated1 == updated2, "unchanged tree must not re-scan/re-save"
+
+    def test_cache_invalidates_on_new_top_level_file(self, tmp_path, monkeypatch):
+        project = tmp_path / "svc4"
+        project.mkdir()
+        (project / "a.txt").write_text("a")
+        svc = self._svc(tmp_path, monkeypatch)
+        assert svc._get_service_info(project)["files"] == ["a.txt"]
+        (project / "b.txt").write_text("b")
+        assert svc._get_service_info(project)["files"] == ["a.txt", "b.txt"]
+
+    def test_state_file_never_listed(self, tmp_path, monkeypatch):
+        project = tmp_path / "svc6"
+        project.mkdir()
+        (project / "a.txt").write_text("a")
+        svc = self._svc(tmp_path, monkeypatch)
+        svc._get_service_info(project)
+        info = svc._get_service_info(project)
+        assert not any(f.startswith(".provision-state") for f in info["files"])
+
+    def test_set_recipes_scopes_and_resets(self, tmp_path, monkeypatch):
+        project = tmp_path / "svc7"
+        project.mkdir()
+        (project / "docker").mkdir()
+        (project / "docker" / "docker-compose.yml").write_text("services: {}")
+        (project / "docker" / "Dockerfile").write_text("FROM python:3.12")
+        (project / "root.txt").write_text("r")
+        svc = self._svc(tmp_path, monkeypatch)
+        info = svc.set_recipes("svc7", ["docker"])
+        assert info["files"] == ["docker/Dockerfile", "docker/docker-compose.yml"]
+        assert info["recipes"] == [{
+            "path": "docker", "label": "docker", "is_root": False,
+            "template_files": ["docker/Dockerfile", "docker/docker-compose.yml"],
+        }]
+        # empty list → root-only reset
+        info = svc.set_recipes("svc7", [])
+        assert info["files"] == ["root.txt"]
+        assert info["recipes"] == [{
+            "path": "", "label": "(root)", "is_root": True, "template_files": [],
+        }]
+
+    def test_set_recipes_normalizes_dot(self, tmp_path, monkeypatch):
+        project = tmp_path / "svc8"
+        project.mkdir()
+        (project / "a.txt").write_text("a")
+        svc = self._svc(tmp_path, monkeypatch)
+        info = svc.set_recipes("svc8", ["", "."])
+        assert info["files"] == ["a.txt"]
+
+    @pytest.mark.parametrize("bad", ["..", "../x", "a/../b", "/abs", "dir\\win", "dir:evil"])
+    def test_set_recipes_rejects_invalid(self, tmp_path, monkeypatch, bad):
+        project = tmp_path / "svc9"
+        project.mkdir()
+        svc = self._svc(tmp_path, monkeypatch)
+        with pytest.raises(ValueError):
+            svc.set_recipes("svc9", [bad])
+
+    def test_set_recipes_rejects_non_dir(self, tmp_path, monkeypatch):
+        project = tmp_path / "svc10"
+        project.mkdir()
+        (project / "file.txt").write_text("x")
+        svc = self._svc(tmp_path, monkeypatch)
+        with pytest.raises(ValueError):
+            svc.set_recipes("svc10", ["file.txt"])
+
+    def test_set_recipes_unknown_service(self, tmp_path, monkeypatch):
+        from app.services.service_manager import ServiceNotFoundError
+        svc = self._svc(tmp_path, monkeypatch)
+        with pytest.raises(ServiceNotFoundError):
+            svc.set_recipes("ghost", ["."])
+
+    def test_tree_unknown_service_raises(self, tmp_path, monkeypatch):
+        from app.services.service_manager import ServiceNotFoundError
+        svc = self._svc(tmp_path, monkeypatch)
+        with pytest.raises(ServiceNotFoundError):
+            svc.list_tree_children("ghost", "")
+
+    def test_recipe_dir_deleted_no_crash(self, tmp_path, monkeypatch):
+        import shutil
+        project = tmp_path / "svc11"
+        project.mkdir()
+        (project / "docker").mkdir()
+        (project / "docker" / "x.yml").write_text("x")
+        svc = self._svc(tmp_path, monkeypatch)
+        svc.set_recipes("svc11", ["docker"])
+        shutil.rmtree(project / "docker")
+        info = svc._get_service_info(project)  # must not crash
+        assert info["files"] == []
+        assert info["recipes"] == []
+
+    def test_tree_immediate_children_only(self, tmp_path, monkeypatch):
+        project = tmp_path / "svc12"
+        project.mkdir()
+        (project / "api").mkdir()
+        (project / "api" / "main.py").write_text("x")
+        (project / "web").mkdir()
+        (project / "web" / "app.py").write_text("x")
+        (project / "top.txt").write_text("t")
+        (project / "gen.py").write_text("g")
+        (project / "gen.py.generated").write_text("")
+        svc = self._svc(tmp_path, monkeypatch)
+        children = svc.list_tree_children("svc12", "")
+        assert [c["name"] for c in children] == ["api", "gen.py", "top.txt", "web"]
+        by_name = {c["name"]: c for c in children}
+        assert by_name["api"]["type"] == "dir"
+        assert by_name["top.txt"]["type"] == "file"
+        assert by_name["top.txt"]["is_generated"] is False
+        assert by_name["gen.py"]["is_generated"] is True
+        assert by_name["top.txt"]["is_template"] is False
+        assert by_name["api"]["path"] == "api"
+        # nested listing is immediate-children only
+        api_children = svc.list_tree_children("svc12", "api")
+        assert [c["name"] for c in api_children] == ["main.py"]
+        assert api_children[0]["path"] == "api/main.py"
+
+    @pytest.mark.parametrize("bad_dir", ["../../etc", "/etc", "api/../../etc"])
+    def test_tree_rejects_path_traversal(self, tmp_path, monkeypatch, bad_dir):
+        project = tmp_path / "svc13"
+        project.mkdir()
+        (project / "api").mkdir()
+        svc = self._svc(tmp_path, monkeypatch)
+        with pytest.raises(ValueError):
+            svc.list_tree_children("svc13", bad_dir)
+
+    def test_tree_missing_dir_raises(self, tmp_path, monkeypatch):
+        project = tmp_path / "svc14"
+        project.mkdir()
+        svc = self._svc(tmp_path, monkeypatch)
+        with pytest.raises(ValueError):
+            svc.list_tree_children("svc14", "nope")
+
+    def test_tree_excludes_state_and_generated_markers(self, tmp_path, monkeypatch):
+        project = tmp_path / "svc15"
+        project.mkdir()
+        (project / "a.txt").write_text("a")
+        (project / "b.txt").write_text("b")
+        (project / "b.txt.generated").write_text("")
+        svc = self._svc(tmp_path, monkeypatch)
+        svc._get_service_info(project)  # writes state file
+        names = [c["name"] for c in svc.list_tree_children("svc15", "")]
+        assert names == ["a.txt", "b.txt"]
+        assert ".provision-state.json" not in names
+        assert "b.txt.generated" not in names
+
+    def test_list_files_returns_cached_union(self, tmp_path, monkeypatch):
+        project = tmp_path / "svc16"
+        project.mkdir()
+        (project / "a.txt").write_text("a")
+        svc = self._svc(tmp_path, monkeypatch)
+        assert svc.list_files("svc16") == ["a.txt"]
+        assert svc.list_files("ghost") == []
+
+    def test_registry_ttl_cache_loads_once(self, tmp_path, monkeypatch):
+        """The registry yaml must be parsed at most once per TTL window — a
+        per-project parse per request made warm /api/services ~200ms (DB1)."""
+        from app.config import settings
+        import app.services.service_manager as sm_mod
+        registry_dir = tmp_path / "generated"
+        registry_dir.mkdir()
+        (registry_dir / "user_registry.yml").write_text(
+            "- user_name: bob\n  service_name: svc17\n  label: '0'\n"
+            "- user_name: alice\n  service_name: svc17\n  label: '1'\n"
+        )
+        monkeypatch.setattr(settings, "GENERATED_DIR", registry_dir)
+        project = tmp_path / "svc17"
+        project.mkdir()
+        (project / "a.txt").write_text("a")
+        svc = self._svc(tmp_path, monkeypatch)
+        svc._registry_cache = None
+
+        loads = {"n": 0}
+        import yaml as _yaml
+        real_load = _yaml.load
+        def counting_load(stream, Loader=None):
+            loads["n"] += 1
+            return real_load(stream, Loader=Loader)
+        monkeypatch.setattr(_yaml, "load", counting_load)
+
+        info1 = svc._get_service_info(project)
+        info2 = svc._get_service_info(project)
+        assert info1["active_users"] == 2
+        assert sorted(info1["active_instances"]) == ["alice/1", "bob/0"]
+        assert loads["n"] == 1, "registry yaml must be parsed only once within the TTL window"
+
+
+class TestScanRearchitectureHandlers:
+    """Non-blocking handler checks + new routes (F24-F29)."""
+
+    def test_pure_blocking_handlers_are_def(self):
+        import inspect
+        from app.routers import services as svc_router
+        for fn_name in (
+            "list_services", "get_project_notifications", "get_service",
+            "create_service", "save_generated_files", "delete_service",
+            "get_service_file", "write_service_file", "create_service_file",
+            "delete_service_file", "convert_service_files", "scan_repo",
+            "git_status", "git_diff", "git_head_file",
+        ):
+            fn = getattr(svc_router, fn_name)
+            assert not inspect.iscoroutinefunction(fn), (
+                f"{fn_name} should be a sync def handler (threadpool)"
+            )
+
+    def test_mixed_handlers_wrap_blocking_in_threadpool(self):
+        import inspect
+        from app.routers.services import check_missing_files, check_deploy_readiness
+        assert inspect.iscoroutinefunction(check_missing_files)
+        assert inspect.iscoroutinefunction(check_deploy_readiness)
+        assert "run_in_threadpool" in inspect.getsource(check_missing_files)
+        assert "run_in_threadpool" in inspect.getsource(check_deploy_readiness)
+
+    def test_recipes_and_tree_routes_registered_before_catch_all(self):
+        from app.routers.services import router
+        prefix = router.prefix
+        routes = router.routes
+
+        def idx(path):
+            for i, r in enumerate(routes):
+                if r.path == f"{prefix}{path}":
+                    return i
+            return None
+
+        recipes_idx = idx("/{name}/recipes")
+        tree_idx = idx("/{name}/tree")
+        catch_all_idx = idx("/{name}")
+        assert recipes_idx is not None, f"recipes route missing: {[r.path for r in routes]}"
+        assert tree_idx is not None, f"tree route missing: {[r.path for r in routes]}"
+        assert catch_all_idx is not None
+        assert recipes_idx < catch_all_idx, "recipes route must be registered before /{name}"
+        assert tree_idx < catch_all_idx, "tree route must be registered before /{name}"
+
+    def test_tree_endpoint_rejects_traversal_with_400(self, tmp_path, monkeypatch):
+        from fastapi import HTTPException
+        from app.routers import services as svc_router
+        from app.routers.services import get_service_tree
+        project = tmp_path / "svc"
+        project.mkdir()
+        monkeypatch.setattr(svc_router.service_manager, "_source_dir", tmp_path)
+        with pytest.raises(HTTPException) as ei:
+            get_service_tree("svc", "../../etc", current_admin={"id": 1, "role": "admin"})
+        assert ei.value.status_code == 400
+
+    def test_recipes_endpoint_rejects_invalid_with_400(self, tmp_path, monkeypatch):
+        from fastapi import HTTPException
+        from app.routers import services as svc_router
+        from app.routers.services import set_service_recipes
+        from app.schemas.services import ServiceRecipesRequest
+        project = tmp_path / "svc"
+        project.mkdir()
+        (project / "recipes").mkdir()
+        (project / "recipes" / "api").mkdir()
+        monkeypatch.setattr(svc_router.service_manager, "_source_dir", tmp_path)
+        with pytest.raises(HTTPException) as ei:
+            set_service_recipes(
+                "svc", ServiceRecipesRequest(recipe_paths=[".."]),
+                current_admin={"id": 1, "role": "admin"},
+            )
+        assert ei.value.status_code == 400
+        with pytest.raises(HTTPException) as ei:
+            set_service_recipes(
+                "svc", ServiceRecipesRequest(recipe_paths=["/etc"]),
+                current_admin={"id": 1, "role": "admin"},
+            )
+        assert ei.value.status_code == 400
+        # non-directory recipe path on an EXISTING service -> 400, never 404
+        with pytest.raises(HTTPException) as ei:
+            set_service_recipes(
+                "svc", ServiceRecipesRequest(recipe_paths=["recipes/api/nonexistentfile"]),
+                current_admin={"id": 1, "role": "admin"},
+            )
+        assert ei.value.status_code == 400
+        with pytest.raises(HTTPException) as ei:
+            set_service_recipes(
+                "ghost", ServiceRecipesRequest(recipe_paths=["."]),
+                current_admin={"id": 1, "role": "admin"},
+            )
+        assert ei.value.status_code == 404
+
+    def test_tree_endpoint_unknown_service_404(self, tmp_path, monkeypatch):
+        from fastapi import HTTPException
+        from app.routers import services as svc_router
+        from app.routers.services import get_service_tree
+        monkeypatch.setattr(svc_router.service_manager, "_source_dir", tmp_path)
+        with pytest.raises(HTTPException) as ei:
+            get_service_tree("ghost", "", current_admin={"id": 1, "role": "admin"})
+        assert ei.value.status_code == 404
+
+    def test_git_status_filters_state_and_markers(self, monkeypatch):
+        from app.routers import services as svc_router
+        monkeypatch.setattr(
+            svc_router, "_git_command",
+            lambda name, *args: (
+                " M .provision-state.json\n"
+                "?? docker-compose.yml.generated\n"
+                " M real.txt\n"
+                "?? new.txt\n"
+            ),
+        )
+        result = svc_router.git_status("svc", current_admin={"id": 1})
+        assert result["modified"] == [{"status": "M", "file": "real.txt"}]
+        assert result["untracked"] == [{"status": "?", "file": "new.txt"}]
+
+    def test_deploy_user_wraps_get_service_in_threadpool(self):
+        from pathlib import Path
+        users_path = Path(__file__).parent.parent / "app" / "routers" / "users.py"
+        content = users_path.read_text()
+        assert "from starlette.concurrency import run_in_threadpool" in content
+        assert "run_in_threadpool(service_manager.get_service" in content
+
+    def test_schemas_models_exist(self):
+        from app.schemas.services import (
+            ServiceRecipesRequest, ServiceTreeChild, ServiceTreeResponse,
+        )
+        req = ServiceRecipesRequest(recipe_paths=["docker"], auto=False)
+        assert req.recipe_paths == ["docker"]
+        assert ServiceRecipesRequest(auto=True).auto is True
+        child = ServiceTreeChild(name="a", path="a", type="file", is_generated=True, is_template=False)
+        assert child.is_generated is True
+        resp = ServiceTreeResponse(name="svc", dir="", children=[child])
+        assert resp.children[0].name == "a"
+
+
+# ---------------------------------------------------------------------------
 # Tests for provision_service — container logs and SSE streaming
 # ---------------------------------------------------------------------------
 
@@ -276,10 +732,13 @@ class TestRecipePathMultiRecipe:
         assert captured["params"] == {}
 
     def test_save_generated_creates_recipe_subdir(self, tmp_path, monkeypatch):
-        """save_generated with recipe_path writes into the recipe subdirectory."""
+        """save_generated with recipe_path writes into the recipe subdirectory.
+
+        The handler is a plain ``def`` now (runs in FastAPI's threadpool), so
+        it is called directly — no ``asyncio.run``.
+        """
         from app.config import settings
         from app.routers import services as services_router
-        import asyncio
 
         monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
         (tmp_path / "multisvc").mkdir()
@@ -292,35 +751,35 @@ class TestRecipePathMultiRecipe:
             "recipe_path": "recipes/web",
             "files": {"docker-compose.yml": "services: {}"},
         }
-        asyncio.run(
-            services_router.save_generated_files(req, current_admin={"id": 1}, db=None)
-        )
+        result = services_router.save_generated_files(req, current_admin={"id": 1}, db=None)
 
         written = tmp_path / "multisvc" / "recipes" / "web" / "docker-compose.yml"
         assert written.read_text() == "services: {}"
         assert (tmp_path / "multisvc" / "recipes" / "web" / "docker-compose.yml.generated").exists()
+        assert result["saved"] == ["docker-compose.yml"]
 
-    def test_discover_recipes_detects_multi_recipe(self, tmp_path):
-        """_discover_recipes finds subdirectories with Dockerfile + docker-compose.yml."""
+    def test_root_only_default_no_subdir_auto_detection(self, tmp_path):
+        """Without configured recipes, scan the project ROOT only — no subdir
+        auto-detection (F4); _discover_recipes is gone."""
         from app.services.service_manager import ServiceManager
         project = tmp_path / "multisvc"
         (project / "recipes" / "web").mkdir(parents=True)
-        (project / "recipes" / "api").mkdir(parents=True)
         (project / "recipes" / "web" / "Dockerfile").write_text("FROM python:3.12")
         (project / "recipes" / "web" / "docker-compose.yml").write_text("services: {}")
+        (project / "recipes" / "api").mkdir(parents=True)
         (project / "recipes" / "api" / "Dockerfile").write_text("FROM python:3.12")
         (project / "recipes" / "api" / "docker-compose.yml").write_text("services: {}")
+        (project / "top.txt").write_text("hi")
+        (project / "README.md").write_text("# ms")
 
-        # git_tracked = all files (filesystem-fallback style input)
-        all_files = {
-            "recipes/web/Dockerfile", "recipes/web/docker-compose.yml",
-            "recipes/api/Dockerfile", "recipes/api/docker-compose.yml",
-        }
-        recipes = ServiceManager._discover_recipes(project, all_files)
-        paths = {r["path"] for r in recipes}
-        assert "recipes/web" in paths
-        assert "recipes/api" in paths
-        assert all(r["is_root"] is False for r in recipes)
+        info = ServiceManager()._get_service_info(project)
+        # Root top-level files only — recipes/web/* and recipes/api/* are NOT listed.
+        assert set(info["files"]) == {"top.txt", "README.md"}
+        # recipes = root-only
+        assert info["recipes"] == [{
+            "path": "", "label": "(root)", "is_root": True, "template_files": [],
+        }]
+        assert not hasattr(ServiceManager, "_discover_recipes")
 
     def test_deploy_form_parses_recipe_path(self):
         """DeployForm must parse the name@@recipe_path service value format."""
@@ -505,47 +964,21 @@ class TestTemplateClassification:
 
 
 # ---------------------------------------------------------------------------
-# Tests for GAP-4 — template classification must enforce git-tracked/original criterion
+# Tests for scan re-architecture — marker-only classification (F1/F18)
 # ---------------------------------------------------------------------------
 
-class TestTemplateClassificationGitTracked:
-    """LLM-generated (untracked / .generated-marked) deployment-critical files
-    must appear ONLY in Generated Files, never in Templates (GAP-4)."""
+class TestTemplateClassificationMarkerOnly:
+    """A file is "generated" iff a sibling {file}.generated marker exists.
+    No git ls-files anywhere in classification (F1)."""
 
-    @staticmethod
-    def _fake_git_ls_files(stdout: str):
-        import subprocess
-
-        def fake_run(args, *a, **k):
-            if "ls-files" in args:
-                return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
-            raise AssertionError(f"unexpected subprocess.run call: {args}")
-        return fake_run
-
-    @staticmethod
-    def _fake_git_missing():
-        import subprocess
-
-        def fake_run(args, *a, **k):
-            if "ls-files" in args:
-                return subprocess.CompletedProcess(args, 128, stdout="", stderr="not a git repo")
-            raise AssertionError(f"unexpected subprocess.run call: {args}")
-        return fake_run
-
-    def test_untracked_deployment_file_not_in_templates(self, tmp_path, monkeypatch):
-        """An untracked (LLM-generated) docker-compose.yml must NOT be in template_files."""
+    def test_generated_marker_classifies_generated(self, tmp_path, monkeypatch):
+        """A .generated-marked docker-compose.yml must be generated, never a template."""
         from app.services.service_manager import ServiceManager
         project = tmp_path / "myapp"
         project.mkdir()
         (project / "Dockerfile").write_text("FROM python:3.12")
         (project / "docker-compose.yml").write_text("services: {}\n")
-        (project / "main.py").write_text("print('hi')\n")
-
-        # Dockerfile and main.py are git-tracked (original); docker-compose.yml is not.
-        monkeypatch.setattr(
-            "subprocess.run",
-            self._fake_git_ls_files("Dockerfile\nmain.py\n"),
-        )
+        (project / "docker-compose.yml.generated").write_text("")
 
         info = ServiceManager()._get_service_info(project)
         assert "docker-compose.yml" in info["generated_files"]
@@ -553,53 +986,50 @@ class TestTemplateClassificationGitTracked:
         assert "Dockerfile" in info["template_files"]
         assert "Dockerfile" not in info["generated_files"]
 
-    def test_tracked_deployment_files_are_templates(self, tmp_path, monkeypatch):
-        """A git-tracked original deployment-critical file should be a template."""
+    def test_no_marker_means_template(self, tmp_path):
+        """Original deployment-critical files without markers are templates."""
         from app.services.service_manager import ServiceManager
         project = tmp_path / "myapp"
         project.mkdir()
         (project / "Dockerfile").write_text("FROM python:3.12")
         (project / "nginx.conf").write_text("server {}\n")
 
-        monkeypatch.setattr(
-            "subprocess.run",
-            self._fake_git_ls_files("Dockerfile\nnginx.conf\n"),
-        )
-
         info = ServiceManager()._get_service_info(project)
         assert "Dockerfile" in info["template_files"]
         assert "nginx.conf" in info["template_files"]
         assert "Dockerfile" not in info["generated_files"]
 
-    def test_generated_marker_excluded_from_all_listings(self, tmp_path, monkeypatch):
-        """`.generated` marker files must be excluded from files, generated_files, template_files."""
+    def test_generated_marker_excluded_from_all_listings(self, tmp_path):
+        """`.generated` marker files must be excluded from all three lists."""
         from app.services.service_manager import ServiceManager
         project = tmp_path / "myapp"
         project.mkdir()
         (project / "docker-compose.yml").write_text("services: {}\n")
         (project / "docker-compose.yml.generated").write_text("")
 
-        # The marker file itself is untracked; docker-compose.yml is untracked too (LLM-generated).
-        monkeypatch.setattr("subprocess.run", self._fake_git_ls_files(""))
-
         info = ServiceManager()._get_service_info(project)
         assert "docker-compose.yml.generated" not in info["files"]
         assert "docker-compose.yml.generated" not in info["generated_files"]
         assert "docker-compose.yml.generated" not in info["template_files"]
 
-    def test_no_git_fallback_uses_type_classification(self, tmp_path, monkeypatch):
-        """When git is unavailable, fall back to type-based template classification (GAP-4)."""
+    def test_classification_never_invokes_git(self, tmp_path, monkeypatch):
+        """Classification must not run any subprocess (git ls-files removed)."""
         from app.services.service_manager import ServiceManager
         project = tmp_path / "myapp"
         project.mkdir()
         (project / "Dockerfile").write_text("FROM python:3.12")
         (project / "main.py").write_text("print('hi')\n")
+        (project / "gen.py").write_text("print('gen')")
+        (project / "gen.py.generated").write_text("")
 
-        monkeypatch.setattr("subprocess.run", self._fake_git_missing())
+        def boom(*a, **k):
+            raise AssertionError(f"no subprocess allowed during classification: {a}")
 
+        monkeypatch.setattr("subprocess.run", boom)
         info = ServiceManager()._get_service_info(project)
-        assert "Dockerfile" in info["template_files"]
-        assert "main.py" not in info["template_files"]
+        assert set(info["files"]) == {"Dockerfile", "main.py", "gen.py"}
+        assert info["generated_files"] == ["gen.py"]
+        assert info["template_files"] == ["Dockerfile"]
 
 
 # ---------------------------------------------------------------------------
@@ -950,10 +1380,16 @@ class TestTemplateMode:
         )
 
     def test_create_service_from_template_not_501(self):
-        """POST /api/services with mode='template' should NOT return 501."""
+        """POST /api/services with mode='template' should NOT return 501.
+
+        The handler is a plain ``def`` now (FastAPI runs it in a threadpool),
+        so it must NOT be a coroutine function.
+        """
         from app.routers.services import create_service
         import inspect
-        assert inspect.iscoroutinefunction(create_service)
+        assert not inspect.iscoroutinefunction(create_service), (
+            "create_service should be a sync def handler (runs in the threadpool)"
+        )
 
     def test_create_from_template_method_exists(self):
         """ServiceManager should have create_from_template method."""

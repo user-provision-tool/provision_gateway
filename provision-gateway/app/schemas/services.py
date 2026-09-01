@@ -94,3 +94,30 @@ class GitHeadFileResponse(BaseModel):
     """File content from HEAD revision."""
     content: str = ""
     filename: str = ""
+
+
+class ServiceRecipesRequest(BaseModel):
+    """Set the recipe (template) subdirectories for a service project.
+
+    Either ``recipe_paths`` (explicit list of subdirectory paths, empty list
+    resets to root-only scanning) or ``auto`` (re-enable auto-detect of the
+    root directory only).
+    """
+    recipe_paths: list[str] | None = None
+    auto: bool = False
+
+
+class ServiceTreeChild(BaseModel):
+    """One entry of the lazy directory tree for a service project."""
+    name: str
+    path: str
+    type: str  # "file" | "dir"
+    is_generated: bool = False
+    is_template: bool = False
+
+
+class ServiceTreeResponse(BaseModel):
+    """Immediate children of a directory in a service project."""
+    name: str
+    dir: str = ""
+    children: list[ServiceTreeChild] = Field(default_factory=list)

@@ -2,13 +2,31 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from ..config import settings
+from .project_state import (
+    PROJECT_STATE_FILENAME,
+    compute_dir_fingerprint,
+    fingerprints_equal,
+    now_iso,
+    ProjectState,
+)
+
+
+class ServiceNotFoundError(Exception):
+    """Raised when a service project directory does not exist.
+
+    Distinct from ``ValueError`` so routers can map "unknown service" to
+    404 deterministically instead of matching on message text (a
+    non-directory recipe path also reads as "not found").
+    """
 
 
 class ServiceManager:
@@ -21,8 +39,45 @@ class ServiceManager:
         self._known_projects: set[str] = set()
         self._new_project_events: list[dict[str, Any]] = []
         self._last_scan_time: float = 0.0
+        # Per-project scan-state locks (threadpool handlers can rescan concurrently)
+        self._project_locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
+        # Registry YAML TTL cache: (loaded_at_epoch, {service_name: [entries]})
+        self._registry_cache: tuple[float, dict[str, list[dict[str, Any]]]] | None = None
+        self._registry_guard = threading.Lock()
         # Initially populate known projects
         self._refresh_known_projects()
+
+    def _load_registry(self) -> dict[str, list[dict[str, Any]]]:
+        """Load ``user_registry.yml`` → ``{service_name: [entry, ...]}``.
+
+        The file can be tens of KB (hundreds of users); parsing it once per
+        project per request made a warm /api/services take ~200ms. The result
+        is cached for 1 second so listing stays well under 100ms (DB1).
+        """
+        now = time.monotonic()
+        with self._registry_guard:
+            if self._registry_cache and now - self._registry_cache[0] < 1.0:
+                return self._registry_cache[1]
+            by_service: dict[str, list[dict[str, Any]]] = {}
+            try:
+                registry_file = settings.GENERATED_DIR / "user_registry.yml"
+                if registry_file.exists():
+                    import yaml
+                    # Prefer the C loader (libyaml) when available — pure-python
+                    # SafeLoader parses a 25KB registry in ~40ms, which alone
+                    # would bust the DB1 < 100ms warm-scan budget.
+                    loader = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
+                    with open(registry_file) as rf:
+                        registry = yaml.load(rf, Loader=loader) or []
+                    for entry in registry:
+                        sn = entry.get("service_name") if isinstance(entry, dict) else None
+                        if sn:
+                            by_service.setdefault(sn, []).append(entry)
+            except Exception:
+                pass
+            self._registry_cache = (now, by_service)
+            return by_service
 
     def _refresh_known_projects(self) -> None:
         """Refresh the set of known project names."""
@@ -104,6 +159,7 @@ class ServiceManager:
         "node_modules", ".npmignore", "package-lock.json",
         "dist", ".vite", ".tsbuildinfo",
         ".github", ".DS_Store",
+        PROJECT_STATE_FILENAME,
     ]
 
     # Template file patterns — only these file types are shown in the
@@ -149,146 +205,187 @@ class ServiceManager:
             return True
         return False
 
-    @staticmethod
-    def _discover_recipes(
-        project_dir: Path, git_tracked: set[str],
-    ) -> list[dict[str, Any]]:
-        """Auto-discover deployable recipe directories in a project.
+    def _project_lock(self, name: str) -> threading.Lock:
+        """Per-project lock, created on demand.
 
-        A recipe directory must contain BOTH a Dockerfile AND at least one
-        docker-compose*.yml file (both git-tracked). Returns list sorted
-        so the root recipe comes first.
+        Threadpool handlers mean concurrent rescans of the same project are
+        possible; the lock serializes them.
         """
-        recipes: list[dict[str, Any]] = []
-        all_files = sorted(git_tracked)
+        with self._locks_guard:
+            lock = self._project_locks.get(name)
+            if lock is None:
+                lock = threading.Lock()
+                self._project_locks[name] = lock
+            return lock
 
-        # Find directories with Dockerfile + docker-compose*
-        dir_has_dockerfile: dict[str, bool] = {}
-        dir_has_compose: dict[str, bool] = {}
-        seen_dirs: set[str] = set()
+    def _scan_recipe_dir(self, project_dir: Path, recipe_path: str) -> dict | None:
+        """Shallow TOP-LEVEL scan of one recipe dir.
 
-        for f in all_files:
-            parent = str(Path(f).parent) if "/" in f else ""
-            basename = f.split("/")[-1]
-            if basename == "Dockerfile":
-                dir_has_dockerfile[parent] = True
-                seen_dirs.add(parent)
-            if basename.startswith("docker-compose") and basename.endswith((".yml", ".yaml")):
-                dir_has_compose[parent] = True
-                seen_dirs.add(parent)
+        ``recipe_path`` is project-root-relative (``"."`` = project root).
+        Returns ``{"fingerprint", "files", "generated", "templates"}`` with
+        project-root-relative paths, or ``None`` if the dir is missing.
 
-        for d in sorted(seen_dirs):
-            if dir_has_dockerfile.get(d) and dir_has_compose.get(d):
-                template_files: list[str] = []
-                for f in all_files:
-                    if not ServiceManager._is_template_file(f):
-                        continue
-                    if d == "":
-                        if "/" not in f:
-                            template_files.append(f)
-                    else:
-                        prefix = d + "/"
-                        if f.startswith(prefix):
-                            template_files.append(f)
-                recipes.append({
-                    "path": d,
-                    "label": d if d else "(root)",
-                    "is_root": d == "",
-                    "template_files": template_files,
-                })
+        Classification is marker-only: a file is "generated" iff a sibling
+        ``{file}.generated`` marker exists. No git anywhere.
+        """
+        if recipe_path in ("", "."):
+            dir_path = project_dir
+            prefix = ""
+        else:
+            dir_path = project_dir / recipe_path
+            prefix = recipe_path.rstrip("/") + "/"
+        if not dir_path.is_dir():
+            return None
+        fingerprint = compute_dir_fingerprint(dir_path)
+        files: list[str] = []
+        generated: list[str] = []
+        templates: list[str] = []
+        try:
+            with os.scandir(str(dir_path)) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError:
+            return None
+        for entry in entries:
+            name = entry.name
+            rel = prefix + name
+            # ``.generated`` markers are tracking metadata; the state file
+            # (and its atomic-write .tmp sibling) is never a project file.
+            if rel.endswith(".generated") or rel.startswith(".provision-state"):
+                continue
+            if self._is_excluded(rel):
+                continue
+            try:
+                is_file = entry.is_file(follow_symlinks=False)
+            except OSError:
+                continue
+            if not is_file:
+                continue  # dirs/symlinks are not part of the files union
+            files.append(rel)
+            has_marker = (dir_path / f"{name}.generated").is_file()
+            if has_marker:
+                generated.append(rel)
+            elif self._is_template_file(rel):
+                templates.append(rel)
+        return {
+            "fingerprint": fingerprint,
+            "files": files,
+            "generated": generated,
+            "templates": templates,
+        }
 
-        recipes.sort(key=lambda r: (not r["is_root"], r["path"]))
-        return recipes
+    @staticmethod
+    def _resolve_recipe_paths(state: ProjectState) -> list[str]:
+        """User-configured recipe dirs, or root-only when not configured."""
+        if state.recipe_origin == "user":
+            return list(state.recipe_paths) or ["."]
+        return ["."]
+
+    @staticmethod
+    def _normalize_recipe_paths(project_dir: Path, recipe_paths: list[str]) -> list[str]:
+        """Normalize + validate recipe dirs; raises ValueError on any bad path."""
+        normalized: list[str] = []
+        for raw in recipe_paths:
+            p = (raw or "").strip()
+            if p in ("", "."):
+                normalized.append(".")
+                continue
+            if p.startswith("/") or "\\" in p or ":" in p:
+                raise ValueError(f"Recipe path must be project-root-relative, got: {raw!r}")
+            parts = [part for part in p.split("/") if part not in ("", ".")]
+            if not parts:
+                normalized.append(".")
+                continue
+            if any(part == ".." for part in parts):
+                raise ValueError(f"Recipe path must not contain '..': {raw!r}")
+            norm = "/".join(parts)
+            if not (project_dir / norm).is_dir():
+                raise ValueError(f"Recipe directory not found: {raw!r}")
+            normalized.append(norm)
+        return normalized or ["."]
 
     def _get_service_info(self, project_dir: Path) -> dict[str, Any]:
-        """Build the service info dict for a project directory.
+        """Build the service info dict for a project directory (cache-warm).
 
-        Uses ``git ls-files`` to distinguish original repo files (templates)
-        from files created by the provision system (generated).
+        Loads the per-project state under the project lock, rescans a recipe
+        dir only when it is missing from the cache or its top-level fingerprint
+        changed, rebuilds the sorted unions, and saves the state when anything
+        changed. Never walks the full tree and never invokes git for
+        classification.
         """
         name = project_dir.name
-        files = []
-        generated_files: list[str] = []
-        template_files: list[str] = []
+        lock = self._project_lock(name)
+        with lock:
+            state = ProjectState.load(project_dir) or ProjectState(project_dir)
+            recipe_paths = self._resolve_recipe_paths(state)
+            changed = False
 
-        # Determine which files are tracked by git (original repo files)
-        git_tracked: set[str] = set()
-        git_available = False
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(project_dir), "ls-files"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                git_tracked = {line.strip() for line in result.stdout.splitlines() if line.strip()}
-                git_available = True
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            pass  # git not available — fall back to treating all files as templates
+            # Recipe set changed (e.g. user reconfigured) → drop stale scans.
+            if list(state.recipe_paths) != recipe_paths:
+                state.recipe_paths = recipe_paths
+                state.dir_scans = {}
+                changed = True
 
-        for f in sorted(project_dir.rglob("*")):
-            if f.is_file():
-                rel = str(f.relative_to(project_dir))
-                if self._is_excluded(rel):
+            scans: dict[str, dict] = {}
+            for rp in recipe_paths:
+                scan = self._scan_recipe_dir(project_dir, rp)
+                if scan is None:
+                    continue  # recipe dir deleted → skip, no crash
+                cached = state.dir_scans.get(rp)
+                cached_ok = (
+                    isinstance(cached, dict)
+                    and all(k in cached for k in ("fingerprint", "files", "generated", "templates"))
+                    and fingerprints_equal(cached.get("fingerprint"), scan["fingerprint"])
+                )
+                if cached_ok:
+                    scans[rp] = cached
+                else:
+                    scans[rp] = scan
+                    changed = True
+            state.dir_scans = scans
+
+            files = sorted({f for s in scans.values() for f in s["files"]})
+            generated_files = sorted({f for s in scans.values() for f in s["generated"]})
+            template_files = sorted({f for s in scans.values() for f in s["templates"]})
+
+            # recipes list in the preserved frontend shape:
+            # [{path, label, is_root, template_files}, ...], root first.
+            recipes: list[dict[str, Any]] = []
+            for rp in recipe_paths:
+                scan = scans.get(rp)
+                if scan is None:
                     continue
-                # `.generated` marker files (written by save_generated_files)
-                # are tracking metadata, not project files — exclude from ALL listings.
-                if rel.endswith(".generated"):
-                    continue
-                files.append(rel)
-                # A file is "generated" if:
-                #   1. It has a .generated marker file (created by save-generated LLM endpoint), OR
-                #   2. Git is available and the file is NOT tracked by git.
-                # The .generated marker check works regardless of git availability
-                # and correctly handles cases where an LLM regenerated/overwrote
-                # a file that was already tracked by git.
-                has_marker = (project_dir / f"{rel}.generated").exists()
-                if has_marker:
-                    generated_files.append(rel)
-                elif git_tracked and rel not in git_tracked:
-                    generated_files.append(rel)
-                # Template classification: only git-tracked (original repo)
-                # deployment-critical file types are shown in the "Templates"
-                # column (G2 + GAP-4). When git is available, an LLM-generated
-                # (untracked / .generated-marked) deployment-critical file must
-                # appear ONLY in "Generated Files". When git is unavailable we
-                # fall back to type-only classification, but still exclude
-                # files that have a .generated marker (LLM-generated).
-                if self._is_template_file(rel) and not has_marker:
-                    if not git_tracked or rel in git_tracked:
-                        template_files.append(rel)
+                is_root = rp in ("", ".")
+                recipes.append({
+                    "path": "" if is_root else rp,
+                    "label": "(root)" if is_root else rp,
+                    "is_root": is_root,
+                    "template_files": sorted(scan["templates"]),
+                })
+            recipes.sort(key=lambda r: (not r["is_root"], r["path"]))
 
-        has_compose_template = any(f.endswith(".yml.j2") for f in files)
-        has_nginx_template = any(f.endswith(".nginx.conf.j2") or f.endswith(".conf.j2") for f in files)
-        has_dockerfile = any("Dockerfile" in f for f in files)
+            has_compose_template = any(f.endswith(".yml.j2") for f in files)
+            has_nginx_template = any(f.endswith(".nginx.conf.j2") or f.endswith(".conf.j2") for f in files)
+            has_dockerfile = any("Dockerfile" in f for f in files)
 
-        # Auto-discover deployable recipe directories
-        if git_available:
-            recipes = self._discover_recipes(project_dir, git_tracked)
-        else:
-            # Fall back to filesystem-based discovery when git is unavailable
-            all_rel_files = sorted(
-                str(f.relative_to(project_dir))
-                for f in project_dir.rglob("*")
-                if f.is_file() and not self._is_excluded(str(f.relative_to(project_dir)))
-            )
-            recipes = self._discover_recipes(project_dir, set(all_rel_files))
+            if changed:
+                state.files = files
+                state.generated_files = generated_files
+                state.template_files = template_files
+                state.recipes = recipes
+                state.updated_at = now_iso()
+                try:
+                    state.save()
+                except OSError:
+                    pass  # the state is a cache — a failed write must not break listing
 
-        # Detect active users from registry
+        # Detect active users from registry (TTL-cached — the yaml can be
+        # tens of KB and parsing it once per project per request dominated
+        # /api/services latency; see DB1 warm-scan < 100ms success criteria)
         active_users = 0
         active_instances = []
-        try:
-            from ..config import settings
-            registry_file = settings.GENERATED_DIR / "user_registry.yml"
-            if registry_file.exists():
-                import yaml
-                with open(registry_file) as rf:
-                    registry = yaml.safe_load(rf) or []
-                for entry in registry:
-                    if entry.get("service_name") == name:
-                        active_users += 1
-                        active_instances.append(f"{entry.get('user_name')}/{entry.get('label', '0')}")
-        except Exception:
-            pass
+        for entry in self._load_registry().get(name, []):
+            active_users += 1
+            active_instances.append(f"{entry.get('user_name')}/{entry.get('label', '0')}")
 
         return {
             "name": name,
@@ -304,6 +401,85 @@ class ServiceManager:
             "active_instances": active_instances,
             "created_at": "",
         }
+
+    def set_recipes(self, name: str, recipe_paths: list[str] | None) -> dict[str, Any]:
+        """Set the recipe dirs scanned for a service project (user-configured).
+
+        Normalizes (``.``/``''`` → ``.``), rejects ``..``/absolute/non-dir
+        paths with ``ValueError`` (router → 400), sets ``recipe_origin="user"``,
+        clears the scan cache, rescans, and returns the updated service info.
+        """
+        project_dir = self._source_dir / name
+        if not project_dir.is_dir():
+            raise ServiceNotFoundError(f"Service '{name}' not found")
+        normalized = self._normalize_recipe_paths(project_dir, recipe_paths or ["."])
+        lock = self._project_lock(name)
+        with lock:
+            state = ProjectState.load(project_dir) or ProjectState(project_dir)
+            state.recipe_origin = "user"
+            state.recipe_paths = normalized
+            state.dir_scans = {}
+            state.updated_at = now_iso()
+            try:
+                state.save()
+            except OSError:
+                pass
+        return self._get_service_info(project_dir)
+
+    def list_tree_children(self, name: str, dir_rel: str = "") -> list[dict[str, Any]]:
+        """Live listing of a directory's IMMEDIATE children for the lazy tree.
+
+        Returns ``[{name, path, type, is_generated, is_template}, ...]`` with
+        project-root-relative paths. Raises ``ValueError`` on path traversal
+        or a missing dir (router → 400).
+        """
+        project_dir = self._source_dir / name
+        if not project_dir.is_dir():
+            raise ServiceNotFoundError(f"Service '{name}' not found")
+        project_resolved = project_dir.resolve()
+        target = (project_dir / (dir_rel or "")).resolve()
+        if target != project_resolved and not str(target).startswith(str(project_resolved) + os.sep):
+            raise ValueError(f"Path traversal is not allowed: {dir_rel!r}")
+        if not target.is_dir():
+            raise ValueError(f"Directory not found: {dir_rel or '.'}")
+        children: list[dict[str, Any]] = []
+        try:
+            with os.scandir(str(target)) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError:
+            raise ValueError(f"Cannot read directory: {dir_rel or '.'}")
+        for entry in entries:
+            name_e = entry.name
+            rel = f"{dir_rel}/{name_e}" if dir_rel else name_e
+            if rel.endswith(".generated") or rel.startswith(".provision-state"):
+                continue
+            if self._is_excluded(rel):
+                continue
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if not is_dir and not entry.is_file(follow_symlinks=False):
+                continue  # sockets/fifos etc.
+            children.append({
+                "name": name_e,
+                "path": rel,
+                "type": "dir" if is_dir else "file",
+                "is_generated": (not is_dir) and (target / f"{name_e}.generated").is_file(),
+                "is_template": (not is_dir) and self._is_template_file(rel),
+            })
+        return children
+
+    def invalidate_state(self, name: str) -> None:
+        """Drop the cached scan state so the next listing rescans fresh.
+
+        Called after direct file writes (LLM save-generated, editor saves)
+        that may touch files below the scanned top level.
+        """
+        try:
+            (self._source_dir / name / PROJECT_STATE_FILENAME).unlink()
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------
     # CRUD
@@ -390,6 +566,7 @@ class ServiceManager:
         filepath = self._source_dir / service_name / filename
         filepath.parent.mkdir(parents=True, exist_ok=True)
         filepath.write_text(content)
+        self.invalidate_state(service_name)
         return True
 
     def create_file(self, service_name: str, filename: str, content: str) -> bool:
@@ -401,6 +578,7 @@ class ServiceManager:
         filepath.write_text(content)
         # Track as generated
         (self._source_dir / service_name / f"{filename}.generated").write_text("")
+        self.invalidate_state(service_name)
         return True
 
     def delete_file(self, service_name: str, filename: str) -> bool:
@@ -413,20 +591,15 @@ class ServiceManager:
         marker = self._source_dir / service_name / f"{filename}.generated"
         if marker.is_file():
             marker.unlink()
+        self.invalidate_state(service_name)
         return True
 
     def list_files(self, service_name: str) -> list[str]:
-        """List all files in a service project, excluding build artifacts and VCS."""
-        target = self._source_dir / service_name
-        if not target.is_dir():
+        """List the cached shallow-scan file union for a service project."""
+        project_dir = self._source_dir / service_name
+        if not project_dir.is_dir():
             return []
-        files = []
-        for f in sorted(target.rglob("*")):
-            if f.is_file():
-                rel = str(f.relative_to(target))
-                if not self._is_excluded(rel):
-                    files.append(rel)
-        return files
+        return self._get_service_info(project_dir).get("files", [])
 
     # ------------------------------------------------------------------
     # Template conversion (delegates to provision-api or local logic)
@@ -454,6 +627,7 @@ class ServiceManager:
         template_out.write_text(header + content)
         # Mark as generated
         (template_out.parent / f"{template_out.name}.generated").write_text("")
+        self.invalidate_state(service_name)
         return {
             "compose_template": str(template_out.name),
             "compose_file": compose_file,
@@ -477,6 +651,7 @@ class ServiceManager:
         template_out.write_text(header + content)
         # Mark as generated
         (template_out.parent / f"{template_out.name}.generated").write_text("")
+        self.invalidate_state(service_name)
         return {
             "nginx_template": str(template_out.name),
             "nginx_file": nginx_file,

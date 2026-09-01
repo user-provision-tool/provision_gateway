@@ -72,3 +72,52 @@ def test_dockerfile_uses_multiple_workers():
     assert int(workers_value) >= 2, (
         f"Dockerfile --workers should be >= 2 for parallel handling, got {workers_value}"
     )
+
+
+def test_health_responds_while_service_scan_in_flight(monkeypatch):
+    """DB1: /health must respond while a slow /api/services scan is in flight.
+
+    list_services is a sync ``def`` handler now, so FastAPI runs it in a
+    worker thread; the event loop stays free and /health answers instantly
+    instead of queueing behind the (potentially huge) scan.
+    """
+    import time
+
+    from app.main import app
+    from app.middleware import require_admin
+    from app.services.service_manager import service_manager
+
+    app.dependency_overrides[require_admin] = lambda: {"id": 1, "role": "admin"}
+
+    original = service_manager.list_services
+
+    def slow_list_services():
+        time.sleep(1.5)
+        return original()
+
+    monkeypatch.setattr(service_manager, "list_services", slow_list_services)
+
+    async def run() -> tuple[httpx.Response, float, httpx.Response]:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test", timeout=30.0
+        ) as client:
+            services_task = asyncio.create_task(client.get("/api/services"))
+            await asyncio.sleep(0.05)  # let the scan handler enter the threadpool
+            start = time.monotonic()
+            health = await client.get("/health")
+            elapsed = time.monotonic() - start
+            services = await services_task
+            return health, elapsed, services
+
+    try:
+        health, elapsed, services = asyncio.run(run())
+    finally:
+        app.dependency_overrides.clear()
+
+    assert health.status_code == 200, "expected 200 from /health during in-flight scan"
+    assert elapsed < 1.0, (
+        f"/health took {elapsed:.2f}s while a scan was in flight — "
+        "the blocking scan is stalling the event loop"
+    )
+    assert services.status_code == 200, "scan request itself must still succeed"
