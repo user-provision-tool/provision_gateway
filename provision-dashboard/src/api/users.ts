@@ -24,12 +24,12 @@ export const testCurl = (user: string, service: string, label: string, includeAu
 export const getContainerLogs = (user: string, service: string, label: string, container: string, tail?: number) =>
   client.get(`/users/${user}/${service}/${label}/containers/${container}/logs${tail ? `?tail=${tail}` : ''}`)
 
-export const getDeploymentFiles = (user: string, service: string, label: string) =>
-  client.get(`/users/${user}/${service}/${label}/deployment-files`)
-export const getDeploymentFile = (user: string, service: string, label: string, fileType: string) =>
-  client.get(`/users/${user}/${service}/${label}/deployment-files/${fileType}`)
-export const updateDeploymentFile = (user: string, service: string, label: string, fileType: string, content: string) =>
-  client.put(`/users/${user}/${service}/${label}/deployment-files/${fileType}`, { content })
+// Per-user deployment files are recipe-scoped, keyed by (recipe_path, filename)
+// — the old convention-based list/edit endpoints were retired (GAP-18).
+export const getPerUserFile = (user: string, service: string, label: string, recipePath: string, filename: string) =>
+  client.get(`/users/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: recipePath, filename } })
+export const savePerUserFile = (user: string, service: string, label: string, recipePath: string, filename: string, content: string) =>
+  client.put(`/users/${user}/${service}/${label}/per-user-file`, { recipe_path: recipePath, filename, content })
 
 export const getRegistrationTime = (user: string, service: string, label: string) =>
   client.get(`/users/${user}/${service}/${label}/registration-time`)

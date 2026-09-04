@@ -222,6 +222,21 @@ class ProvisionService:
             params["recipe_path"] = recipe_path
         return await self._request("GET", f"/services/{service_name}/check-missing-files", params=params)
 
+    async def compose_preview(self, service_name: str, compose_files: list[str], recipe_path: str = "") -> dict[str, Any]:
+        """Lightweight convert/preview: converter in-call src→key mapping.
+
+        Proxies to provision-api's ``/services/{name}/compose/preview`` so the
+        deploy panel's volume-override rows obtain their keys from the
+        converter's in-call src→key mapping (design §Implementation notes
+        L284-286) — the gateway holds no converter copy.
+        """
+        # httpx repeats list values as repeated query params — compose_files
+        # must stay a list (order preserved) so the API sees the full set.
+        params: dict[str, Any] = {"compose_files": compose_files}
+        if recipe_path:
+            params["recipe_path"] = recipe_path
+        return await self._request("GET", f"/services/{service_name}/compose/preview", params=params)
+
     # ---- SSL certificates ----
 
     async def list_ssl_certs(self) -> dict[str, Any]:

@@ -140,17 +140,22 @@ async def deploy_user(
 ):
     """Deploy a service to a user (proxied to provision-api POST /users).
 
-    Validates that essential file paths are provided before proxying.
-    Returns 400 if deploy would fail due to missing compose/nginx paths.
-    All DB work uses short-lived sessions so no connection is held during the
-    (potentially long) provision-api deploy call.
+    Compose is the root of the dependency graph (design §Dependency graph):
+    deploy hard-gates on compose presence only — nginx is optional. Returns
+    400 if the deploy would fail due to a missing compose source.
+    A successful submission persists the file-set selection as the new
+    default (design §Selection & UI L43-46: persist on 202 accept, not task
+    completion). All DB work uses short-lived sessions so no connection is
+    held during the (potentially long) provision-api deploy call.
     """
-    # Validate that compose/nginx paths are provided (GAP-002)
+    # Validate that a compose source is provided (GAP-002 + design gate).
     service_name = req.get("service_name", "")
-    compose_path = req.get("compose_file_path") or req.get("compose_template_path")
-    nginx_path = req.get("nginx_conf_file_path") or req.get("nginx_conf_template_path")
+    compose_path = (
+        req.get("compose_file_path") or req.get("compose_template_path")
+        or (req.get("compose_file_paths") or [None])[0]
+    )
 
-    # Check if service project has compose/nginx files
+    # Check if service project has a compose source
     from starlette.concurrency import run_in_threadpool
     from ..services.service_manager import service_manager
     info = await run_in_threadpool(service_manager.get_service, service_name)
@@ -158,22 +163,24 @@ async def deploy_user(
         files = info.get("files", [])
         has_compose = any(f.endswith((".yml", ".yaml")) for f in files if not f.endswith(".j2"))
         has_compose |= any(f.endswith(".yml.j2") for f in files)
-        has_nginx = any(f.endswith(".conf") for f in files if not f.endswith(".j2"))
-        has_nginx |= any(f.endswith(".conf.j2") for f in files)
 
-        missing = []
         if not has_compose and not compose_path:
-            missing.append("docker-compose.yml")
-        if not has_nginx and not nginx_path:
-            missing.append("nginx.conf")
-
-        if missing:
             raise HTTPException(
                 400,
-                f"Cannot deploy '{service_name}': missing essential files ({', '.join(missing)}). "
-                "Use LLM-based auto-generation (configure BYOK in Settings) to generate missing files, "
-                "or upload them manually to the source project before deploying.",
+                f"Cannot deploy '{service_name}': missing docker-compose.yml (or .yml.j2 template). "
+                "Use the generate-missing panel (LLM configured) to generate it, or add it manually "
+                "to the source project before deploying.",
             )
+
+    # Persist the selection as the new default on submission (202 accept).
+    selection = req.get("selection")
+    recipe_path = req.get("recipe_path") or ""
+    if isinstance(selection, dict):
+        from ..services.file_sets import FileSetError, put_file_set
+        try:
+            put_file_set(service_name, recipe_path, selection)
+        except FileSetError:
+            pass  # selection persistence is best-effort — deploy still proceeds
 
     # Inject global proxy into build_args if requested
     use_global_proxy = req.pop("use_global_proxy", False)
@@ -544,104 +551,91 @@ async def clone_user(
 
 
 # ---------------------------------------------------------------------------
-# Deployment File Operations (read/write generated deployment files)
+# Per-user deployment files (per-user-per-recipe scoping — design §Per-recipe
+# scoping L221-238). The convention-based deployment-file editor
+# (_resolve_deployment_file + fixed project-root paths + source-fallback) is
+# RETIRED. A plain per-user-file GET/PUT keyed by (user, service, label,
+# recipe_path) replaces it — no path-guessing; the deploy panel computes the
+# per-user-per-recipe path itself and writes through its review/edit gate.
 # ---------------------------------------------------------------------------
 
 from pathlib import Path as _Path
 import os as _os
 
 
-def _resolve_deployment_file(
-    user_name: str, service_name: str, label: str, file_type: str
+def _resolve_per_user_file(
+    user_name: str, service_name: str, label: str, recipe_path: str, filename: str
 ) -> _Path | None:
-    """Resolve a deployment file path from file_type identifier.
-    
-    file_type can be:
-    - 'env' → .env.{user_name}.{label}
-    - 'compose' → docker-compose.user-{user_name}.{label}.yml
-    - 'nginx' → {service_name}.user-{user_name}.{label}.nginx.conf
+    """Resolve a per-user deployment file inside the recipe dir.
+
+    Per-user files live in the RECIPE dir (not the project root)::
+        {recipe}/.env.{user}.{label}
+        {recipe}/docker-compose.user-{user}.{label}.yml
+
+    The recipe dir is the project dir itself when ``recipe_path`` is empty.
+    Path traversal is rejected (the file must stay inside the recipe dir).
     """
-    source_dir = settings.SOURCE_PROJECTS_DIR / service_name
-    generated_dir = settings.GENERATED_DIR
+    from ..services.file_sets import FileSetError, _recipe_dir
 
-    if file_type == "env":
-        return source_dir / f".env.{user_name}.{label}"
-    elif file_type == "compose":
-        return source_dir / f"docker-compose.user-{user_name}.{label}.yml"
-    elif file_type == "nginx":
-        # Try common naming patterns for nginx conf
-        candidates = [
-            generated_dir / f"{service_name}.user-{user_name}.{label}.nginx.conf",
-            generated_dir / f"{user_name}.{service_name}.{label}.nginx.conf",
-        ]
-        for c in candidates:
-            if c.exists():
-                return c
-        return candidates[0]  # Return primary candidate even if not exists (for write)
-    return None
+    project_dir = settings.SOURCE_PROJECTS_DIR / service_name
+    try:
+        recipe_dir = _recipe_dir(project_dir, recipe_path or "")
+    except FileSetError:
+        return None  # traversal-invalid recipe_path ('' = project root)
+    if filename.startswith("/") or "\\" in filename or ":" in filename or ".." in filename.split("/"):
+        return None
+    resolved = (recipe_dir / filename).resolve()
+    recipe_resolved = recipe_dir.resolve()
+    if not str(resolved).startswith(str(recipe_resolved) + "/") and resolved != recipe_resolved:
+        return None
+    return resolved
 
 
-@router.get("/{user_name}/{service_name}/{label}/deployment-files")
-async def list_deployment_files(
+@router.get("/{user_name}/{service_name}/{label}/per-user-file")
+async def get_per_user_file(
     user_name: str, service_name: str, label: str,
+    recipe_path: str = Query("", description="Recipe subdirectory ('' = project root)"),
+    filename: str = Query(..., description="Per-user filename, e.g. .env.{user}.{label}"),
     current_admin: dict = Depends(require_admin),
 ):
-    """List deployment files for a service instance (paths, sizes, modification times)."""
-    files = []
-    for ft in ["env", "compose", "nginx"]:
-        fp = _resolve_deployment_file(user_name, service_name, label, ft)
-        if fp:
-            info = {
-                "file_type": ft,
-                "path": str(fp),
-                "filename": fp.name,
-                "exists": fp.exists(),
-            }
-            if fp.exists():
-                stat = fp.stat()
-                info["size"] = stat.st_size
-                info["modified_at"] = stat.st_mtime
-            files.append(info)
-    return {"files": files}
+    """Get a per-user deployment file's content.
 
-
-@router.get("/{user_name}/{service_name}/{label}/deployment-files/{file_type}")
-async def get_deployment_file(
-    user_name: str, service_name: str, label: str, file_type: str,
-    current_admin: dict = Depends(require_admin),
-):
-    """Get the content of a deployment file.
-
-    If the per-user deployment file does not exist yet, falls back to the
-    source template (e.g. .env → .env from source project) so the user can
-    edit a meaningful starting point rather than a blank file.
+    Falls back to the recipe's base file when the per-user file does not
+    exist yet (prefill from base/generated/last-saved → edit → save), so the
+    review/edit gate always starts from a meaningful document.
     """
-    fp = _resolve_deployment_file(user_name, service_name, label, file_type)
-    if not fp:
-        raise HTTPException(400, f"Unknown file type: {file_type}")
+    fp = _resolve_per_user_file(user_name, service_name, label, recipe_path, filename)
+    if fp is None:
+        raise HTTPException(400, f"Invalid per-user file path: {filename!r}")
 
     content = ""
     exists = fp.exists()
-
     if exists:
         try:
             content = fp.read_text()
         except Exception as e:
             raise HTTPException(500, f"Failed to read file: {e}")
     else:
-        # Fall back to source template for .env files
-        if file_type == "env":
-            source_env = settings.SOURCE_PROJECTS_DIR / service_name / ".env"
-            if source_env.exists():
+        # Prefill fallback: the recipe-level base file with the same stem
+        # (e.g. .env for .env.{user}.{label}) — the base selection is the
+        # sensible starting point for a per-user file.
+        base_candidates = [fp.name, fp.name.split(".")[0] if "." in fp.name else ""]
+        for base_name in base_candidates:
+            base = fp.parent / base_name
+            if base.is_file() and base != fp:
                 try:
-                    content = source_env.read_text()
+                    content = base.read_text()
                 except Exception:
                     content = ""
+                break
 
     return {
-        "file_type": file_type,
-        "path": str(fp),
+        "user_name": user_name,
+        "service_name": service_name,
+        "label": label,
+        "recipe_path": recipe_path,
         "filename": fp.name,
+        "path": str(fp),
         "content": content,
         "size": len(content),
         "modified_at": fp.stat().st_mtime if exists else None,
@@ -650,37 +644,42 @@ async def get_deployment_file(
     }
 
 
-@router.put("/{user_name}/{service_name}/{label}/deployment-files/{file_type}")
-async def save_deployment_file(
-    user_name: str, service_name: str, label: str, file_type: str,
+@router.put("/{user_name}/{service_name}/{label}/per-user-file")
+async def save_per_user_file(
+    user_name: str, service_name: str, label: str,
     req: dict[str, Any],
     current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Save/update a deployment file's content."""
-    content = req.get("content", "")
-    fp = _resolve_deployment_file(user_name, service_name, label, file_type)
-    if not fp:
-        raise HTTPException(400, f"Unknown file type: {file_type}")
+    """Save a per-user deployment file's content (review/edit gate write-through).
 
-    # Ensure parent directory exists
+    Body: ``{"recipe_path": "...", "filename": ".env.alice.0", "content": "..."}``
+    """
+    recipe_path = req.get("recipe_path") or ""
+    filename = req.get("filename") or ""
+    content = req.get("content") or ""
+    if not filename:
+        raise HTTPException(400, "'filename' is required")
+    fp = _resolve_per_user_file(user_name, service_name, label, recipe_path, filename)
+    if fp is None:
+        raise HTTPException(400, f"Invalid per-user file path: {filename!r}")
+
     fp.parent.mkdir(parents=True, exist_ok=True)
-
     try:
         fp.write_text(content)
     except Exception as e:
         raise HTTPException(500, f"Failed to write file: {e}")
 
     audit_service.log_action(
-        db, action="deployment_file_edit", admin_id=current_admin["id"],
+        db, action="per_user_file_edit", admin_id=current_admin["id"],
         target_user=user_name, target_service=service_name,
         target_label=label,
-        detail={"file_type": file_type, "path": str(fp)},
+        detail={"recipe_path": recipe_path, "filename": fp.name, "path": str(fp)},
         status="success",
     )
     return {
         "saved": True,
-        "file_type": file_type,
+        "filename": fp.name,
         "path": str(fp),
         "size": len(content),
         "modified_at": fp.stat().st_mtime,

@@ -232,7 +232,13 @@ class ServiceManager:
             dir_path = project_dir
             prefix = ""
         else:
-            dir_path = project_dir / recipe_path
+            # Traversal-safe join (GAP-3) — callers pre-normalize via
+            # _normalize_recipe_paths, this guards stale stored state too.
+            try:
+                from ..services.file_sets import _recipe_dir
+                dir_path = _recipe_dir(project_dir, recipe_path)
+            except Exception:
+                return None  # traversal-invalid recipe path → skip, no crash
             prefix = recipe_path.rstrip("/") + "/"
         if not dir_path.is_dir():
             return None

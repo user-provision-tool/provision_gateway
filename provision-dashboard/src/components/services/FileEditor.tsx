@@ -28,10 +28,10 @@ export default function FileEditor({ open, file, onClose, getLanguage = defaultG
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
 
-  const loadFile = async (user: string, service: string, label: string, fileType: string) => {
+  const loadFile = async (user: string, service: string, label: string, fileType: string, filename: string) => {
     setLoading(true)
     try {
-      const { data } = await client.get(`/users/${user}/${service}/${label}/deployment-files/${fileType}`)
+      const { data } = await client.get(`/users/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: '', filename } })
       setContent(data.content || '')
       setOriginal(data.content || '')
     } catch (err: any) {
@@ -48,14 +48,14 @@ export default function FileEditor({ open, file, onClose, getLanguage = defaultG
 
   // Load when file changes
   if (file && open) {
-    loadFile(file.user, file.service, file.label, file.fileType)
+    loadFile(file.user, file.service, file.label, file.fileType, file.filename)
   }
 
   const handleSave = async () => {
     if (!file) return
     setSaving(true)
     try {
-      await client.put(`/users/${file.user}/${file.service}/${file.label}/deployment-files/${file.fileType}`, { content })
+      await client.put(`/users/${file.user}/${file.service}/${file.label}/per-user-file`, { recipe_path: '', filename: file.filename, content })
       message.success('File saved')
       setOriginal(content)
     } catch (err: any) {

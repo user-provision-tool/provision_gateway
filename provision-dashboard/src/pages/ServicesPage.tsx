@@ -14,6 +14,7 @@ import {
 import Editor, { DiffEditor } from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
 import client from '../api/client'
+import GenerateMissingPanel from '../components/services/GenerateMissingPanel'
 
 const { Title, Text } = Typography
 
@@ -47,7 +48,6 @@ export default function ServicesPage() {
   const [addMode, setAddMode] = useState<'git' | 'upload'>('git')
   const [form] = Form.useForm()
   const [proxyEnabled, setProxyEnabled] = useState(false)
-  const [genLoading, setGenLoading] = useState<string | null>(null)
   const [missingFilesMap, setMissingFilesMap] = useState<Record<string, string[]>>({})  // recipeKey → missing file types
   const [checkingMap, setCheckingMap] = useState<Record<string, boolean>>({})  // recipeKey → currently checking
   // Recipe-directory editor (gear icon in Name column)
@@ -179,44 +179,10 @@ export default function ServicesPage() {
     } finally { setRecipesSaving(false) }
   }
 
-  // Generate missing files via LLM for a service project
-  const generateMissingFiles = async (serviceName: string, recipePath: string = '') => {
-    const genKey = recipePath ? `${serviceName}@@${recipePath}` : serviceName
-    setGenLoading(genKey)
-    try {
-      const params: any = {}
-      if (recipePath) params.recipe_path = recipePath
-      const { data: check } = await client.get(`/services/${serviceName}/check-missing-files`, { params })
-      const missing: string[] = check.missing || []
-      if (missing.length === 0) { message.info('All essential files are present'); return }
-      
-      const ctx = check.scan_context || { repo_description: `Service: ${serviceName}${recipePath ? ` (${recipePath})` : ''}` }
-      const typeMap: Record<string, string> = {
-        'docker-compose': 'docker_compose', 'nginx.conf': 'nginx_conf',
-        '.env': 'env_file', 'Dockerfile': 'dockerfile',
-      }
-      const results: Record<string, string> = {}
-      for (const ft of missing) {
-        try {
-          const { data: gen } = await client.post('/llm/generate', { type: typeMap[ft] || 'docker_compose', context: ctx })
-          if (gen.generated_content) {
-            const fn = ft === 'docker-compose' ? 'docker-compose.yml' : ft === 'nginx.conf' ? 'nginx.conf' : ft
-            results[fn] = gen.generated_content
-          }
-        } catch { /* skip individual failures */ }
-      }
-      
-      if (Object.keys(results).length > 0) {
-        await client.post('/services/save-generated', { service_name: serviceName, files: results, recipe_path: recipePath })
-        message.success(`LLM generated ${Object.keys(results).length} file(s) for ${serviceName}${recipePath ? ` @ ${recipePath}` : ''}`)
-        refreshServices()
-      } else {
-        message.warning('LLM could not generate any files. Configure BYOK LLM in Settings.')
-      }
-    } catch (err: any) {
-      message.error(err.response?.data?.detail || 'Generation failed')
-    } finally { setGenLoading(null) }
-  }
+  // LLM generate-missing panel — the "Missing files" action now OPENS the
+  // panel (design §Selection & UI L34-38) instead of triggering generation
+  // directly. The panel holds the full selection + prompt UI.
+  const [genPanel, setGenPanel] = useState<{ name: string; recipePath: string } | null>(null)
 
   // Flatten multi-recipe projects into table rows with rowSpan on Name
   // MUST be before the early return (React hooks rule)
@@ -300,8 +266,8 @@ export default function ServicesPage() {
         const checking = checkingMap[genKey] === true
         const hasAll = !checking && missing !== null && missing.length === 0
         const isChecking = checking || missing === null
-        return <Tooltip title={isChecking ? 'Checking deployment readiness...' : hasAll ? 'No missing basic files, ready for deployment' : `Missing: ${(missing||[]).join(', ')}`}>
-          <Button size="small" type="primary" icon={<RobotOutlined/>} disabled={isChecking || hasAll} loading={isChecking || genLoading === genKey} onClick={()=>generateMissingFiles(r.name, r.recipePath)}/>
+        return <Tooltip title={isChecking ? 'Checking deployment readiness...' : hasAll ? 'No missing basic files, ready for deployment' : `Missing: ${(missing||[]).join(', ')} — open generate-missing panel`}>
+          <Button size="small" type="primary" icon={<RobotOutlined/>} disabled={isChecking || hasAll} loading={isChecking} onClick={()=>setGenPanel({ name: r.name, recipePath: r.recipePath })}/>
         </Tooltip>
       } },
   ]
@@ -363,6 +329,15 @@ export default function ServicesPage() {
           </>)}
         </Form>
       </Modal>
+
+      {/* LLM generate-missing panel (selection + prompt + job polling + review gate) */}
+      <GenerateMissingPanel
+        open={genPanel !== null}
+        serviceName={genPanel?.name || ''}
+        recipePath={genPanel?.recipePath || ''}
+        onClose={() => setGenPanel(null)}
+        onChanged={refreshServices}
+      />
 
       {/* Recipe directories editor */}
       <Modal

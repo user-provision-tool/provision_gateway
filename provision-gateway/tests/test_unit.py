@@ -106,7 +106,7 @@ class TestProjectStateModule:
         state.save()
         loaded = ProjectState.load(tmp_path)
         assert loaded is not None
-        assert loaded.schema_version == 1
+        assert loaded.schema_version == 2
         assert loaded.recipe_origin == "user"
         assert loaded.recipe_paths == [".", "docker"]
         assert loaded.recipes == [{"path": "", "label": "(root)", "is_root": True}]
@@ -165,7 +165,7 @@ class TestScanRearchitecture:
         assert state_file.is_file()
         state = ProjectState.load(project)
         assert state is not None
-        assert state.schema_version == 1
+        assert state.schema_version == 2
         assert state.recipe_origin == "auto"
         assert state.recipe_paths == ["."]
         assert state.files == ["Dockerfile"]
@@ -400,7 +400,12 @@ class TestScanRearchitectureHandlers:
         assert inspect.iscoroutinefunction(check_missing_files)
         assert inspect.iscoroutinefunction(check_deploy_readiness)
         assert "run_in_threadpool" in inspect.getsource(check_missing_files)
-        assert "run_in_threadpool" in inspect.getsource(check_deploy_readiness)
+        # check-deploy's implicit LLM auto-generation was RETIRED (design
+        # §Implementation notes L252-253) — the readiness report now awaits
+        # provision_service directly; the remaining blocking scan runs in the
+        # threadpool via provision_service's async proxy.
+        assert "provision_service.check_missing_files" in inspect.getsource(check_deploy_readiness)
+        assert "generate_config" not in inspect.getsource(check_deploy_readiness)
 
     def test_recipes_and_tree_routes_registered_before_catch_all(self):
         from app.routers.services import router
@@ -758,6 +763,175 @@ class TestRecipePathMultiRecipe:
         assert (tmp_path / "multisvc" / "recipes" / "web" / "docker-compose.yml.generated").exists()
         assert result["saved"] == ["docker-compose.yml"]
 
+    def test_save_generated_rejects_recipe_path_traversal(self, tmp_path, monkeypatch):
+        """GAP-3: save-generated must 400 on a traversal recipe_path and write
+        nothing outside the project dir."""
+        from fastapi import HTTPException
+        from app.config import settings
+        from app.routers import services as services_router
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        (tmp_path / "multisvc").mkdir()
+        monkeypatch.setattr("app.routers.services.log_action", lambda db, **kw: None)
+
+        req = {
+            "service_name": "multisvc",
+            "recipe_path": "../etc",
+            "files": {"docker-compose.yml": "services: {}"},
+        }
+        with pytest.raises(HTTPException) as exc:
+            services_router.save_generated_files(req, current_admin={"id": 1}, db=None)
+        assert exc.value.status_code == 400
+        assert not (tmp_path / "etc" / "docker-compose.yml").exists()
+        assert not (tmp_path.parent / "etc" / "docker-compose.yml").exists()
+
+    def test_save_generated_rejects_filename_traversal(self, tmp_path, monkeypatch):
+        """GAP-3: save-generated must 400 on a traversal filename — generated
+        output stays inside the recipe dir (design L221-238)."""
+        from fastapi import HTTPException
+        from app.config import settings
+        from app.routers import services as services_router
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        (tmp_path / "multisvc").mkdir()
+        monkeypatch.setattr("app.routers.services.log_action", lambda db, **kw: None)
+
+        req = {
+            "service_name": "multisvc",
+            "recipe_path": "recipes/web",
+            "files": {"../../escape.yml": "services: {}"},
+        }
+        with pytest.raises(HTTPException) as exc:
+            services_router.save_generated_files(req, current_admin={"id": 1}, db=None)
+        assert exc.value.status_code == 400
+        assert not (tmp_path / "escape.yml").exists()
+        assert not (tmp_path.parent / "escape.yml").exists()
+
+    def test_save_generated_absolute_recipe_path_confined(self, tmp_path, monkeypatch):
+        """GAP-3: an absolute recipe_path is re-rooted INTO the project dir —
+        generated output never lands outside source_projects/<service>."""
+        from app.config import settings
+        from app.routers import services as services_router
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        (tmp_path / "multisvc").mkdir()
+        monkeypatch.setattr("app.routers.services.log_action", lambda db, **kw: None)
+
+        req = {
+            "service_name": "multisvc",
+            "recipe_path": "/sub",
+            "files": {"docker-compose.yml": "services: {}"},
+        }
+        result = services_router.save_generated_files(req, current_admin={"id": 1}, db=None)
+        written = tmp_path / "multisvc" / "sub" / "docker-compose.yml"
+        assert written.read_text() == "services: {}"
+        assert result["saved"] == ["docker-compose.yml"]
+        assert not (tmp_path / "sub" / "docker-compose.yml").exists()  # NOT project-escaped
+
+    def test_compute_needs_env_traversal_recipe_path_falls_back(self, tmp_path, monkeypatch):
+        """GAP-3: _compute_needs_env with a traversal recipe_path must not
+        crash or scan outside — it falls back to the api result."""
+        from app.config import settings
+        from app.routers.services import _compute_needs_env
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        assert _compute_needs_env("myapp", "../etc", {"needs_env": True}) is True
+        assert _compute_needs_env("myapp", "a/../../etc", {"needs_env": False}) is False
+
+    def test_scan_recipe_dir_rejects_traversal(self, tmp_path):
+        """GAP-3: _scan_recipe_dir skips a traversal-invalid recipe path
+        (defense-in-depth; stored state is normalized, but never escapes)."""
+        from app.services.service_manager import ServiceManager
+        project = tmp_path / "svc"
+        project.mkdir()
+        assert ServiceManager()._scan_recipe_dir(project, "../etc") is None
+        assert ServiceManager()._scan_recipe_dir(project, "docker/../../etc") is None
+
+    def test_validate_generated_rejects_recipe_path_traversal(self, tmp_path, monkeypatch):
+        """GAP-3: validation-draft writes must not escape via recipe_path —
+        an invalid recipe_path yields an invalid result, no draft outside."""
+        import asyncio
+        from app.config import settings
+        from app.services.llm_service import LLMService
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        svc = LLMService()
+        result = asyncio.run(svc._validate_generated(
+            "docker_compose", "services: {}",
+            {"project_dir": str(tmp_path), "recipe_path": "../etc"},
+        ))
+        assert result.get("valid") is False
+        assert result.get("repairable") is False
+        assert "invalid recipe_path" in " ".join(result.get("errors") or [])
+        assert not (tmp_path.parent / ".draft-generated-compose.yml").exists()
+        assert not (tmp_path / ".draft-generated-compose.yml").exists()
+
+
+class TestProfilesDerive:
+    """GAP-2/GAP-4: in-panel profile-candidate derivation (file-sets derive).
+
+    The panels recompute profile candidates from the in-panel compose
+    selection via POST /services/{name}/file-sets/derive — regression for the
+    'No non-empty profiles found.' staleness on first-time selection.
+    """
+
+    def _service_dir(self, tmp_path, name="dify") -> Path:
+        from app.config import settings
+        project = tmp_path / name
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "docker-compose.middleware.yaml").write_text(
+            "services:\n  db_postgres:\n    profiles: ['', 'postgresql']\n"
+        )
+        (project / "docker-compose.yaml").write_text(
+            "services:\n  api:\n    profiles: ['collaboration']\n  db_mysql:\n    profiles: ['mysql', 'postgresql']\n"
+        )
+        return project
+
+    def test_derive_profiles_from_compose_selection(self, tmp_path, monkeypatch):
+        """Candidates derive from the IN-PANEL compose selection: union of
+        non-empty profiles across the selected files, '' excluded."""
+        from app.config import settings
+        from app.routers.services import derive_file_sets_profiles
+
+        self._service_dir(tmp_path)
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        result = derive_file_sets_profiles(
+            "dify",
+            {"recipe_path": "", "compose": ["docker-compose.middleware.yaml", "docker-compose.yaml"]},
+            {"id": 1},
+        )
+        profiles = result["candidates"]["profiles"]
+        assert set(profiles) == {"postgresql", "collaboration", "mysql"}
+        assert "" not in profiles
+        assert result["service_name"] == "dify"
+
+    def test_derive_profiles_empty_compose(self, tmp_path, monkeypatch):
+        """No compose selection → no profile candidates."""
+        from app.config import settings
+        from app.routers.services import derive_file_sets_profiles
+
+        self._service_dir(tmp_path)
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        result = derive_file_sets_profiles("dify", {"recipe_path": "", "compose": []}, {"id": 1})
+        assert result["candidates"]["profiles"] == []
+
+    def test_derive_profiles_rejects_traversal(self, tmp_path, monkeypatch):
+        """Traversal recipe_path / compose paths are rejected with 400."""
+        from fastapi import HTTPException
+        from app.config import settings
+        from app.routers.services import derive_file_sets_profiles
+
+        self._service_dir(tmp_path)
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        with pytest.raises(HTTPException) as exc:
+            derive_file_sets_profiles(
+                "dify", {"recipe_path": "../etc", "compose": ["docker-compose.yaml"]}, {"id": 1})
+        assert exc.value.status_code == 400
+        with pytest.raises(HTTPException) as exc:
+            derive_file_sets_profiles(
+                "dify", {"recipe_path": "", "compose": ["sub/../../docker-compose.yaml"]}, {"id": 1})
+        assert exc.value.status_code == 400
+
     def test_root_only_default_no_subdir_auto_detection(self, tmp_path):
         """Without configured recipes, scan the project ROOT only — no subdir
         auto-detection (F4); _discover_recipes is gone."""
@@ -814,41 +988,123 @@ class TestRecipePathMultiRecipe:
         )
 
 
-class TestDeploymentFileFallback:
-    """Tests for deployment file source fallback (task 1.3)."""
+class TestPerUserFileEndpoints:
+    """Per-user-per-recipe deployment files (GAP-18 — the convention-based
+    deployment-file editor was RETIRED; plain per-user-file GET/PUT keyed by
+    (user, service, label, recipe_path) replaced it)."""
 
-    def test_resolve_deployment_file_env_returns_correct_path(self):
-        """_resolve_deployment_file for env type should use .env.{user}.{label} pattern."""
-        from app.routers.users import _resolve_deployment_file
-        result = _resolve_deployment_file("alice", "myapp", "0", "env")
+    def test_convention_deployment_files_endpoints_retired(self):
+        """The old deployment-files endpoints must be GONE."""
+        from app.routers.users import router
+        routes = [r.path for r in router.routes]
+        assert not any("deployment-files" in r for r in routes), (
+            f"convention deployment-files routes still registered: {routes}"
+        )
+
+    def test_resolve_per_user_file_env_in_recipe_dir(self, monkeypatch):
+        """_resolve_per_user_file for .env.{user}.{label} resolves INSIDE the recipe dir."""
+        from app.routers import users as users_router
+        monkeypatch.setattr(users_router.settings, "SOURCE_PROJECTS_DIR", Path("/srv/provision/source_projects"))
+        from app.routers.users import _resolve_per_user_file
+        result = _resolve_per_user_file("alice", "myapp", "0", "docker", ".env.alice.0")
         assert result is not None
-        assert result.name == ".env.alice.0"
+        assert str(result) == "/srv/provision/source_projects/myapp/docker/.env.alice.0"
 
-    def test_resolve_deployment_file_compose_returns_correct_path(self):
-        """_resolve_deployment_file for compose type should use docker-compose.user-{user}.{label}.yml."""
-        from app.routers.users import _resolve_deployment_file
-        result = _resolve_deployment_file("alice", "myapp", "0", "compose")
+    def test_resolve_per_user_file_compose(self, monkeypatch):
+        """docker-compose.user-{user}.{label}.yml resolves into the recipe dir."""
+        from app.routers import users as users_router
+        monkeypatch.setattr(users_router.settings, "SOURCE_PROJECTS_DIR", Path("/srv/provision/source_projects"))
+        from app.routers.users import _resolve_per_user_file
+        result = _resolve_per_user_file("alice", "myapp", "0", "", "docker-compose.user-alice.0.yml")
         assert result is not None
-        assert "docker-compose.user-alice.0.yml" in result.name
+        assert str(result) == "/srv/provision/source_projects/myapp/docker-compose.user-alice.0.yml"
 
-    def test_resolve_deployment_file_nginx_returns_path(self):
-        """_resolve_deployment_file for nginx type should return a candidate path."""
-        from app.routers.users import _resolve_deployment_file
-        result = _resolve_deployment_file("alice", "myapp", "0", "nginx")
+    def test_resolve_per_user_file_rejects_traversal(self, monkeypatch):
+        """Path traversal must be rejected (None) — no path-guessing escapes."""
+        from app.routers import users as users_router
+        monkeypatch.setattr(users_router.settings, "SOURCE_PROJECTS_DIR", Path("/srv/provision/source_projects"))
+        from app.routers.users import _resolve_per_user_file
+        assert _resolve_per_user_file("alice", "myapp", "0", "", "../.env") is None
+        assert _resolve_per_user_file("alice", "myapp", "0", "", "/etc/passwd") is None
+        assert _resolve_per_user_file("alice", "myapp", "0", "docker", "sub/../x.env") is None
+
+    def test_resolve_per_user_file_rejects_recipe_path_traversal(self, monkeypatch):
+        """GAP-1: recipe_path with '..' must be rejected (None) — the file
+        cannot escape the project dir via the recipe subdirectory."""
+        from app.routers import users as users_router
+        monkeypatch.setattr(users_router.settings, "SOURCE_PROJECTS_DIR", Path("/srv/provision/source_projects"))
+        from app.routers.users import _resolve_per_user_file
+        assert _resolve_per_user_file("alice", "myapp", "0", "../etc", "passwd") is None
+        assert _resolve_per_user_file("alice", "myapp", "0", "docker/../../etc", ".env.alice.0") is None
+        assert _resolve_per_user_file("alice", "myapp", "0", "..", "x.env") is None
+        assert _resolve_per_user_file("alice", "myapp", "0", "a/../..", "x.env") is None
+
+    def test_resolve_per_user_file_recipe_path_absolute_confined(self, monkeypatch):
+        """GAP-1: an absolute recipe_path is re-rooted INTO the project dir
+        (file_sets._recipe_dir semantics) — never joined outside it."""
+        from app.routers import users as users_router
+        monkeypatch.setattr(users_router.settings, "SOURCE_PROJECTS_DIR", Path("/srv/provision/source_projects"))
+        from app.routers.users import _resolve_per_user_file
+        result = _resolve_per_user_file("alice", "myapp", "0", "/etc", "passwd")
         assert result is not None
-        assert "nginx.conf" in result.name
+        assert str(result).startswith("/srv/provision/source_projects/myapp/"), (
+            f"absolute recipe_path escaped the project dir: {result}"
+        )
 
-    def test_resolve_deployment_file_unknown_type_returns_none(self):
-        """_resolve_deployment_file for unknown type should return None."""
-        from app.routers.users import _resolve_deployment_file
-        result = _resolve_deployment_file("alice", "myapp", "0", "unknown")
-        assert result is None
+    def test_resolve_per_user_file_recipe_path_nested_valid(self, monkeypatch):
+        """A nested recipe subdir still resolves INSIDE the project dir."""
+        from app.routers import users as users_router
+        monkeypatch.setattr(users_router.settings, "SOURCE_PROJECTS_DIR", Path("/srv/provision/source_projects"))
+        from app.routers.users import _resolve_per_user_file
+        result = _resolve_per_user_file("alice", "myapp", "0", "docker/extra", ".env.alice.0")
+        assert result is not None
+        assert str(result) == "/srv/provision/source_projects/myapp/docker/extra/.env.alice.0"
 
-    def test_get_deployment_file_endpoint_has_source_fallback(self):
-        """get_deployment_file should handle source_fallback in response."""
-        from app.routers.users import get_deployment_file
+    def test_save_per_user_file_rejects_recipe_path_traversal(self, monkeypatch):
+        """GAP-1: the PUT handler 400s on a traversal recipe_path (GAP-1
+        baseline repro: recipe_path=../../etc wrote outside the recipe dir)."""
+        import asyncio
+        from fastapi import HTTPException
+        from app.routers import users as users_router
+        monkeypatch.setattr(users_router.settings, "SOURCE_PROJECTS_DIR", Path("/srv/provision/source_projects"))
+        from app.routers.users import save_per_user_file
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(save_per_user_file(
+                "alice", "myapp", "0",
+                {"recipe_path": "../etc", "filename": "qa-traversal.txt", "content": "x"},
+                {"id": 1}, db=None,
+            ))
+        assert exc.value.status_code == 400
+
+    def test_per_user_file_endpoints_are_coroutine(self):
+        """The new per-user-file GET/PUT are async handlers."""
+        from app.routers.users import get_per_user_file, save_per_user_file
         import inspect
-        assert inspect.iscoroutinefunction(get_deployment_file)
+        assert inspect.iscoroutinefunction(get_per_user_file)
+        assert inspect.iscoroutinefunction(save_per_user_file)
+
+    def test_per_user_file_routes_registered(self):
+        """The per-user-file routes exist on the users router."""
+        from app.routers.users import router
+        routes = [r.path for r in router.routes]
+        assert any("per-user-file" in r for r in routes), (
+            f"per-user-file routes missing from users router. Routes: {routes}"
+        )
+
+    def test_frontend_no_longer_calls_retired_deployment_files(self):
+        """UsersPage/FileEditor must use the per-user-file endpoints keyed by
+        (recipe_path, filename), never the retired /deployment-files ones."""
+        _dash = _DASH
+        users_page = (_dash / "src" / "pages" / "UsersPage.tsx").read_text()
+        file_editor = (_dash / "src" / "components" / "services" / "FileEditor.tsx").read_text()
+        users_api = (_dash / "src" / "api" / "users.ts").read_text()
+        for name, content in [("UsersPage.tsx", users_page), ("FileEditor.tsx", file_editor), ("api/users.ts", users_api)]:
+            assert "deployment-files" not in content, f"{name} still calls retired /deployment-files endpoints"
+        # The dirty-check now probes the recipe-root per-user files.
+        assert "per-user-file" in users_page
+        assert "recipe_path: ''" in users_page
+        assert "per-user-file" in file_editor
+        assert "getPerUserFile" in users_api and "savePerUserFile" in users_api
 
 
 class TestSystemStatsKeys:
@@ -1318,15 +1574,20 @@ class TestTaskNotificationSystem:
 # ---------------------------------------------------------------------------
 
 class TestAutoDeploy:
-    """Tests for auto-deploy flow (G6)."""
+    """Tests for the deploy flow — implicit LLM auto-generation on deploy is
+    RETIRED (design §Selection & UI): generation is an explicit, human-gated
+    action; deployment always waits for explicit user action."""
 
-    def test_deploy_form_has_auto_submit(self):
-        """DeployForm.tsx should auto-submit when autoDeploy is true."""
+    def test_deploy_form_submits_via_form(self):
+        """DeployForm.tsx should submit the deploy payload via the form's
+        submit handling (Deploy button), not an implicit auto-deploy flag."""
         from pathlib import Path
         deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
         content = deploy_form.read_text()
         assert "onFinish={handleDeploy}" in content or "htmlType=\"submit\"" in content or "type=\"submit\"" in content
-        assert "autoDeploy" in content or "Auto Templates Completion" in content
+        # The autoDeploy flag is retired — no implicit auto-generation on deploy.
+        assert "autoDeploy" not in content
+        assert "Auto Templates Completion" not in content
 
 
 # G4 checkDeploy — function removed in iteration 2 (dead code cleanup G13/G14).
@@ -1445,26 +1706,23 @@ class TestTemplateMode:
 # ---------------------------------------------------------------------------
 
 class TestG12SaveLogic:
-    """Tests that generated files are saved to disk before deployment regardless of autoDeploy state (G12)."""
+    """Tests that generated files are saved to disk before deployment (G12)."""
 
-    def test_save_block_not_gated_by_autodeploy(self):
-        """The save-to-disk block should NOT be conditional on autoDeploy."""
+    def test_save_block_not_gated(self):
+        """The save-to-disk block should NOT be conditional on anything
+        (implicit LLM auto-generation is retired; the save block stays
+        unconditional)."""
         from pathlib import Path
         deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
         content = deploy_form.read_text()
-        # The save block comment explicitly states "regardless of autoDeploy state"
-        assert "regardless of autoDeploy state" in content, (
-            "Save block comment should clarify unconditional execution"
-        )
-        # Verify `&& autoDeploy` is NOT in the save condition
-        # Locate the save block within handleDeploy by finding the comment anchor
-        anchor_idx = content.find("regardless of autoDeploy state")
-        assert anchor_idx > 0, "Anchor comment not found"
+        # The save block comment explicitly states it saves generated files first
+        anchor_idx = content.find("Save any LLM-generated files first")
+        assert anchor_idx > 0, "Save block comment not found"
         save_block = content[anchor_idx:anchor_idx + 200]
-        assert "&& autoDeploy" not in save_block, (
-            "Save block should NOT be gated by autoDeploy: " + save_block
+        assert "autoDeploy" not in save_block, (
+            "Save block should NOT be gated by the retired autoDeploy flag: " + save_block
         )
-        assert "Object.keys(gen).length > 0" in save_block or "Object.keys(generatedFiles).length > 0" in save_block, (
+        assert "Object.keys(gen).length > 0" in save_block, (
             "Save block should check if generated files exist"
         )
 
@@ -1474,8 +1732,8 @@ class TestG12SaveLogic:
         deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
         content = deploy_form.read_text()
         # Locate the save block within handleDeploy by finding the comment anchor
-        anchor_idx = content.find("regardless of autoDeploy state")
-        assert anchor_idx > 0, "regardless of autoDeploy state comment not found"
+        anchor_idx = content.find("Save any LLM-generated files first")
+        assert anchor_idx > 0, "Save block comment not found"
         # The save block starts at or near this anchor
         save_block = content[anchor_idx:anchor_idx + 400]
         save_relative = save_block.find("save-generated")
@@ -1554,27 +1812,30 @@ class TestDeployValidation:
     """Tests that deploy rejects missing compose/nginx paths (GAP-002)."""
 
     def test_deploy_validation_code_exists(self):
-        """users.py deploy endpoint should contain compose/nginx path validation."""
+        """users.py deploy endpoint should contain compose path validation."""
         from pathlib import Path
         users_path = Path(__file__).parent.parent / "app" / "routers" / "users.py"
         content = users_path.read_text()
         assert "one of compose_template_path or compose_file_path is required" not in content, (
             "Gateway should handle the error before provision-api returns it"
         )
-        assert "missing essential files" in content.lower(), (
-            "Deploy validation should mention missing essential files"
+        assert "missing docker-compose.yml" in content, (
+            "Deploy validation should mention the missing compose file"
+        )
+        assert "generate-missing panel" in content, (
+            "The 400 message should point the user to the generate-missing panel"
         )
 
     def test_deploy_validation_checks_service_files(self):
-        """Deploy validation should check service project files."""
+        """Deploy validation should check service project files (compose-only gate)."""
         from pathlib import Path
         users_path = Path(__file__).parent.parent / "app" / "routers" / "users.py"
         content = users_path.read_text()
         assert "has_compose" in content, (
             "Deploy validation should check for compose files in the service"
         )
-        assert "has_nginx" in content, (
-            "Deploy validation should check for nginx files in the service"
+        assert "has_nginx" not in content, (
+            "Deploy validation must NOT gate on nginx — compose is the only hard gate (GAP-16)"
         )
 
     def test_deploy_form_disabled_when_missing(self):
@@ -1656,8 +1917,8 @@ class TestDeployValidation:
         assert "raise HTTPException" in content, (
             "Deploy validation should raise HTTPException"
         )
-        assert "missing essential files" in content.lower(), (
-            "Deploy validation error should mention missing essential files"
+        assert "missing docker-compose.yml" in content, (
+            "Deploy validation error should mention the missing compose file"
         )
         assert "Cannot deploy" in content, (
             "Deploy validation error should start with 'Cannot deploy'"
@@ -3685,3 +3946,707 @@ class TestG8CreateKeyDefaultFallback:
              patch("app.routers.auth.auth_service.set_default_api_key") as sda:
             create_key({"label": "x"}, {"role": "viewer", "id": 2}, db)
         sda.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests for GAP-7 — async generation jobs (persist / poll / cancel / prune /
+# restart recovery)
+# ---------------------------------------------------------------------------
+
+class TestGenerationJobs:
+    """GenerationJobManager lifecycle: phases, persistence, cancel, TTL
+    prune, restart recovery (GAP-7)."""
+
+    def _make_session(self, tmp_path):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.database import Base
+        eng = create_engine(f"sqlite:///{tmp_path}/jobs.db")
+        Base.metadata.create_all(eng)
+        # expire_on_commit=False: attribute reads after commit must not hit the
+        # DB (a synchronize_session=False DELETE makes expired reads raise).
+        return sessionmaker(bind=eng, expire_on_commit=False)
+
+    def test_phase_order_is_compose_nginx_env(self):
+        """generate_missing = compose → nginx → env (dependency order)."""
+        from app.services.generation_jobs import GenerationJobManager
+        m = GenerationJobManager()
+        assert m._compute_phases("generate_missing", {}) == ["compose", "nginx", "env"]
+
+    def test_compute_phases_per_user_env_is_env_only(self):
+        """per_user_env jobs run ONLY the env phase."""
+        from app.services.generation_jobs import GenerationJobManager
+        m = GenerationJobManager()
+        assert m._compute_phases("per_user_env", {}) == ["env"]
+
+    def test_compute_phases_single_category(self):
+        """Single-category jobs map to exactly one phase."""
+        from app.services.generation_jobs import GenerationJobManager
+        m = GenerationJobManager()
+        assert m._compute_phases("category", {"category": "docker_compose"}) == ["compose"]
+        assert m._compute_phases("category", {"category": "nginx_conf"}) == ["nginx"]
+        assert m._compute_phases("category", {"category": "env_file"}) == ["env"]
+        assert m._compute_phases("category", {"category": "compose"}) == ["compose"]
+
+    def test_compute_phases_unknown_raises(self):
+        """Unknown categories must raise GenerationJobError (router → 400)."""
+        from app.services.generation_jobs import GenerationJobError, GenerationJobManager
+        m = GenerationJobManager()
+        with pytest.raises(GenerationJobError):
+            m._compute_phases("category", {"category": "bogus"})
+        with pytest.raises(GenerationJobError):
+            m._compute_phases("weird", {})
+
+    def test_create_job_persists_queued_and_schedules(self, tmp_path):
+        """create_job persists a queued job and schedules a runner task."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from app.services.generation_jobs import GenerationJobManager
+
+        async def scenario():
+            Session = self._make_session(tmp_path)
+            db = Session()
+            m = GenerationJobManager()
+            m._run_job = AsyncMock()
+            job = m.create_job(db, "myapp", "docker", "generate_missing",
+                               {"prompt": "build it", "selection": {"compose": []}})
+            return job, db, m
+
+        job, db, m = asyncio.run(scenario())
+        assert job.id is not None
+        assert job.status == "queued"
+        assert job.phase == "compose"
+        assert job.phase_total == 3
+        assert job.progress == "queued"
+        m._run_job.assert_awaited_once()
+
+    def test_get_and_list_jobs_newest_first(self, tmp_path):
+        """GET /api/llm/jobs lists newest-first and hides request/result by default."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from app.services.generation_jobs import GenerationJobManager
+
+        async def scenario():
+            Session = self._make_session(tmp_path)
+            db = Session()
+            m = GenerationJobManager()
+            m._run_job = AsyncMock()
+            j1 = m.create_job(db, "a", "", "per_user_env", {"category": "env_file", "prompt": "x"})
+            j2 = m.create_job(db, "b", "", "per_user_env", {"category": "env_file", "prompt": "y"})
+            jobs = m.list_jobs(db)
+            return j1, j2, jobs, m, db
+
+        j1, j2, jobs, m, db = asyncio.run(scenario())
+        assert [j["id"] for j in jobs] == [j2.id, j1.id]
+        assert "result" not in jobs[0]
+        got = m.get_job(db, j1.id)
+        assert got is not None and got.id == j1.id
+        assert m.get_job(db, 99999) is None
+
+    def test_cancel_job_only_for_active(self, tmp_path):
+        """Cancel marks queued/running jobs cancelled; finished jobs are untouched."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from app.services.generation_jobs import (
+            GenerationJobManager, JOB_STATUS_CANCELLED, JOB_STATUS_COMPLETED,
+        )
+
+        async def scenario():
+            Session = self._make_session(tmp_path)
+            db = Session()
+            m = GenerationJobManager()
+            m._run_job = AsyncMock()
+            active = m.create_job(db, "a", "", "per_user_env", {"category": "env_file", "prompt": "x"})
+            done = m.create_job(db, "b", "", "per_user_env", {"category": "env_file", "prompt": "y"})
+            done.status = JOB_STATUS_COMPLETED
+            db.commit()
+            return active, done, m, db
+
+        active, done, m, db = asyncio.run(scenario())
+        cancelled = m.cancel_job(db, active.id)
+        assert cancelled.status == JOB_STATUS_CANCELLED
+        assert active.id in m._cancelled
+        # Completed jobs are not cancellable.
+        again = m.cancel_job(db, done.id)
+        assert again.status == JOB_STATUS_COMPLETED
+        assert m.cancel_job(db, 99999) is None
+
+    def test_prune_finished_ttl(self, tmp_path):
+        """Finished jobs older than the TTL are pruned; recent ones stay."""
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import AsyncMock
+        from app.services.generation_jobs import (
+            GenerationJobManager, JOB_STATUS_COMPLETED,
+        )
+
+        async def scenario():
+            maker = self._make_session(tmp_path)
+            db = maker()
+            m = GenerationJobManager()
+            m._run_job = AsyncMock()
+            old = m.create_job(db, "a", "", "per_user_env", {"category": "env_file", "prompt": "x"})
+            fresh = m.create_job(db, "b", "", "per_user_env", {"category": "env_file", "prompt": "y"})
+            old.status = JOB_STATUS_COMPLETED
+            old.updated_at = datetime.now(timezone.utc) - timedelta(days=10)
+            fresh.status = JOB_STATUS_COMPLETED
+            db.commit()
+            old_id, fresh_id = old.id, fresh.id
+            pruned = m.prune_finished(db)
+            return pruned, old_id, fresh_id, maker, m
+
+        pruned, old_id, fresh_id, maker, m = asyncio.run(scenario())
+        assert pruned == 1
+        # Fresh session: the pruned row is truly gone (no identity-map staleness).
+        db2 = maker()
+        assert m.get_job(db2, old_id) is None
+        assert m.get_job(db2, fresh_id) is not None
+
+    def test_recover_stale_jobs_marks_interrupted(self, tmp_path):
+        """Restart recovery: queued/running → failed 'interrupted by gateway restart'."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from app.services.generation_jobs import (
+            GenerationJobManager, JOB_STATUS_FAILED, JOB_STATUS_RUNNING,
+            JOB_STATUS_COMPLETED,
+        )
+
+        async def scenario():
+            maker = self._make_session(tmp_path)
+            db = maker()
+            m = GenerationJobManager()
+            m._run_job = AsyncMock()
+            queued = m.create_job(db, "a", "", "per_user_env", {"category": "env_file", "prompt": "x"})
+            running = m.create_job(db, "b", "", "per_user_env", {"category": "env_file", "prompt": "y"})
+            done = m.create_job(db, "c", "", "per_user_env", {"category": "env_file", "prompt": "z"})
+            running.status = JOB_STATUS_RUNNING
+            done.status = JOB_STATUS_COMPLETED
+            db.commit()
+            ids = (queued.id, running.id, done.id)
+            recovered = m.recover_stale_jobs(db)
+            return recovered, ids, maker, m
+
+        recovered, (qid, rid, did), maker, m = asyncio.run(scenario())
+        assert recovered == 2
+        # Fresh session: reload the rows after the bulk UPDATE.
+        db2 = maker()
+        assert m.get_job(db2, qid).status == JOB_STATUS_FAILED
+        assert m.get_job(db2, rid).status == JOB_STATUS_FAILED
+        assert "interrupted by gateway restart" in m.get_job(db2, qid).error
+        assert m.get_job(db2, did).status == JOB_STATUS_COMPLETED
+        assert m._tasks == {} and m._cancelled == set()
+
+
+# ---------------------------------------------------------------------------
+# Tests for GAP-21 — LLM agent tool loop (closed allowlist, rounds cap,
+# single-shot fallback, self-repair) + per-user env generation (GAP-19)
+# ---------------------------------------------------------------------------
+
+class TestAgentToolLoop:
+    """Agentic generation: tool rounds, fallback, self-repair, caps."""
+
+    def _service(self):
+        from app.services.llm_service import LLMService
+        return LLMService()
+
+    def _tool_response(self, calls=None, content=None):
+        """Shape an OpenAI-style chat completion response."""
+        msg = {"role": "assistant", "content": content}
+        if calls:
+            msg["tool_calls"] = calls
+        return {"choices": [{"message": msg}]}
+
+    def _list_files_call(self):
+        return [{"id": "call_1", "type": "function",
+                 "function": {"name": "list_files", "arguments": "{}"}}]
+
+    @staticmethod
+    def _seq_chat(seq):
+        """Wrap an iterator of responses in an async _chat stand-in
+        (``_chat`` is awaited inside generate_with_agent)."""
+        async def _chat(*args, **kwargs):
+            return next(seq)
+        return _chat
+
+    def _base_context(self, tmp_path):
+        return {
+            "project_dir": str(tmp_path),
+            "recipe_path": "",
+            "empty_recipe": False,
+            "prompt": "create the env",
+            "base_files": {},
+            "compose_paths": [],
+            "profiles": [],
+            "deploy_metadata": {"service_name": "myapp", "user_name": "alice",
+                                "label": "0", "domain": "example.com"},
+        }
+
+    def test_tool_round_then_answer(self, tmp_path, monkeypatch):
+        """Model calls list_files once, then answers — no fallback needed."""
+        import asyncio
+        svc = self._service()
+        ctx = self._base_context(tmp_path)
+        calls = iter([
+            self._tool_response(self._list_files_call(), None),
+            self._tool_response(None, "SECRET_KEY=abc"),
+        ])
+        monkeypatch.setattr(svc, "_chat", self._seq_chat(calls))
+        result = asyncio.run(svc.generate_with_agent(_FakeSession(), "env_file", ctx))
+        assert result["generated_content"] == "SECRET_KEY=abc"
+        assert result["validation"]["valid"] is True
+        assert result["tool_rounds"] == 2
+        assert not any("falling back" in w for w in result["warnings"])
+
+    def test_tool_rejection_falls_back_to_single_shot(self, tmp_path, monkeypatch):
+        """Model ignores tools and returns empty → single-shot fallback with URL prefetch."""
+        import asyncio
+        svc = self._service()
+        ctx = self._base_context(tmp_path)
+        calls = iter([
+            self._tool_response(None, ""),          # no tools, empty content
+            self._tool_response(None, "SECRET_KEY=final"),  # single-shot answer
+        ])
+        monkeypatch.setattr(svc, "_chat", self._seq_chat(calls))
+        result = asyncio.run(svc.generate_with_agent(_FakeSession(), "env_file", ctx))
+        assert any("falling back to single-shot" in w for w in result["warnings"])
+        assert result["generated_content"] == "SECRET_KEY=final"
+
+    def test_self_repair_on_validation_failure(self, tmp_path, monkeypatch):
+        """Invalid env (missing ${IMAGE}) triggers one bounded self-repair round."""
+        import asyncio
+        svc = self._service()
+        compose = tmp_path / "docker-compose.yml"
+        compose.write_text("services:\n  app:\n    image: ${IMAGE}\n", encoding="utf-8")
+        ctx = self._base_context(tmp_path)
+        ctx["compose_paths"] = [str(compose)]
+        calls = iter([
+            self._tool_response(None, "A=1"),                     # missing IMAGE
+            self._tool_response(None, "IMAGE=nginx:latest\nA=1"),  # repaired
+        ])
+        monkeypatch.setattr(svc, "_chat", self._seq_chat(calls))
+        result = asyncio.run(svc.generate_with_agent(_FakeSession(), "env_file", ctx))
+        assert result["validation"]["valid"] is True
+        assert result["generated_content"] == "IMAGE=nginx:latest\nA=1"
+        assert result["tool_rounds"] == 2
+
+    def test_tool_loop_capped_and_flagged(self, tmp_path, monkeypatch):
+        """A model that never answers hits the tool-round cap with a warning."""
+        import asyncio
+        svc = self._service()
+        ctx = self._base_context(tmp_path)
+        (tmp_path / "main.py").write_text("print(1)\n", encoding="utf-8")
+
+        async def always_tool(*args, **kwargs):
+            return self._tool_response(self._list_files_call(), None)
+
+        monkeypatch.setattr(svc, "_chat", always_tool)
+        result = asyncio.run(svc.generate_with_agent(_FakeSession(), "env_file", ctx))
+        assert result["tool_rounds"] == 6
+        assert any("tool loop exhausted" in w for w in result["warnings"])
+        assert result["generated_content"] == ""
+
+    def test_empty_recipe_requires_prompt(self, tmp_path, monkeypatch):
+        """Empty recipe without a prompt short-circuits before any LLM call."""
+        import asyncio
+        svc = self._service()
+        ctx = self._base_context(tmp_path)
+        ctx["empty_recipe"] = True
+        ctx["prompt"] = ""
+        monkeypatch.setattr(svc, "_chat", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call LLM")))
+        result = asyncio.run(svc.generate_with_agent(_FakeSession(), "env_file", ctx))
+        assert result["generated_content"] == ""
+        assert any("Prompt is REQUIRED" in w for w in result["warnings"])
+
+    def test_per_user_env_generation(self, tmp_path, monkeypatch):
+        """generate_per_user_env targets .env.{user}.{label} with a fresh SECRET_KEY
+        and never touches the stored default (GAP-19)."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        svc = self._service()
+        ctx = self._base_context(tmp_path)
+        ctx["deploy_metadata"] = {"service_name": "myapp", "user_name": "alice",
+                                  "label": "0", "domain": "example.com"}
+        svc.generate_with_agent = AsyncMock(return_value={
+            "generated_content": "SECRET_KEY=fresh-secret\n",
+            "validation": {"valid": True}, "warnings": [], "tool_rounds": 1,
+        })
+        result = asyncio.run(svc.generate_per_user_env(_FakeSession(), ctx))
+        assert result["per_user_env_name"] == ".env.alice.0"
+        assert result["hostname"] == "myapp-alice-0.example.com"
+        # generate_with_agent(db, config_type, context) — context is arg 2.
+        call_config_type = svc.generate_with_agent.call_args.args[1]
+        call_ctx = svc.generate_with_agent.call_args.args[2]
+        assert call_config_type == "env_file"
+        assert "fresh" in call_ctx["prompt"]
+        assert "SECRET_KEY" in call_ctx["prompt"]
+
+    def test_unknown_tool_rejected(self, tmp_path):
+        """The tool allowlist is closed — anything else is an error."""
+        import asyncio
+        svc = self._service()
+        ctx = self._base_context(tmp_path)
+        assert asyncio.run(svc._exec_tool("bash", {}, ctx)).startswith("ERROR: unknown tool")
+
+    def test_read_file_path_confined(self, tmp_path):
+        """read_file cannot escape the project/recipe scope."""
+        import asyncio
+        svc = self._service()
+        ctx = self._base_context(tmp_path)
+        (tmp_path / "main.py").write_text("print(1)\n", encoding="utf-8")
+        assert asyncio.run(svc._exec_tool("read_file", {"path": "../etc/passwd"}, ctx)).startswith("ERROR")
+        assert asyncio.run(svc._exec_tool("read_file", {"path": "missing.py"}, ctx)).startswith("ERROR")
+        out = asyncio.run(svc._exec_tool("read_file", {"path": "main.py"}, ctx))
+        assert out.startswith("<file main.py>")
+
+    def test_web_fetch_rejects_non_http(self):
+        """web_fetch only allows http/https URLs."""
+        import asyncio
+        svc = self._service()
+        out = asyncio.run(svc._exec_tool("web_fetch", {"url": "file:///etc/passwd"}, {}))
+        assert "ERROR" in out
+
+
+# ---------------------------------------------------------------------------
+# Tests for GAP-16/20 — gateway var_scan port (parity with api-side scanner)
+# ---------------------------------------------------------------------------
+
+class TestGatewayVarScan:
+    """The gateway ${VAR} scanner must behave exactly like the api-side one."""
+
+    def test_basic_ref_and_default(self):
+        from app.utils.var_scan import scan_text
+        refs = scan_text("image: ${IMAGE}\nport: ${PORT:-8080}\n").refs
+        names = [(r.name, r.has_default, r.required) for r in refs]
+        assert ("IMAGE", False, False) in names
+        assert ("PORT", True, False) in names
+
+    def test_required_syntax(self):
+        from app.utils.var_scan import scan_text
+        refs = scan_text("${DB_URL:?db url required}").refs
+        assert refs[0].name == "DB_URL"
+        assert refs[0].required is True
+
+    def test_nested_defaults(self):
+        from app.utils.var_scan import scan_text
+        refs = scan_text("${A:-${B:-x}}").refs
+        names = sorted(r.name for r in refs)
+        assert names == ["A", "B"]
+        assert all(r.has_default for r in refs)
+
+    def test_dollar_escapes(self):
+        from app.utils.var_scan import scan_text
+        # $${LIT} is a literal ${LIT}; $${REAL} (odd run) is a live ref.
+        assert [r.name for r in scan_text("$${LIT}").refs] == []
+        assert [r.name for r in scan_text("$$${REAL}").refs] == ["REAL"]
+
+    def test_missing_and_completeness(self):
+        import tempfile
+        from pathlib import Path
+        from app.utils.var_scan import env_completeness, parse_env_file, skeleton_env
+        with tempfile.TemporaryDirectory() as tmp:
+            compose = Path(tmp) / "docker-compose.yml"
+            compose.write_text(
+                "services:\n  app:\n    image: ${IMAGE}\n    ports:\n      - \"${PORT:-80}:80\"\n",
+                encoding="utf-8",
+            )
+            env = Path(tmp) / ".env"
+            env.write_text("IMAGE=nginx\n", encoding="utf-8")
+            assert env_completeness([compose], [env]) == []
+            env.write_text("", encoding="utf-8")
+            assert env_completeness([compose], [env]) == ["IMAGE"]
+            skel = skeleton_env([compose])
+            assert skel.strip() == "IMAGE="
+        assert parse_env_file(Path(tmp) / "missing.env") == {}
+
+    def test_needs_env_union_scan(self):
+        import tempfile
+        from pathlib import Path
+        from app.utils.var_scan import needs_env
+        with tempfile.TemporaryDirectory() as tmp:
+            a = Path(tmp) / "a.yml"
+            b = Path(tmp) / "b.yml"
+            a.write_text("services:\n  x:\n    image: nginx\n", encoding="utf-8")
+            b.write_text("services:\n  y:\n    image: ${IMG}\n", encoding="utf-8")
+            assert needs_env([a]) is False
+            assert needs_env([a, b]) is True
+
+
+# ---------------------------------------------------------------------------
+# Tests for GAP-2 — frontend: generate-missing panel + selection UI + deploy
+# panel integration (static-content checks on the TSX sources)
+# ---------------------------------------------------------------------------
+
+_DASH = Path(__file__).parent.parent.parent / "provision-dashboard"
+
+
+class TestGenerateMissingPanel:
+    """The LLM generate-missing panel (opened by the Missing-files action)."""
+
+    def _src(self) -> str:
+        return (_DASH / "src" / "components" / "services" / "GenerateMissingPanel.tsx").read_text()
+
+    def test_panel_exists_and_uses_selection_ui(self):
+        src = self._src()
+        assert "FileSetSelection" in src
+        assert "service_name" in src and "recipe_path" in src
+
+    def test_panel_uses_async_job_with_polling(self):
+        src = self._src()
+        assert "useGenerationJob" in src
+        assert "job_type: 'generate_missing'" in src
+        assert "Save to project" in src
+        # The /llm/jobs endpoints (POST start / GET poll / DELETE cancel) are
+        # implemented by the shared hook, not the panel itself.
+        hook = (_DASH / "src" / "hooks" / "useGenerationJob.ts").read_text()
+        assert "/llm/jobs" in hook
+        assert "setInterval" in hook
+
+    def test_panel_has_prompt_input_and_review_gate(self):
+        src = self._src()
+        assert "Generation prompt" in src
+        assert "REQUIRED when the recipe has no base files" in src
+        assert "Review &amp; edit" in src or "review" in src.lower()
+
+    def test_panel_no_llm_alert_and_greyed_generate(self):
+        src = self._src()
+        assert "No LLM configured — no-LLM fallback strategy in effect" in src
+        assert "disabled={!llmActive" in src
+
+    def test_panel_cancels_job(self):
+        src = self._src()
+        assert "cancelJob" in src
+        assert "Cancel" in src
+
+    def test_panel_saves_generated_via_save_generated(self):
+        src = self._src()
+        assert "/services/save-generated" in src
+        assert "selection" in src
+
+    def test_panel_recomputes_profiles_from_compose_selection(self):
+        """GAP-2/GAP-4: the panel derives profile candidates from the IN-PANEL
+        compose selection (file-sets derive) instead of showing the stale
+        'No non-empty profiles found.' from the stored set only."""
+        src = self._src()
+        assert "deriveProfiles" in src
+        assert "selection.compose.length === 0" in src
+        assert "profiles.includes(p)" in src  # stale-profile pruning
+        api = (_DASH / "src" / "api" / "services.ts").read_text()
+        assert "file-sets/derive" in api
+
+
+class TestFileSetSelection:
+    """Shared per-recipe selection component (both panels)."""
+
+    def _src(self) -> str:
+        return (_DASH / "src" / "components" / "services" / "FileSetSelection.tsx").read_text()
+
+    def test_ordered_multi_with_order_controls(self):
+        src = self._src()
+        assert "ArrowUpOutlined" in src and "ArrowDownOutlined" in src
+        assert "merge order" in src
+
+    def test_nginx_single_select_optional(self):
+        src = self._src()
+        assert "No nginx selected (optional)" in src
+        assert "allowClear" in src
+
+    def test_env_disabled_without_needs_env(self):
+        src = self._src()
+        assert "needsEnv" in src
+        assert "No ${VAR} interpolation detected" in src
+
+    def test_profiles_checkboxes(self):
+        src = self._src()
+        assert "Checkbox.Group" in src
+        assert "gate optional services" in src
+
+    def test_stale_keep_and_mark(self):
+        src = self._src()
+        assert "stale" in src.lower()
+        assert "excluded from generation/deploy requests" in src
+
+
+class TestServicesPagePanelOpen:
+    """The Missing-files action now opens the panel (no direct generation)."""
+
+    def _src(self) -> str:
+        return (_DASH / "src" / "pages" / "ServicesPage.tsx").read_text()
+
+    def test_action_opens_panel(self):
+        src = self._src()
+        assert "GenerateMissingPanel" in src
+        assert "setGenPanel" in src
+
+    def test_direct_single_shot_generation_retired(self):
+        src = self._src()
+        assert "generateMissingFiles" not in src
+        assert "/llm/generate" not in src
+
+
+class TestDeployFormSelection:
+    """Deploy panel: full selection + prompt UI + deploy-time per-user env."""
+
+    def _src(self) -> str:
+        return (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+
+    def test_selection_section_present(self):
+        src = self._src()
+        assert "FileSetSelection" in src
+        assert "Base file selection" in src
+
+    def test_prompt_input_in_deploy_panel(self):
+        src = self._src()
+        assert "Generation prompt" in src
+
+    def test_per_user_env_generation(self):
+        src = self._src()
+        assert "Generate per-user .env at deploy time" in src
+        assert "job_type: 'per_user_env'" in src
+        assert "fresh SECRET_KEY" in src or "fresh, " in src
+
+    def test_payload_uses_ordered_compose_and_profiles(self):
+        src = self._src()
+        assert "compose_file_paths" in src
+        assert "payload.profiles" in src
+        assert "env_files" in src
+
+    def test_selection_persisted_on_deploy(self):
+        src = self._src()
+        assert "selection: sel" in src
+
+    def test_deploy_panel_recomputes_profiles_from_compose_selection(self):
+        """GAP-2/GAP-4: the deploy panel derives profile candidates from the
+        IN-PANEL compose selection (file-sets derive) too."""
+        src = self._src()
+        assert "deriveProfiles" in src
+        assert "Form.useWatch('service_name', form)" in src
+        assert "profiles.includes(p)" in src  # stale-profile pruning
+        api = (_DASH / "src" / "api" / "services.ts").read_text()
+        assert "file-sets/derive" in api
+
+    def test_implicit_auto_generation_retired(self):
+        src = self._src()
+        assert "Auto Templates Completion" not in src
+        assert "autoDeploy" not in src
+
+    def test_no_llm_fallback_alert(self):
+        src = self._src()
+        assert "no-LLM fallback strategy in effect" in src
+
+
+class TestUseGenerationJob:
+    """The shared async job client hook (create / poll / cancel)."""
+
+    def _src(self) -> str:
+        return (_DASH / "src" / "hooks" / "useGenerationJob.ts").read_text()
+
+    def test_creates_job_via_post(self):
+        src = self._src()
+        assert "client.post('/llm/jobs'" in src
+
+    def test_polls_job(self):
+        src = self._src()
+        assert "client.get(`/llm/jobs/${id}`)" in src
+        assert "setInterval" in src
+
+    def test_cancels_via_delete(self):
+        src = self._src()
+        assert "client.delete(`/llm/jobs/${jobId}`)" in src
+
+
+# ---------------------------------------------------------------------------
+# GAP-24: lightweight convert/preview (design §Implementation notes L284-286)
+# ---------------------------------------------------------------------------
+
+class TestComposePreviewProxy:
+    """Gateway compose-preview: proxied converter in-call src→key mapping."""
+
+    def test_provision_service_has_compose_preview(self):
+        """provision_service should expose a compose_preview public method."""
+        from app.services.provision_service import ProvisionService
+        assert callable(ProvisionService().compose_preview)
+
+    def test_compose_preview_route_exists_and_is_async(self):
+        """Services router should expose GET /{name}/compose-preview (async)."""
+        from app.routers.services import router
+        routes = [r.path for r in router.routes]
+        assert any("compose-preview" in r for r in routes), (
+            f"compose-preview route missing from services router. Routes: {routes}"
+        )
+        import inspect
+        from app.routers.services import compose_preview
+        assert inspect.iscoroutinefunction(compose_preview), (
+            "compose_preview should be an async function"
+        )
+
+    def test_compose_preview_forwards_files_and_recipe_path(self, monkeypatch):
+        """compose_preview must forward compose_files + recipe_path as params."""
+        from app.services.provision_service import ProvisionService
+        captured: dict = {}
+
+        async def fake_request(self, method, path, json_data=None, params=None, timeout=300.0):
+            captured["path"] = path
+            captured["params"] = params
+            return {
+                "compose_files": ["docker-compose.yml"],
+                "src_to_key": {"./app_data": "app_data"},
+                "volume_keys": ["app_data"],
+            }
+
+        monkeypatch.setattr(ProvisionService, "_request", fake_request)
+        import asyncio
+        result = asyncio.run(
+            ProvisionService().compose_preview(
+                "multisvc", ["docker-compose.yml"], "recipes/web"
+            )
+        )
+        assert captured["path"] == "/services/multisvc/compose/preview"
+        assert captured["params"] == {
+            "compose_files": ["docker-compose.yml"],
+            "recipe_path": "recipes/web",
+        }
+        assert result["volume_keys"] == ["app_data"]
+
+    def test_compose_preview_no_recipe_path(self, monkeypatch):
+        """Without recipe_path, only compose_files params are forwarded."""
+        from app.services.provision_service import ProvisionService
+        captured: dict = {}
+
+        async def fake_request(self, method, path, json_data=None, params=None, timeout=300.0):
+            captured["params"] = params
+            return {"volume_keys": []}
+
+        monkeypatch.setattr(ProvisionService, "_request", fake_request)
+        import asyncio
+        asyncio.run(ProvisionService().compose_preview("myapp", ["a.yml", "b.yml"]))
+        assert captured["params"] == {"compose_files": ["a.yml", "b.yml"]}
+
+    def test_endpoint_wraps_provision_errors_as_502(self, monkeypatch):
+        """provision-api failures surface as 502, mirroring check-missing-files."""
+        import asyncio
+        from app.routers.services import compose_preview
+        from app.services.provision_service import provision_service
+        from fastapi import HTTPException
+
+        async def boom(*a, **k):
+            raise RuntimeError("provision-api down")
+
+        monkeypatch.setattr(provision_service, "compose_preview", boom)
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(compose_preview("myapp", ["docker-compose.yml"], ""))
+        assert exc.value.status_code == 502
+
+    def test_frontend_no_longer_parses_j2_for_volume_keys(self):
+        """DeployForm must obtain volume keys from the preview endpoint, not
+        regex-parsing .j2 templates (design §Implementation notes L284-286)."""
+        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
+        content = deploy_form.read_text()
+        assert "compose-preview" in content, (
+            "DeployForm should call the compose-preview endpoint"
+        )
+        assert "volRegex" not in content, (
+            "DeployForm must not regex-parse .j2 content for volume keys"
+        )
+        assert "/services/${baseName}/files/" not in content.replace(" ", ""), (
+            "DeployForm must not fetch raw .j2 files to derive volume keys"
+        )

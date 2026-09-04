@@ -153,16 +153,22 @@ export default function UsersPage() {
     } catch { /* ignore */ }
   }
 
-  // Check file modification times for deployment files
+  // Check file modification times for per-user deployment files
+  // (recipe-root scoped; the convention list endpoint was retired — GAP-18).
   const checkFileModTimes = useCallback(async (user: string, service: string, label: string) => {
     const key = `${user}-${service}-${label}`
     try {
-      const { data } = await client.get(`/users/${user}/${service}/${label}/deployment-files`)
+      const envName = `.env.${user}.${label}`
+      const composeName = `docker-compose.user-${user}.${label}.yml`
+      const [envRes, composeRes] = await Promise.all([
+        client.get(`/users/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: '', filename: envName } }),
+        client.get(`/users/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: '', filename: composeName } }),
+      ])
       let latestMod: number | null = null
-      for (const f of (data.files || [])) {
-        if (f.exists && f.modified_at) {
-          if (latestMod === null || f.modified_at > latestMod) {
-            latestMod = f.modified_at
+      for (const data of [envRes.data, composeRes.data]) {
+        if (data.exists && data.modified_at) {
+          if (latestMod === null || data.modified_at > latestMod) {
+            latestMod = data.modified_at
           }
         }
       }
@@ -214,7 +220,7 @@ export default function UsersPage() {
   useEffect(() => {
     for (const svc of services) {
       const key = `${svc.user_name}-${svc.service_name}-${svc.label}`
-      // deployment-files (checkFileModTimes) is admin-only — skip for viewers
+      // per-user-file mod-time checks (checkFileModTimes) are admin-only — skip for viewers
       if (isAdmin && fileModTimes[key] === undefined) {
         checkFileModTimes(svc.user_name, svc.service_name, svc.label)
       }
@@ -236,7 +242,7 @@ export default function UsersPage() {
     setEditorFile({ user, service, label, fileType, filename, path: '' })
     setEditorOpen(true)
     try {
-      const { data } = await client.get(`/users/${user}/${service}/${label}/deployment-files/${fileType}`)
+      const { data } = await client.get(`/users/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: '', filename } })
       setEditorContent(data.content || '')
       setEditorOriginal(data.content || '')
       setEditorFile(prev => prev ? {...prev, path: data.path || ''} : null)
@@ -264,7 +270,7 @@ export default function UsersPage() {
     if (!editorFile) return
     setEditorSaving(true)
     try {
-      await client.put(`/users/${editorFile.user}/${editorFile.service}/${editorFile.label}/deployment-files/${editorFile.fileType}`, { content: editorContent })
+      await client.put(`/users/${editorFile.user}/${editorFile.service}/${editorFile.label}/per-user-file`, { recipe_path: '', filename: editorFile.filename, content: editorContent })
       message.success('File saved')
       setEditorOriginal(editorContent)
       // Re-check modification times
@@ -623,18 +629,6 @@ export default function UsersPage() {
                             <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
                               onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'compose', composeFile)}>{composeFile}</Text>
                             <Text type="secondary" style={{fontSize:11}}> (in PROVISION/source_projects/{svc.service_name} dir)</Text>
-                          </div>
-                        })()}
-                        {/* nginx conf file */}
-                        {(() => {
-                          const nginxConfPath = svc.nginx_conf_template_path || ''
-                          const nginxBase = nginxConfPath.split('/').pop()?.replace('.j2', '') || svc.service_name
-                          const nginxConfFile = `${nginxBase}.user-${svc.user_name}.${svc.label}.nginx.conf`
-                          return <div style={{marginBottom:4}}>
-                            <Text>nginx conf: </Text>
-                            <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
-                              onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'nginx', nginxConfFile)}>{nginxConfFile}</Text>
-                            <Text type="secondary" style={{fontSize:11}}> (in PROVISION/generated dir)</Text>
                           </div>
                         })()}
                         {/* ssl */}

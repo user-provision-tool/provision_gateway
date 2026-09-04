@@ -5,6 +5,19 @@ hidden ``.provision-state.json`` file (like ``.generated`` markers). A recipe
 dir is re-scanned only when its top-level fingerprint changed, so listing a
 large repo stays fast after the first scan.
 
+Schema v2 adds the per-recipe **file sets** (file-selection-and-generation
+design)::
+
+    file_sets: { "<recipe_path>": {
+        compose:  [ordered paths],   # multi, ordered
+        nginx:    path | null,       # single
+        env:      [ordered paths],   # INTERPOLATION env only (.env-class; order matters)
+        profiles: [str]              # selectable option category
+    }}
+
+v1 files load with empty ``file_sets`` (backward compatible — the bump only
+adds the field). Recipe keys use ``"."`` for the project root.
+
 No scan logic here — this module only fingerprints and persists; scanning
 lives in ``service_manager`` (avoids circular imports).
 """
@@ -18,7 +31,11 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_STATE_FILENAME = ".provision-state.json"
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
+# v1 files are accepted and silently upgraded in-memory (file_sets added).
+_ACCEPTED_SCHEMA_VERSIONS = (1, 2)
+
+ROOT_RECIPE_KEY = "."
 
 
 def compute_dir_fingerprint(dir_path: str | Path) -> dict[str, dict]:
@@ -64,13 +81,41 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalize_file_sets(raw: Any) -> dict[str, dict]:
+    """Validate + normalize a loaded ``file_sets`` payload.
+
+    Accepts v2 payloads only; anything malformed is dropped per-key so a
+    corrupt entry can never crash listing. Each recipe entry keeps the four
+    known categories and discards unknown keys.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, dict] = {}
+    for recipe_key, entry in raw.items():
+        if not isinstance(recipe_key, str) or not isinstance(entry, dict):
+            continue
+        compose = [p for p in (entry.get("compose") or []) if isinstance(p, str)]
+        nginx = entry.get("nginx")
+        if nginx is not None and not isinstance(nginx, str):
+            nginx = None
+        env = [p for p in (entry.get("env") or []) if isinstance(p, str)]
+        profiles = [p for p in (entry.get("profiles") or []) if isinstance(p, str)]
+        result[recipe_key] = {
+            "compose": compose,
+            "nginx": nginx,
+            "env": env,
+            "profiles": profiles,
+        }
+    return result
+
+
 class ProjectState:
     """Serialized per-project scan state.
 
     Fields:
         schema_version, recipe_origin ("user"|"auto"), recipe_paths: list[str],
         recipes: list[dict], files, generated_files, template_files: list[str],
-        dir_scans: dict[str, dict], updated_at: str
+        dir_scans: dict[str, dict], file_sets: dict[str, dict], updated_at: str
     """
 
     def __init__(
@@ -84,6 +129,7 @@ class ProjectState:
         generated_files: list[str] | None = None,
         template_files: list[str] | None = None,
         dir_scans: dict[str, dict] | None = None,
+        file_sets: dict[str, dict] | None = None,
         updated_at: str = "",
     ) -> None:
         self.project_dir = Path(project_dir)
@@ -95,6 +141,7 @@ class ProjectState:
         self.generated_files = list(generated_files or [])
         self.template_files = list(template_files or [])
         self.dir_scans = dict(dir_scans or {})
+        self.file_sets = _normalize_file_sets(file_sets or {})
         self.updated_at = updated_at
 
     @classmethod
@@ -102,7 +149,8 @@ class ProjectState:
         """Load the state file for a project; None on missing or corrupt.
 
         A corrupt file (bad JSON, wrong schema version, non-dict payload) is
-        treated as absent so the caller starts fresh.
+        treated as absent so the caller starts fresh. v1 payloads load with
+        empty ``file_sets`` (the schema bump only adds the field).
         """
         path = Path(project_dir) / PROJECT_STATE_FILENAME
         if not path.is_file():
@@ -111,7 +159,7 @@ class ProjectState:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
-        if not isinstance(data, dict) or data.get("schema_version") != STATE_SCHEMA_VERSION:
+        if not isinstance(data, dict) or data.get("schema_version") not in _ACCEPTED_SCHEMA_VERSIONS:
             return None
         try:
             state = cls(project_dir)
@@ -123,6 +171,7 @@ class ProjectState:
             state.generated_files = [str(f) for f in (data.get("generated_files") or [])]
             state.template_files = [str(f) for f in (data.get("template_files") or [])]
             state.dir_scans = dict(data.get("dir_scans") or {})
+            state.file_sets = _normalize_file_sets(data.get("file_sets") or {})
             state.updated_at = str(data.get("updated_at") or "")
         except (TypeError, ValueError):
             return None
@@ -145,6 +194,7 @@ class ProjectState:
             "generated_files": self.generated_files,
             "template_files": self.template_files,
             "dir_scans": self.dir_scans,
+            "file_sets": self.file_sets,
             "updated_at": self.updated_at,
         }
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")

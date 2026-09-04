@@ -1704,3 +1704,24 @@ These features have been implemented in `_users_provision/` to fully support the
 | `GATEWAY_LOG_LEVEL` | — | `INFO` | Logging level |
 | `JWT_EXPIRE_SEC` | — | `3600` | JWT access token TTL |
 | `JWT_REFRESH_EXPIRE_SEC` | — | `604800` | JWT refresh token TTL (7 days) |
+
+---
+
+## 11. Cross-Process Race Window (documented, not mitigated)
+
+Design §Implementation notes L270-272 (`file-selection-and-generation-design.md`):
+generation-save vs deploy is **cross-process** — the gateway process saves
+generated files (atomic: write content, then write the `.generated` marker),
+while the provision-api process registers deployments that **read at render
+time**. There is **no shared lock** between the two processes.
+
+The narrow acceptable race window this leaves is intentional and documented,
+**not mitigated** (no cross-process mutex/fencing). A deploy that races an
+in-progress generation-save simply reads the pre-write (or pre-marker)
+snapshot of the compose/nginx/env files; the operator's review gate
+(save-generated) and the deploy task outcome make the race harmless in
+practice. Implementation-site notes live at:
+
+- `provision-gateway/app/routers/services.py` — `save_generated_files` (save site)
+- `provision-gateway/app/services/generation_jobs.py` — job manager (save path)
+- `_users_provision/user_provision_tool/api.py` — `register_user` (deploy read site)

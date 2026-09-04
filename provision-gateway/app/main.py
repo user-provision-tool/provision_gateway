@@ -151,6 +151,16 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         print(f"[gateway] WARNING: default-key backfill failed: {exc}")
 
+    # Generation jobs left queued/running by a previous process are dead —
+    # mark them failed ("interrupted by gateway restart") so polls resolve.
+    try:
+        from .services.generation_jobs import generation_jobs
+        stale = generation_jobs.recover_stale_jobs(SessionLocal())
+        if stale:
+            print(f"[gateway] Marked {stale} stale generation job(s) as failed (restart recovery)")
+    except Exception as exc:
+        print(f"[gateway] WARNING: generation-job recovery failed: {exc}")
+
     _reconcile_task = asyncio.create_task(_reconcile_loop())
     print("[gateway] Scheduled reconciliation background task started")
     _docker_events_task = asyncio.create_task(_docker_events_monitor())

@@ -22,7 +22,13 @@ services:
       - REGISTRY_FILE=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/user_registry.yml
       - PROVISION_COOKIE_TTL=${PROVISION_COOKIE_TTL:-604800}
     networks:
-      - subnet_acl_shared
+      # Static IP pin: the edge (subnet-acl-nginx-acl) resolves the DNS name
+      # 'subnet-acl-gateway' at startup and caches the peer for the container's
+      # lifetime. Without a pin, any gateway recreate can move the container to a
+      # new IP and silently break every edge -> gateway proxy hop (502) until the
+      # edge is restarted (cycle 20260901T102115Z GAP-22). Pin keeps the IP stable.
+      subnet_acl_shared:
+        ipv4_address: 172.17.0.4
     restart: unless-stopped
 
   subnet-acl-dashboard:

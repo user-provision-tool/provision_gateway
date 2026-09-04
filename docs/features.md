@@ -37,6 +37,48 @@
 > pytest 293/0 (11.63s), shell 124/0 (10+53+10+24+27), browser 4/0, registry 15/15 RESOLVED 0 OPEN.
 > Rows updated: S5 (marker-only classification + lazy tree), RC1 (root-only default + explicit recipe
 > paths).
+> **Updated**: 2026-09-01 — cycle 20260901T102115Z file-selection-and-generation design FINAL
+> verification (supervisor PASSED, openGapCount=0, iteration 3): the iter-3 gap list was EMPTY
+> (analyzer PASSED gaps:[], gap-reviewer r1 PASSED failures:[], coder filesChanged:[] — no
+> code/config/test changes). GAP-23/GAP-24 (implemented iter-2) remain live, re-verified this
+> iteration: race-window documentation at all 4 implementation sites (design.md §11 L1718,
+> routers/services.py:393, generation_jobs.py:75, user_provision_tool/api.py:350); compose-preview
+> chain end-to-end (gateway GET /{name}/compose-preview → provision-api GET
+> /services/{name}/compose/preview → DeployForm volume rows from volume_keys; browser Deploy modal
+> auto-populated 54 volume rows, 0 console errors). Final test evidence (QA iter-3 r1 + supervisor):
+> gateway pytest 348/0 + provision-api pytest 438/0 (pythonPassed 786), shell 124/0 (53+10+10+24+27),
+> browser 4/0, edge nginx 0 [error], registry 24/24 RESOLVED 0 OPEN. No feature row in this doc
+> changed status.
+> **Updated**: 2026-09-01 — cycle 20260901T164901Z file-selection-and-generation design FINAL
+> verification (supervisor PASSED, openGapCount=0, iteration 3): GAP-1..GAP-4 (implemented iter-1)
+> re-verified live — per-user-file GET/PUT and save-generated now reject recipe_path traversal at
+> every join site (`..`/`../..` → 400, absolute recipe_path re-rooted into the project dir;
+> users.py `_resolve_per_user_file`, services.py save-generated + `_compute_needs_env`/check-missing
+> fallbacks, llm_service validation drafts reject invalid recipe_path, service_manager
+> `_scan_recipe_dir` skips traversal-invalid paths); new traversal-safe `file_sets.derive_profiles`
+> + admin-gated `POST /api/services/{name}/file-sets/derive`; both panels (GenerateMissingPanel,
+> DeployForm) recompute the profiles section from the in-panel compose selection (23-profile union
+> live, nothing persisted) — rows F3-F11/F17-F19/F47/F49 DEVIATES → IMPLEMENTED. Iter-2 env fix
+> GAP-5 (`server_names_hash_bucket_size 128` in nginx.provision.conf) holds: subnet-acl-nginx Up
+> RestartCount 0, 8766 401/444 signature; GAP-6 (test_gateway_api 4.1 down-op) resolved 53/0.
+> Iter-3 GAP-7 (flaky test_merge_real_docker_golden) fixed in the test-script layer
+> (`_retry_transient` bounded retry, user_provision_tool tests). Final test evidence (QA iter-3
+> r2 + supervisor): gateway pytest 363/0 + user_provision_tool pytest 441/0 (pythonPassed 804),
+> shell 245/0, browser 6/0 (iter-3 r1 full matrix; r2 0/0 — webui unchanged, 0 console errors),
+> registry 7/7 RESOLVED 0 OPEN. All F1-F62 IMPLEMENTED — no feature row in this doc changed status.
+> **Updated**: 2026-09-03 — cycle 20260903T154936Z file-selection-and-generation design FINAL
+> verification (supervisor PASSED, openGapCount=0, iteration 3): the iter-1/iter-2/iter-3 gap
+> lists were ALL EMPTY (analyzer PASSED gaps:[] each iteration, gap-reviewer r1 PASSED
+> failures:[], coder filesChanged:[] — no code/config/test changes in this whole cycle; drift
+> clean: no source file newer than 2026-09-01T19:31:40Z). F1-F62 all remain IMPLEMENTED;
+> prior-cycle GAP-1..GAP-7 (cycle 20260901T164901Z) remain RESOLVED 7/7, re-verified in source
+> this cycle (users.py:557-674 traversal rejection + derive 400s; nginx.provision.conf:27
+> server_names_hash_bucket_size; _retry_transient tests/test_selection_generation.py:17/169);
+> the four design-documented bugs still FIXED in source (no DEVIATES table rows). Final test
+> evidence (QA iter-3 r1 + supervisor): python 804/0 (gateway 363/0 + user_provision_tool
+> 441/0), shell 245/0 (27+10+10+24+53+121), browser 1/0 (dashboard renders, ACL Enabled,
+> 5/5 System Components Running, console 0 errors), stack 5/5 Up RestartCount 0 (probes
+> 200/200/200), registry 0 OPEN. No feature row in this doc changed status.
 > **Coverage note**: this doc is the capability summary; the complete endpoint reference (including
 > `GET /api/auth/me`, `POST /api/auth/logout`, `DELETE /api/tasks/{task_id}`, per-service container logs,
 > and the DB `_ensure_schema` migration) is in `api_references.md`.
