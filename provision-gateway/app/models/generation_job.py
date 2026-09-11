@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import Column, DateTime, Integer, String, Text
@@ -36,9 +37,10 @@ class GenerationJob(Base):
     # Result: {"files": {filename: content}} for completed jobs.
     result = Column(Text, nullable=True)
     error = Column(Text, nullable=True)
-    # Optional per-user generation target (deploy-time per-user env).
-    target_user = Column(String(255), nullable=True)
-    target_label = Column(String(50), nullable=True)
+    # Live token-usage stats {"prompt","completion","reasoning"} (design §2).
+    usage = Column(Text, nullable=True)
+    # Per-file structured events [{file, status, ts, usage}] for the panel.
+    events = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -54,9 +56,17 @@ class GenerationJob(Base):
             "phase_total": self.phase_total,
             "progress": self.progress,
             "error": self.error,
+            "usage": json.loads(self.usage) if self.usage else None,
+            "events": json.loads(self.events) if self.events else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
         if include_result:
-            data["result"] = self.result
+            # result is persisted as a JSON string (generation_jobs._set_status
+            # json.dumps it) — parse it back so callers get the dict (the
+            # deploy panel reads result.files directly).
+            try:
+                data["result"] = json.loads(self.result) if self.result else None
+            except (TypeError, ValueError):
+                data["result"] = self.result
         return data

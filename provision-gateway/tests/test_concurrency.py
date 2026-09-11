@@ -84,18 +84,22 @@ def test_health_responds_while_service_scan_in_flight(monkeypatch):
     import time
 
     from app.main import app
-    from app.middleware import require_admin
+    from app.middleware import require_gateway_token
     from app.services.service_manager import service_manager
 
-    app.dependency_overrides[require_admin] = lambda: {"id": 1, "role": "admin"}
+    # /api/services is guarded by require_gateway_token (the router moved off
+    # require_admin when it was renamed from /api/users).
+    app.dependency_overrides[require_gateway_token] = lambda: {"id": 1, "role": "admin"}
 
-    original = service_manager.list_services
+    # The handler awaits provision_service.list_users() — patch the call it
+    # actually makes (service_manager.list_services is not on this path).
+    from app.services.provision_service import provision_service
 
-    def slow_list_services():
-        time.sleep(1.5)
-        return original()
+    async def slow_list_users():
+        await asyncio.sleep(1.5)
+        return {"user_status": []}
 
-    monkeypatch.setattr(service_manager, "list_services", slow_list_services)
+    monkeypatch.setattr(provision_service, "list_users", slow_list_users)
 
     async def run() -> tuple[httpx.Response, float, httpx.Response]:
         transport = httpx.ASGITransport(app=app)

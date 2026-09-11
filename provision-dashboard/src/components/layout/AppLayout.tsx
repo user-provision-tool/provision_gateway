@@ -21,17 +21,30 @@ import client from '../../api/client'
 const { Header, Sider, Content, Footer } = Layout
 const { Text } = Typography
 
-const menuItems = [
-  { key: '/dashboard', icon: <DashboardOutlined />, label: 'Dashboard' },
-  { key: '/services', icon: <AppstoreOutlined />, label: 'Source Projects' },
-  { key: '/users', icon: <UserOutlined />, label: 'Services' },
-  { key: '/tasks', icon: <UnorderedListOutlined />, label: 'Tasks' },
+// Sidebar groups (top → bottom). Rendered with inset horizontal rules between
+// groups; the last group is pinned to the BOTTOM of the sider (still inside the
+// sidebar — same Menu surface/handling, just pushed down).
+// Route names match the labels: Services → /services, Source Projects → /projects.
+const menuGroups: { key: string; icon: JSX.Element; label: string }[][] = [
+  [{ key: '/dashboard', icon: <DashboardOutlined />, label: 'Dashboard' }],
+  [
+    { key: '/services', icon: <UserOutlined />, label: 'Services' },
+    { key: '/projects', icon: <AppstoreOutlined />, label: 'Source Projects' },
+    { key: '/ssl', icon: <SafetyCertificateOutlined />, label: 'SSL Certs' },
+    { key: '/tasks', icon: <UnorderedListOutlined />, label: 'Tasks' },
+  ],
+  [
+    { key: '/users/manage', icon: <UserOutlined />, label: 'Users' },
+    { key: '/api-keys', icon: <KeyOutlined />, label: 'API Keys' },
+  ],
+]
+// Pinned to the sidebar bottom.
+const menuBottomGroup: { key: string; icon: JSX.Element; label: string }[] = [
   { key: '/settings', icon: <SettingOutlined />, label: 'Settings' },
   { key: '/audit', icon: <AuditOutlined />, label: 'Audit' },
-  { key: '/users/manage', icon: <UserOutlined />, label: 'Users' },
-  { key: '/ssl', icon: <SafetyCertificateOutlined />, label: 'SSL Certs' },
-  { key: '/api-keys', icon: <KeyOutlined />, label: 'API Keys' },
 ]
+// Inset horizontal rule between sidebar groups (indented from both edges).
+const menuDivider = { type: 'divider' as const, style: { margin: '6px 12px', minWidth: 'auto' } }
 
 export default function AppLayout() {
   const [collapsed, setCollapsed] = useState(false)
@@ -53,13 +66,29 @@ export default function AppLayout() {
   const isAdmin = admin?.role === 'admin'
   const isEndUser = (admin as any)?.user_type === 'end_user'
   
-  // Determine visible menu items based on user type and role
-  const visibleMenuItems = (() => {
-    if (isAdmin && !isEndUser) return menuItems // Gateway admin: all items
-    if (isEndUser && admin?.role === 'admin') return menuItems // End-user promoted to admin: all items
-    // End-user viewer: Services page + API Keys page
-    return menuItems.filter(m => m.key === '/users' || m.key === '/api-keys')
-  })()
+  // Determine visible menu items based on user type and role. The viewer filter
+  // applies PER GROUP and empty groups (and their dividers) are dropped, so a
+  // viewer never sees a lone divider or the admin-only bottom group.
+  const isFullAdmin = (isAdmin && !isEndUser) || (isEndUser && admin?.role === 'admin')
+  const canSee = (key: string) => isFullAdmin || key === '/services' || key === '/api-keys'
+  const visibleGroups = menuGroups
+    .map(g => g.filter(m => canSee(m.key)))
+    .filter(g => g.length > 0)
+  const visibleBottom = menuBottomGroup.filter(m => canSee(m.key))
+
+  // Flatten groups into antd items with an inset divider between groups.
+  const toItems = (groups: typeof menuGroups) =>
+    groups.flatMap((g, i) => (i === 0 ? g : [menuDivider, ...g]))
+  const topMenuItems = toItems(visibleGroups)
+  const bottomMenuItems = toItems([visibleBottom].filter(g => g.length > 0))
+
+  // Highlight the longest menu key the current path starts with.
+  const allKeys = [...menuGroups.flat(), ...menuBottomGroup].map(m => m.key)
+  const selectedKeys = [
+    allKeys
+      .filter(k => location.pathname === k || location.pathname.startsWith(k + '/'))
+      .sort((a, b) => b.length - a.length)[0] || location.pathname,
+  ]
 
   const handleMenuClick = ({ key }: { key: string }) => {
     navigate(key)
@@ -219,17 +248,25 @@ export default function AppLayout() {
             {collapsed ? 'PG' : 'Provision Gateway'}
           </Text>
         </div>
-        <Menu
-          theme="dark"
-          mode="inline"
-          selectedKeys={[location.pathname.startsWith('/services') ? '/services' :
-                         location.pathname.startsWith('/users/manage') ? '/users/manage' :
-                         location.pathname.startsWith('/users') ? '/users' :
-                         location.pathname.startsWith('/api-keys') ? '/api-keys' :
-                         location.pathname.startsWith('/alert') ? '/alert' : location.pathname]}
-          items={visibleMenuItems}
-          onClick={handleMenuClick}
-        />
+        {/* Sidebar nav: grouped items + the bottom group pinned INSIDE the sider
+            (flex column + marginTop:auto). */}
+        <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100% - 64px)' }}>
+          <Menu
+            theme="dark"
+            mode="inline"
+            selectedKeys={selectedKeys}
+            items={topMenuItems}
+            onClick={handleMenuClick}
+          />
+          <Menu
+            theme="dark"
+            mode="inline"
+            selectedKeys={selectedKeys}
+            items={bottomMenuItems}
+            onClick={handleMenuClick}
+            style={{ marginTop: 'auto' }}
+          />
+        </div>
       </Sider>
       <Layout style={{ marginLeft: collapsed ? 80 : 220, transition: 'all 0.2s' }}>
         <Header style={{

@@ -33,6 +33,9 @@ from .project_state import (
 
 # Per-user deployment files (.env.{user}.{label}) are NOT candidates.
 _PER_USER_ENV_RE = re.compile(r"^\.env\.[^./]+\.[0-9]+$")
+# Per-user rendered compose artifacts (deploy pipeline output, e.g.
+# docker-compose.user-specialsync.0.yml) — never recipe candidates.
+_PER_USER_COMPOSE_RE = re.compile(r"^docker-compose\.user-[^/]+\.yml$")
 
 _FILE_SET_CATEGORIES = ("compose", "nginx", "env", "profiles")
 
@@ -62,6 +65,8 @@ def _recipe_dir(project_dir: Path, recipe_path: str) -> Path:
 
 def _is_compose_candidate(name: str) -> bool:
     if name.endswith(".generated") or name.endswith(".j2"):
+        return False
+    if _PER_USER_COMPOSE_RE.match(name):
         return False
     return (name.startswith("docker-compose") or name.startswith("compose")) and (
         name.endswith(".yml") or name.endswith(".yaml")

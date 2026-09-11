@@ -21,6 +21,10 @@ class LLMConfig(Base):
     byok_model = Column(String(255), nullable=True)
     is_active = Column(Boolean, nullable=False, default=False)  # only one at a time
     system_prompt = Column(Text, nullable=True)
+    # Generation behavior settings (design §2 LLM settings):
+    reasoning_effort = Column(String(20), nullable=False, default="low")  # UI + backend agree on 'low'
+    max_tokens = Column(Integer, nullable=False, default=100000)
+    tool_rounds_max = Column(Integer, nullable=False, default=6)  # ceiling 20
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     def to_dict(self, mask_key: bool = True, include_agent_fields: bool = False) -> dict:
@@ -38,6 +42,9 @@ class LLMConfig(Base):
             "byok_base_url": self.byok_base_url,
             "byok_model": self.byok_model,
             "is_active": self.is_active,
+            "reasoning_effort": self.reasoning_effort,
+            "max_tokens": self.max_tokens,
+            "tool_rounds_max": self.tool_rounds_max,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
         if include_agent_fields:

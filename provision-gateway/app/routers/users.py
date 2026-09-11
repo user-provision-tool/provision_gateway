@@ -14,7 +14,7 @@ from ..config import settings
 from ..services import audit_service, curl_service
 from ..services.provision_service import provision_service
 
-router = APIRouter(prefix="/api/users", tags=["users"])
+router = APIRouter(prefix="/api/services", tags=["services"])
 
 
 def _log_action_short(action: str, admin_id: int | None = None, **kw) -> None:

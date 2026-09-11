@@ -688,6 +688,30 @@ def update_end_user(
     return {"updated": True, "user": user.to_dict()}
 
 
+@router.put("/users/{user_id}/password")
+def reset_end_user_password(
+    user_id: int,
+    req: dict,
+    current_admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Admin resets an end-user's password (min 4 chars).
+
+    Viewers are auto-registered with random passwords during service deploy —
+    without this the admin has no way to give a viewer a known login
+    credential from the dashboard.
+    """
+    user = db.query(EndUser).filter(EndUser.id == user_id).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+    password = (req or {}).get("password", "")
+    if len(password) < 4:
+        raise HTTPException(400, "password too short (min 4 chars)")
+    user.password_hash = _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
+    db.commit()
+    return {"updated": True, "user": user.to_dict()}
+
+
 @router.delete("/users/{user_id}")
 def delete_end_user(
     user_id: int,

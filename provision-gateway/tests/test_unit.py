@@ -1100,9 +1100,13 @@ class TestPerUserFileEndpoints:
         users_api = (_dash / "src" / "api" / "users.ts").read_text()
         for name, content in [("UsersPage.tsx", users_page), ("FileEditor.tsx", file_editor), ("api/users.ts", users_api)]:
             assert "deployment-files" not in content, f"{name} still calls retired /deployment-files endpoints"
-        # The dirty-check now probes the recipe-root per-user files.
+        # The dirty-check probes the per-user files INSIDE the instance's recipe
+        # dir (the recipe subdir comes from the -api; a hardcoded '' resolved to
+        # the project root and never found a sub-recipe service's files).
         assert "per-user-file" in users_page
-        assert "recipe_path: ''" in users_page
+        assert "recipe_path: recipePath" in users_page
+        assert "recipe_path: editorFile.recipePath" in users_page
+        assert "recipe_path: ''" not in users_page
         assert "per-user-file" in file_editor
         assert "getPerUserFile" in users_api and "savePerUserFile" in users_api
 
@@ -2700,7 +2704,8 @@ class TestViewerServiceVisibility:
         )
         content = users_path.read_text()
         # The fetch must read the backend-filtered payload directly (no owner check).
-        assert "client.get('/users')" in content
+        # (Route/API renamed: Services instances live under /services now.)
+        assert "client.get('/services')" in content
         assert "for (const u of users)" in content
 
 
@@ -2770,7 +2775,7 @@ class TestRouteRoleGating:
     def test_viewer_pages_not_gated(self):
         content = self._app_source()
         # Services (deployed instances) and API Keys are viewer-accessible.
-        assert '<Route path="users" element={<UsersPage />} />' in content
+        assert '<Route path="services" element={<UsersPage />} />' in content
         assert '<Route path="api-keys" element={<ApiKeysPage />} />' in content
 
 
@@ -2883,6 +2888,33 @@ class TestGoServiceRedirect:
         assert "return `/go/${host}`" in content, (
             "service card must link to /go/{hostname} (gateway redirect) so the "
             "browser gets the provision_token cookie for the service domain"
+        )
+
+    def test_deployment_files_links_use_instance_recipe_path(self):
+        """Deployment-Files links must resolve inside the instance's RECIPE dir.
+
+        Regression: the card hardcoded ``recipe_path: ''`` (= project root) and
+        the legacy ``.env.{user}.{label}`` name, so for a multi-recipe service
+        (dify's recipe lives in ``docker/``) every link opened an empty editor
+        ("file does not exist") — and a save would have written a stray file
+        into the project root."""
+        from pathlib import Path
+        p = (
+            Path(__file__).parent.parent.parent
+            / "provision-dashboard" / "src" / "pages" / "UsersPage.tsx"
+        )
+        content = p.read_text()
+        # recipe subdir taken from the -api payload, not hardcoded
+        assert "svc.recipe_path" in content
+        assert "recipePath" in content
+        assert "recipe_path: recipePath" in content, "GET must send the instance recipe path"
+        assert "recipe_path: editorFile.recipePath" in content, "PUT must save back into the same recipe dir"
+        # no leftover hardcoded empty recipe path on either call
+        assert "recipe_path: ''" not in content
+        # the env link targets a file that actually exists (canonical .env.N or .env.raw)
+        assert "svc.env_file_path" in content
+        assert "`.env.${svc.user_name}.${svc.label}`" not in content, (
+            "legacy .env.{user}.{label} name is never written by the pipeline"
         )
 
 
@@ -3973,12 +4005,6 @@ class TestGenerationJobs:
         m = GenerationJobManager()
         assert m._compute_phases("generate_missing", {}) == ["compose", "nginx", "env"]
 
-    def test_compute_phases_per_user_env_is_env_only(self):
-        """per_user_env jobs run ONLY the env phase."""
-        from app.services.generation_jobs import GenerationJobManager
-        m = GenerationJobManager()
-        assert m._compute_phases("per_user_env", {}) == ["env"]
-
     def test_compute_phases_single_category(self):
         """Single-category jobs map to exactly one phase."""
         from app.services.generation_jobs import GenerationJobManager
@@ -4031,8 +4057,8 @@ class TestGenerationJobs:
             db = Session()
             m = GenerationJobManager()
             m._run_job = AsyncMock()
-            j1 = m.create_job(db, "a", "", "per_user_env", {"category": "env_file", "prompt": "x"})
-            j2 = m.create_job(db, "b", "", "per_user_env", {"category": "env_file", "prompt": "y"})
+            j1 = m.create_job(db, "a", "", "env_file", {"category": "env_file", "prompt": "x"})
+            j2 = m.create_job(db, "b", "", "env_file", {"category": "env_file", "prompt": "y"})
             jobs = m.list_jobs(db)
             return j1, j2, jobs, m, db
 
@@ -4056,8 +4082,8 @@ class TestGenerationJobs:
             db = Session()
             m = GenerationJobManager()
             m._run_job = AsyncMock()
-            active = m.create_job(db, "a", "", "per_user_env", {"category": "env_file", "prompt": "x"})
-            done = m.create_job(db, "b", "", "per_user_env", {"category": "env_file", "prompt": "y"})
+            active = m.create_job(db, "a", "", "env_file", {"category": "env_file", "prompt": "x"})
+            done = m.create_job(db, "b", "", "env_file", {"category": "env_file", "prompt": "y"})
             done.status = JOB_STATUS_COMPLETED
             db.commit()
             return active, done, m, db
@@ -4085,8 +4111,8 @@ class TestGenerationJobs:
             db = maker()
             m = GenerationJobManager()
             m._run_job = AsyncMock()
-            old = m.create_job(db, "a", "", "per_user_env", {"category": "env_file", "prompt": "x"})
-            fresh = m.create_job(db, "b", "", "per_user_env", {"category": "env_file", "prompt": "y"})
+            old = m.create_job(db, "a", "", "env_file", {"category": "env_file", "prompt": "x"})
+            fresh = m.create_job(db, "b", "", "env_file", {"category": "env_file", "prompt": "y"})
             old.status = JOB_STATUS_COMPLETED
             old.updated_at = datetime.now(timezone.utc) - timedelta(days=10)
             fresh.status = JOB_STATUS_COMPLETED
@@ -4116,9 +4142,9 @@ class TestGenerationJobs:
             db = maker()
             m = GenerationJobManager()
             m._run_job = AsyncMock()
-            queued = m.create_job(db, "a", "", "per_user_env", {"category": "env_file", "prompt": "x"})
-            running = m.create_job(db, "b", "", "per_user_env", {"category": "env_file", "prompt": "y"})
-            done = m.create_job(db, "c", "", "per_user_env", {"category": "env_file", "prompt": "z"})
+            queued = m.create_job(db, "a", "", "env_file", {"category": "env_file", "prompt": "x"})
+            running = m.create_job(db, "b", "", "env_file", {"category": "env_file", "prompt": "y"})
+            done = m.create_job(db, "c", "", "env_file", {"category": "env_file", "prompt": "z"})
             running.status = JOB_STATUS_RUNNING
             done.status = JOB_STATUS_COMPLETED
             db.commit()
@@ -4256,29 +4282,6 @@ class TestAgentToolLoop:
         result = asyncio.run(svc.generate_with_agent(_FakeSession(), "env_file", ctx))
         assert result["generated_content"] == ""
         assert any("Prompt is REQUIRED" in w for w in result["warnings"])
-
-    def test_per_user_env_generation(self, tmp_path, monkeypatch):
-        """generate_per_user_env targets .env.{user}.{label} with a fresh SECRET_KEY
-        and never touches the stored default (GAP-19)."""
-        import asyncio
-        from unittest.mock import AsyncMock
-        svc = self._service()
-        ctx = self._base_context(tmp_path)
-        ctx["deploy_metadata"] = {"service_name": "myapp", "user_name": "alice",
-                                  "label": "0", "domain": "example.com"}
-        svc.generate_with_agent = AsyncMock(return_value={
-            "generated_content": "SECRET_KEY=fresh-secret\n",
-            "validation": {"valid": True}, "warnings": [], "tool_rounds": 1,
-        })
-        result = asyncio.run(svc.generate_per_user_env(_FakeSession(), ctx))
-        assert result["per_user_env_name"] == ".env.alice.0"
-        assert result["hostname"] == "myapp-alice-0.example.com"
-        # generate_with_agent(db, config_type, context) — context is arg 2.
-        call_config_type = svc.generate_with_agent.call_args.args[1]
-        call_ctx = svc.generate_with_agent.call_args.args[2]
-        assert call_config_type == "env_file"
-        assert "fresh" in call_ctx["prompt"]
-        assert "SECRET_KEY" in call_ctx["prompt"]
 
     def test_unknown_tool_rejected(self, tmp_path):
         """The tool allowlist is closed — anything else is an error."""
@@ -4419,7 +4422,7 @@ class TestGenerateMissingPanel:
 
     def test_panel_saves_generated_via_save_generated(self):
         src = self._src()
-        assert "/services/save-generated" in src
+        assert "/projects/save-generated" in src
         assert "selection" in src
 
     def test_panel_recomputes_profiles_from_compose_selection(self):
@@ -4455,10 +4458,11 @@ class TestFileSetSelection:
         assert "needsEnv" in src
         assert "No ${VAR} interpolation detected" in src
 
-    def test_profiles_checkboxes(self):
+    def test_profiles_multi_select(self):
         src = self._src()
-        assert "Checkbox.Group" in src
-        assert "gate optional services" in src
+        assert "<Select" in src
+        assert 'mode="multiple"' in src or "mode: 'multiple'" in src or 'mode="tags"' in src
+        assert "Select profiles…" in src
 
     def test_stale_keep_and_mark(self):
         src = self._src()
@@ -4498,11 +4502,13 @@ class TestDeployFormSelection:
         src = self._src()
         assert "Generation prompt" in src
 
-    def test_per_user_env_generation(self):
+    def test_standalone_per_user_env_removed(self):
+        """Feature 7: the standalone per-user-env generation path is gone —
+        the deploy panel drives everything through generate_missing (the env
+        phase writes .env.raw and reports it as result.env_name)."""
         src = self._src()
-        assert "Generate per-user .env at deploy time" in src
-        assert "job_type: 'per_user_env'" in src
-        assert "fresh SECRET_KEY" in src or "fresh, " in src
+        assert "per_user_env" not in src
+        assert "generateMissingFilesForDeploy" in src
 
     def test_payload_uses_ordered_compose_and_profiles(self):
         src = self._src()
@@ -4650,3 +4656,233 @@ class TestComposePreviewProxy:
         assert "/services/${baseName}/files/" not in content.replace(" ", ""), (
             "DeployForm must not fetch raw .j2 files to derive volume keys"
         )
+
+
+# ---------------------------------------------------------------------------
+# Streaming `_chat` — deltas reassembled into the SAME shape as non-streaming,
+# with automatic fallback (the only new failure surface of the streaming path)
+# ---------------------------------------------------------------------------
+
+class TestChatStreaming:
+    """`_chat(stream=True)` must be a drop-in for the non-streaming call."""
+
+    # expected non-streaming equivalent of the canned stream below
+    _STREAM_LINES = [
+        'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}',
+        'data: {"choices":[{"index":0,"delta":{"reasoning_content":"think "}}]}',
+        'data: {"choices":[{"index":0,"delta":{"reasoning_content":"hard"}}]}',
+        'data: {"choices":[{"index":0,"delta":{"content":" world","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"web_","arguments":"{\\"ur"}}]}}]}',
+        'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"fetch","arguments":"l\\": \\"http://x\\"}"}}]}}]}',
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+        'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":22,"completion_tokens_details":{"reasoning_tokens":7}}}',
+        'data: [DONE]',
+    ]
+
+    def _patch_client(self, monkeypatch, lines, status=200, nonstream=None):
+        import types
+        import httpx as _httpx
+        from app.services import llm_service as mod
+
+        class _Resp:
+            def __init__(self):
+                self.status_code = status
+            async def aread(self):
+                return b'{"error":{"message":"boom"}}'
+            async def aiter_lines(self):
+                for ln in lines:
+                    yield ln
+
+        class _Ctx:
+            async def __aenter__(self_):
+                return _Resp()
+            async def __aexit__(self_, *a):
+                return False
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            def stream(self, method, url, json=None, headers=None):
+                return _Ctx()
+            async def post(self, url, json=None, headers=None):
+                return types.SimpleNamespace(
+                    status_code=200, json=lambda: (nonstream or {}), text=""
+                )
+
+        monkeypatch.setattr(mod.httpx, "AsyncClient", _Client)
+        return mod
+
+    def test_stream_reassembles_into_nonstreaming_shape(self, monkeypatch):
+        """Content, reasoning, split tool-call args and usage all merge."""
+        import asyncio
+        mod = self._patch_client(monkeypatch, self._STREAM_LINES)
+        delta_calls = []
+        out = asyncio.run(mod.llm_service._chat(
+            "http://x/v1", "m", {}, [{"role": "user", "content": "hi"}],
+            on_delta=lambda est: delta_calls.append(est),
+        ))
+        assert "_error" not in out, out
+        msg = out["choices"][0]["message"]
+        assert msg["content"] == "Hello world"
+        assert msg["reasoning_content"] == "think hard"
+        # fragmented tool call reassembled (name + arguments concatenated)
+        tc = msg["tool_calls"][0]
+        assert tc["function"]["name"] == "web_fetch"
+        assert tc["function"]["arguments"] == '{"url": "http://x"}'
+        assert tc["id"] == "call_1"
+        assert out["choices"][0]["finish_reason"] == "tool_calls"
+        assert out["usage"]["prompt_tokens"] == 11
+        assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 7
+        # the live estimate fired (throttled to >=1.5s → may be 0 calls; the
+        # important part is that it never raises when invoked)
+        assert all(isinstance(x, int) for x in delta_calls)
+
+    def test_stream_without_usage_falls_back_to_nonstreaming(self, monkeypatch):
+        """No usage block ⇒ fall back (exact accounting) instead of reporting 0."""
+        import asyncio
+        nonstream = {
+            "choices": [{"index": 0, "message": {"content": "from non-stream"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 6},
+        }
+        lines = [l for l in self._STREAM_LINES if '"usage"' not in l]
+        mod = self._patch_client(monkeypatch, lines, nonstream=nonstream)
+        out = asyncio.run(mod.llm_service._chat(
+            "http://x/v1", "m", {}, [{"role": "user", "content": "hi"}],
+        ))
+        assert out["choices"][0]["message"]["content"] == "from non-stream"
+        assert out["usage"]["prompt_tokens"] == 5
+
+    def test_stream_http_error_falls_back(self, monkeypatch):
+        """A non-2xx streaming response degrades to the non-streaming call."""
+        import asyncio
+        nonstream = {
+            "choices": [{"index": 0, "message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+        }
+        mod = self._patch_client(monkeypatch, [], status=400, nonstream=nonstream)
+        out = asyncio.run(mod.llm_service._chat(
+            "http://x/v1", "m", {}, [{"role": "user", "content": "hi"}],
+        ))
+        assert out["choices"][0]["message"]["content"] == "ok"
+
+    def test_stream_disabled_uses_plain_call(self, monkeypatch):
+        import asyncio
+        nonstream = {
+            "choices": [{"index": 0, "message": {"content": "plain"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+        }
+        mod = self._patch_client(monkeypatch, [], nonstream=nonstream)
+        out = asyncio.run(mod.llm_service._chat(
+            "http://x/v1", "m", {}, [{"role": "user", "content": "hi"}], stream=False,
+        ))
+        assert out["choices"][0]["message"]["content"] == "plain"
+
+    def test_est_tokens_handles_cjk_and_ascii(self):
+        from app.services.llm_service import llm_service
+        assert llm_service._est_tokens("") == 0
+        assert llm_service._est_tokens("abcdefgh") >= 2
+        # CJK counts ~1 token/char, so it must exceed the ASCII estimate
+        assert llm_service._est_tokens("我们需要根据部署元数据") > llm_service._est_tokens("abcdefghij")
+
+
+class TestGitCloneStall:
+    """A clone that HANGS must be retried, not left pinning the request.
+
+    Regression (observed live): `git clone` sat in git-remote-https with no pack
+    data arriving; `subprocess.run` had no timeout, so there was no non-zero exit
+    to trigger the retry — the create request stayed in flight and the dashboard
+    spinner never resolved.
+    """
+
+    def _mgr(self, monkeypatch, tmp_path):
+        from app.config import settings
+        from app.services.service_manager import ServiceManager
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        return ServiceManager()
+
+    def test_stalled_clone_is_aborted_and_retried(self, monkeypatch, tmp_path):
+        import subprocess
+        from app.services import service_manager as sm
+
+        mgr = self._mgr(monkeypatch, tmp_path)
+        calls = {"n": 0}
+
+        def fake_run(cmd, **kw):
+            calls["n"] += 1
+            assert kw.get("timeout") == sm.GIT_CLONE_TIMEOUT, "clone must be bounded"
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+
+        monkeypatch.setattr(sm.subprocess, "run", fake_run)
+        monkeypatch.setattr(sm.time, "sleep", lambda *_: None)
+
+        with pytest.raises(RuntimeError) as ei:
+            mgr.create_from_git("https://example.invalid/x.git", "main", "x")
+
+        assert calls["n"] == sm.GIT_CLONE_ATTEMPTS, "a stall must consume the retry budget"
+        assert "no progress" in str(ei.value)
+        assert not (tmp_path / "x").exists(), "partial target must be cleaned up"
+
+    def test_stall_then_success_recovers(self, monkeypatch, tmp_path):
+        """One stall followed by a clean clone → the create still succeeds."""
+        import subprocess
+        from app.services import service_manager as sm
+
+        mgr = self._mgr(monkeypatch, tmp_path)
+        calls = {"n": 0}
+
+        def fake_run(cmd, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+            (tmp_path / "x").mkdir(exist_ok=True)
+
+        monkeypatch.setattr(sm.subprocess, "run", fake_run)
+        monkeypatch.setattr(sm.time, "sleep", lambda *_: None)
+
+        info = mgr.create_from_git("https://example.invalid/x.git", "main", "x")
+        assert calls["n"] == 2
+        assert info is not None
+
+
+class TestRemovedReport:
+    """Turn 2 self-reports what its adversarial pass removed.
+
+    The removal itself is the model's judgement (no name matching anywhere in
+    the gateway), so the report is what makes that judgement auditable — a
+    misjudgement would otherwise be invisible.
+    """
+
+    def test_report_is_split_out_of_the_answer(self):
+        from app.services.llm_service import _split_removed_report
+        kvs, report = _split_removed_report({
+            "CONSOLE_API_URL": {"env_type": "non-secret", "value": "http://x"},
+            "_removed": {"COOKIE_DOMAIN": "restates the hostname the platform serves this instance on"},
+        })
+        assert "_removed" not in kvs
+        assert list(kvs) == ["CONSOLE_API_URL"]
+        assert report == {"COOKIE_DOMAIN": "restates the hostname the platform serves this instance on"}
+
+    def test_no_report_is_not_an_error(self):
+        from app.services.llm_service import _split_removed_report
+        src = {"A": {"env_type": "non-secret", "value": "v"}}
+        kvs, report = _split_removed_report(src)
+        assert report is None and kvs == src
+
+    def test_empty_report_and_non_dict_input(self):
+        from app.services.llm_service import _split_removed_report
+        kvs, report = _split_removed_report({"_removed": {}})
+        assert kvs == {} and report == {}
+        assert _split_removed_report(None) == (None, None)
+        assert _split_removed_report("nonsense") == ("nonsense", None)
+
+    def test_the_env_filter_would_have_dropped_it_anyway(self):
+        """`_removed` carries no env_type, so it never reaches the env."""
+        from app.services.llm_service import _split_removed_report
+        raw = {"_removed": {"COOKIE_DOMAIN": "why"}}
+        filtered = {str(k): v for k, v in raw.items()
+                    if isinstance(v, dict) and v.get("env_type") in ("secret", "non-secret")}
+        assert filtered == {}

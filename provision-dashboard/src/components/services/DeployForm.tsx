@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { Modal, Form, Input, Select, Button, Switch, Space, Divider, message, Checkbox, Alert, Spin, Tag, Typography } from 'antd'
+import { Modal, Form, Input, Select, Button, Switch, Space, Divider, message, Checkbox, Alert, Spin, Tag, Typography, Collapse } from 'antd'
 import { PlusOutlined, MinusCircleOutlined, GlobalOutlined, RobotOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import client from '../../api/client'
@@ -43,6 +43,9 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
   // Auto-deploy / missing files state
   const [checkingMissing, setCheckingMissing] = useState(false)
+  // True while the stored file-set selection for the chosen service/recipe is
+  // still being fetched — Deploy must not run with an unresolved selection.
+  const [fileSetLoading, setFileSetLoading] = useState(false)
   const [missingFiles, setMissingFiles] = useState<string[]>([])
   const [generatingFiles, setGeneratingFiles] = useState(false)
   const [generatedFiles, setGeneratedFiles] = useState<Record<string,string>>({})
@@ -57,7 +60,6 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   const [prompt, setPrompt] = useState('')
   // Deploy-time per-user env generation (GAP-19): fresh SECRET_KEY per instance.
   const [perUserEnv, setPerUserEnv] = useState<string | null>(null)
-  const { jobState: perUserJob, startJob: startPerUserJob, cancelJob: cancelPerUserJob, reset: resetPerUserJob } = useGenerationJob()
   // Editor modal for reviewing generated files (clickable → built-in editor)
   const [editorModalOpen, setEditorModalOpen] = useState(false)
   const [editorFileName, setEditorFileName] = useState('')
@@ -70,6 +72,9 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
   // Auto-detected volume keys from compose template
   const [expectedVolumeKeys, setExpectedVolumeKeys] = useState<string[]>([])
+  // Canonical per-user volume root (from compose-preview; never hardcoded —
+  // the provision-api bootstraps bind targets under ITS user_data root).
+  const [userDataDir, setUserDataDir] = useState<string>('/srv/provision/user_data')
 
   // Helper: parse service value which may include recipe path (format: "name@@recipe_path")
   const parseServiceValue = (val: string): { baseName: string; recipePath: string } => {
@@ -83,6 +88,11 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   const fetchExpectedVolumes = async (serviceName: string, sourcesList?: { name: string; files: string[] }[]) => {
     try {
       const svcVal = serviceName || ''
+      // Reset stale volume rows whenever the service changes — the mapping
+      // is user+service+label-dependent and must never survive a selection
+      // change (design §8.2).
+      setExpectedVolumeKeys([])
+      form.setFieldsValue({ volumes: [] })
       const { baseName, recipePath } = parseServiceValue(svcVal)
       const list = sourcesList || sources
       const svc = list.find(s => s.name === baseName)
@@ -91,6 +101,12 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       const recipeFiles = recipePrefix
         ? svc.files.filter((f: string) => f.startsWith(recipePrefix))
         : svc.files
+      // Exclude GENERATED artifacts (deploy-saved files have a sibling
+      // `<name>.generated` marker) — merging a generated docker-compose.yml
+      // into the preview changes the volume-key set and breaks the deploy
+      // (the template still references every key of the real compose).
+      const isGenerated = (f: string) => recipeFiles.includes(`${f}.generated`)
+      const candidates = recipeFiles.filter((f: string) => !isGenerated(f))
       const pathFor = (f: string) => (recipePrefix ? f.slice(recipePrefix.length) : f)
 
       // Same preference order as the deploy payload: the selected compose set
@@ -100,12 +116,12 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       if (selection.compose.length > 0) {
         composeFiles = selection.compose
       } else {
-        const plain = recipeFiles.filter((f: string) =>
+        const plain = candidates.filter((f: string) =>
           (f.endsWith('.yml') || f.endsWith('.yaml')) && !f.endsWith('.j2'))
         if (plain.length > 0) {
           composeFiles = plain.map(pathFor)
         } else {
-          const composeJ2 = recipeFiles.find((f: string) => f.endsWith('.yml.j2'))
+          const composeJ2 = candidates.find((f: string) => f.endsWith('.yml.j2'))
           if (composeJ2) composeFiles = [pathFor(composeJ2)]
         }
       }
@@ -113,6 +129,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
       const { data } = await getComposePreview(baseName, composeFiles, recipePath)
       setExpectedVolumeKeys(data.volume_keys || [])
+      if (data.user_data_dir) setUserDataDir(data.user_data_dir)
     } catch { setExpectedVolumeKeys([]) }
   }
 
@@ -124,7 +141,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     }
     setComputingLabel(true)
     try {
-      const { data } = await client.get(`/users/${userName}/${serviceName}/next-label`)
+      const { data } = await client.get(`/services/${userName}/${serviceName}/next-label`)
       const label = data.label || '0'
       setNextLabel(label)
       form.setFieldsValue({ label })
@@ -157,7 +174,6 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         setNeedsEnv(true)
         setPrompt('')
         setPerUserEnv(null)
-        resetPerUserJob()
         try {
           const { data: cfg } = await client.get('/llm/config')
           setLlmActive(!!(cfg && (cfg.is_active || cfg.byok_configured)))
@@ -189,7 +205,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
   const loadSources = async () => {
     try {
-      const { data } = await client.get('/services')
+      const { data } = await client.get('/projects')
       setSources(data.services || [])
       return data.services || []
     } catch { return [] }
@@ -207,8 +223,9 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   // Load the stored file set + live candidates + stale markers for the
   // selected service/recipe (design §Selection & UI — dashboard pre-selection).
   const loadFileSets = async (baseName: string, recipePath: string) => {
+    setFileSetLoading(true)
     try {
-      const { data } = await client.get(`/services/${baseName}/file-sets`)
+      const { data } = await client.get(`/projects/${baseName}/file-sets`)
       const rp = recipePath || '.'
       const entry = (data.file_sets || {})[rp] || {}
       setFileSetCandidates((data.candidates || {})[rp] || EMPTY_CANDIDATES)
@@ -221,6 +238,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       })
       setPerUserEnv(null)
     } catch { /* selection stays empty on failure */ }
+    finally { setFileSetLoading(false) }
   }
 
   // Profiles recompute (GAP-2): profile candidates derive from the merged
@@ -263,7 +281,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       const [baseName, recipePath] = serviceName.includes('@@') ? serviceName.split('@@') : [serviceName, '']
       const params: Record<string, string> = {}
       if (recipePath) params.recipe_path = recipePath
-      const { data } = await client.get(`/services/${baseName}/check-missing-files`, { params })
+      const { data } = await client.get(`/projects/${baseName}/check-missing-files`, { params })
       setMissingFiles(data.missing || [])
       setCheckError(null)
       setNeedsEnv(data.needs_env !== false)
@@ -289,6 +307,12 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   // Async generation job (ordered phases compose → nginx → env, one job).
   const genJob = useGenerationJob()
   const [genValidations, setGenValidations] = useState<Record<string, any>>({})
+  // Deploy progress popup (design §8.3) — shows generation steps + deploy step.
+  const [genPopupOpen, setGenPopupOpen] = useState(false)
+  // True while handleDeploy's one-shot auto-gen runs — the popup FREEZES on the
+  // completed frame (no reset, no "review, then deploy" toast) until /users/deploy
+  // returns; the manual Generate button keeps the review-gate behavior (feature 4).
+  const deployAutoRunRef = useRef(false)
 
   const generateMissingFiles = async () => {
     setGeneratingFiles(true)
@@ -301,11 +325,14 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         job_type: 'generate_missing',
         prompt,
         selection: effectiveSelection(),
+        user_name: form.getFieldValue('user_name') || '',
+        label: form.getFieldValue('label') || '0',
         deploy_metadata: {
           service_name: baseName,
           user_name: form.getFieldValue('user_name') || '',
           label: form.getFieldValue('label') || '0',
           domain: form.getFieldValue('domain') || 'localhost',
+          https: !!form.getFieldValue('https'),
         },
       })
     } catch (err: any) {
@@ -313,61 +340,73 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     } finally { setGeneratingFiles(false) }
   }
 
-  // Generation job completed → move the result into the review gate.
+  // Deploy-path auto-generation: run the pipeline and WAIT for completion,
+  // then adopt the generated per-user env name (design §2 Deploy auto-run).
+  // `snap` = the form values captured BEFORE the panel was closed (the panel is
+  // destroyOnClose/preserve=false, so the live form is gone by now).
+  const generateMissingFilesForDeploy = async (snap: any) => {
+    const svcVal = snap.service_name || ''
+    const { baseName, recipePath } = parseServiceValue(svcVal)
+    const jobId = await genJob.startJob({
+      service_name: baseName,
+      recipe_path: recipePath,
+      job_type: 'generate_missing',
+      prompt,
+      selection: effectiveSelection(),
+      user_name: snap.user_name || '',
+      label: snap.label || '0',
+      deploy_metadata: {
+        service_name: baseName,
+        user_name: snap.user_name || '',
+        label: snap.label || '0',
+        domain: snap.domain || 'localhost',
+        https: !!snap.https,
+      },
+    })
+    if (!jobId) throw new Error('Failed to start generation job')
+    for (let i = 0; i < 900; i++) {
+      await new Promise(r => setTimeout(r, 1000))
+      const { data } = await client.get(`/llm/jobs/${jobId}`)
+      if (data.status === 'completed') {
+        const result = data.result || {}
+        const name = result.env_name || null
+        const files = result.files || {}
+        if (name) setPerUserEnv(name)
+        if (Object.keys(files).length > 0) setGeneratedFiles(files)
+        // Return the fresh results synchronously — React state updates are not
+        // visible inside this still-running async flow, and the deploy payload
+        // must reference the just-generated env.raw name + files NOW.
+        return { envName: name, files }
+      }
+      if (data.status === 'failed' || data.status === 'cancelled') {
+        throw new Error(data.error || `Generation ${data.status}`)
+      }
+    }
+    throw new Error('Generation timed out')
+  }
+
+  // Generation job completed → move the result into the review gate. On the
+  // Deploy auto-run path (popup open) the completed events are KEPT so the popup
+  // freezes on the final frame; the manual Generate path resets into the review
+  // gate with the "review, then deploy" toast (feature 4).
   useEffect(() => {
     const st = genJob.jobState
     if (!st || st.status !== 'completed') return
+    const isDeployAuto = deployAutoRunRef.current
     const files = (st.result && st.result.files) || {}
     if (Object.keys(files).length > 0) {
       setGeneratedFiles(files)
       setGenValidations((st.result && st.result.validations) || {})
-      message.success(`LLM generated ${Object.keys(files).length} file(s) — review, then deploy`)
-    } else {
+      if (!isDeployAuto) {
+        message.success(`LLM generated ${Object.keys(files).length} file(s) — review, then deploy`)
+      }
+    } else if (!isDeployAuto) {
       message.warning('LLM returned no files. See the job result in the panel.')
     }
-    genJob.reset()
+    const name = (st.result && st.result.env_name) || null
+    if (name) setPerUserEnv(name)
+    if (!isDeployAuto) genJob.reset()
   }, [genJob.jobState])
-
-  // Deploy-time per-user env (GAP-19): writes {recipe}/.env.{user}.{label}
-  // with a fresh SECRET_KEY; the stored default selection is untouched.
-  const generatePerUserEnv = async () => {
-    const svcVal = form.getFieldValue('service_name') || ''
-    const { baseName, recipePath } = parseServiceValue(svcVal)
-    const userName = form.getFieldValue('user_name')
-    const label = form.getFieldValue('label') || '0'
-    if (!userName) { message.warning('Select a user first'); return }
-    try {
-      await startPerUserJob({
-        service_name: baseName,
-        recipe_path: recipePath,
-        job_type: 'per_user_env',
-        prompt,
-        selection: effectiveSelection(),
-        user_name: userName,
-        label,
-        domain: form.getFieldValue('domain') || 'localhost',
-        deploy_metadata: {
-          service_name: baseName, user_name: userName, label,
-          domain: form.getFieldValue('domain') || 'localhost',
-        },
-      })
-    } catch (err: any) {
-      message.error(err.response?.data?.detail || 'Failed to start per-user env generation')
-    }
-  }
-
-  useEffect(() => {
-    const st = perUserJob
-    if (!st || st.status !== 'completed') return
-    const name = (st.result && st.result.per_user_env_name) || ''
-    if (name) {
-      setPerUserEnv(name)
-      message.success(`Generated ${name} — this deployment will use it as its interpolation env`)
-    } else {
-      message.warning('Per-user env job completed without a file name')
-    }
-    resetPerUserJob()
-  }, [perUserJob])
 
   // Save an edited generated file back to state + disk
   const saveEditorFile = async () => {
@@ -379,7 +418,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       // Persist to the service project on disk
       const svcVal = form.getFieldValue('service_name') || ''
       const { baseName, recipePath } = parseServiceValue(svcVal)
-      await client.post('/services/save-generated', {
+      await client.post('/projects/save-generated', {
         service_name: baseName,
         recipe_path: recipePath,
         files: { [editorFileName]: editorContent },
@@ -395,29 +434,55 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
   const handleDeploy = async (values: any) => {
     setLoading(true)
+    setGenPopupOpen(true)
+    deployAutoRunRef.current = true
+    // Snapshot the form values BEFORE closing the panel: the modal is
+    // destroyOnClose + the Form is preserve={false}, so once the panel is gone
+    // every `form.getFieldValue` below would read empty.
+    const snap: any = { ...values }
+    // Close the deploy panel immediately — the Deploying… popup is the UI from
+    // here on (it lives in this component, which stays mounted).
+    onClose()
     try {
-      // Snapshot previously generated files; anything generated during this call is tracked locally
-      const gen = generatedFiles
+      // Snapshot previously generated files; the Deploy auto-run below adds
+      // anything generated during THIS call and returns it synchronously
+      // (React state is not visible mid-async-flow).
       const sel = effectiveSelection()
       const hasSelectedCompose = sel.compose.length > 0
 
-      // Compose is the root of the dependency graph: deploy hard-gates on a
-      // compose source only. The implicit LLM auto-generation on deploy is
-      // RETIRED — the operator generates via the panel, or selects a compose
-      // file below.
-      if (missingFiles.length > 0 && Object.keys(generatedFiles).length === 0 && !hasSelectedCompose) {
-        message.error('Cannot deploy: missing essential files. Open the generate-missing panel or select a compose file below.')
-        setLoading(false)
-        return
-      }
-
-      const svcVal = values.service_name || ''
+      const svcVal = snap.service_name || ''
       const { baseName, recipePath } = parseServiceValue(svcVal)
       const selectedService = sources.find(s => s.name === baseName)
 
-      // Save any LLM-generated files first
+      // ---- Always-on generation (design §2): Deploy auto-runs whatever is
+      // missing (compose/nginx + the per-user env.raw) BEFORE deploying —
+      // no review pause on the Deploy path. ----
+      const needsGeneration =
+        missingFiles.length > 0 ||
+        (needsEnv && !perUserEnv)
+      if (needsGeneration && !hasSelectedCompose && missingFiles.length > 0 && !genJob.jobState) {
+        message.error('Cannot deploy: missing essential files and no compose selected.')
+        setLoading(false)
+        setGenPopupOpen(false)
+        deployAutoRunRef.current = false
+        return
+      }
+      let envName = perUserEnv
+      let genNow: Record<string, string> = {}
+      if (needsGeneration) {
+        const res = await generateMissingFilesForDeploy(snap)
+        envName = (res && res.envName) || perUserEnv
+        genNow = (res && res.files) || {}
+      }
+      // Merge previously generated (reviewed) files with the just-generated
+      // ones — the Deploy auto-run MUST see them (compose/nginx are persisted
+      // for the -api render; re-persisting the env.raw identically is a no-op).
+      const gen = { ...generatedFiles, ...genNow }
+
+      // Save any LLM-generated files first (also persists the selection as the
+      // new stored default — design §Selection & UI L43-46).
       if (Object.keys(gen).length > 0) {
-        await client.post('/services/save-generated', {
+        await client.post('/projects/save-generated', {
           service_name: baseName,
           recipe_path: recipePath,
           files: gen,
@@ -427,14 +492,14 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
       // Build deploy payload
       const payload: any = {
-        user_name: values.user_name,
+        user_name: snap.user_name,
         service_name: baseName,
         project_root: recipePath ? `${baseName}/${recipePath}` : baseName,
-        label: values.label || '0',
-        domain: values.domain || 'localhost',
-        passwd: values.passwd || '',
-        https: values.https || false,
-        use_global_proxy: values.use_global_proxy || false,
+        label: snap.label || '0',
+        domain: snap.domain || 'localhost',
+        passwd: snap.passwd || '',
+        https: snap.https || false,
+        use_global_proxy: snap.use_global_proxy || false,
         // The selection is persisted as the new default on 202 accept
         // (server-side put_file_set) — design §Selection & UI L43-46.
         selection: sel,
@@ -456,73 +521,86 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         const pathFor = (f: string) => (recipePrefix ? f.slice(recipePrefix.length) : f)
 
         const composeJ2 = recipeFiles.find((f: string) => f.endsWith('.yml.j2'))
-        const nginxJ2 = recipeFiles.find((f: string) => f.endsWith('.conf.j2'))
-        // Fallback: look for regular (non-.j2) compose/nginx files that already exist in the project
+        // Fallback: look for regular (non-.j2) compose files that already exist in the project
         const composeFile = recipeFiles.find((f: string) =>
           (f.endsWith('.yml') || f.endsWith('.yaml')) && !f.endsWith('.j2'))
-        const nginxFile = recipeFiles.find((f: string) =>
-          f.endsWith('.conf') && !f.endsWith('.j2'))
 
         if (composeJ2) payload.compose_template_path = pathFor(composeJ2)
         else if (gen['docker-compose.yml']) payload.compose_file_path = 'docker-compose.yml'
         else if (composeFile) payload.compose_file_path = pathFor(composeFile)
+      }
 
-        if (nginxJ2) payload.nginx_conf_template_path = pathFor(nginxJ2)
-        else if (gen['nginx.conf']) payload.nginx_conf_file_path = 'nginx.conf'
-        else if (nginxFile) payload.nginx_conf_file_path = pathFor(nginxFile)
+      // Nginx wiring applies in BOTH cases above: a selected compose set does
+      // NOT make nginx irrelevant. Without a per-user nginx conf the shared
+      // nginx has no route for the service and the edge 502s the /go/ relay.
+      // Preference: panel selection > LLM-generated nginx.conf (saved to the
+      // recipe by save-generated above) > recipe .conf.j2 template > plain
+      // recipe .conf.
+      {
+        const recipePrefixN = recipePath ? `${recipePath}/` : ''
+        const recipeFilesN = recipePrefixN
+          ? (selectedService?.files || []).filter((f: string) => f.startsWith(recipePrefixN))
+          : (selectedService?.files || [])
+        const pathForN = (f: string) => (recipePrefixN ? f.slice(recipePrefixN.length) : f)
+        const nginxJ2 = recipeFilesN.find((f: string) => f.endsWith('.conf.j2'))
+        const nginxFile = recipeFilesN.find((f: string) =>
+          f.endsWith('.conf') && !f.endsWith('.j2') && !f.endsWith('.generated'))
+        if (sel.nginx) {
+          payload.nginx_conf_file_path = sel.nginx
+        } else if (gen['nginx.conf']) {
+          payload.nginx_conf_file_path = 'nginx.conf'
+        } else if (nginxJ2) {
+          payload.nginx_conf_template_path = pathForN(nginxJ2)
+        } else if (nginxFile) {
+          payload.nginx_conf_file_path = pathForN(nginxFile)
+        }
       }
 
       // Repeatable profiles (later wins is the compose CLI behavior).
       if (sel.profiles.length > 0) payload.profiles = sel.profiles
 
-      // Interpolation env: selected env files + the deploy-time per-user env.
-      const envList: string[] = [...sel.env]
-      if (perUserEnv && !envList.includes(perUserEnv)) envList.push(perUserEnv)
-      if (envList.length > 0) {
-        payload.env_files = envList
-      } else if (selectedService && sel.compose.length === 0) {
-        // Legacy auto-detect fallback (nothing selected).
-        const recipePrefix = recipePath ? `${recipePath}/` : ''
-        const recipeFiles = recipePrefix
-          ? selectedService.files.filter((f: string) => f.startsWith(recipePrefix))
-          : selectedService.files
-        const envFile = recipeFiles.find((f: string) =>
-          f === '.env' || f.endsWith('/.env'))
-        if (envFile) payload.env_file_path = '.env'
-        else if (gen['.env']) payload.env_file_path = '.env'
+      // Interpolation env: ONLY the generated per-user env.raw is passed to
+      // the -api (design §2 — selection is generation context, never the
+      // handoff). Empty list when nothing was generated.
+      if (envName) {
+        payload.env_files = [envName]
       }
 
       // HTTPS certs
-      if (values.https) {
-        payload.fullchain = values.fullchain || ''
-        payload.privkey = values.privkey || ''
+      if (snap.https) {
+        payload.fullchain = snap.fullchain || ''
+        payload.privkey = snap.privkey || ''
       }
 
       // Volume mapping
-      if (values.volumes && values.volumes.length > 0) {
+      if (snap.volumes && snap.volumes.length > 0) {
         payload.volumes = {}
-        for (const v of values.volumes) {
+        for (const v of snap.volumes) {
           if (v.key && v.value) payload.volumes[v.key] = v.value
         }
       }
 
       // Build args
-      if (values.build_args && values.build_args.length > 0) {
+      if (snap.build_args && snap.build_args.length > 0) {
         payload.build_args = {}
-        for (const a of values.build_args) {
+        for (const a of snap.build_args) {
           if (a.key && a.value) payload.build_args[a.key] = a.value
         }
       }
 
-      const { data } = await client.post('/users/deploy', payload)
+      const { data } = await client.post('/services/deploy', payload)
       message.success(`Deploy queued! Task: ${data.task_id}`)
-      onDeployed(data.task_id, values.user_name, baseName, values.label || '0')
-      form.resetFields()
+      onDeployed(data.task_id, snap.user_name, baseName, snap.label || '0')
       onClose()
     } catch (err: any) {
       message.error(err.response?.data?.detail || 'Deploy failed')
     } finally {
       setLoading(false)
+      setGenPopupOpen(false)
+      deployAutoRunRef.current = false
+      // Free the job state now that the popup is closed (feature 4: during the
+      // auto-run the completed frame was intentionally kept in the popup).
+      genJob.reset()
     }
   }
 
@@ -543,7 +621,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     if (keys.length === 0) return
     const volumes = keys.map(key => ({
       key,
-      value: `/srv/provision/user_data/${selectedUserName}/${serviceBaseName}/${label}/${key}`
+      value: `${userDataDir}/${selectedUserName}/${serviceBaseName}/${label}/${key}`
     }))
     // First set the values on the form
     form.setFieldsValue({ volumes })
@@ -557,9 +635,10 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       // After adding, set values again
       setTimeout(() => form.setFieldsValue({ volumes }), 0)
     }
-  }, [selectedServiceName, selectedUserName, selectedLabel, expectedVolumeKeys])
+  }, [selectedServiceName, selectedUserName, selectedLabel, expectedVolumeKeys, userDataDir])
 
   return (
+    <>
     <Modal
       title={`Deploy${selectedServiceName ? `: ${selectedServiceName}` : ''}`}
       open={open}
@@ -571,6 +650,11 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       <Form form={form} layout="vertical" onFinish={handleDeploy} preserve={false}
         initialValues={{ label: '0', domain: 'localhost', https: false }}>
         
+        {/* Hidden certificate fields live OUTSIDE the Space: as direct Space
+            children they rendered zero-height rows, each adding a 16px gap
+            (the "3 blank lines" above Volume Mapping). */}
+        <Form.Item name="fullchain" hidden><Input /></Form.Item>
+        <Form.Item name="privkey" hidden><Input /></Form.Item>
         <Space style={{ width: '100%' }} direction="vertical" size="middle">
           {/* ---- User & Service ---- */}
           <Space.Compact block>
@@ -592,13 +676,20 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
                   const opts: { value: string; label: string }[] = []
                   for (const s of sources) {
                     const recipes = s.recipes || []
-                    if (recipes.length > 1) {
-                      for (const r of recipes) {
-                        const suffix = r.is_root ? '' : ` @ ${r.path}`
-                        opts.push({ value: `${s.name}${r.is_root ? '' : '@@' + r.path}`, label: `${s.name}${suffix}` })
-                      }
-                    } else {
+                    if (recipes.length === 0) {
+                      // No configured recipe dirs → the project root itself.
                       opts.push({ value: s.name, label: s.name })
+                      continue
+                    }
+                    // ONE option per configured recipe — including the
+                    // single-recipe case. Gating this on `length > 1` meant a
+                    // project with exactly one sub-recipe (e.g. dify → docker)
+                    // lost its path: candidates were then looked up under '.'
+                    // (empty) and the Compose selector stayed disabled, so a
+                    // freshly imported monorepo could not be deployed at all.
+                    for (const r of recipes) {
+                      const suffix = r.is_root ? '' : ` @ ${r.path}`
+                      opts.push({ value: `${s.name}${r.is_root ? '' : '@@' + r.path}`, label: `${s.name}${suffix}` })
                     }
                   }
                   return opts
@@ -628,17 +719,25 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           </Space.Compact>
 
           {/* ---- HTTPS ---- */}
-          <Form.Item name="https" label="Enable HTTPS" valuePropName="checked">
-            <Switch onChange={(v) => {
-              setHttpsEnabled(v)
-              if (!v) {
-                setSelectedSslDomain('')
-                form.setFieldsValue({ ssl_domain: undefined, fullchain: '', privkey: '' })
-              }
-            }} />
+          {/* Label + toggle on ONE line, no bottom margin (was a vertical
+              label row + switch row + 24px gap). */}
+          <Form.Item style={{ marginBottom: 0 }}>
+            <Space size={8} align="center">
+              <Text>Enable HTTPS</Text>
+              <Form.Item name="https" valuePropName="checked" noStyle>
+                <Switch onChange={(v) => {
+                  setHttpsEnabled(v)
+                  if (!v) {
+                    setSelectedSslDomain('')
+                    form.setFieldsValue({ ssl_domain: undefined, fullchain: '', privkey: '' })
+                  }
+                }} />
+              </Form.Item>
+            </Space>
           </Form.Item>
           {httpsEnabled && (
-            <Form.Item name="ssl_domain" label="SSL Certificate" rules={[{ required: true, message: 'Select an SSL certificate' }]}>
+            <Form.Item name="ssl_domain" label="SSL Certificate" style={{ marginTop: 12, marginBottom: 0 }}
+              rules={[{ required: true, message: 'Select an SSL certificate' }]}>
               <Select
                 showSearch
                 placeholder="Select uploaded SSL certificate"
@@ -658,53 +757,68 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
               />
             </Form.Item>
           )}
-          <Form.Item name="fullchain" hidden><Input /></Form.Item>
-          <Form.Item name="privkey" hidden><Input /></Form.Item>
-
-          <Divider plain>Volume Mapping (optional)</Divider>
-          <Form.List name="volumes">
-            {(fields, { add, remove }) => {
-              volumeAddRef.current = add
-              return (
-                <>
-                  {fields.map(({ key, name, ...rest }) => (
-                    <Space key={key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
-                      <Form.Item {...rest} name={[name, 'key']} rules={[{ required: true, message: 'Volume name' }]}>
-                        <Input placeholder="app_data" style={{ width: 180 }} />
-                      </Form.Item>
-                      <span>→</span>
-                      <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Host path' }]}>
-                        <Input placeholder="/srv/provision/user-data/alice/app" style={{ width: 320 }} />
-                      </Form.Item>
-                      <Button type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(name)} />
-                    </Space>
-                  ))}
-                  <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>Add Volume</Button>
-                </>
-              )
-            }}
-          </Form.List>
-
-          <Divider plain>Build Args (optional)</Divider>
-          <Form.List name="build_args">
-            {(fields, { add, remove }) => (
-              <>
-                {fields.map(({ key, name, ...rest }) => (
-                  <Space key={key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
-                    <Form.Item {...rest} name={[name, 'key']} rules={[{ required: true, message: 'Arg name' }]}>
-                      <Input placeholder="HTTP_PROXY" style={{ width: 180 }} />
-                    </Form.Item>
-                    <span>→</span>
-                    <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Arg value' }]}>
-                      <Input placeholder="http://proxy:8080" style={{ width: 320 }} />
-                    </Form.Item>
-                    <Button type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(name)} />
-                  </Space>
-                ))}
-                <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>Add Build Arg</Button>
-              </>
-            )}
-          </Form.List>
+          {/* Exactly ONE blank line above Volume Mapping: the hidden cert fields
+              now live outside this Space (they used to add zero-height Space
+              rows), so the Space's own 16px gap is the single separator. */}
+          <Collapse
+            size="small"
+            ghost
+            items={[
+              {
+                key: 'volumes',
+                label: 'Volume Mapping (optional)',
+                children: (
+                  <Form.List name="volumes">
+                    {(fields, { add, remove }) => {
+                      volumeAddRef.current = add
+                      return (
+                        <>
+                          {fields.map(({ key, name, ...rest }) => (
+                            <Space key={key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
+                              <Form.Item {...rest} name={[name, 'key']} rules={[{ required: true, message: 'Volume name' }]}>
+                                <Input placeholder="app_data" style={{ width: 180 }} />
+                              </Form.Item>
+                              <span>→</span>
+                              <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Host path' }]}>
+                                <Input placeholder="/srv/provision/user-data/alice/app" style={{ width: 320 }} />
+                              </Form.Item>
+                              <Button type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(name)} />
+                            </Space>
+                          ))}
+                          <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>Add Volume</Button>
+                        </>
+                      )
+                    }}
+                  </Form.List>
+                ),
+              },
+              {
+                key: 'build_args',
+                label: 'Build Args (optional)',
+                children: (
+                  <Form.List name="build_args">
+                    {(fields, { add, remove }) => (
+                      <>
+                        {fields.map(({ key, name, ...rest }) => (
+                          <Space key={key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
+                            <Form.Item {...rest} name={[name, 'key']} rules={[{ required: true, message: 'Arg name' }]}>
+                              <Input placeholder="HTTP_PROXY" style={{ width: 180 }} />
+                            </Form.Item>
+                            <span>→</span>
+                            <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Arg value' }]}>
+                              <Input placeholder="http://proxy:8080" style={{ width: 320 }} />
+                            </Form.Item>
+                            <Button type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(name)} />
+                          </Space>
+                        ))}
+                        <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>Add Build Arg</Button>
+                      </>
+                    )}
+                  </Form.List>
+                ),
+              },
+            ]}
+          />
 
           {/* ---- Base file selection (design §Selection & UI) ---- */}
           <Divider plain>Base file selection <span style={{fontSize:12,color:'#999'}}>— stored default pre-selected; save happens on deploy</span></Divider>
@@ -716,39 +830,15 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
             onChange={setSelection}
           />
 
-          {/* ---- Deploy-time per-user env (GAP-19) ---- */}
+          {/* ---- Deploy-time per-user env (pipeline env phase, design §2) ---- */}
           {needsEnv && (
             <Space direction="vertical" style={{ width: '100%' }} size={4}>
-              <Divider plain style={{ margin: '4px 0' }}>Deploy-time per-user env (fresh SECRET_KEY per instance)</Divider>
               {perUserEnv ? (
                 <Alert type="success" showIcon message={`Per-user env ready: ${perUserEnv} — this deployment will use it as its interpolation env`} />
               ) : (
-                <>
-                  {perUserJob && (perUserJob.status === 'queued' || perUserJob.status === 'running') && (
-                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                      <Spin size="small" />
-                      <Text type="secondary" style={{ fontSize: 12 }}>Generating per-user env… {perUserJob.progress || ''}</Text>
-                      <Button size="small" danger onClick={cancelPerUserJob}>Cancel</Button>
-                    </div>
-                  )}
-                  {perUserJob && (perUserJob.status === 'failed' || perUserJob.status === 'cancelled') && (
-                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                      <Text type="danger" style={{ fontSize: 12 }}>{perUserJob.error || `Job ${perUserJob.status}`}</Text>
-                      <Button size="small" onClick={resetPerUserJob}>Dismiss</Button>
-                    </div>
-                  )}
-                  <Button
-                    size="small"
-                    icon={<RobotOutlined />}
-                    disabled={!llmActive || (!!perUserJob && (perUserJob.status === 'queued' || perUserJob.status === 'running'))}
-                    onClick={generatePerUserEnv}
-                  >
-                    Generate per-user .env at deploy time
-                  </Button>
-                  <div style={{ fontSize: 12, color: '#999' }}>
-                    Uses the prompt below + user/label/domain to produce a fresh SECRET_KEY for this instance only — the stored default env selection is untouched.
-                  </div>
-                </>
+                <div style={{ fontSize: 12, color: '#999' }}>
+                  The per-user env is generated automatically as the last step of the missing-files pipeline when you Deploy (or click Generate).
+                </div>
               )}
             </Space>
           )}
@@ -796,7 +886,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
                           </div>
                         )}
                         <div style={{marginTop:4,fontSize:12,color:'#999'}}>
-                          Runs the ordered phases (compose → nginx → env) as one async job with progress polling; generated files appear below for review before deploy.
+                          <b>Optional preview</b> — runs the ordered phases (compose → nginx → env) and pauses for your review before deploying. Clicking Deploy directly runs the same generation automatically but skips the review chance.
                         </div>
                         {genJob.jobState && (genJob.jobState.status === 'queued' || genJob.jobState.status === 'running') && (
                           <div style={{marginTop:8, display:'flex', gap: 8, alignItems:'center'}}>
@@ -896,13 +986,93 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
           <Space style={{ justifyContent: 'flex-end', width: '100%' }}>
             <Button onClick={onClose}>Cancel</Button>
+            {fileSetLoading && (
+              <Text type="secondary" style={{ fontSize: 12 }}><Spin size="small" /> Loading file selection…</Text>
+            )}
+            {!fileSetLoading && (fileSetCandidates.compose || []).length > 0 && effectiveSelection().compose.length === 0 && (
+              <Text type="warning" style={{ fontSize: 12 }}>
+                Select at least one compose file — deploying with an empty selection skips env generation.
+              </Text>
+            )}
+            {/* A compose may declare profile-gated services (e.g. the database or
+                vector store). With none activated, `docker compose` starts only the
+                unprofiled ones — the stack comes up missing those services and
+                nothing errors, so say so before the operator deploys. Warning, not
+                a block: an empty selection is legitimate for recipes whose optional
+                services are genuinely not wanted. */}
+            {!fileSetLoading && (fileSetCandidates.profiles || []).length > 0 && effectiveSelection().profiles.length === 0 && (
+              <Text type="warning" style={{ fontSize: 12 }}>
+                This compose gates {(fileSetCandidates.profiles || []).length} optional service profile(s) and none is
+                selected — those services will not start. Select the ones this deployment needs
+                (a database or vector store is usually required).
+              </Text>
+            )}
             <Button type="primary" htmlType="submit" loading={loading} icon={<span>🚀</span>}
-              disabled={!selectedUserName || !selectedServiceName || !!checkError || (missingFiles.length > 0 && Object.keys(generatedFiles).length === 0 && effectiveSelection().compose.length === 0)}>
+              disabled={!selectedUserName || !selectedServiceName || !!checkError || fileSetLoading
+                || (!fileSetLoading && (fileSetCandidates.compose || []).length > 0 && effectiveSelection().compose.length === 0)
+                || (missingFiles.length > 0 && Object.keys(generatedFiles).length === 0 && effectiveSelection().compose.length === 0)}>
               Deploy
             </Button>
           </Space>
         </Space>
       </Form>
     </Modal>
+
+    {/* ---- Deploy progress popup (design §8.3) — closeable anytime ---- */}
+    <Modal
+      title="Deploying…"
+      open={genPopupOpen}
+      onCancel={() => setGenPopupOpen(false)}
+      footer={null}
+      width={560}
+    >
+      <Space direction="vertical" style={{ width: '100%' }} size={6}>
+        {genJob.jobState && (genJob.jobState.status === 'queued' || genJob.jobState.status === 'running' || genJob.jobState.status === 'completed') && (
+          <>
+            {genJob.jobState.status === 'completed' ? (
+              <Text style={{ fontSize: 13, color: '#389e0d' }}>
+                Generation complete — deploying the instance…
+              </Text>
+            ) : (
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <Spin size="small" />
+                <Text style={{ fontSize: 13 }}>{genJob.jobState.progress || 'Generating…'}</Text>
+              </div>
+            )}
+            {(() => {
+              // Append-only step list: one row per step (keyed by file), first
+              // seen order preserved, the row UPDATED in place as the step
+              // progresses — finished steps are never removed. Each row shows
+              // the step's purpose and its in/out/rsn token counters.
+              const evs = (genJob.jobState && genJob.jobState.events) || []
+              const rows: any[] = []
+              const at: Record<string, number> = {}
+              for (const ev of evs) {
+                // One row PER STEP (step id, falling back to file for the
+                // terminal artifact rows) — steps accumulate, they are never
+                // merged/overwritten, and each shows the token usage known at
+                // the time it was emitted.
+                const k = ev.step || ev.file || '?'
+                if (at[k] === undefined) { at[k] = rows.length; rows.push({ ...ev }) }
+                else { rows[at[k]] = { ...ev } }
+              }
+              return rows.map((ev, i) => (
+                <div key={i} style={{ fontFamily: 'monospace', fontSize: 12, color: ev.status === 'done' ? '#389e0d' : ev.status === 'failed' ? '#cf1322' : ev.status === 'skipped (no ${VAR} interpolation)' ? '#8c8c8c' : '#1677ff' }}>
+                  {ev.purpose ? <span style={{ color: '#8c8c8c' }}>{ev.purpose} · </span> : null}
+                  {ev.file}  {ev.status}{ev.usage ? `  in ${(ev.usage.prompt/1000).toFixed(1)}k / out ${(ev.usage.completion/1000).toFixed(1)}k / rsn ${(ev.usage.reasoning/1000).toFixed(1)}k` : ''}
+                </div>
+              ))
+            })()}
+          </>
+        )}
+        {genJob.jobState && genJob.jobState.status === 'failed' && (
+          <Text type="danger" style={{ fontSize: 13 }}>{genJob.jobState.error || 'Generation failed'}</Text>
+        )}
+        <div style={{ fontSize: 12, color: '#999' }}>
+          You can close this popup anytime — the job continues in the background and remains visible on the Tasks page.
+        </div>
+      </Space>
+    </Modal>
+    </>
   )
 }

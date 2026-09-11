@@ -34,69 +34,35 @@ from .config_validation import validate_compose, validate_env
 # ---------------------------------------------------------------------------
 
 TOOL_ROUNDS_MAX = 6          # max agent loop iterations (4–6)
+
+# When the tool loop (or a self-repair response) ends with tool calls but no
+# file content, force ONE content-only call so the accumulated tool results
+# turn into an answer instead of failing the phase with "empty output".
+FINALIZE_PROMPT = (
+    "Stop using tools. Output the COMPLETE requested file now — ONLY the raw "
+    "file content, no markdown fences, no explanations."
+)
 WEB_FETCH_MAX_BYTES = 64 * 1024      # per-page size cap
 TOTAL_FETCH_MAX_BYTES = 512 * 1024   # total fetched bytes cap
 FETCH_TIMEOUT = 30.0
 MAX_BASE_FILE_BYTES = 128 * 1024
 
-# App-manifest carve-out: the small closed set of build/dependency/runtime
-# convention files included when compose itself is missing (§Generation 5a).
-MANIFEST_FILENAMES = (
-    "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
-    "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
-    "package.json", "go.mod", "Cargo.toml", "pom.xml", "build.gradle",
-    "Gemfile", "composer.json", "Makefile", "Procfile",
-    "main.py", "app.py", "manage.py", "wsgi.py", "asgi.py",
-    "alembic.ini", "vite.config.js", "vite.config.ts", "next.config.js",
-    "next.config.mjs",
-)
 
-TOOL_DEFINITIONS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_fetch",
-            "description": (
-                "Fetch a documentation page over http/https (the project's official "
-                "deployment docs). Only the first 64KB is returned."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {"url": {"type": "string", "description": "http(s) URL"}},
-                "required": ["url"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": (
-                "Read a text file from the service project (confined to the recipe "
-                "directory / project root). Use for Dockerfiles, configs, etc."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string", "description": "project-root-relative file path"}},
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_files",
-            "description": (
-                "List the files of the recipe directory (and project root when the "
-                "recipe is a subdirectory). Shallow listing."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-    },
-]
+def _split_removed_report(kvs: Any) -> tuple[Any, Any]:
+    """Pull the model's self-reported adversarial removals out of its answer.
+
+    Turn 2 asks for an extra ``_removed`` key: the variables it judged
+    platform-owned, each with a one-line reason. That key carries no
+    ``env_type``, so the env filter would discard it — this keeps the reasons so
+    they can be logged, making the model's filtering auditable without the
+    gateway pattern-matching variable names.
+
+    Returns ``(kvs_without_the_key, report_or_None)``.
+    """
+    if isinstance(kvs, dict) and "_removed" in kvs:
+        kvs = dict(kvs)          # don't mutate the caller's parsed object
+        return kvs, kvs.pop("_removed")
+    return kvs, None
 
 
 class LLMService:
@@ -137,6 +103,7 @@ class LLMService:
             byok_base_url=data.get("byok_base_url", ""),
             byok_model=data.get("byok_model", ""),
             system_prompt=data.get("system_prompt", ""),
+            reasoning_effort=str(data.get("reasoning_effort") or "low"),
             is_active=False,
         )
         if data.get("byok_api_key"):
@@ -190,6 +157,19 @@ class LLMService:
         config.byok_model = data.get("byok_model", config.byok_model)
         config.system_prompt = data.get("system_prompt", config.system_prompt)
         config.is_active = True
+        # Generation behavior settings (design §2 LLM settings).
+        if "reasoning_effort" in data:
+            config.reasoning_effort = str(data["reasoning_effort"]) or "low"
+        if "max_tokens" in data:
+            try:
+                config.max_tokens = int(data["max_tokens"])
+            except (TypeError, ValueError):
+                config.max_tokens = 100000
+        if "tool_rounds_max" in data:
+            try:
+                config.tool_rounds_max = max(1, min(int(data["tool_rounds_max"]), 20))
+            except (TypeError, ValueError):
+                config.tool_rounds_max = 6
         if data.get("byok_api_key"):
             config.byok_api_key_enc = encrypt_api_key(data["byok_api_key"])
         db.commit()
@@ -210,7 +190,8 @@ class LLMService:
         config: only an active BYOK config is used; otherwise a neutral
         OpenAI-compatible default is returned (GAP-2).
         """
-        config = db.query(LLMConfig).filter(LLMConfig.is_active == True).first()
+        self._active_config = db.query(LLMConfig).filter(LLMConfig.is_active == True).first()
+        config = self._active_config
 
         if config and config.mode == "byok" and config.byok_api_key_enc:
             api_key = decrypt_api_key(config.byok_api_key_enc)
@@ -223,6 +204,22 @@ class LLMService:
             headers = {}
 
         return base, model, headers
+
+    def _behavior_settings(self) -> dict:
+        """Generation behavior settings from the active config (design §2).
+
+        reasoning_effort / max_tokens / tool_rounds_max with defaults when the
+        config row is missing or legacy.
+        """
+        cfg = getattr(self, "_active_config", None)
+        rounds = (cfg.tool_rounds_max if cfg else None) or 6
+        return {
+            # default to the LOWEST reasoning effort (thinking still enabled) —
+            # env/agent turns that only need a short answer stay fast (design §2).
+            "reasoning_effort": (cfg.reasoning_effort if cfg else None) or "low",
+            "max_tokens": (cfg.max_tokens if cfg else None) or 100000,
+            "tool_rounds_max": max(1, min(int(rounds), 20)),
+        }
 
     async def test_connection(self, db: Session) -> dict:
         """Test the LLM connection with a simple chat request."""
@@ -398,7 +395,9 @@ class LLMService:
             meta_lines.append(f"activated compose profiles: {', '.join(profiles)}")
         if compose_service_names:
             meta_lines.append(f"compose service names: {', '.join(compose_service_names)}")
-        if meta_lines:
+        # The env phase prints its own structured deployment_meta handoff (see
+        # the env_file branch) — keep the generic block for compose/nginx.
+        if meta_lines and config_type != "env_file":
             parts.append("\nDeploy metadata:\n" + "\n".join(meta_lines))
 
         if config_type == "docker_compose":
@@ -442,18 +441,473 @@ Output ONLY the raw nginx config, no markdown fences.""")
 
         elif config_type == "env_file":
             meta_bits = f" for user '{deploy_meta.get('user_name','?')}' label {deploy_meta.get('label','0')} on {deploy_meta.get('domain','localhost')}"
+            handoff = (
+                "  serving_url: " + str(deploy_meta.get("serving_url") or "") + "\n"
+                "  scheme: " + str(deploy_meta.get("scheme") or "http") + "\n"
+                "  hostname: " + str(deploy_meta.get("hostname") or "") + "\n"
+                "  http_port: " + str(deploy_meta.get("http_port") or "") + "\n"
+                "  https_port: " + str(deploy_meta.get("https_port") or "") + "\n"
+                "  service_name: " + str(deploy_meta.get("service_name") or "") + "\n"
+                "  user_name: " + str(deploy_meta.get("user_name") or "") + "\n"
+                "  label: " + str(deploy_meta.get("label") or "0")
+            )
             parts.append(f"""
-Generate a .env file (interpolation env for docker compose ${'{VAR}'} substitution){meta_bits}.
-The compose file's ${'{VAR}'} references determine the required keys — every
-no-default variable MUST be present in the output.
-Generate a fresh random SECRET_KEY for this instance (unique per deployment).
-{('Activated profiles: ' + ', '.join(profiles) + ' — the env must match the services those profiles gate (e.g. a postgresql profile needs a working DATABASE_URL).') if profiles else ''}
-Output ONLY the raw env file contents, KEY=VALUE per line.""")
+Generate the per-user .env (docker compose ${'{VAR}'} interpolation env){meta_bits}.
+
+The base files named like *.env / *.example document each variable — READ their
+comment lines to understand what each variable is FOR before you fill anything.
+Do not assume meaning from the variable name alone.
+
+deployment_meta — authoritative, these are the values the deployed instance is
+served on (the gateway assembled them from the -api naming + edge ports):
+{handoff}
+
+Every variable the instance needs in order to be reachable and usable by a
+browser/operator MUST be filled from deployment_meta, never left at an empty or
+localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
+1. Every REQUIRED variable in __compose_variables__.txt must be present.
+2. Identify by READING the base-file comments the variables whose meaning is the
+   instance's externally-reachable identity — a serving/entry URL, origin, host,
+   API/console/web base, login/callback/redirect/webhook or websocket URL, or a
+   "localhost"-style placeholder. Fill each from deployment_meta: an absolute
+   origin/URL from serving_url; a bare host from hostname; a sub-path only when
+   the variable's meaning requires it (e.g. origin + "/console/api"). Keep the
+   scheme consistent with deployment_meta.scheme.
+3. Secrets (SECRET_KEY, password, key, token, secret, salt, credential): a fresh
+   random value.
+4. Internal service-to-service addresses (compose service names such as
+   "http://api:5001", or plain :port inside the compose network) stay unchanged.
+5. Other variables keep their example value; never invent values the deployment
+   does not need.
+6. Output KEY=VALUE lines for the variables you set plus the REQUIRED/OPTIONAL
+   compose variables. No markdown fences, no comments, no explanations.
+   Answer with the file content immediately.""" + (
+                ('\nActivated profiles: ' + ', '.join(profiles) + ' — the env must match the services those profiles gate (e.g. a postgresql profile needs a working DATABASE_URL).') if profiles else ''
+            ))
 
         else:
             parts.append(f"\nGenerate the {config_type} file for {desc}.")
 
         return "\n".join(parts)
+
+
+    def _rec_usage_live(self, resp: dict, usage_cb=None) -> None:
+        """Record usage AND push the running totals to the job runner so the
+        Deploying… popup can show live in/out/rsn counters per step."""
+        self._record_usage(resp)
+        if usage_cb:
+            try:
+                usage_cb(dict(self._usage_total))
+            except Exception:
+                pass
+
+    def _record_usage(self, resp: dict) -> None:
+        """Accumulate token usage into the current generation's totals."""
+        total = getattr(self, "_usage_total", None)
+        if total is None:
+            return
+        u = (resp or {}).get("usage") or {}
+        total["prompt"] += int(u.get("prompt_tokens") or 0)
+        total["completion"] += int(u.get("completion_tokens") or 0)
+        det = u.get("completion_tokens_details") or {}
+        total["reasoning"] += int(det.get("reasoning_tokens") or 0)
+
+    # ------------------------------------------------------------------
+    # Env fill — two-turn conversation (design §2 env redesign)
+    # ------------------------------------------------------------------
+    # Turn 1: model reads the env base files (comment lines = variable meaning)
+    # + the compose ${VAR} surface and identifies the variables that MUST be
+    # given concrete values. NO deployment_meta is shown.
+    # Turn 2 (same conversation): deployment_meta is appended and the model
+    # returns a JSON object mapping those variables to their final values.
+    # The gateway assembles the .env programmatically from that map over the
+    # mechanical merge — the model never emits the whole file.
+
+    @staticmethod
+    def _json_first(text: str, want_object: bool) -> Any:
+        """Parse a JSON array (want_object=False) or object (True) out of a
+        model reply, tolerating markdown fences / prose around it."""
+        import json as _json
+        import re as _re
+
+        text = (text or "").strip()
+        text = _re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        try:
+            data = _json.loads(text)
+            ok = isinstance(data, dict) if want_object else isinstance(data, list)
+            return data if ok else None
+        except Exception:
+            pass
+        pat = r"\{[\s\S]*\}" if want_object else r"\[[\s\S]*\]"
+        m = _re.search(pat, text)
+        if not m:
+            return None
+        try:
+            return _json.loads(m.group(0))
+        except Exception:
+            return None
+
+    # ==================================================================
+    # ENV PROMPTS — READ THIS BEFORE ADDING A VARIABLE NAME
+    # ==================================================================
+    # The two env prompts below name a handful of variables
+    # (COOKIE_DOMAIN, COMPOSE_PROFILES, CERTBOT_DOMAIN, CONSOLE_API_URL,
+    # SECRET_KEY). Every one of them is an ILLUSTRATION of a class, or part of
+    # a JSON shape example. None of them is a rule, and no code branches on any
+    # of them — the model decides, the gateway does not pattern-match.
+    #
+    # When a new variable-shaped failure turns up, the fix is to extend the
+    # SYSTEM MODEL (what the platform owns and why) and let the model re-derive
+    # which variables that covers. Adding the new name to a list here is the
+    # move that FAILED: `cookie domain` was named in the necessary list, so the
+    # model filled COOKIE_DOMAIN and the scope flipped between deploys (broke
+    # sign-in); CERTBOT_DOMAIN then got filled for the same reason (this service
+    # never terminates TLS); COMPOSE_PROFILES was dropped from some runs and
+    # silently replaced the deploy panel's recorded choice. Each was patched
+    # with a name check in code, and each patch was reverted — name lists do not
+    # generalise, and a name match cannot tell a platform-owned variable from an
+    # app one that merely looks like it.
+    #
+    # So: state the property ("would this restate a decision the platform has
+    # already made?"), give the reason, and let the model judge meaning from the
+    # base-file comments. Turn 2 self-reports its removals under `_removed`
+    # (see _split_removed_report) so the judgement is auditable; if it gets one
+    # wrong, sharpen the reasoning — do not add a name check.
+    # ==================================================================
+
+    def _env_turn1_prompt(self, context: dict) -> str:
+        """Turn-1 prompt: identify which variables need concrete values.
+        Deliberately excludes deployment_meta so identification is unbiased."""
+        dm = context.get("deploy_metadata") or {}
+        parts: list[str] = []
+        parts.append(
+            f"Do NOT write any file. Identify which environment variables must be "
+            f"given concrete values so this deployed instance (service "
+            f"{context.get('repo_description','?')}, user "
+            f"'{dm.get('user_name','')}' label {dm.get('label','0')}) works."
+        )
+        # How the platform actually serves this instance. Without it the model can
+        # only guess whether the service terminates its own TLS / owns its own
+        # cookie scope / chooses its own optional services — and it guessed wrong:
+        # it filled COOKIE_DOMAIN (broke sessions across redeploys), certbot's
+        # CERTBOT_DOMAIN (this service never terminates TLS), and would fill
+        # COMPOSE_PROFILES (the deploy panel owns that). State the model of the
+        # system; the variable-level conclusions then follow from it.
+        parts.append(
+            "How THIS PLATFORM serves the instance (authoritative — reason from "
+            "this, do not assume a normal standalone deployment):\n"
+            "- Requests reach it ONLY through the platform's own edge, at the "
+            "single hostname assigned to this instance. The edge terminates TLS "
+            "with the PLATFORM's certificate and forwards plain HTTP into the "
+            "compose network. This service's nginx therefore listens on plain "
+            "HTTP and needs no certificate: nothing here obtains one (no "
+            "ACME/certbot), and when an operator wants HTTPS they give the "
+            "platform the certificate.\n"
+            "- That hostname is fixed per (service, user, label) and is REUSED "
+            "across redeploys of the same instance.\n"
+            "- Which optional services exist is decided in the deploy panel and "
+            "passed to compose as --profile, then recorded by the platform.\n"
+            "- So three kinds of variable are the PLATFORM's, not the app's, and "
+            "must be left exactly as the base files have them: anything that "
+            "scopes cookies to a domain, anything that activates compose "
+            "profiles, and anything that configures obtaining a TLS certificate."
+        )
+        base_files = context.get("base_files") or {}
+        blocks = []
+        for fname, content in base_files.items():
+            if fname.startswith("__mechanical_env__"):
+                continue  # KEY=VALUE-only duplicate — no comment meaning to read
+            blocks.append(f"--- base file: {fname} ---\n{content}")
+        if blocks:
+            parts.append(
+                "The following files document every variable. READ the comment "
+                "lines to learn each variable's meaning before deciding:\n\n"
+                + "\n\n".join(blocks)
+            )
+        parts.append(
+            "Identify the NECESSARY variables — and ONLY those. A variable is "
+            "necessary iff:\n"
+            "1. Its meaning (from the comments) is the instance's "
+            "externally-reachable identity affected by THIS deployment — "
+            "serving/entry URL, origin, host, API/console/web/ws BASE, "
+            "login/callback/redirect/webhook URL. These are "
+            "filled from deployment_meta, overriding any existing value.\n"
+            "2. It is REQUIRED by the compose (no default) AND currently EMPTY — "
+            "the instance cannot boot without it.\n"
+            "NOT necessary — and therefore EXCLUDED:\n"
+            "- Anything the PLATFORM owns (see 'How THIS PLATFORM serves the "
+            "instance' above), judged by MEANING — what the variable DOES — "
+            "never by its spelling:\n"
+            "  · a cookie's domain/scope. The platform assigns one hostname per "
+            "instance and reuses it, so the scope must be identical on every "
+            "deploy: set once and not the next time, a browser keeps sending a "
+            "stale cookie from the destroyed instance that shadows the fresh "
+            "one, and the app then rejects every logged-in request while its "
+            "login call still returns success.\n"
+            "  · compose profile activation (e.g. COMPOSE_PROFILES). The deploy "
+            "panel decides it, records it and passes `--profile`; a value here "
+            "silently OVERRIDES that recorded choice.\n"
+            "  · obtaining a TLS certificate (e.g. an ACME/certbot domain, "
+            "contact email or challenge setting). This service does not "
+            "terminate TLS — the platform's edge does, with the platform's "
+            "certificate, so nothing in this deployment requests one.\n"
+            "- Any password/secret/credential/SECRET_KEY/token/key that ALREADY "
+            "carries a value (app defaults are left untouched — they are "
+            "internally consistent and must NOT be regenerated).\n"
+            "- Internal service-to-service addresses (compose service names / "
+            ":port inside the compose network).\n"
+            "- Anything with a safe compose default that is not deployment-"
+            "affected.\n"
+            'Reply with ONLY a JSON array of variable names, e.g. '
+            '["CONSOLE_API_URL","SECRET_KEY"]. No markdown fences, no prose.'
+        )
+        return "\n".join(parts)
+
+    def _env_turn2_prompt(
+        self, context: dict, var_list: list[str], operator_prompt: str = ""
+    ) -> str:
+        """Turn-2 prompt (appended to the same conversation): map the
+        identified variables to concrete values from deployment_meta."""
+        dm = context.get("deploy_metadata") or {}
+        handoff = (
+            "  serving_url: " + str(dm.get("serving_url") or "") + "\n"
+            "  scheme: " + str(dm.get("scheme") or "http") + "\n"
+            "  hostname: " + str(dm.get("hostname") or "") + "\n"
+            "  http_port: " + str(dm.get("http_port") or "") + "\n"
+            "  https_port: " + str(dm.get("https_port") or "") + "\n"
+            "  service_name: " + str(dm.get("service_name") or "") + "\n"
+            "  user_name: " + str(dm.get("user_name") or "") + "\n"
+            "  label: " + str(dm.get("label") or "0")
+        )
+        names = "\n".join(f"- {n}" for n in var_list)
+        operator_block = ""
+        if operator_prompt and operator_prompt.strip():
+            operator_block = (
+                "\n\nOperator prompt (AUTHORITATIVE when present — if it states "
+                "exact URL/API/console rules or points at the app's docs, follow "
+                "them EXACTLY; these OVERRIDE the default-origin rule below). "
+                "Where it is silent, keep the defaults below.\n"
+                "--- operator prompt / docs ---\n"
+                f"{operator_prompt.strip()}\n"
+                "--- end operator prompt ---"
+            )
+        return (
+            "deployment_meta — authoritative values this instance is served on "
+            "(assembled by the gateway from the -api naming + edge ports):\n"
+            f"{handoff}\n\n"
+            "Now assign the final value for each variable you identified. Recall "
+            "each variable's meaning from the base files you read.\n"
+            f"Variables to fill:\n{names}\n{operator_block}\n\n"
+            "Rules (defaults — overridden only by the operator prompt above):\n"
+            "- A variable whose meaning is the instance's externally-reachable "
+            "identity (URL/origin/host, or an API/console/web/ws BASE) gets its "
+            "value FROM deployment_meta: a BASE variable equals serving_url "
+            "(the ORIGIN) EXACTLY — the app appends its own path prefix (e.g. "
+            "/console/api) to that base itself, so NEVER append /console/api, "
+            "/api or any API path to it. Use a bare host from hostname when the "
+            "variable is only the host. Only set a full URL that carries a "
+            "sub-path when the variable's meaning is an explicit endpoint or "
+            "template (e.g. a URL_TEMPLATE) — derive it from serving_url. Never "
+            "leave it empty or at a localhost/example placeholder.\n"
+            "- For a variable in the list whose MEANING is a SECRET (password, "
+            "key, token, secret, salt, credential): env_type is 'secret' and "
+            "value is null — the gateway mints a PLAIN random value. (Only "
+            "EMPTY required secrets appear in the list; secrets that already "
+            "carry a value are never listed.)\n"
+            "- BEFORE YOU ANSWER, re-read the list above and REMOVE every "
+            "variable that belongs to the PLATFORM rather than to the app.\n"
+            "  THE TEST — apply it to each variable in the list, and to ones I "
+            "have not thought of: would setting it RESTATE A DECISION THE "
+            "PLATFORM HAS ALREADY MADE for this instance? The platform decided, "
+            "and recorded elsewhere, (a) the one hostname this instance is "
+            "served on and anything scoped to it, (b) which optional services "
+            "are activated, and (c) which certificate the edge presents. It "
+            "applied those decisions when it deployed you; a second copy in "
+            "this env is redundant at best and DISAGREES at worst.\n"
+            "  The three cases I know of, and why each is the platform's: a "
+            "cookie's domain/scope — a browser then keeps a stale cookie from "
+            "the destroyed instance that shadows the fresh one, so the app "
+            "rejects every logged-in request while its login call still "
+            "returns success; compose profile activation — the deploy panel "
+            "records it and passes `--profile`, so a value here silently "
+            "overrides the recorded choice; anything for obtaining a TLS "
+            "certificate (ACME/certbot domain, contact, challenge) — this "
+            "service does not terminate TLS, the platform's edge does.\n"
+            "  Judge by MEANING — what the variable DOES, from the base-file "
+            "comments — never by its spelling. The list may well contain one "
+            "that slipped through identification. Drop each from your JSON "
+            "ENTIRELY: do not give it a value, do not set it to empty, do not "
+            "carry it over.\n"
+            "- For every OTHER variable: env_type is 'non-secret' and value is "
+            "the final value (from deployment_meta / derivation as above).\n"
+            "- Keep values consistent with the compose network for internal "
+            "addresses if any are in the list.\n"
+            "Reply with ONLY a JSON object mapping each variable to "
+            '{"env_type":"secret"|"non-secret","value":<string|null>}, e.g. '
+            '{"SECRET_KEY":{"env_type":"secret","value":null},'
+            '"CONSOLE_API_URL":{"env_type":"non-secret",'
+            '"value":"http://dify-x.localhost:8767"}}. '
+            'Plus exactly one extra key, "_removed": an object mapping each '
+            "variable you removed above to a one-line reason naming the "
+            'platform decision it would have restated, e.g. {"_removed":'
+            '{"COOKIE_DOMAIN":"restates the hostname the platform serves this '
+            'instance on"}}. Use {} when you removed nothing. That key is the '
+            "audit trail for the removal step — the reason must be specific "
+            "enough that a reviewer can disagree with your judgement. "
+            "No markdown fences, no comments, no other extra keys."
+        )
+
+    async def generate_env_two_turn(
+        self,
+        db: Session,
+        context: dict,
+        progress=None,
+        session_log=None,
+        usage_cb=None,
+        on_delta=None,
+    ) -> dict:
+        """Run the two-turn env conversation. Returns
+        ``{"vars": [...], "kvs": {...}, "warnings": [...], "usage": {...}}``.
+        ``kvs`` empty ⇒ caller falls back to the mechanical env.
+        """
+        import json as _json
+
+        base_url, model, headers = self._resolve_endpoint(db)
+        cfg = db.query(LLMConfig).filter(LLMConfig.is_active == True).first()
+        sysp = (cfg.system_prompt if cfg and cfg.system_prompt else "") or ""
+        usage_total: dict[str, int] = {"prompt": 0, "completion": 0, "reasoning": 0}
+
+        def _add(resp: dict) -> None:
+            u = (resp or {}).get("usage") or {}
+            usage_total["prompt"] += int(u.get("prompt_tokens") or 0)
+            usage_total["completion"] += int(u.get("completion_tokens") or 0)
+            det = u.get("completion_tokens_details") or {}
+            usage_total["reasoning"] += int(det.get("reasoning_tokens") or 0)
+            # Live token counters: hand the running totals to the caller after
+            # EVERY LLM call (the popup shows them per step while it runs).
+            if usage_cb:
+                try:
+                    usage_cb(dict(usage_total))
+                except Exception:
+                    pass
+
+        def _cap(s: str, n: int = 30000) -> str:
+            s = s or ""
+            return s if len(s) <= n else s[:n] + f"…[+{len(s) - n} chars]"
+
+        def _log(entry: dict) -> None:
+            if session_log:
+                entry.setdefault("usage", dict(usage_total))
+                session_log(entry)
+
+        messages: list[dict] = []
+        if sysp:
+            messages.append({"role": "system", "content": sysp})
+
+        # ---- Turn 1: identify necessary variables (no deployment_meta) ----
+        user1 = self._env_turn1_prompt(context)
+        messages.append({"role": "user", "content": user1})
+        if progress:
+            await progress("env: identifying variables that need values (turn 1/2)")
+        resp1 = await self._chat(base_url, model, headers, messages, on_delta=on_delta)
+        _add(resp1)
+        c1 = ((resp1.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        _m1 = ((resp1.get("choices") or [{}])[0].get("message") or {})
+        _log({
+            "stage": "env.turn1",
+            "finish_reason": ((resp1.get("choices") or [{}])[0].get("finish_reason")),
+            "prompt_head": _cap(user1, 1500),
+            "content_head": _cap(c1, 3000),
+            "reasoning": _cap(_m1.get("reasoning_content") or ""),
+        })
+        var_list = self._json_first(c1, want_object=False)
+        if var_list is None:
+            # one strict-JSON nudge for turn 1
+            messages.append({"role": "assistant", "content": c1[:2000]})
+            messages.append({"role": "user", "content": "Your reply was not a JSON array. Reply with ONLY the JSON array of variable names."})
+            resp1b = await self._chat(base_url, model, headers, messages, on_delta=on_delta)
+            _add(resp1b)
+            c1 = ((resp1b.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            var_list = self._json_first(c1, want_object=False)
+        var_list = [str(x) for x in (var_list or []) if isinstance(x, str) and x.strip()]
+        # Surface turn 1's tokens the moment the call returns (the popup's step
+        # row shows the counters live instead of waiting for turn 2 to start).
+        if progress:
+            await progress(
+                f"env: turn 1 done — {len(var_list)} variable(s) identified"
+                f" (in {usage_total['prompt']} / out {usage_total['completion']} / rsn {usage_total['reasoning']})"
+            )
+
+        warnings: list[str] = []
+        if not var_list:
+            warnings.append("env turn 1 returned no variables — falling back to mechanical env")
+            _log({"stage": "env.turn1", "ok": False, "vars": []})
+            return {"vars": [], "kvs": {}, "warnings": warnings, "usage": dict(usage_total)}
+
+        # assistant continuity into turn 2
+        messages.append({"role": "assistant", "content": c1[:4000]})
+
+        # ---- Turn 2: map variables → values with deployment_meta ----
+        op_prompt = (context.get("prompt") or "").strip()
+        op_prefetched = await self._prefetch_prompt_urls(op_prompt) if op_prompt else ""
+        user2 = self._env_turn2_prompt(context, var_list, operator_prompt=op_prefetched or op_prompt)
+        messages.append({"role": "user", "content": user2})
+        if progress:
+            await progress(f"env: mapping {len(var_list)} values from deployment_meta (turn 2/2)")
+        resp2 = await self._chat(base_url, model, headers, messages, on_delta=on_delta)
+        _add(resp2)
+        c2 = ((resp2.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        _m2 = ((resp2.get("choices") or [{}])[0].get("message") or {})
+        _log({
+            "stage": "env.turn2",
+            "finish_reason": ((resp2.get("choices") or [{}])[0].get("finish_reason")),
+            "prompt_head": _cap(user2, 1500),
+            "content_head": _cap(c2, 3000),
+            "reasoning": _cap(_m2.get("reasoning_content") or ""),
+        })
+        kvs = self._json_first(c2, want_object=True)
+        if not kvs:
+            messages.append({"role": "assistant", "content": c2[:2000]})
+            messages.append({"role": "user", "content": "Your reply was not a JSON object. Reply with ONLY the JSON object mapping each variable to its final value."})
+            resp2b = await self._chat(base_url, model, headers, messages, on_delta=on_delta)
+            _add(resp2b)
+            c2 = ((resp2b.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            kvs = self._json_first(c2, want_object=True)
+        # Turn 2 self-reports what its adversarial pass removed, under a
+        # `_removed` key. Pull it out BEFORE the filter below (which would drop
+        # it anyway — it carries no env_type) so the reasons are recorded
+        # instead of silently discarded.
+        kvs, _removed_report = _split_removed_report(kvs)
+        # Values are {env_type: secret|non-secret, value: str|null} objects
+        # (decision-4 schema). Keep entries that carry the env_type marker.
+        kvs = {
+            str(k): v
+            for k, v in (kvs or {}).items()
+            if isinstance(v, dict) and v.get("env_type") in ("secret", "non-secret")
+        }
+        if not kvs:
+            warnings.append("env turn 2 returned no JSON map — falling back to mechanical env")
+        if progress:
+            await progress(
+                f"env: turn 2 done — {len(kvs)} value(s) mapped"
+                f" (in {usage_total['prompt']} / out {usage_total['completion']} / rsn {usage_total['reasoning']})"
+            )
+        _log({
+            "stage": "env.turn2", "ok": bool(kvs), "vars": var_list,
+            "kvs_head": dict(list(kvs.items())[:5]),
+            # Audit trail for the adversarial removal pass — what the model
+            # judged platform-owned and why. Absent if it reported nothing.
+            "removed": _removed_report,
+        })
+        if _removed_report:
+            warnings.append(
+                "env: model removed platform-owned variable(s): "
+                + ", ".join(sorted(str(k) for k in _removed_report))
+            )
+        return {
+            "vars": var_list, "kvs": kvs, "removed": _removed_report,
+            "warnings": warnings, "usage": dict(usage_total),
+        }
 
     def _build_repair_prompt(self, validation_errors: list[str]) -> str:
         return (
@@ -462,9 +916,164 @@ Output ONLY the raw env file contents, KEY=VALUE per line.""")
             + "\n\nRevise the output to fix every error. Output ONLY the corrected raw file content, no markdown fences."
         )
 
+    @staticmethod
+    def _non_thinking_sibling(base_url: str, model: str) -> str | None:
+        """The non-reasoning sibling model for a deepseek endpoint.
+
+        ``deepseek-v4-flash`` emits ``reasoning_content`` and can loop in
+        chain-of-thought until the whole token budget is exhausted
+        (finish_reason=length with EMPTY content) — ``deepseek-chat`` answers
+        directly. Returns None when the endpoint is not deepseek or the
+        configured model is already the sibling.
+        """
+        if "deepseek" not in (base_url or "").lower():
+            return None
+        if not model or model == "deepseek-chat":
+            return None
+        return "deepseek-chat"
+
+    async def _finalize_chat(
+        self,
+        base_url: str,
+        model: str,
+        headers: dict,
+        messages: list[dict],
+        warnings: list[str],
+    ) -> str:
+        """One content-only call after a tool-heavy response produced no file content.
+
+        The tool loop / repair response may end with tool calls (or empty text)
+        instead of the file — this turns the accumulated tool results into the
+        answer. Returns the raw content (possibly empty on failure).
+        """
+        messages.append({"role": "user", "content": FINALIZE_PROMPT})
+        try:
+            resp = await self._chat(base_url, model, headers, messages)
+        except Exception as exc:
+            warnings.append(f"finalize call failed: {exc}")
+            return ""
+        if "_error" in resp:
+            warnings.append(resp["_error"])
+            return ""
+        self._record_usage(resp)
+        return ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+
     # ------------------------------------------------------------------
     # LLM round-trip (tool-capable)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _est_tokens(text: str) -> int:
+        """Rough token estimate for live progress (CJK ≈ 1 token/char, other
+        text ≈ 1 token per 3.5 chars). Display only — never used for accounting."""
+        if not text:
+            return 0
+        cjk = sum(1 for c in text if '\u3000' <= c <= '\u9fff' or '\uff00' <= c <= '\uffef')
+        return int(cjk + (len(text) - cjk) / 3.5) + 1
+
+    async def _chat_stream(
+        self,
+        base_url: str,
+        headers: dict,
+        payload: dict,
+        on_delta=None,
+    ) -> dict:
+        """Streaming chat/completions that REASSEMBLES the deltas into the SAME
+        dict shape the non-streaming path returns, so every caller is unchanged.
+
+        ``on_delta(est_out_tokens)`` is called (throttled) while the response
+        streams, for live progress display. Returns ``{"_error": ...}`` on any
+        problem (no usage, empty stream, HTTP error) so the caller can fall back
+        to the non-streaming call.
+        """
+        import time as _time
+
+        body = dict(payload)
+        body["stream"] = True
+        # Ask for the usage block on the final chunk (OpenAI-compatible servers).
+        body["stream_options"] = {"include_usage": True}
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_calls: dict[int, dict] = {}
+        finish_reason = None
+        usage: dict | None = None
+        chunks = 0
+        last_report = 0.0
+
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            async with client.stream(
+                "POST", f"{base_url}/chat/completions", json=body, headers=headers
+            ) as resp:
+                if resp.status_code != 200:
+                    detail = (await resp.aread()).decode(errors="replace")[:300]
+                    return {"_error": f"LLM HTTP {resp.status_code}: {detail}"}
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except ValueError:
+                        continue
+                    chunks += 1
+                    if obj.get("usage"):
+                        usage = obj["usage"]
+                    for choice in (obj.get("choices") or []):
+                        delta = choice.get("delta") or {}
+                        if delta.get("content"):
+                            content_parts.append(delta["content"])
+                        if delta.get("reasoning_content"):
+                            reasoning_parts.append(delta["reasoning_content"])
+                        for tc in (delta.get("tool_calls") or []):
+                            idx = int(tc.get("index") or 0)
+                            slot = tool_calls.setdefault(
+                                idx, {"id": "", "type": "function",
+                                      "function": {"name": "", "arguments": ""}}
+                            )
+                            if tc.get("id"):
+                                slot["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            # name/arguments arrive FRAGMENTED — concatenate.
+                            if fn.get("name"):
+                                slot["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                slot["function"]["arguments"] += fn["arguments"]
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                    if on_delta:
+                        now = _time.monotonic()
+                        if now - last_report >= 1.5:
+                            last_report = now
+                            est = self._est_tokens(
+                                "".join(content_parts) + "".join(reasoning_parts)
+                            )
+                            try:
+                                on_delta(est)
+                            except Exception:
+                                pass
+
+        if chunks == 0:
+            return {"_error": "stream produced no chunks"}
+        if not usage:
+            # No usage block → the numbers would silently read 0; let the caller
+            # fall back to the non-streaming call (exact accounting).
+            return {"_error": "stream returned no usage"}
+
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "".join(content_parts),
+        }
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
+        if tool_calls:
+            message["tool_calls"] = [tool_calls[k] for k in sorted(tool_calls)]
+        return {
+            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+            "usage": usage,
+        }
 
     async def _chat(
         self,
@@ -473,17 +1082,44 @@ Output ONLY the raw env file contents, KEY=VALUE per line.""")
         headers: dict,
         messages: list[dict],
         tools: list[dict] | None = None,
-        max_tokens: int = 4000,
+        max_tokens: int = 16000,
+        stream: bool = True,
+        on_delta=None,
     ) -> dict:
-        """One chat/completions call; returns the raw response dict (or {})."""
+        """One chat/completions call; returns the raw response dict (or {}).
+
+        ``max_tokens`` is generous on purpose: reasoning models (deepseek
+        emits ``reasoning_content``) count chain-of-thought against the same
+        budget — small caps truncate the REASONING and leave ``content`` empty
+        (finish_reason=length), which surfaces as "empty output" phase
+        failures. The default is overridden by the configurable token budget
+        (design §2 LLM settings); the finalize-call fallback in
+        :meth:`generate_with_agent` covers the remaining exhaustion cases.
+        """
+        behavior = self._behavior_settings()
+        budget = int(behavior.get("max_tokens") or max_tokens)
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "max_tokens": max_tokens,
+            "max_tokens": budget,
             "temperature": 0.3,
         }
+        if behavior.get("reasoning_effort"):
+            payload["reasoning_effort"] = behavior["reasoning_effort"]
         if tools:
             payload["tools"] = tools
+        # Stream by default: `_chat_stream` returns the SAME dict shape, so every
+        # caller is unchanged; any streaming problem degrades to the exact
+        # non-streaming call below (never breaks generation).
+        if stream:
+            try:
+                out = await self._chat_stream(
+                    base_url, headers, payload, on_delta=on_delta
+                )
+            except Exception as exc:  # noqa: BLE001 — degrade, never raise
+                out = {"_error": f"stream failed: {exc}"}
+            if out and "_error" not in out:
+                return out
         async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(f"{base_url}/chat/completions", json=payload, headers=headers)
             if resp.status_code != 200:
@@ -520,7 +1156,8 @@ Output ONLY the raw env file contents, KEY=VALUE per line.""")
     # ------------------------------------------------------------------
 
     async def generate_with_agent(
-        self, db: Session, config_type: str, context: dict, progress=None
+        self, db: Session, config_type: str, context: dict, progress=None, session_log=None,
+        usage_cb=None, on_delta=None,
     ) -> dict:
         """Agentic generation with the closed tool allowlist + self-repair.
 
@@ -529,8 +1166,12 @@ Output ONLY the raw env file contents, KEY=VALUE per line.""")
         profiles, compose_service_names, compose_paths (for validation),
         project_dir, recipe_path, empty_recipe.
 
+        ``session_log`` (optional): sync callable receiving per-call dicts
+        (role, content_head, tools, usage, finish_reason) for the Tasks-page
+        session record.
+
         Returns ``{"generated_content", "filename_suggestion", "warnings",
-        "validation": {...}, "tool_rounds": int}``.
+        "validation": {...}, "tool_rounds": int, "usage": {...}}``.
         """
         from ..utils.skill_loader import get_compose_rules, get_nginx_rules
 
@@ -555,10 +1196,43 @@ Output ONLY the raw env file contents, KEY=VALUE per line.""")
                 "tool_rounds": 0,
             }
 
+        rounds_cap = self._behavior_settings()["tool_rounds_max"]
+        self._usage_total: dict[str, int] = {"prompt": 0, "completion": 0, "reasoning": 0}
+        usage_total = self._usage_total
+
+        def _cap(s: str, n: int = 30000) -> str:
+            s = s or ""
+            return s if len(s) <= n else s[:n] + f"…[+{len(s) - n} chars]"
+
+        def _log(entry: dict) -> None:
+            if session_log:
+                entry.setdefault("usage", dict(usage_total))
+                session_log(entry)
+
+        def _log_resp(stage: str, resp: dict, extra: dict | None = None) -> None:
+            """Session-log one assistant reply: finish reason + content head +
+            full reasoning + usage (feature 5 full-log contract)."""
+            choice = (resp.get("choices") or [{}])[0] or {}
+            msg = choice.get("message") or {}
+            entry: dict = {
+                "stage": stage,
+                "finish_reason": choice.get("finish_reason"),
+                "content_head": _cap(msg.get("content") or "", 3000),
+                "reasoning": _cap(msg.get("reasoning_content") or ""),
+            }
+            if extra:
+                entry.update(extra)
+            _log(entry)
+
         messages: list[dict] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": user_prompt})
+
+        # Record the operator/generation prompt head once per agent session so
+        # the Tasks log shows what each LLM session was asked (feature 5).
+        _log({"stage": "start", "config_type": config_type,
+              "prompt_head": _cap(user_prompt, 1500), "tools_enabled": config_type != "env_file"})
 
         filename = {
             "docker_compose": "docker-compose.yml",
@@ -572,24 +1246,76 @@ Output ONLY the raw env file contents, KEY=VALUE per line.""")
         tool_calls_seen = 0
         content = ""
         used_tools_ok = True
+        early_length = False
+
+        # Sibling-first for env (design §2 overflow avoidance): the
+        # non-reasoning model answers the env task in one fast call — run it
+        # BEFORE the reasoning chain; fall through to the full chain on failure.
+        if config_type == "env_file":
+            sib = await self._sibling_single_shot(
+                base_url, model, headers, system_prompt, user_prompt,
+                config_type, context, warnings,
+            )
+            if sib is not None:
+                _log({"stage": "sibling-first", "ok": True, "warnings": warnings})
+                return {
+                    "generated_content": sib[0],
+                    "filename_suggestion": filename,
+                    "warnings": warnings,
+                    "validation": sib[1],
+                    "tool_rounds": tool_rounds,
+                    "usage": dict(usage_total),
+                }
+            _log({"stage": "sibling-first", "ok": False, "warnings": warnings})
+
+        # The env phase needs NO tools (its context already carries the var
+        # manifest + trimmed env example). Disabling tools keeps the
+        # conversation small: reasoning models otherwise burn their whole
+        # token budget on chain-of-thought over tool results and return
+        # EMPTY content (finish_reason=length).
+        tools_enabled = config_type != "env_file"
 
         if progress:
             await progress(f"agent round 1/{TOOL_ROUNDS_MAX}")
 
-        while tool_rounds < TOOL_ROUNDS_MAX:
+        while tool_rounds < rounds_cap:
             tool_rounds += 1
             try:
-                resp = await self._chat(base_url, model, headers, messages, tools=TOOL_DEFINITIONS)
+                resp = await self._chat(
+                    base_url, model, headers, messages,
+                    tools=(TOOL_DEFINITIONS if tools_enabled else None),
+                    on_delta=on_delta,
+                )
             except Exception as exc:
                 warnings.append(f"LLM call failed: {exc}")
                 break
             if "_error" in resp:
                 warnings.append(resp["_error"])
                 break
+            self._rec_usage_live(resp, usage_cb)
             choice = (resp.get("choices") or [{}])[0]
             msg = choice.get("message") or {}
             content = msg.get("content") or ""
             calls = msg.get("tool_calls") or []
+            finish = choice.get("finish_reason")
+
+            _log({
+                "stage": "tool-loop",
+                "round": tool_rounds,
+                "finish_reason": finish,
+                "content_head": _cap(content, 3000),
+                "tool_calls": [c.get("function", {}).get("name") for c in calls],
+                "reasoning": _cap(msg.get("reasoning_content") or ""),
+            })
+
+            # Early length detection (design §2 overflow avoidance): a
+            # full-budget reasoning truncation means the reasoning model
+            # failed — jump straight to the sibling instead of burning more
+            # rounds on it.
+            if finish == "length" and not content.strip():
+                warnings.append(f"finish_reason=length at round {tool_rounds} — reasoning budget exhausted")
+                early_length = True
+                break
 
             if not calls:
                 if tool_calls_seen == 0:
@@ -599,6 +1325,7 @@ Output ONLY the raw env file contents, KEY=VALUE per line.""")
             tool_calls_seen += 1
             # Execute every tool call in this round (bounded by caps).
             messages.append({"role": "assistant", "content": content or None, "tool_calls": calls})
+            tool_logs: list[dict] = []
             for call in calls:
                 fn = (call.get("function") or {})
                 name = fn.get("name") or ""
@@ -607,15 +1334,21 @@ Output ONLY the raw env file contents, KEY=VALUE per line.""")
                 except (ValueError, TypeError):
                     args = {}
                 result = await self._exec_tool(name, args, context)
+                tool_logs.append({
+                    "name": name,
+                    "args_head": _cap(json.dumps(args, ensure_ascii=False), 1000),
+                    "result_head": _cap(result, 1500),
+                })
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.get("id") or "",
                     "content": result,
                 })
+            _log({"stage": "tool-results", "round": tool_rounds, "tools": tool_logs})
             if progress:
-                await progress(f"agent round {tool_rounds}/{TOOL_ROUNDS_MAX} (tool: {name})")
+                await progress(f"agent round {tool_rounds}/{rounds_cap} (tool: {name})")
         else:
-            warnings.append(f"tool loop exhausted after {TOOL_ROUNDS_MAX} rounds")
+            warnings.append(f"tool loop exhausted after {rounds_cap} rounds")
 
         if not content and (tool_calls_seen == 0 or used_tools_ok is False):
             # Fallback: model rejected/ignored tools → single-shot with
@@ -627,55 +1360,183 @@ Output ONLY the raw env file contents, KEY=VALUE per line.""")
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prefetched})
             try:
-                resp = await self._chat(base_url, model, headers, messages)
+                resp = await self._chat(base_url, model, headers, messages, on_delta=on_delta)
             except Exception as exc:
                 warnings.append(f"single-shot fallback failed: {exc}")
                 content = ""
             else:
+                self._rec_usage_live(resp, usage_cb)
+                content = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                _log_resp("single-shot", resp, {"prompt_head": _cap(prefetched, 1500)})
                 if "_error" in resp:
                     warnings.append(resp["_error"])
                     content = ""
-                else:
-                    content = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            if not content:
+                # One final content-only retry before giving up — the model
+                # sometimes returns an empty first message (flaky) but
+                # answers a direct "output now" instruction.
+                content = await self._finalize_chat(base_url, model, headers, messages, warnings)
+                if not content:
+                    sib = await self._sibling_single_shot(
+                        base_url, model, headers, system_prompt, user_prompt,
+                        config_type, context, warnings,
+                    )
+                    if sib is not None:
+                        return {
+                            "generated_content": sib[0],
+                            "filename_suggestion": filename,
+                            "warnings": warnings,
+                            "validation": sib[1],
+                            "tool_rounds": tool_rounds,
+                            "usage": dict(usage_total),
+                        }
+                    return {
+                        "generated_content": "",
+                        "filename_suggestion": filename,
+                        "warnings": warnings + ["LLM returned no content"],
+                        "validation": {"valid": False, "errors": ["LLM returned no content"]},
+                        "tool_rounds": tool_rounds,
+                        "usage": dict(usage_total),
+                    }
+
+        if not content.strip() and tool_calls_seen > 0 and not early_length:
+            # Tool-loop exhausted with tool calls but no file content (the
+            # model explored but never concluded) — force ONE content-only
+            # call so the accumulated tool results become the answer.
+            content = await self._finalize_chat(base_url, model, headers, messages, warnings)
             if not content:
                 return {
                     "generated_content": "",
                     "filename_suggestion": filename,
-                    "warnings": warnings + ["LLM returned no content"],
+                    "warnings": warnings + ["LLM returned no content after the tool loop"],
                     "validation": {"valid": False, "errors": ["LLM returned no content"]},
                     "tool_rounds": tool_rounds,
+                    "usage": dict(usage_total),
                 }
 
         extracted = self._extract_code_block(content, config_type)
 
         # ---- Mechanical validation + self-repair (bounded by the same cap) ----
         validation = await self._validate_generated(config_type, extracted, context)
-        while not validation.get("valid") and tool_rounds < TOOL_ROUNDS_MAX and validation.get("repairable", True):
+        last_raw = content
+        while not validation.get("valid") and tool_rounds < rounds_cap and validation.get("repairable", True):
             tool_rounds += 1
             messages.append({"role": "user", "content": self._build_repair_prompt(validation.get("errors", []))})
             if progress:
-                await progress(f"self-repair round {tool_rounds}/{TOOL_ROUNDS_MAX}")
+                await progress(f"self-repair round {tool_rounds}/{rounds_cap}")
             try:
-                resp = await self._chat(base_url, model, headers, messages)
+                resp = await self._chat(base_url, model, headers, messages, on_delta=on_delta)
             except Exception as exc:
                 warnings.append(f"self-repair call failed: {exc}")
                 break
             if "_error" in resp:
                 warnings.append(resp["_error"])
                 break
-            extracted = self._extract_code_block(
-                ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or "",
-                config_type,
-            )
+            self._rec_usage_live(resp, usage_cb)
+            _log_resp("repair", resp, {"round": tool_rounds})
+            last_raw = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            extracted = self._extract_code_block(last_raw, config_type)
+            if not extracted.strip():
+                # Repair answer used tools / gave no file — finalize once.
+                final = await self._finalize_chat(base_url, model, headers, messages, warnings)
+                last_raw = final
+                if final:
+                    extracted = self._extract_code_block(final, config_type)
             validation = await self._validate_generated(config_type, extracted, context)
 
+        # Stuck-in-tool-mode recovery: some reasoning models keep emitting
+        # <invoke …> XML inside the content field (even with no tools in the
+        # request) once the conversation contains tool messages. The XML is
+        # stripped by the extractor, which then leaves EMPTY/invalid content
+        # after every repair. Break the loop with a CLEAN single-shot call —
+        # fresh system+user messages, no tools, no tool history.
+        if (
+            not validation.get("valid")
+            and ("<invoke" in last_raw.lower() or "dsml" in last_raw.lower())
+        ):
+            warnings.append("tool-call XML contamination — retrying with a clean single-shot prompt")
+            prefetched = await self._prefetch_prompt_urls(user_prompt)
+            clean = []
+            if system_prompt:
+                clean.append({"role": "system", "content": system_prompt})
+            clean.append({"role": "user", "content": prefetched})
+            try:
+                resp = await self._chat(base_url, model, headers, clean, on_delta=on_delta)
+            except Exception as exc:
+                warnings.append(f"clean single-shot failed: {exc}")
+            else:
+                if "_error" in resp:
+                    warnings.append(resp["_error"])
+                else:
+                    clean_content = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                    clean_extracted = self._extract_code_block(clean_content, config_type)
+                    clean_validation = await self._validate_generated(config_type, clean_extracted, context)
+                    if clean_validation.get("valid"):
+                        extracted = clean_extracted
+                        validation = clean_validation
+
+        # Non-thinking sibling fallback: deepseek reasoning variants can loop
+        # endlessly in chain-of-thought (finish_reason=length, empty content)
+        # on real-world prompts. Retry the clean single-shot with the
+        # non-reasoning sibling model when the endpoint is a deepseek API.
+        if not validation.get("valid"):
+            sib = await self._sibling_single_shot(
+                base_url, model, headers, system_prompt, user_prompt,
+                config_type, context, warnings,
+            )
+            if sib is not None:
+                extracted, validation = sib
+
+        _log({"stage": "final", "valid": bool(validation.get("valid"))})
         return {
             "generated_content": extracted,
             "filename_suggestion": filename,
             "warnings": warnings,
             "validation": validation,
             "tool_rounds": tool_rounds,
+            "usage": dict(usage_total),
         }
+
+    async def _sibling_single_shot(
+        self,
+        base_url: str,
+        model: str,
+        headers: dict,
+        system_prompt: str,
+        user_prompt: str,
+        config_type: str,
+        context: dict,
+        warnings: list[str],
+    ) -> tuple[str, dict] | None:
+        """Clean single-shot with the non-thinking sibling model.
+
+        Returns ``(extracted_content, validation)`` when the sibling produced
+        VALID output, else None.
+        """
+        sibling = self._non_thinking_sibling(base_url, model)
+        if not sibling:
+            return None
+        warnings.append(f"retrying with non-thinking sibling model {sibling}")
+        prefetched = await self._prefetch_prompt_urls(user_prompt)
+        clean: list[dict] = []
+        if system_prompt:
+            clean.append({"role": "system", "content": system_prompt})
+        clean.append({"role": "user", "content": prefetched})
+        try:
+            resp = await self._chat(base_url, sibling, headers, clean)
+        except Exception as exc:
+            warnings.append(f"sibling single-shot failed: {exc}")
+            return None
+        if "_error" in resp:
+            warnings.append(resp["_error"])
+            return None
+        self._record_usage(resp)
+        sib_content = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        sib_extracted = self._extract_code_block(sib_content, config_type)
+        sib_validation = await self._validate_generated(config_type, sib_extracted, context)
+        if sib_validation.get("valid"):
+            return sib_extracted, sib_validation
+        return None
 
     async def _validate_generated(
         self, config_type: str, content: str, context: dict
@@ -799,35 +1660,6 @@ Output ONLY the raw env file contents, KEY=VALUE per line.""")
                 "warnings": [],
             }
 
-    # ------------------------------------------------------------------
-    # Deploy-time per-user env generation (GAP-19)
-    # ------------------------------------------------------------------
-
-    async def generate_per_user_env(
-        self, db: Session, context: dict
-    ) -> dict:
-        """Generate a per-user .env at deployment time.
-
-        Knows user/label/domain (fresh SECRET_KEY per instance). Does NOT
-        touch the stored default file set — it writes the per-user file only.
-        """
-        deploy_meta = context.get("deploy_metadata") or {}
-        user_name = deploy_meta.get("user_name", "user")
-        label = deploy_meta.get("label", "0")
-        domain = deploy_meta.get("domain", "localhost")
-        service_name = deploy_meta.get("service_name", "service")
-
-        ctx = dict(context)
-        ctx["prompt"] = (
-            "This .env is for ONE deployed instance and must contain a fresh, "
-            "random SECRET_KEY unique to this instance (and unique DB passwords "
-            "if applicable)."
-        )
-        result = await self.generate_with_agent(db, "env_file", ctx)
-        result["per_user_env_name"] = f".env.{user_name}.{label}"
-        result["hostname"] = f"{service_name}-{user_name}-{label}.{domain}"
-        return result
-
     def _build_prompt(self, config_type: str, context: dict) -> str:
         """Build a prompt for config generation (legacy single-shot path)."""
         from ..utils.skill_loader import get_compose_rules, get_nginx_rules, get_compose_template, get_nginx_template
@@ -931,7 +1763,13 @@ Output ONLY the raw Dockerfile, no markdown fences."""
         return f"Generate a {config_type} for {desc}"
 
     def _extract_code_block(self, content: str, config_type: str) -> str:
-        """Extract YAML/code blocks from LLM response."""
+        """Extract YAML/code blocks from LLM response.
+
+        Also strips inline tool-call tags: reasoning models can emit
+        ``<invoke name="...">…</invoke>`` XML INLINE in the content field
+        instead of the tool_calls array — left in, it corrupts generated
+        files (e.g. docker compose rejects ``.env`` lines starting with '<').
+        """
         fence_lang = {
             "docker_compose": "yaml",
             "nginx_conf": "nginx",
@@ -942,22 +1780,49 @@ Output ONLY the raw Dockerfile, no markdown fences."""
         pattern = rf"```(?:{fence_lang})?\s*\n(.*?)```"
         matches = re.findall(pattern, content, re.DOTALL)
         if matches:
-            return matches[0].strip()
+            extracted = matches[0]
+        else:
+            # Some reasoning models fence code with CJK corner brackets:
+            # <｜yaml> … <／yaml> or <｜ … ｜>.
+            cjk = re.search(r"<｜[^｜]*｜>(.*?)<｜", content, re.DOTALL) or re.search(r"<｜(.*?)｜>", content, re.DOTALL)
+            if cjk and cjk.group(1).strip():
+                extracted = cjk.group(1)
+            else:
+                extracted = None
+        if extracted is None:
+            if config_type == "docker_compose":
+                m = re.search(r"(version:|services:|name:)", content)
+                extracted = content[m.start():] if m else content
+            elif config_type == "nginx_conf":
+                m = re.search(r"(server\s*\{|upstream\s+)", content)
+                extracted = content[m.start():] if m else content
+            elif config_type == "dockerfile":
+                m = re.search(r"(FROM\s+\S+)", content, re.IGNORECASE)
+                extracted = content[m.start():] if m else content
+            else:
+                extracted = content
 
-        if config_type == "docker_compose":
-            m = re.search(r"(version:|services:|name:)", content)
-            if m:
-                return content[m.start():].strip()
-        elif config_type == "nginx_conf":
-            m = re.search(r"(server\s*\{|upstream\s+)", content)
-            if m:
-                return content[m.start():].strip()
-        elif config_type == "dockerfile":
-            m = re.search(r"(FROM\s+\S+)", content, re.IGNORECASE)
-            if m:
-                return content[m.start():].strip()
+        # DeepSeek can render its tool-call markup as SPECIAL-TOKEN TEXT
+        # (｜DSML｜｜ invoke name="read_file"…) instead of the tool_calls array.
+        # Any file built from that is garbage — emit nothing so the phase
+        # retries (clean single-shot, no tools) instead of persisting junk.
+        low = extracted.lower()
+        if "dsml" in low or "｜invoke" in extracted or "|invoke" in low:
+            return ""
 
-        return content.strip()
+        # Strip inline tool-call XML: reasoning models emit several variants —
+        # <invoke name="…">…</invoke>, <invoke_tools>…</invoke_tools>, and
+        # <parameter …> payload tags — all corrupt generated files.
+        extracted = re.sub(
+            r"</?(?:invoke|invoke_tools|parameter)\b[^>]*>.*?</(?:invoke|invoke_tools|parameter)>",
+            "",
+            extracted,
+            flags=re.DOTALL,
+        )
+        extracted = re.sub(r"</?(?:invoke|invoke_tools|parameter)\b[^>]*/>?", "", extracted)
+        # Stray CJK corner-bracket fence tokens (unmatched <｜ / ｜> pairs).
+        extracted = extracted.replace("<｜", "").replace("｜>", "")
+        return extracted.strip()
 
 
 # Singleton

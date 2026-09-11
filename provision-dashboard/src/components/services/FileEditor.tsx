@@ -31,7 +31,7 @@ export default function FileEditor({ open, file, onClose, getLanguage = defaultG
   const loadFile = async (user: string, service: string, label: string, fileType: string, filename: string) => {
     setLoading(true)
     try {
-      const { data } = await client.get(`/users/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: '', filename } })
+      const { data } = await client.get(`/services/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: '', filename } })
       setContent(data.content || '')
       setOriginal(data.content || '')
     } catch (err: any) {
@@ -55,7 +55,7 @@ export default function FileEditor({ open, file, onClose, getLanguage = defaultG
     if (!file) return
     setSaving(true)
     try {
-      await client.put(`/users/${file.user}/${file.service}/${file.label}/per-user-file`, { recipe_path: '', filename: file.filename, content })
+      await client.put(`/services/${file.user}/${file.service}/${file.label}/per-user-file`, { recipe_path: '', filename: file.filename, content })
       message.success('File saved')
       setOriginal(content)
     } catch (err: any) {

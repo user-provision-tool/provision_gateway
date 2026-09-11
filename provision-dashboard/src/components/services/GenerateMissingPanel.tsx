@@ -63,9 +63,9 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, on
     const params: Record<string, string> = {}
     if (recipePath) params.recipe_path = recipePath
     Promise.all([
-      client.get(`/services/${serviceName}/file-sets`).then(r => r.data),
+      client.get(`/projects/${serviceName}/file-sets`).then(r => r.data),
       client.get('/llm/config').then(r => r.data).catch(() => ({ is_active: false })),
-      client.get(`/services/${serviceName}/check-missing-files`, { params })
+      client.get(`/projects/${serviceName}/check-missing-files`, { params })
         .then(r => r.data).catch(() => ({ needs_env: true })),
     ]).then(([fs, cfg, check]: any[]) => {
       const rp = recipePath || '.'
@@ -136,6 +136,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, on
         service_name: serviceName,
         recipe_path: recipePath,
         job_type: 'generate_missing',
+        skip_env: true,  // env is generated per-user at deploy time (§8.7)
         prompt,
         selection: effectiveSelection(),
         deploy_metadata: { service_name: serviceName, user_name: '', label: '0', domain: 'localhost' },
@@ -149,7 +150,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, on
     if (!reviewFiles) return
     setSaving(true)
     try {
-      const { data } = await client.post('/services/save-generated', {
+      const { data } = await client.post('/projects/save-generated', {
         service_name: serviceName,
         recipe_path: recipePath,
         files: reviewFiles,
@@ -186,6 +187,12 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, on
     >
       <Space direction="vertical" style={{ width: '100%' }} size="middle">
         {loading ? <div style={{ textAlign: 'center', padding: 24 }}><Spin /></div> : (<>
+          <Alert
+            type="info"
+            showIcon
+            message="Env files are NOT generated here"
+            description="Per-user env files are generated automatically at deploy time (last step of the deploy pipeline). This panel generates compose and nginx only."
+          />
           {!llmActive && (
             <Alert
               type="warning"

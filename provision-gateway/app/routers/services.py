@@ -19,7 +19,7 @@ from ..utils.file_scanner import scan_directory
 from ..services.provision_service import provision_service
 from ..schemas.services import ServiceRecipesRequest, ServiceTreeResponse
 
-router = APIRouter(prefix="/api/services", tags=["services"])
+router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
 @router.get("")
@@ -307,9 +307,17 @@ async def compose_preview(
     preview — no templates or markers are written.
     """
     try:
-        return await provision_service.compose_preview(name, compose_files, recipe_path)
+        result = await provision_service.compose_preview(name, compose_files, recipe_path)
     except Exception as e:
         raise HTTPException(502, f"provision-api error: {e}")
+    # The panel's volume-override rows default to
+    # {user_data_dir}/{user}/{service}/{label}/{key} — inject the canonical
+    # root so the frontend never hardcodes a stale path (the provision-api
+    # bootstraps bind targets under ITS user_data root; a mismatched prefix
+    # makes copy-if-empty write to container-local paths the compose mounts
+    # never see).
+    result["user_data_dir"] = str(settings.USER_DATA_DIR)
+    return result
 
 
 @router.post("/check-deploy")

@@ -54,6 +54,17 @@ class ProvisionService:
     async def list_users(self) -> dict[str, Any]:
         return await self._request("GET", "/users")
 
+    async def get_service_url_base(
+        self, service_name: str, user_name: str, label: str, domain: str = "localhost"
+    ) -> dict[str, Any]:
+        """Ask the -api for the hostname a service instance will be served on
+        (pre-deploy, same code the -api uses at deploy time)."""
+        return await self._request(
+            "GET", "/service-url-base",
+            params={"service_name": service_name, "user_name": user_name,
+                    "label": str(label), "domain": domain or "localhost"},
+        )
+
     async def get_user(self, user_name: str) -> dict[str, Any]:
         return await self._request("GET", f"/users/{user_name}")
 
@@ -179,6 +190,14 @@ class ProvisionService:
                     )
                 async for line in resp.aiter_lines():
                     if line:
+                        # provision-api already emits SSE frames (``data: <log line>``);
+                        # httpx yields the raw frame line including the ``data: ``
+                        # prefix. Strip it so the forwarded payload carries ONLY the
+                        # log content (the drawer then shows clean lines, not ``data:``).
+                        if line.startswith("data: "):
+                            line = line[len("data: "):]
+                        if line.startswith("event:") or line.startswith(":"):
+                            continue
                         # Emit proper SSE format: data: {json_line}\n\n — G11 fix
                         import json as _json
                         yield f"data: {_json.dumps({'line': line})}\n\n"

@@ -120,6 +120,15 @@ function LlmPanel() {
         <Form.Item name="byok_base_url" label="API Base URL"><Input placeholder="https://api.deepseek.com/v1" prefix={<ApiOutlined />} /></Form.Item>
         <Form.Item name="byok_model" label="Model Name"><Input placeholder="deepseek-chat" /></Form.Item>
         <Form.Item name="byok_api_key" label="API Key"><Input.Password placeholder="sk-..." prefix={<KeyOutlined />} /></Form.Item>
+        <Form.Item name="reasoning_effort" label="Reasoning Effort" initialValue="low">
+          <Select options={[{ value: 'low', label: 'low' }, { value: 'medium', label: 'medium' }, { value: 'high', label: 'high' }]} />
+        </Form.Item>
+        <Form.Item name="max_tokens" label="Token Budget" initialValue={100000}>
+          <Input type="number" placeholder="100000" />
+        </Form.Item>
+        <Form.Item name="tool_rounds_max" label="Tool Rounds Max (≤20)" initialValue={6}>
+          <Input type="number" min={1} max={20} placeholder="6" />
+        </Form.Item>
         <Space>
           <Button type="primary" htmlType="submit" loading={saving} icon={<SaveOutlined />}>Add Config</Button>
           <Button onClick={handleTest} loading={testing} icon={<RobotOutlined />}>Test Active</Button>

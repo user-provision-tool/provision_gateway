@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Typography, Card, Table, Tag, Space, Button, message, Spin, Empty, Modal, Form, Input, Select, Collapse } from 'antd'
-import { UserAddOutlined, CheckOutlined, CloseOutlined, ReloadOutlined, SettingOutlined } from '@ant-design/icons'
+import { UserAddOutlined, CheckOutlined, CloseOutlined, ReloadOutlined, SettingOutlined, KeyOutlined } from '@ant-design/icons'
 import client from '../api/client'
 
 const { Title, Text } = Typography
@@ -58,6 +58,25 @@ export default function UserManagementPage() {
     catch (err: any) { message.error('Failed') }
   }
 
+  // Admin password reset (viewers are auto-registered with random passwords
+  // during service deploy — the admin needs a way to set a known login
+  // credential from the dashboard).
+  const [pwdTarget, setPwdTarget] = useState<any>(null)
+  const [pwdLoading, setPwdLoading] = useState(false)
+  const [pwdForm] = Form.useForm()
+
+  const resetPassword = async (values: any) => {
+    if (!pwdTarget) return
+    setPwdLoading(true)
+    try {
+      await client.put(`/auth/users/${pwdTarget.id}/password`, { password: values.password })
+      message.success(`Password reset for ${pwdTarget.username}`)
+      setPwdTarget(null)
+      pwdForm.resetFields()
+    } catch (err: any) { message.error(err.response?.data?.detail || 'Failed') }
+    finally { setPwdLoading(false) }
+  }
+
   const openSpecialUsers = (user: any) => {
     setSpecialUsersTarget(user)
     setSpecialUsersSelected(user.allowed_special_users || [])
@@ -99,6 +118,7 @@ export default function UserManagementPage() {
     { title: 'Actions', key: 'actions', render: (_:any, r:any) => <Space>
       <Button size="small" icon={<SettingOutlined/>} onClick={()=>openSpecialUsers(r)} title="Set allowed special functional users">Special</Button>
       {!r.is_approved && <Button size="small" type="primary" icon={<CheckOutlined/>} onClick={()=>handleApprove(r.id)}>Approve</Button>}
+      <Button size="small" icon={<KeyOutlined/>} onClick={()=>{pwdForm.resetFields();setPwdTarget(r)}} title="Reset password">Pwd</Button>
       <Button size="small" danger icon={<CloseOutlined/>} onClick={()=>handleDelete(r.id)}/>
     </Space> },
   ]
@@ -143,6 +163,19 @@ export default function UserManagementPage() {
           <Form.Item name="password" label="Password" rules={[{required:true,min:4}]}><Input.Password placeholder="****"/></Form.Item>
           <Form.Item name="role" label="Role" initialValue="viewer"><Select options={[{value:'viewer',label:'Viewer'},{value:'special',label:'Special'}]}/></Form.Item>
           <Button type="primary" htmlType="submit" loading={addLoading} block>Register</Button>
+        </Form>
+      </Modal>
+
+      {/* Admin password reset modal */}
+      <Modal
+        title={`Reset Password — ${pwdTarget?.username || ''}`}
+        open={!!pwdTarget}
+        onCancel={()=>{setPwdTarget(null);pwdForm.resetFields()}}
+        footer={null}
+      >
+        <Form form={pwdForm} layout="vertical" onFinish={resetPassword}>
+          <Form.Item name="password" label="New Password" rules={[{required:true,min:4}]}><Input.Password placeholder="min 4 chars"/></Form.Item>
+          <Button type="primary" htmlType="submit" loading={pwdLoading} block>Reset Password</Button>
         </Form>
       </Modal>
 

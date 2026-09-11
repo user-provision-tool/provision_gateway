@@ -1,4 +1,4 @@
-import { Alert, Button, Checkbox, Select, Space, Tag, Typography } from 'antd'
+import { Alert, Button, Select, Space, Tag, Typography } from 'antd'
 import { ArrowDownOutlined, ArrowUpOutlined, CloseOutlined } from '@ant-design/icons'
 
 /**
@@ -8,8 +8,8 @@ import { ArrowDownOutlined, ArrowUpOutlined, CloseOutlined } from '@ant-design/i
  * - compose: ordered multi (merge order is user-visible)
  * - nginx: single
  * - env: ordered multi (later wins), disabled/collapsed when needs_env=false
- * - profiles: checkboxes (candidates derive from the SELECTED compose, so the
- *   section is disabled until the compose selection resolves)
+ * - profiles: multi-select dropdown (candidates derive from the SELECTED
+ *   compose, so the section is disabled until the compose selection resolves)
  * - stale stored entries are kept + flagged (never dropped here); callers
  *   exclude them from generation/deploy requests.
  */
@@ -167,11 +167,14 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
             No non-empty profiles found{sel.compose.length === 0 ? ' — select compose files first' : ''}.
           </div>
         ) : (
-          <Checkbox.Group
+          <Select
+            mode="multiple"
+            allowClear
+            placeholder="Select profiles…"
+            style={{ width: '100%', marginTop: 4 }}
             value={sel.profiles}
-            onChange={(vals) => set({ profiles: (vals as string[]).filter(p => !isStale('profiles', p)) })}
+            onChange={(vals: string[]) => set({ profiles: vals.filter(p => !isStale('profiles', p)) })}
             options={candidates.profiles.map(p => ({ value: p, label: p }))}
-            style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 4 }}
           />
         )}
         {(st.profiles || []).map(p => (

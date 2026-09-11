@@ -1,6 +1,6 @@
 import client from './client'
 
-export const createServiceGit = (data: Record<string, any>) => client.post('/services', data)
+export const createServiceGit = (data: Record<string, any>) => client.post('/projects', data)
 
 // Lightweight convert/preview (design §Implementation notes L284-286):
 // volume-override keys come from the converter's in-call src→key mapping,
@@ -17,7 +17,7 @@ export const getComposePreview = (
     ...composeFiles.map(f => `compose_files=${encodeURIComponent(f)}`),
     ...(recipePath ? [`recipe_path=${encodeURIComponent(recipePath)}`] : []),
   ].join('&')
-  return client.get(`/services/${serviceName}/compose-preview?${qs}`)
+  return client.get(`/projects/${serviceName}/compose-preview?${qs}`)
 }
 
 // Profile candidates derived from an IN-PANEL compose selection (GAP-2):
@@ -28,7 +28,7 @@ export const deriveProfiles = (
   serviceName: string,
   composeFiles: string[],
   recipePath: string = '',
-) => client.post(`/services/${serviceName}/file-sets/derive`, {
+) => client.post(`/projects/${serviceName}/file-sets/derive`, {
   recipe_path: recipePath,
   compose: composeFiles,
 })

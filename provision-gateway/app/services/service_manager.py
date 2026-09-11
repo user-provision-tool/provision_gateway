@@ -19,6 +19,13 @@ from .project_state import (
     ProjectState,
 )
 
+# Large repos over a flaky link fail transiently — retry the clone (create_from_git).
+GIT_CLONE_ATTEMPTS = 3
+# Per-attempt wall clock for `git clone`. A hung transfer must not pin the
+# request (and the dashboard's spinner) forever — see create_from_git.
+# 3 × 300s = 15 min worst case, inside the dashboard's 20-min create timeout.
+GIT_CLONE_TIMEOUT = 300
+
 
 class ServiceNotFoundError(Exception):
     """Raised when a service project directory does not exist.
@@ -513,11 +520,44 @@ class ServiceManager:
                 raise ValueError("No active proxy configured. Activate a proxy in Settings first.")
             configure_git_proxy(db_session)
 
+        # Cloning a large repo over the network fails transiently (DNS/proxy
+        # blips, git exit 128). Retry a couple of times and surface git's REAL
+        # stderr — "returned non-zero exit status 128" tells the operator
+        # nothing. A failed clone can also leave a partial target dir behind,
+        # which would make the next attempt die with "already exists".
+        #
+        # A clone can also HANG rather than fail: git sits in git-remote-https
+        # with no pack data arriving (observed live — a stalled transfer left the
+        # create request in flight and the dashboard spinning forever, with no
+        # retry, because a hang is not a non-zero exit). Bound each attempt so a
+        # stall is retried like any other transient failure. Attempts × timeout
+        # stays under the dashboard's per-call create timeout.
+        last_err = ""
         try:
-            subprocess.run(
-                ["git", "clone", "--branch", branch, "--single-branch", repo_url, str(target)],
-                check=True, capture_output=True, text=True,
-            )
+            for attempt in range(1, GIT_CLONE_ATTEMPTS + 1):
+                try:
+                    subprocess.run(
+                        ["git", "clone", "--branch", branch, "--single-branch", repo_url, str(target)],
+                        check=True, capture_output=True, text=True,
+                        timeout=GIT_CLONE_TIMEOUT,
+                    )
+                    last_err = ""
+                    break
+                except subprocess.TimeoutExpired:
+                    last_err = (
+                        f"git clone produced no progress for {GIT_CLONE_TIMEOUT}s "
+                        f"(stalled transfer) — aborted"
+                    )
+                    if target.exists():
+                        shutil.rmtree(target, ignore_errors=True)
+                    if attempt < GIT_CLONE_ATTEMPTS:
+                        time.sleep(2 * attempt)
+                except subprocess.CalledProcessError as exc:
+                    last_err = (exc.stderr or "").strip() or str(exc)
+                    if target.exists():
+                        shutil.rmtree(target, ignore_errors=True)
+                    if attempt < GIT_CLONE_ATTEMPTS:
+                        time.sleep(2 * attempt)
         finally:
             # Clean up git proxy config
             if use_proxy:
@@ -530,6 +570,10 @@ class ServiceManager:
                     check=False, capture_output=True,
                 )
 
+        if last_err:
+            raise RuntimeError(
+                f"git clone failed after {GIT_CLONE_ATTEMPTS} attempts: {last_err[:400]}"
+            )
         return self._get_service_info(target)
 
     def create_from_upload(

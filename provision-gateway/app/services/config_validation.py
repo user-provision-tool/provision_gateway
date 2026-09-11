@@ -72,6 +72,22 @@ async def validate_nginx(
         return {"valid": False, "errors": [f"nginx conf does not exist: {p}"], "skipped": False}
 
     errors: list[str] = []
+    # 0. Sanity: the file must actually LOOK like an nginx configuration.
+    # A proxy-target check alone accepted leaked tool-call markup (DeepSeek
+    # ｜DSML｜ tokens) as "valid" and persisted it as the deployed conf.
+    try:
+        _text = p.read_text(errors="replace")
+    except OSError as exc:
+        return {"valid": False, "errors": [f"nginx conf unreadable: {exc}"], "skipped": False}
+    if "server" not in _text and "location" not in _text:
+        return {
+            "valid": False,
+            "errors": [
+                "nginx conf contains no server{} / location block — "
+                "not a valid nginx configuration (tool-call markup leak?)"
+            ],
+            "skipped": False,
+        }
     # 1. Proxy-target validation (authoritative — provision-api endpoint).
     try:
         import httpx
@@ -109,27 +125,35 @@ async def validate_nginx(
 def validate_env(
     env_content: str, compose_paths: list[str | Path]
 ) -> dict[str, Any]:
-    """Completeness check: every no-default ${VAR} must be present in the env output.
+    """Completeness + line-sanity check for the generated env output.
+
+    Every non-empty, non-comment line MUST look like KEY=VALUE — junk lines
+    (e.g. inline ``<invoke …>`` tool-call XML that reasoning models emit in
+    the content field) make ``docker compose --env-file`` fail at deploy time
+    even when the completeness check passes.
 
     Returns ``{"valid", "errors", "missing": [str], "skipped"}``.
     """
     from pathlib import Path as _Path
     import tempfile
 
+    errors: list[str] = []
+    for raw in (env_content or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            errors.append(f"invalid env line (not KEY=VALUE): {line[:80]}")
+
     paths = [_Path(p) for p in compose_paths]
     scan = scan_compose_files(paths)
-    if not scan.refs:
-        return {"valid": True, "errors": [], "missing": [], "skipped": False}
+    missing: list[str] = []
+    if scan.refs:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = _Path(tmp) / ".env"
+            env_file.write_text(env_content or "", encoding="utf-8")
+            missing = env_completeness(paths, [env_file])
+        if missing:
+            errors.append(f"missing env var(s) without defaults: {', '.join(missing)}")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        env_file = _Path(tmp) / ".env"
-        env_file.write_text(env_content or "", encoding="utf-8")
-        missing = env_completeness(paths, [env_file])
-    if missing:
-        return {
-            "valid": False,
-            "errors": [f"missing env var(s) without defaults: {', '.join(missing)}"],
-            "missing": missing,
-            "skipped": False,
-        }
-    return {"valid": True, "errors": [], "missing": [], "skipped": False}
+    return {"valid": not errors, "errors": errors, "missing": missing, "skipped": False}

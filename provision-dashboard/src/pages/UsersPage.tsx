@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Popconfirm, Modal, Drawer, Checkbox } from 'antd'
+import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Modal, Drawer, Checkbox } from 'antd'
 import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, SwapOutlined, UnorderedListOutlined, DashboardOutlined, GlobalOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
@@ -9,12 +9,22 @@ import DeployForm from '../components/services/DeployForm'
 
 const { Title, Text } = Typography
 
+// Basename of a server-side path ('' when unknown) — used to turn the -api's
+// per-instance file paths into the filenames the per-user-file API expects.
+const baseName = (p?: string) => (p ? p.split('/').pop() || '' : '')
+
 interface ServiceInstance {
   user_name: string; service_name: string; label: string;
   healthy_containers?: Record<string,string>
   unhealthy_containers?: Record<string,string>
   missing_containers?: Record<string,string>
   compose_template_path?: string; nginx_conf_template_path?: string
+  compose_file_path?: string
+  // Recipe subdir of this instance relative to its project dir ('' = root) and
+  // the effective per-user env file — supplied by the -api (single source of
+  // truth) so the Deployment-Files links resolve inside the right recipe.
+  recipe_path?: string
+  env_file_path?: string
   has_auth?: boolean; url?: string
   status?: string  // "building" | "running" | "unknown"
   volumes?: Record<string,string>
@@ -47,9 +57,19 @@ export default function UsersPage() {
 
   // Deployment file editor drawer
   const [editorOpen, setEditorOpen] = useState(false)
-  const [editorFile, setEditorFile] = useState<{user:string;service:string;label:string;fileType:string;filename:string;path:string}|null>(null)
+  const [editorFile, setEditorFile] = useState<{user:string;service:string;label:string;fileType:string;filename:string;path:string;recipePath:string}|null>(null)
   const [editorContent, setEditorContent] = useState('')
   const [editorOriginal, setEditorOriginal] = useState('')
+  const [delOpen, setDelOpen] = useState(false)
+  const [delTarget, setDelTarget] = useState<{user_name:string;service_name:string;label:string}|null>(null)
+  const [delToken, setDelToken] = useState('')
+  const [delInput, setDelInput] = useState('')
+  // Batch (multi-select) delete also uses the typed-confirm modal (feature 2 —
+  // no plain-Popconfirm delete path remains).
+  const [delBatch, setDelBatch] = useState(false)
+  // Optimistic "Deleting…" overlay (the durable state is the -api registry
+  // status 'deleting'; this only bridges click → next poll).
+  const [deletingKeys, setDeletingKeys] = useState<Set<string>>(new Set())
   const [editorLoading, setEditorLoading] = useState(false)
   const [editorSaving, setEditorSaving] = useState(false)
 
@@ -127,7 +147,7 @@ export default function UsersPage() {
         const key = `${svc.user_name}-${svc.service_name}-${svc.label}`
         if (regTimes[key] !== undefined) continue // Already fetched
         try {
-          const { data } = await client.get(`/users/${svc.user_name}/${svc.service_name}/${svc.label}/registration-time`)
+          const { data } = await client.get(`/services/${svc.user_name}/${svc.service_name}/${svc.label}/registration-time`)
           const rt = data.registration_time || null
           setRegTimes(prev => ({...prev, [key]: rt}))
         } catch { /* ignore */ }
@@ -141,7 +161,7 @@ export default function UsersPage() {
     const key = `${user}-${service}-${label}`
     if (volumeUsage[key] !== undefined) return
     try {
-      const { data } = await client.get(`/users/${user}/${service}/${label}/volume-usage`)
+      const { data } = await client.get(`/services/${user}/${service}/${label}/volume-usage`)
       setVolumeUsage(prev => ({...prev, [key]: data}))
       // Also populate disk info into resource stats
       if (data.volumes) {
@@ -154,15 +174,19 @@ export default function UsersPage() {
   }
 
   // Check file modification times for per-user deployment files
-  // (recipe-root scoped; the convention list endpoint was retired — GAP-18).
-  const checkFileModTimes = useCallback(async (user: string, service: string, label: string) => {
+  // (recipe-scoped — the convention list endpoint was retired, GAP-18; the
+  // recipe subdir comes from the -api so sub-recipe services like dify resolve).
+  const checkFileModTimes = useCallback(async (
+    user: string, service: string, label: string,
+    recipePath = '', envFile = '', composeFile = '',
+  ) => {
     const key = `${user}-${service}-${label}`
     try {
-      const envName = `.env.${user}.${label}`
-      const composeName = `docker-compose.user-${user}.${label}.yml`
+      const envName = envFile || `.env.raw.${user}.${label}`
+      const composeName = composeFile || `docker-compose.user-${user}.${label}.yml`
       const [envRes, composeRes] = await Promise.all([
-        client.get(`/users/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: '', filename: envName } }),
-        client.get(`/users/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: '', filename: composeName } }),
+        client.get(`/services/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: recipePath, filename: envName } }),
+        client.get(`/services/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: recipePath, filename: composeName } }),
       ])
       let latestMod: number | null = null
       for (const data of [envRes.data, composeRes.data]) {
@@ -222,7 +246,10 @@ export default function UsersPage() {
       const key = `${svc.user_name}-${svc.service_name}-${svc.label}`
       // per-user-file mod-time checks (checkFileModTimes) are admin-only — skip for viewers
       if (isAdmin && fileModTimes[key] === undefined) {
-        checkFileModTimes(svc.user_name, svc.service_name, svc.label)
+        checkFileModTimes(
+          svc.user_name, svc.service_name, svc.label,
+          svc.recipe_path || '', baseName(svc.env_file_path), baseName(svc.compose_file_path),
+        )
       }
       if (isAdmin && volumeUsage[key] === undefined) {
         fetchVolumeUsage(svc.user_name, svc.service_name, svc.label)
@@ -237,12 +264,12 @@ export default function UsersPage() {
   }, [services, checkFileModTimes])
 
   // Open deployment file editor
-  const openFileEditor = async (user: string, service: string, label: string, fileType: string, filename: string) => {
+  const openFileEditor = async (user: string, service: string, label: string, fileType: string, filename: string, recipePath = '') => {
     setEditorLoading(true)
-    setEditorFile({ user, service, label, fileType, filename, path: '' })
+    setEditorFile({ user, service, label, fileType, filename, path: '', recipePath })
     setEditorOpen(true)
     try {
-      const { data } = await client.get(`/users/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: '', filename } })
+      const { data } = await client.get(`/services/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: recipePath, filename } })
       setEditorContent(data.content || '')
       setEditorOriginal(data.content || '')
       setEditorFile(prev => prev ? {...prev, path: data.path || ''} : null)
@@ -270,11 +297,17 @@ export default function UsersPage() {
     if (!editorFile) return
     setEditorSaving(true)
     try {
-      await client.put(`/users/${editorFile.user}/${editorFile.service}/${editorFile.label}/per-user-file`, { recipe_path: '', filename: editorFile.filename, content: editorContent })
+      // Save into the SAME recipe dir the file was read from (never the project
+      // root) — otherwise a save would create a stray root-level file.
+      await client.put(`/services/${editorFile.user}/${editorFile.service}/${editorFile.label}/per-user-file`, { recipe_path: editorFile.recipePath || '', filename: editorFile.filename, content: editorContent })
       message.success('File saved')
       setEditorOriginal(editorContent)
       // Re-check modification times
-      checkFileModTimes(editorFile.user, editorFile.service, editorFile.label)
+      checkFileModTimes(
+        editorFile.user, editorFile.service, editorFile.label, editorFile.recipePath,
+        editorFile.fileType === 'env' ? editorFile.filename : '',
+        editorFile.fileType === 'compose' ? editorFile.filename : '',
+      )
     } catch (err: any) {
       message.error(err.response?.data?.detail || 'Failed to save')
     } finally {
@@ -321,10 +354,9 @@ export default function UsersPage() {
       for (const key of keys) {
         const {user, service, label} = parseServiceKey(key)
         switch (action) {
-          case 'stop': await client.post(`/users/${user}/${service}/${label}/down`); break
-          case 'start': await client.post(`/users/${user}/${service}/${label}/up`); break
-          case 'rebuild': await client.post(`/users/${user}/${service}/${label}/rebuild`, {no_cache: true}); break
-          case 'remove': await client.delete(`/users/${user}/${service}/${label}`); break
+          case 'stop': await client.post(`/services/${user}/${service}/${label}/down`); break
+          case 'start': await client.post(`/services/${user}/${service}/${label}/up`); break
+          case 'rebuild': await client.post(`/services/${user}/${service}/${label}/rebuild`, {no_cache: true}); break
         }
       }
       message.success(`Batch ${action}: ${keys.length} service(s) processed`)
@@ -338,7 +370,7 @@ export default function UsersPage() {
   }
 
   const _fetchServices = async (): Promise<ServiceInstance[]> => {
-    const { data } = await client.get('/users')
+    const { data } = await client.get('/services')
     // The backend (GET /api/users, gateway `list_users`) already ACL-filters the
     // response to a viewer's own services + their allowed_special_users. Do NOT
     // re-filter client-side here: the prior `if (endUserViewer && u.user_name !==
@@ -354,10 +386,22 @@ export default function UsersPage() {
     return all
   }
 
+  // Drop optimistic "Deleting…" flags for instances that are gone from the
+  // server list (so a failed/never-arriving removal can't stick forever).
+  const pruneDeleting = (list: ServiceInstance[]) => {
+    setDeletingKeys(prev => {
+      if (prev.size === 0) return prev
+      const live = new Set(list.map(s => `${s.user_name}-${s.service_name}-${s.label}`))
+      const next = new Set([...prev].filter(k => live.has(k)))
+      return next.size === prev.size ? prev : next
+    })
+  }
+
   const loadServices = async () => {
     setLoading(true)
     try {
-      setServices(await _fetchServices())
+      const list = await _fetchServices()
+      setServices(list); pruneDeleting(list)
     } catch (err: any) { message.error('Failed to load services') }
     finally { setLoading(false) }
   }
@@ -365,7 +409,8 @@ export default function UsersPage() {
   // Silent refresh — no loading spinner, for auto-polling
   const refreshServices = useCallback(async () => {
     try {
-      setServices(await _fetchServices())
+      const list = await _fetchServices()
+      setServices(list); pruneDeleting(list)
     } catch { /* silent */ }
   }, [])
 
@@ -394,9 +439,15 @@ export default function UsersPage() {
     return filtered
   }, [services, search])
 
-  const getBadge = (s: ServiceInstance) => {
+  const getBadge = (s: ServiceInstance, key?: string) => {
     // Building: containers don't exist yet, don't show misleading "down" count
     if (s.status === 'building') return <Badge status="processing" text="Building..."/>
+    // Deleting: persisted server-side in the registry (like 'building'), so it
+    // survives a page refresh; the local key set only bridges the instant
+    // between the click and the next poll.
+    if (s.status === 'deleting' || (key && deletingKeys.has(key))) {
+      return <Badge status="processing" text="Deleting..."/>
+    }
     const h = Object.keys(s.healthy_containers||{}).length
     const uh = Object.keys(s.unhealthy_containers||{}).length
     const m = Object.keys(s.missing_containers||{}).length
@@ -415,7 +466,7 @@ export default function UsersPage() {
     if (!pwdTarget || !newPassword) { message.warning('Enter a new password'); return }
     setPwdLoading(true)
     try {
-      await client.put(`/users/${pwdTarget.user}/${pwdTarget.service}/${pwdTarget.label}/password`, { passwd: newPassword })
+      await client.put(`/services/${pwdTarget.user}/${pwdTarget.service}/${pwdTarget.label}/password`, { passwd: newPassword })
       message.success('Password changed')
       setPwdModalOpen(false)
     } catch (err: any) { message.error(err.response?.data?.detail || 'Failed') }
@@ -426,7 +477,7 @@ export default function UsersPage() {
     if (!cloneSource || !cloneTarget) { message.warning('Enter target user'); return }
     setCloneLoading(true)
     try {
-      await client.post('/users/clone', { source_user: cloneSource, target_user: cloneTarget })
+      await client.post('/services/clone', { source_user: cloneSource, target_user: cloneTarget })
       message.success(`Cloning ${cloneSource} → ${cloneTarget}`)
       setCloneOpen(false)
       refreshServices()
@@ -445,7 +496,7 @@ export default function UsersPage() {
       const payload: any = {}
       if (noCache) payload.no_cache = true
       if (rebuildProxy) payload.use_global_proxy = true
-      const r = await client.post(`/users/${user}/${service}/${label}/rebuild`, payload)
+      const r = await client.post(`/services/${user}/${service}/${label}/rebuild`, payload)
       const taskId = r.data?.task_id || r.data?.id
       message.success({content:<span>{noCache ? 'Redeploying' : 'Rebuilding'}... {taskId && <Button type="link" size="small" icon={<UnorderedListOutlined/>} onClick={()=>navigate('/tasks')}>View Task</Button>}</span>,duration:5})
       if (noCache) setNeedsRedeploy(prev => ({...prev, [key]: false}))
@@ -482,9 +533,9 @@ export default function UsersPage() {
             <Button size="small" loading={batchLoading} onClick={()=>batchAction('stop')}>Stop</Button>
             <Button size="small" loading={batchLoading} onClick={()=>batchAction('start')}>Start</Button>
             <Button size="small" loading={batchLoading} icon={<RocketOutlined/>} onClick={()=>batchAction('rebuild')}>Rebuild</Button>
-            <Popconfirm title={`Remove ${selectedKeys.size} service(s)?`} onConfirm={()=>batchAction('remove')}>
-              <Button size="small" danger loading={batchLoading}>Remove</Button>
-            </Popconfirm>
+            <Button size="small" danger loading={batchLoading} disabled={batchLoading} onClick={()=>{
+              setDelBatch(true); setDelToken(Math.random().toString(36).slice(2,8)); setDelInput(''); setDelOpen(true)
+            }}>Remove</Button>
             <Button size="small" onClick={()=>setSelectedKeys(new Set())}>Clear</Button>
           </Space>
         </Card>
@@ -494,9 +545,10 @@ export default function UsersPage() {
         <Card><Empty description={search?"No matches":"No services deployed"}/></Card>
       ) : (
         Object.entries(grouped).map(([userName, userSvcs], idx) => {
-          const allHealthy = userSvcs.every(s => s.status === 'building' || (Object.keys(s.unhealthy_containers||{}).length===0 && Object.keys(s.missing_containers||{}).length===0))
+          const isBusy = (s: any) => s.status === 'building' || s.status === 'deleting'
+          const allHealthy = userSvcs.every(s => isBusy(s) || (Object.keys(s.unhealthy_containers||{}).length===0 && Object.keys(s.missing_containers||{}).length===0))
           const healthyCount = userSvcs.filter(s => Object.keys(s.healthy_containers||{}).length > 0 && Object.keys(s.unhealthy_containers||{}).length===0 && Object.keys(s.missing_containers||{}).length===0).length
-          const buildingCount = userSvcs.filter(s => s.status === 'building').length
+          const buildingCount = userSvcs.filter(s => isBusy(s)).length
           const unhealthyCount = userSvcs.length - healthyCount - buildingCount
           return (
           <div key={userName} style={{marginBottom: idx<Object.keys(grouped).length-1?32:0, paddingBottom: idx<Object.keys(grouped).length-1?16:0, borderBottom: idx<Object.keys(grouped).length-1?'1px solid #f0f0f0':'none'}}>
@@ -523,6 +575,7 @@ export default function UsersPage() {
             <Collapse activeKey={expandedPanels} onChange={(keys) => setExpandedPanels(typeof keys === 'string' ? [keys] : keys)}>
               {userSvcs.map((svc) => {
                 const key = `${svc.user_name}-${svc.service_name}-${svc.label}`
+                const isDeleting = svc.status === 'deleting' || deletingKeys.has(key)
                 const containers = {...svc.healthy_containers, ...svc.unhealthy_containers, ...svc.missing_containers}
                 const pwdVisible = visiblePwds[key] || false
                 return (
@@ -530,7 +583,7 @@ export default function UsersPage() {
                     key={key}
                     header={<Space>
                       {isAdmin && <Checkbox checked={selectedKeys.has(key)} onChange={()=>toggleSelect(key)} onClick={(e:any)=>e.stopPropagation()}/>}
-                      {getBadge(svc)}
+                      {getBadge(svc, key)}
                       <Text strong>{highlight(svc.service_name, search)}</Text>
                       <Tag>{svc.label}</Tag>
                       {resourceStats[key] && Object.keys(svc.healthy_containers||{}).length > 0 && (
@@ -543,7 +596,9 @@ export default function UsersPage() {
                     extra={
                       <Space onClick={e=>e.stopPropagation()}>
                         {isAdmin && <>
-                          {svc.status !== 'building' && <Tooltip title={Object.keys(svc.healthy_containers||{}).length > 0 ? 'Stop containers' : 'Start containers'}>
+                          {/* Actions are disabled while the instance is being
+                              deleted (server status 'deleting' or optimistic). */}
+                          {svc.status !== 'building' && !isDeleting && <Tooltip title={Object.keys(svc.healthy_containers||{}).length > 0 ? 'Stop containers' : 'Start containers'}>
                             <Button size="small" 
                               icon={Object.keys(svc.healthy_containers||{}).length > 0 ? <PauseOutlined/> : <CaretRightOutlined/>}
                               type={Object.keys(svc.healthy_containers||{}).length > 0 ? 'default' : 'primary'}
@@ -551,18 +606,18 @@ export default function UsersPage() {
                                 const isRunning = Object.keys(svc.healthy_containers||{}).length > 0
                                 const action = isRunning ? 'down' : 'up'
                                 const label = isRunning ? 'Stopping...' : 'Starting...'
-                                client.post(`/users/${svc.user_name}/${svc.service_name}/${svc.label}/${action}`)
+                                client.post(`/services/${svc.user_name}/${svc.service_name}/${svc.label}/${action}`)
                                   .then(()=>{message.success(label); refreshServices()})
                                   .catch(e=>message.error(e.response?.data?.detail||'Failed'))
                               }}
                             />
                           </Tooltip>}
-                          <Button size="small" onClick={()=>{
+                          <Button size="small" disabled={isDeleting} onClick={()=>{
                             setRebuildTarget({user:svc.user_name,service:svc.service_name,label:svc.label,noCache:false})
                             setRebuildProxy(false)
                           }}>Rebuild</Button>
                           <Tooltip title="Redeploy service with no-cache rebuild">
-                            <Button size="small" icon={<RocketOutlined/>} 
+                            <Button size="small" icon={<RocketOutlined/>} disabled={isDeleting}
                               className={needsRedeploy[key] ? 'redeploy-blink' : ''}
                               style={needsRedeploy[key] ? {borderColor:'#faad14',color:'#faad14'} : {}}
                               onClick={()=>{
@@ -571,19 +626,19 @@ export default function UsersPage() {
                           }}>Redeploy</Button>
                           </Tooltip>
                           <Tooltip title="Change password">
-                            <Button size="small" icon={<KeyOutlined/>} onClick={()=>openPwdChange(svc.user_name,svc.service_name,svc.label)}/>
+                            <Button size="small" icon={<KeyOutlined/>} disabled={isDeleting} onClick={()=>openPwdChange(svc.user_name,svc.service_name,svc.label)}/>
                           </Tooltip>
                           <Tooltip title="Duplicate for another user">
-                            <Button size="small" icon={<CopyOutlined/>} onClick={()=>{
+                            <Button size="small" icon={<CopyOutlined/>} disabled={isDeleting} onClick={()=>{
                               setPreselectedDeploy(svc.service_name)
                               setDeployOpen(true)
                             }}>Dup</Button>
                           </Tooltip>
-                          <Popconfirm title="Delete?" onConfirm={()=>{
-                            client.delete(`/users/${svc.user_name}/${svc.service_name}/${svc.label}`).then(()=>{message.success('Deleted');refreshServices()}).catch(()=>message.error('Failed'))
-                          }}>
-                            <Button size="small" danger icon={<DeleteOutlined/>}/>
-                          </Popconfirm>
+                          <Button size="small" danger icon={<DeleteOutlined/>} disabled={isDeleting} onClick={()=>{
+                            setDelTarget({user_name:svc.user_name, service_name:svc.service_name, label:svc.label})
+                            setDelToken(Math.random().toString(36).slice(2,8))
+                            setDelInput(''); setDelOpen(true)
+                          }}/>
                         </>}
                       </Space>
                     }
@@ -611,25 +666,31 @@ export default function UsersPage() {
                       {isAdmin && <>
                       <div><Text strong>Deployment Files: </Text></div>
                       <div style={{paddingLeft:16}}>
-                        {/* .env file */}
                         {(() => {
-                          const envFile = `.env.${svc.user_name}.${svc.label}`
-                          return <div style={{marginBottom:4}}>
-                            <Text>.env: </Text>
-                            <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
-                              onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'env', envFile)}>{envFile}</Text>
-                            <Text type="secondary" style={{fontSize:11}}> (in PROVISION/source_projects/{svc.service_name} dir)</Text>
-                          </div>
-                        })()}
-                        {/* generated compose file */}
-                        {(() => {
-                          const composeFile = `docker-compose.user-${svc.user_name}.${svc.label}.yml`
-                          return <div style={{marginBottom:4}}>
-                            <Text>compose: </Text>
-                            <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
-                              onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'compose', composeFile)}>{composeFile}</Text>
-                            <Text type="secondary" style={{fontSize:11}}> (in PROVISION/source_projects/{svc.service_name} dir)</Text>
-                          </div>
+                          // The recipe subdir comes from the -api (registry =
+                          // single source of truth); '' = project root. Passing
+                          // it keeps these links AND the editor's save inside
+                          // the recipe dir the deploy actually wrote to (a
+                          // hardcoded '' resolved to the project root and made
+                          // every file look missing).
+                          const recipePath = svc.recipe_path || ''
+                          const envFile = baseName(svc.env_file_path) || `.env.raw.${svc.user_name}.${svc.label}`
+                          const composeFile = baseName(svc.compose_file_path) || `docker-compose.user-${svc.user_name}.${svc.label}.yml`
+                          const recipeHint = `PROVISION/source_projects/${svc.service_name}${recipePath ? '/' + recipePath : ''}`
+                          return <>
+                            <div style={{marginBottom:4}}>
+                              <Text>.env: </Text>
+                              <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
+                                onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'env', envFile, recipePath)}>{envFile}</Text>
+                              <Text type="secondary" style={{fontSize:11}}> (in {recipeHint} dir)</Text>
+                            </div>
+                            <div style={{marginBottom:4}}>
+                              <Text>compose: </Text>
+                              <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
+                                onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'compose', composeFile, recipePath)}>{composeFile}</Text>
+                              <Text type="secondary" style={{fontSize:11}}> (in {recipeHint} dir)</Text>
+                            </div>
+                          </>
                         })()}
                         {/* ssl */}
                         {svc.url && svc.url.startsWith('https') && (() => {
@@ -680,6 +741,38 @@ export default function UsersPage() {
       }}/>
 
       {/* Password change modal */}
+      <Modal
+        title={delBatch ? `Delete ${selectedKeys.size} services — confirm` : 'Delete service — confirm'}
+        open={delOpen}
+        onCancel={()=>{ setDelOpen(false); setDelBatch(false) }}
+        okText="Delete" okButtonProps={{ danger: true, disabled: delInput !== delToken }}
+        onOk={() => {
+          if (delInput !== delToken) return
+          // Capture the targets, then dismiss the popup IMMEDIATELY — the
+          // teardown is an async -api task, so we don't wait for the round-trip.
+          const keys: string[] = delBatch
+            ? Array.from(selectedKeys)
+            : (delTarget ? [`${delTarget.user_name}-${delTarget.service_name}-${delTarget.label}`] : [])
+          setDelOpen(false); setDelBatch(false); setDelInput('')
+          if (keys.length === 0) return
+          // Optimistic "Deleting..." until the next poll (the -api also persists
+          // a 'deleting' registry status, which is what survives a refresh).
+          setDeletingKeys(prev => new Set([...prev, ...keys]))
+          if (delBatch) setSelectedKeys(new Set())
+          for (const key of keys) {
+            const {user, service, label} = parseServiceKey(key)
+            client.delete(`/services/${user}/${service}/${label}`)
+              .then(() => { message.success(`Deleting ${service}/${label}…`); refreshServices() })
+              .catch(() => {
+                setDeletingKeys(prev => { const n = new Set(prev); n.delete(key); return n })
+                message.error('Failed to delete')
+              })
+          }
+        }}>
+        <p>This <b>permanently deletes</b> {delBatch ? 'the selected instances' : 'the instance'}: its containers, generated files <b>and data volumes</b> (decision #2 — nothing is kept). This cannot be undone.</p>
+        <p>Type <Text code>{delToken}</Text> to confirm:</p>
+        <Input value={delInput} onChange={(e)=>setDelInput(e.target.value)} placeholder="confirm string" />
+      </Modal>
       <Modal title="Change Service Password" open={pwdModalOpen} onCancel={()=>setPwdModalOpen(false)}
         onOk={handlePwdChange} confirmLoading={pwdLoading} okText="Change">
         <Space direction="vertical" style={{width:'100%'}} size="middle">

@@ -53,7 +53,7 @@ export default function ServicesPage() {
   // Recipe-directory editor (gear icon in Name column)
   const [recipesModalFor, setRecipesModalFor] = useState<string | null>(null)
   const [recipesSaving, setRecipesSaving] = useState(false)
-  const [recipesAuto, setRecipesAuto] = useState(true)
+  // (recipe auto-detect is implicit now: an empty directory list = root-only)
   const [recipesForm] = Form.useForm()
   // Recipe-directories section in the Add Project modal — its OWN form store.
   // (Sharing `form` across two <Form> components broke the git form's submit
@@ -73,7 +73,7 @@ export default function ServicesPage() {
   const loadServices = async () => {
     setLoading(true)
     try {
-      const { data } = await client.get('/services')
+      const { data } = await client.get('/projects')
       const svcs = data.services || []
       setServices(svcs)
       // Check missing files for all services in parallel
@@ -85,7 +85,7 @@ export default function ServicesPage() {
 
   const refreshServices = async () => {
     try {
-      const { data } = await client.get('/services')
+      const { data } = await client.get('/projects')
       const svcs = data.services || []
       setServices(svcs)
       checkAllMissing(svcs)
@@ -96,26 +96,22 @@ export default function ServicesPage() {
     const map: Record<string, string[]> = {}
     const checks = svcs.flatMap(async (s) => {
       const recipes = s.recipes || []
-      if (recipes.length > 1) {
-        return recipes.map(async (r) => {
-          const key = r.path ? `${s.name}@@${r.path}` : s.name
-          setCheckingMap(prev => ({ ...prev, [key]: true }))
-          try {
-            const params: any = {}
-            if (r.path) params.recipe_path = r.path
-            const { data } = await client.get(`/services/${s.name}/check-missing-files`, { params })
-            map[key] = data.missing || []
-          } catch { map[key] = [] }
-          finally { setCheckingMap(prev => ({ ...prev, [key]: false })) }
-        })
-      }
-      const key = s.name
-      setCheckingMap(prev => ({ ...prev, [key]: true }))
-      try {
-        const { data } = await client.get(`/services/${s.name}/check-missing-files`)
-        map[s.name] = data.missing || []
-      } catch { map[s.name] = [] }
-      finally { setCheckingMap(prev => ({ ...prev, [key]: false })) }
+      // Check every CONFIGURED recipe — including a single one. Gating this on
+      // `length > 1` checked the project root instead, so a one-recipe project
+      // (dify → docker) was reported as "missing compose/nginx" although its
+      // recipe ships them.
+      const targets = recipes.length ? recipes : [{ path: '', is_root: true }]
+      return targets.map(async (r) => {
+        const key = r.path ? `${s.name}@@${r.path}` : s.name
+        setCheckingMap(prev => ({ ...prev, [key]: true }))
+        try {
+          const params: any = {}
+          if (r.path) params.recipe_path = r.path
+          const { data } = await client.get(`/projects/${s.name}/check-missing-files`, { params })
+          map[key] = data.missing || []
+        } catch { map[key] = [] }
+        finally { setCheckingMap(prev => ({ ...prev, [key]: false })) }
+      })
     })
     await Promise.all(checks)
     setMissingFilesMap(map)
@@ -128,7 +124,12 @@ export default function ServicesPage() {
     setAddLoading(true)
     try {
       const { recipe_auto, recipe_paths, ...serviceFields } = values
-      await client.post('/services', { ...serviceFields, mode: addMode })
+      // Project creation can be a large `git clone` (dify ≈ 1-2 min): the
+      // client's global 30s timeout aborted the request mid-clone, so the UI
+      // never learned the result (modal stayed open, no row) while the server
+      // finished the clone. Give this call its own generous timeout.
+      await client.post('/projects', { ...serviceFields, mode: addMode },
+        { timeout: 20 * 60 * 1000 })
       await applyRecipesIfConfigured(recipesAddForm.getFieldsValue(), values.name)
       message.success('Service created!')
       setAddModalOpen(false); form.resetFields(); recipesAddForm.resetFields(); loadServices()
@@ -144,7 +145,7 @@ export default function ServicesPage() {
       okText: 'Delete', okType: 'danger',
       onOk: async () => {
         try {
-          await client.delete(`/services/${serviceName}`)
+          await client.delete(`/projects/${serviceName}`)
           message.success('Deleted'); loadServices()
         } catch (err: any) {
           message.error(err.response?.data?.detail || 'Failed to delete')
@@ -157,7 +158,6 @@ export default function ServicesPage() {
   const openRecipesModal = (serviceName: string) => {
     const svc = services.find(s => s.name === serviceName)
     const paths = (svc?.recipes || []).filter(r => !r.is_root).map(r => r.path)
-    setRecipesAuto(!svc || !svc.recipes || svc.recipes.length <= 1)
     recipesForm.setFieldsValue({ recipe_paths: paths.length ? paths : [''] })
     setRecipesModalFor(serviceName)
   }
@@ -167,10 +167,11 @@ export default function ServicesPage() {
     setRecipesSaving(true)
     try {
       const values = recipesForm.getFieldsValue()
-      const payload = recipesAuto
-        ? { auto: true }
-        : { recipe_paths: (values.recipe_paths || []).filter((p: string) => p && p.trim()) }
-      await client.post(`/services/${recipesModalFor}/recipes`, payload)
+      // No auto-detect control anymore: an explicit (non-empty) list wins,
+      // an empty list means root-only/auto.
+      const paths = (values.recipe_paths || []).filter((p: string) => p && p.trim())
+      const payload = paths.length ? { recipe_paths: paths.map((p: string) => p.trim()) } : { auto: true }
+      await client.post(`/projects/${recipesModalFor}/recipes`, payload)
       message.success('Recipe directories updated')
       setRecipesModalFor(null)
       refreshServices()
@@ -191,7 +192,9 @@ export default function ServicesPage() {
     for (const s of services) {
       const recipes = s.recipes || []
       const allGenerated = s.generated_files || []
-      if (recipes.length > 1) {
+      // One row per configured recipe — including a single one (otherwise the
+      // row lost its recipe context: recipePath '' + root-level file lists).
+      if (recipes.length > 0) {
         // Collect all recipe subdirectory prefixes
         const recipePrefixes = recipes.map(r => r.path ? r.path + '/' : '')
         recipes.forEach((r, i) => {
@@ -224,13 +227,13 @@ export default function ServicesPage() {
     return rows
   }, [services])
 
-  if (name) return <ServiceDetailPage name={name} onBack={() => navigate('/services')} />
+  if (name) return <ServiceDetailPage name={name} onBack={() => navigate('/projects')} />
 
   const columns = [
     { title: 'Name', dataIndex: 'name', key: 'name',
       render: (t: string, r: TableRow) => ({
         children: <Space size={4}>
-          <Button type="link" onClick={() => navigate(`/services/${t}`)}><FolderOpenOutlined /> {t}</Button>
+          <Button type="link" onClick={() => navigate(`/projects/${t}`)}><FolderOpenOutlined /> {t}</Button>
           {isAdmin && r.nameRowSpan > 0 && <>
             <Tooltip title="Recipe directories">
               <Button size="small" icon={<SettingOutlined/>} onClick={()=>openRecipesModal(r.name)}/>
@@ -246,20 +249,20 @@ export default function ServicesPage() {
         if (recipes.length > 1 && r.recipeLabel) {
           return <Space size={4} wrap>
             <Tag color="blue" style={{fontWeight:600}}>{r.recipeLabel}</Tag>
-            {r.recipeTemplates.map(f => <Tag key={f} color="green" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>)}
+            {r.recipeTemplates.map(f => <Tag key={f} color="green" style={{cursor:'pointer'}} onClick={()=>navigate(`/projects/${r.name}?file=${f}`)}>{f}</Tag>)}
           </Space>
         }
         const temps = r.template_files || []
-        return <Space size={4} wrap>{temps.length>0 ? temps.map(f=><Tag key={f} color="green" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
+        return <Space size={4} wrap>{temps.length>0 ? temps.map(f=><Tag key={f} color="green" style={{cursor:'pointer'}} onClick={()=>navigate(`/projects/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
       }
     },
     { title: 'Generated Files', key: 'generated',
       render: (_:any, r: TableRow) => {
         const gens = r.recipeGeneratedFiles || r.generated_files || []
-        return <Space size={4} wrap>{gens.length>0 ? gens.map(f=><Tag key={f} color="gold" style={{cursor:'pointer'}} onClick={()=>navigate(`/services/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
+        return <Space size={4} wrap>{gens.length>0 ? gens.map(f=><Tag key={f} color="gold" style={{cursor:'pointer'}} onClick={()=>navigate(`/projects/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
       }
     },
-    { title: 'Actions', key: 'actions',
+    { title: 'AI Generate', key: 'actions',
       render: (_:any, r: TableRow) => {
         const genKey = r.recipePath ? `${r.name}@@${r.recipePath}` : r.name
         const missing = missingFilesMap[genKey] ?? null
@@ -348,32 +351,28 @@ export default function ServicesPage() {
         confirmLoading={recipesSaving}
         okText="Save"
       >
-        <div style={{marginBottom:12}}>
-          <Checkbox checked={recipesAuto} onChange={e=>setRecipesAuto(e.target.checked)}>
-            Auto-detect (root only)
-          </Checkbox>
-          <div style={{fontSize:12,color:'#999',marginTop:4}}>
-            Auto mode scans only the project root for deployment files. Turn it off to scan specific
-            recipe subdirectories instead (e.g. <code>docker</code> for docker-compose.yml templates).
-          </div>
+        {/* No "Auto-detect (root only)" checkbox: list the recipe directories
+            directly. An EMPTY list means root-only (auto) — clear the rows to go
+            back to that. */}
+        <div style={{fontSize:12,color:'#999',marginBottom:8}}>
+          Recipe subdirectories to scan (e.g. <code>docker</code>). Leave the list empty to scan
+          only the project root.
         </div>
-        {!recipesAuto && (
-          <Form form={recipesForm} layout="vertical">
-            <Form.List name="recipe_paths">
-              {(fields, { add, remove }) => (<>
-                {fields.map(f => (
-                  <Space key={f.key} style={{display:'flex',marginBottom:8}} align="baseline">
-                    <Form.Item {...f} name={[f.name]} rules={[{required:true,message:'Path required'}]} style={{marginBottom:0,flex:1}}>
-                      <Input placeholder="docker" />
-                    </Form.Item>
-                    <Button size="small" icon={<DeleteOutlined/>} onClick={()=>remove(f.name)}/>
-                  </Space>
-                ))}
-                <Button type="dashed" onClick={()=>add()} block icon={<PlusOutlined/>}>Add recipe dir</Button>
-              </>)}
-            </Form.List>
-          </Form>
-        )}
+        <Form form={recipesForm} layout="vertical">
+          <Form.List name="recipe_paths">
+            {(fields, { add, remove }) => (<>
+              {fields.map(f => (
+                <Space key={f.key} style={{display:'flex',marginBottom:8}} align="baseline">
+                  <Form.Item {...f} name={[f.name]} style={{marginBottom:0,flex:1}}>
+                    <Input placeholder="docker" />
+                  </Form.Item>
+                  <Button size="small" icon={<DeleteOutlined/>} onClick={()=>remove(f.name)}/>
+                </Space>
+              ))}
+              <Button type="dashed" onClick={()=>add()} block icon={<PlusOutlined/>}>Add recipe dir</Button>
+            </>)}
+          </Form.List>
+        </Form>
       </Modal>
     </div>
   )
@@ -387,7 +386,7 @@ async function applyRecipesIfConfigured(values: any, serviceName: string) {
   const paths = (values.recipe_paths || []).filter((p: string) => p && p.trim())
   if (values.recipe_auto || paths.length === 0) return
   try {
-    await client.post(`/services/${serviceName}/recipes`, { recipe_paths: paths.map((p: string) => p.trim()) })
+    await client.post(`/projects/${serviceName}/recipes`, { recipe_paths: paths.map((p: string) => p.trim()) })
   } catch (err: any) {
     message.warning('Project created, but recipe directories failed to apply: ' + (err.response?.data?.detail || err.message))
   }
@@ -435,7 +434,7 @@ function UploadZipForm({ form, recipeForm, addLoading, setAddLoading, onSuccess 
       if (values.files) {
         try { payload.files = JSON.parse(values.files) } catch { /* not JSON */ }
       }
-      await client.post('/services', payload)
+      await client.post('/projects', payload)
       await applyRecipesIfConfigured(recipeForm.getFieldsValue(), values.name)
       message.success('Service created!')
       onSuccess()
@@ -492,7 +491,7 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
   const [addFileLoading, setAddFileLoading] = useState(false)
 
   useEffect(() => {
-    client.get(`/services/${name}`).then(r=>setService(r.data)).catch(()=>message.error('Failed'))
+    client.get(`/projects/${name}`).then(r=>setService(r.data)).catch(()=>message.error('Failed'))
     refreshGitStatus()
     loadDir('')
   }, [name])
@@ -538,7 +537,7 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
 
   const refreshGitStatus = async () => {
     try {
-      const { data } = await client.get(`/services/${name}/git/status`)
+      const { data } = await client.get(`/projects/${name}/git/status`)
       const modified = new Set<string>()
       const untracked = new Set<string>()
       for (const m of (data.modified || [])) { modified.add(m.file) }
@@ -550,7 +549,7 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
 
   const loadHeadContent = async (file: string): Promise<string> => {
     try {
-      const { data } = await client.get(`/services/${name}/git/head-file`, { params: { file } })
+      const { data } = await client.get(`/projects/${name}/git/head-file`, { params: { file } })
       return (data.content || '').replace(/\r\n/g, '\n')
     } catch { return '' }
   }
@@ -558,7 +557,7 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
   const loadFile = async (f: string) => {
     try {
       const [{ data: fileData }, headText] = await Promise.all([
-        client.get(`/services/${name}/files/${f}`),
+        client.get(`/projects/${name}/files/${f}`),
         loadHeadContent(f),
       ])
       setFileContent((fileData.content || '').replace(/\r\n/g, '\n'))
@@ -571,7 +570,7 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
   const saveFile = async () => {
     setSaving(true)
     try {
-      await client.put(`/services/${name}/files/${selectedFile}`, { content: fileContent })
+      await client.put(`/projects/${name}/files/${selectedFile}`, { content: fileContent })
       message.success('Saved')
       setHeadContent(fileContent)
       setEditing(false)
@@ -587,12 +586,12 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
 
   const handleConvert = async () => {
     try {
-      await client.post(`/services/${name}/convert`,{
+      await client.post(`/projects/${name}/convert`,{
         compose_file: service?.files.find(f=>f.includes('docker-compose')&&!f.endsWith('.j2')),
         nginx_file: service?.files.find(f=>f.includes('nginx')&&f.endsWith('.conf')&&!f.endsWith('.j2')),
         recipe_path: selectedRecipe,
       })
-      message.success('Converted'); client.get(`/services/${name}`).then(r=>setService(r.data))
+      message.success('Converted'); client.get(`/projects/${name}`).then(r=>setService(r.data))
     } catch (err:any) { message.error(err.response?.data?.detail||'Failed') }
   }
 
@@ -601,10 +600,10 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
     if (!addFileName.trim()) { message.warning('Enter a filename'); return }
     setAddFileLoading(true)
     try {
-      await client.post(`/services/${name}/files/${addFileName}`, { content: addFileContent })
+      await client.post(`/projects/${name}/files/${addFileName}`, { content: addFileContent })
       message.success(`Created ${addFileName}`)
       setAddFileOpen(false); setAddFileName(''); setAddFileContent('')
-      client.get(`/services/${name}`).then(r => setService(r.data))
+      client.get(`/projects/${name}`).then(r => setService(r.data))
     } catch (err: any) { message.error(err.response?.data?.detail || 'Failed') }
     finally { setAddFileLoading(false) }
   }
@@ -617,11 +616,11 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
       okText: 'Delete', okType: 'danger',
       onOk: async () => {
         try {
-          await client.delete(`/services/${name}/files/${selectedFile}`)
+          await client.delete(`/projects/${name}/files/${selectedFile}`)
           message.success(`Deleted ${selectedFile}`)
           setSelectedFile('')
           setFileContent('')
-          client.get(`/services/${name}`).then(r => setService(r.data))
+          client.get(`/projects/${name}`).then(r => setService(r.data))
         } catch (err: any) { message.error(err.response?.data?.detail || 'Failed') }
       },
     })
@@ -634,7 +633,7 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
   const loadDir = async (dir: string) => {
     setLoadingDirs(prev => { const n = new Set(prev); n.add(dir); return n })
     try {
-      const { data } = await client.get(`/services/${name}/tree`, { params: dir ? { dir } : {} })
+      const { data } = await client.get(`/projects/${name}/tree`, { params: dir ? { dir } : {} })
       setTreeNodes(prev => ({ ...prev, [dir]: data.children || [] }))
     } catch (err: any) {
       message.error(err.response?.data?.detail || 'Failed to load directory')

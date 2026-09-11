@@ -113,13 +113,13 @@ def test_users_proxy(token):
     print("\nTesting users proxy...")
     
     # List users
-    status, body = run_curl("GET", "/api/users", token=token)
+    status, body = run_curl("GET", "/api/services", token=token)
     assert status == 200, f"List users failed: {body}"
     assert "users" in body or "user_status" in body
     print(f"  ✓ GET /users works (count: {body.get('count', 'N/A')})")
     
     # Get non-existent user
-    status, body = run_curl("GET", "/api/users/nonexistent_user_xyz", token=token)
+    status, body = run_curl("GET", "/api/services/nonexistent_user_xyz", token=token)
     # May return 200 with empty or 404
     print(f"  GET /users/nonexistent → {status}")
 
@@ -160,7 +160,7 @@ def test_container_logs_endpoint(token):
     # Test with non-existent user/service — should get error from provision-api
     status, body = run_curl(
         "GET",
-        "/api/users/nonexistent_user/nonexistent_svc/0/containers/web/logs?tail=10",
+        "/api/services/nonexistent_user/nonexistent_svc/0/containers/web/logs?tail=10",
         token=token,
     )
     # Should get a response (may be 404 or 502 depending on provision-api state)

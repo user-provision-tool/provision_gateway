@@ -151,17 +151,15 @@ async def create_generation_job(
         {
           "service_name": "dify",
           "recipe_path": "docker",           # "" = root recipe
-          "job_type": "generate_missing",    # 'generate_missing' | 'per_user_env' | single category
-          "category": "compose",             # for single-category jobs
+          "job_type": "generate_missing",    # 'generate_missing' | per-category
+          "category": "compose",             # for per-category jobs
           "prompt": "...",                   # mandatory for empty recipes
           "selection": {"compose": [...], "nginx": ..., "env": [...], "profiles": [...]},
           "deploy_metadata": {"user_name": ..., "label": ..., "domain": ...},
-          "user_name": "...", "label": "...", "domain": "..."   # per_user_env target
         }
 
     ``generate_missing`` runs the ordered phases compose → nginx → env as ONE
-    job (progress per phase); ``per_user_env`` writes the per-user env file
-    only (stored default untouched).
+    job (progress per phase); per-category jobs run a single phase.
     """
     service_name = req.get("service_name")
     if not service_name:

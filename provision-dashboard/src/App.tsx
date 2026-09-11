@@ -65,7 +65,7 @@ function LoginRoute() {
 // page shells and buttons (and a Reconcile button → 403, Gap 5).
 function AdminRoute({ children }: { children: React.ReactNode }) {
   const { admin } = useAuth()
-  if (admin?.role !== 'admin') return <Navigate to="/users" replace />
+  if (admin?.role !== 'admin') return <Navigate to="/services" replace />
   return <>{children}</>
 }
 
@@ -93,10 +93,12 @@ export default function App() {
       }>
         <Route index element={<Navigate to="/dashboard" replace />} />
         <Route path="dashboard" element={<AdminRoute><DashboardPage /></AdminRoute>} />
-        <Route path="services" element={<AdminRoute><ServicesPage /></AdminRoute>} />
-        <Route path="services/:name" element={<AdminRoute><ServicesPage /></AdminRoute>} />
-        <Route path="users" element={<UsersPage />} />
-        <Route path="users/:name" element={<UsersPage />} />
+        {/* Route names match the labels: Source Projects → /projects,
+            Services → /services (the admin Users page stays /users/manage). */}
+        <Route path="projects" element={<AdminRoute><ServicesPage /></AdminRoute>} />
+        <Route path="projects/:name" element={<AdminRoute><ServicesPage /></AdminRoute>} />
+        <Route path="services" element={<UsersPage />} />
+        <Route path="services/:name" element={<UsersPage />} />
         <Route path="tasks" element={<AdminRoute><TasksPage /></AdminRoute>} />
         <Route path="settings" element={<AdminRoute><SettingsPage /></AdminRoute>} />
         <Route path="audit" element={<AdminRoute><AuditPage /></AdminRoute>} />
