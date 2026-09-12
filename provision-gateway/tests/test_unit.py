@@ -4886,3 +4886,106 @@ class TestRemovedReport:
         filtered = {str(k): v for k, v in raw.items()
                     if isinstance(v, dict) and v.get("env_type") in ("secret", "non-secret")}
         assert filtered == {}
+
+
+class TestComposePresenceScan:
+    """The missing-file scan and the candidate scan must agree on what a compose is.
+
+    Regression: `_recipe_missing` counted ANY *.yml/*.yaml as a compose, so
+    importing n8n — whose root ships codecov.yml, cubic.yaml, lefthook.yml and
+    the .tbls.*.yml files and has NO compose — reported compose as PRESENT. The
+    compose phase was then skipped while the panel (correctly) offered no
+    compose to select, so the deploy had a phase that never ran and no file to
+    deploy. Two scans disagreeing is the whole bug: they now share one
+    definition.
+    """
+
+    def test_only_compose_named_yaml_counts(self):
+        from app.services.file_sets import _is_compose_name
+        for ok in ("docker-compose.yml", "docker-compose.yaml", "compose.yml",
+                   "compose.yaml", "docker-compose.override.yml"):
+            assert _is_compose_name(ok), ok
+        for no in ("codecov.yml", "cubic.yaml", "lefthook.yml",
+                   ".tbls.sqlite.yml", ".tbls.postgres.yml", "values.yaml",
+                   "docker-compose.yml.bak", "biome.jsonc"):
+            assert not _is_compose_name(no), no
+
+    def test_template_counts_for_presence_but_is_not_a_candidate(self):
+        from app.services.file_sets import _is_compose_candidate, _is_compose_name
+        assert _is_compose_name("docker-compose.yml.j2", allow_template=True)
+        assert not _is_compose_name("docker-compose.yml.j2")
+        assert not _is_compose_candidate("docker-compose.yml.j2")
+
+    def test_unrelated_yaml_no_longer_satisfies_the_compose_phase(self, tmp_path, monkeypatch):
+        from app.config import settings
+        from app.services.generation_jobs import GenerationJobManager
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        p = tmp_path / "n8n"
+        p.mkdir()
+        for f, body in (("codecov.yml", "coverage: {}\n"), ("cubic.yaml", "x: 1\n"),
+                        ("lefthook.yml", "pre-commit: {}\n"), ("pnpm-workspace.yaml", "packages: []\n")):
+            (p / f).write_text(body)
+        missing = GenerationJobManager._recipe_missing({"service_name": "n8n", "recipe_path": ""})
+        assert missing == ["docker-compose", "nginx.conf"], missing
+
+    def test_real_recipe_reports_nothing_missing(self, tmp_path, monkeypatch):
+        from app.config import settings
+        from app.services.generation_jobs import GenerationJobManager
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        p = tmp_path / "svc"
+        p.mkdir()
+        (p / "docker-compose.yml").write_text("services: {}\n")
+        (p / "nginx.conf").write_text("server {}\n")
+        (p / "codecov.yml").write_text("coverage: {}\n")
+        assert GenerationJobManager._recipe_missing({"service_name": "svc", "recipe_path": ""}) == []
+
+
+class TestGeneratedComposeFeedsOtherPhases:
+    """A compose generated in THIS run must be visible to the later phases.
+
+    Regression: the compose phase runs precisely because the operator had
+    nothing to select, so `sel_compose` is empty. `_build_context` then derived
+    the compose service names (nginx validation) and the ${VAR} surface (env
+    phase) from the selection alone, so the nginx phase was validated against an
+    empty service list: every proxy_pass host read as unknown and the phase
+    failed with "proxy_pass target(s) do not match any compose service name.
+    Compose services: []" — even though the model's target (`n8n`) was correct
+    and the generated docker-compose.yml was already on disk.
+    """
+
+    def _recipe(self, tmp_path, body="services:\n  n8n:\n    image: x\n"):
+        (tmp_path / "n8n").mkdir()
+        (tmp_path / "n8n" / "docker-compose.yml").write_text(body)
+        return tmp_path
+
+    def _ctx(self, tmp_path, monkeypatch, phase, request):
+        from app.config import settings
+        from app.services.generation_jobs import GenerationJobManager
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        return GenerationJobManager()._build_context("n8n", "", phase, request)
+
+    def test_nginx_phase_sees_a_compose_it_did_not_select(self, tmp_path, monkeypatch):
+        self._recipe(tmp_path)
+        ctx = self._ctx(tmp_path, monkeypatch, "nginx", {"selection": {}})
+        assert ctx["compose_service_names"] == ["n8n"], ctx["compose_service_names"]
+
+    def test_env_phase_gets_the_var_surface_of_a_generated_compose(self, tmp_path, monkeypatch):
+        self._recipe(tmp_path, "services:\n  n8n:\n    environment:\n      - N8N_HOST=${N8N_HOST}\n")
+        ctx = self._ctx(tmp_path, monkeypatch, "env", {"selection": {}})
+        assert ctx["compose_paths"], "the env phase must still see the compose"
+        assert "__compose_variables__.txt" in ctx["base_files"]
+
+    def test_an_explicit_selection_still_wins(self, tmp_path, monkeypatch):
+        self._recipe(tmp_path)
+        (tmp_path / "n8n" / "other-compose.yml").write_text("services:\n  other:\n    image: y\n")
+        ctx = self._ctx(tmp_path, monkeypatch, "nginx",
+                        {"selection": {"compose": ["other-compose.yml"]}})
+        assert ctx["compose_service_names"] == ["other"], ctx["compose_service_names"]
+
+    def test_rendered_per_user_compose_is_never_treated_as_the_recipe_compose(self, tmp_path, monkeypatch):
+        """The per-user rendered file lives in the same dir; it is not a source."""
+        self._recipe(tmp_path)
+        (tmp_path / "n8n" / "docker-compose.user-specialsync.0.yml").write_text(
+            "services:\n  rendered:\n    image: z\n")
+        ctx = self._ctx(tmp_path, monkeypatch, "nginx", {"selection": {}})
+        assert ctx["compose_service_names"] == ["n8n"], ctx["compose_service_names"]

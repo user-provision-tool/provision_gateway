@@ -207,7 +207,7 @@ class GenerationJobManager:
         ``nginx.conf`` are ABSENT from the recipe, i.e. which LLM phases a
         generate-missing run must include.
         """
-        from ..services.file_sets import _recipe_dir
+        from ..services.file_sets import _is_compose_name, _recipe_dir
 
         service_name = request.get("service_name") or ""
         recipe_path = request.get("recipe_path") or ""
@@ -220,12 +220,10 @@ class GenerationJobManager:
             files = [f.name for f in recipe_dir.iterdir() if f.is_file()]
         except OSError:
             return ["docker-compose", "nginx.conf"]
-        has_compose = any(
-            f.endswith(".yml.j2") or f.endswith(".yaml.j2")
-            or (f.endswith(".yml") and not f.endswith(".j2"))
-            or (f.endswith(".yaml") and not f.endswith(".j2"))
-            for f in files
-        )
+        # Same definition the candidate scan uses (a template still counts as
+        # present) — if these two disagree, the compose phase is skipped while
+        # the panel offers nothing to select and the deploy has no compose.
+        has_compose = any(_is_compose_name(f, allow_template=True) for f in files)
         has_nginx = any(
             f.endswith(".conf.j2") or (f.endswith(".conf") and not f.endswith(".j2"))
             for f in files
@@ -776,12 +774,29 @@ class GenerationJobManager:
         activated profiles; app-manifest carve-out when compose itself is
         missing. ``compose_paths`` are included for the env completeness check.
         """
-        from ..services.file_sets import _recipe_dir, compose_service_names as _names
+        from ..services.file_sets import (
+            _is_compose_candidate,
+            _recipe_dir,
+            compose_service_names as _names,
+        )
 
         project_dir = settings.SOURCE_PROJECTS_DIR / service_name
         recipe_dir = _recipe_dir(project_dir, recipe_path)
         selection = request.get("selection") or {}
         sel_compose = [p for p in selection.get("compose", []) if isinstance(p, str)]
+        # The compose files this run is actually configuring. Prefer the
+        # operator's selection; when there is none, use the recipe's compose
+        # candidates. A compose GENERATED earlier in this same run is not in
+        # the selection — that is precisely why the compose phase ran — and
+        # looking only at the selection then starves the other phases:
+        # nginx validation gets an empty service list (so every proxy_pass
+        # host reads as unknown and the phase fails) and the env phase gets an
+        # empty ${VAR} surface. Only for reading, never for the rendered
+        # per-user compose (the candidate rule excludes those).
+        eff_compose = list(sel_compose) or [
+            f.name for f in sorted(recipe_dir.iterdir())
+            if f.is_file() and _is_compose_candidate(f.name)
+        ]
         sel_nginx = selection.get("nginx")
         sel_env = [p for p in selection.get("env", []) if isinstance(p, str)]
         profiles = [p for p in selection.get("profiles", []) if isinstance(p, str)]
@@ -794,7 +809,7 @@ class GenerationJobManager:
         # token budget on chain-of-thought and return EMPTY content
         # (finish_reason=length) — the var list is all the phase needs.
         if phase == "nginx":
-            for p in sel_compose:
+            for p in eff_compose:
                 fp = recipe_dir / p
                 if fp.is_file():
                     try:
@@ -804,7 +819,7 @@ class GenerationJobManager:
         elif phase == "env":
             from ..utils.var_scan import scan_compose_files
 
-            compose_paths = [recipe_dir / p for p in sel_compose if (recipe_dir / p).is_file()]
+            compose_paths = [recipe_dir / p for p in eff_compose if (recipe_dir / p).is_file()]
             if compose_paths:
                 scan = scan_compose_files(compose_paths)
                 if scan.refs:
@@ -841,14 +856,14 @@ class GenerationJobManager:
                     except OSError:
                         continue
 
-        has_compose = bool(sel_compose) and all((recipe_dir / p).is_file() for p in sel_compose)
+        has_compose = bool(eff_compose) and all((recipe_dir / p).is_file() for p in eff_compose)
 
         context: dict[str, Any] = {
             "repo_description": f"Service: {service_name}{' @ ' + recipe_path if recipe_path else ''}",
             "prompt": request.get("prompt") or "",
             "base_files": base_files,
             "profiles": profiles,
-            "compose_paths": [str(recipe_dir / p) for p in sel_compose],
+            "compose_paths": [str(recipe_dir / p) for p in eff_compose],
             "project_dir": str(project_dir),
             "recipe_path": recipe_path,
             "empty_recipe": not has_compose and not sel_nginx and not sel_env,
@@ -889,7 +904,7 @@ class GenerationJobManager:
 
         # Compose service names (merged set incl. profile-gated services) —
         # used for nginx validation + generation hints.
-        context["compose_service_names"] = _names([recipe_dir / p for p in sel_compose])
+        context["compose_service_names"] = _names([recipe_dir / p for p in eff_compose])
 
         # App-manifest carve-out (compose missing → shallow RepoContext scan).
         if not has_compose:

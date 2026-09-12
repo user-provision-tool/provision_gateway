@@ -47,6 +47,64 @@ TOTAL_FETCH_MAX_BYTES = 512 * 1024   # total fetched bytes cap
 FETCH_TIMEOUT = 30.0
 MAX_BASE_FILE_BYTES = 128 * 1024
 
+MANIFEST_FILENAMES = (
+    "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+    "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
+    "package.json", "go.mod", "Cargo.toml", "pom.xml", "build.gradle",
+    "Gemfile", "composer.json", "Makefile", "Procfile",
+    "main.py", "app.py", "manage.py", "wsgi.py", "asgi.py",
+    "alembic.ini", "vite.config.js", "vite.config.ts", "next.config.js",
+    "next.config.mjs",
+)
+
+TOOL_DEFINITIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": (
+                "Fetch a documentation page over http/https (the project's official "
+                "deployment docs). Only the first 64KB is returned."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "http(s) URL"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read a text file from the service project (confined to the recipe "
+                "directory / project root). Use for Dockerfiles, configs, etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "project-root-relative file path"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": (
+                "List the files of the recipe directory (and project root when the "
+                "recipe is a subdirectory). Shallow listing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+]
+
+
 
 def _split_removed_report(kvs: Any) -> tuple[Any, Any]:
     """Pull the model's self-reported adversarial removals out of its answer.

@@ -63,14 +63,37 @@ def _recipe_dir(project_dir: Path, recipe_path: str) -> Path:
 # Candidate discovery (from the recipe dir's shallow scan)
 # ---------------------------------------------------------------------------
 
-def _is_compose_candidate(name: str) -> bool:
-    if name.endswith(".generated") or name.endswith(".j2"):
-        return False
-    if _PER_USER_COMPOSE_RE.match(name):
-        return False
+def _is_compose_name(name: str, *, allow_template: bool = False) -> bool:
+    """True when ``name`` is a compose file by the platform's naming convention.
+
+    The convention — not "any YAML" — is what identifies a compose. A recipe
+    that merely ships unrelated YAML (a CI config, a linter config, a codecov
+    config) has no compose, and treating one as a compose is not harmless: the
+    missing-file scan then reports compose as PRESENT and skips compose
+    generation, while this module's candidate scan (correctly) offers no compose
+    to select — so the deploy has a compose phase that never runs and no file to
+    deploy. The two scans MUST agree; this predicate is the single definition
+    they both use.
+
+    ``allow_template`` counts the ``.j2`` form: a recipe that ships a compose
+    *template* does have a compose for presence purposes, but a template is not
+    a selectable candidate.
+    """
+    if name.endswith(".j2"):
+        if not allow_template:
+            return False
+        name = name[:-3]
     return (name.startswith("docker-compose") or name.startswith("compose")) and (
         name.endswith(".yml") or name.endswith(".yaml")
     )
+
+
+def _is_compose_candidate(name: str) -> bool:
+    if name.endswith(".generated"):
+        return False
+    if _PER_USER_COMPOSE_RE.match(name):
+        return False
+    return _is_compose_name(name)
 
 
 def _is_nginx_candidate(name: str) -> bool:
