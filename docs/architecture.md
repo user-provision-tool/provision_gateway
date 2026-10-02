@@ -177,7 +177,7 @@ The gateway is the auth authority; the edge `-nginx-acl` (fullset) is the gate. 
    - **Token missing**: Returns 401 with `X-Auth-Action: login_required`.
    - **Token expired**: Returns 401 with `X-Auth-Action: token_expired`.
 
-4. **Credential injection**: On successful verification, the endpoint returns an `X-Service-Basic` header containing the base64-encoded `username:password` for the target service's auth_basic. Nginx uses this to authenticate against the service's htpasswd (v4 N2 — no "123456" fallback).
+4. **Credential injection**: On successful verification, the endpoint returns an `X-Service-Basic` header containing the base64-encoded `username:password` for the target service's auth_basic. Nginx uses this to authenticate against the service's htpasswd (v4 N2 — no "123456" fallback). The pair is built from the registry entry's `user_name` and **`passwd_plain`** (`_get_service_basic_credential`) — the plaintext is stored precisely because a bcrypt htpasswd cannot be replayed. That makes one invariant load-bearing: **`passwd_plain` must be re-recorded whenever the htpasswd is rewritten** (`provisioner.change_password`). An entry that is protected but has no plaintext yields an EMPTY credential: the gate passes, the instance's `auth_basic` refuses with its OWN realm, and the service is unopenable through the gate (the exit is `DELETE .../password`, which strips `auth_basic`).
 
 5. **Hostname-to-service resolution**: Two in-memory services read `user_registry.yml` from the shared filesystem:
    - **HostnameIndex** (`app/services/hostname_index.py`): Maps hostnames (e.g., `myapp-alice-0.localhost`) to registry entries for O(1) lookup.
@@ -380,7 +380,7 @@ main.tsx (Entry Point)
                     │   └── ServiceDetailPage (file tree, Monaco editor, git diff)
                     ├── /users[/:name] → UsersPage (viewer-accessible)
                     │   ├── DeployForm (modal)
-                    │   ├── ServiceInstanceCards (expandable)
+                    │   ├── ServiceCard (session + instance, expandable)
                     │   └── CloneUserModal
                     ├── /tasks → AdminRoute → TasksPage
                     │   ├── TaskTable (with auto-polling)

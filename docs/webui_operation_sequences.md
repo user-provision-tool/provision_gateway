@@ -1,7 +1,7 @@
 # Provision Gateway — WebUI Operation Sequences
 
-> Version: 3.1
-> Date: 2026-08-22 (updated — v4 Service-ACL enforcement: cookie-only login (provision_token), two-token/JWT-body login model removed, /go/ issues a 30s exchange code with no JWT in URL; prior: API Keys page, Alert page, viewer role-gating (AdminRoute), /go/{hostname} service access, multi-recipe DeployForm, two-token login, Dashboard Subnet Pool card)
+> Version: 3.6
+> Date: 2026-09-28 (updated — `AI Generate` acts only on the Source Projects panel's OWN jobs (§2.5b): a deploy-path pause belongs to its service card, whose `Check` can continue the deploy, so `origin` is now recorded on every job and the row ignores the rest — and there is no busy guard, since G33's token already makes parallel generations safe. Prior: 2026-09-26 — the service-card / task-lifecycle round: session cards join their own user's group (no separate section), the card header's status note is ONE line (the refused header went from 150 px to 48 px), the Tasks page polls silently and its `Answer` action is gone (§4.5 — a pause is answered on the surface that owns it), the Source Projects row's button slot is state-aware (robot / running / `Check` + `Cancel`, §3.5.4), the instance card gained its `Task:` link and the `nginx:` row and a recipe-scoped single-line `LLM fix:` field (§3.6), and answering a pause cancels the leg it answered. Verified live by T20/T23–T30 on the frozen build — `_tasks/service-cards-round-20260926.md`. Prior: v3.4 — the refused card's per-code `Retry` (§3.5.5); prior: v3.3 — GRILLING G27–G31: the paused/refused session-card states (§3.5.4/§3.5.5), the ONE Tasks list holding both families, per-task logs (§4.2), the row-carried cancel semantics (§4.3); prior: v4 Service-ACL enforcement: cookie-only login (provision_token), two-token/JWT-body login model removed, /go/ issues a 30s exchange code with no JWT in URL; prior: API Keys page, Alert page, viewer role-gating (AdminRoute), /go/{hostname} service access, multi-recipe DeployForm, two-token login, Dashboard Subnet Pool card)
 > Purpose: Document all operation sequences defined by each button on the webui, verified for correctness.
 > Verified against: actual running dashboard at http://localhost:8771
 
@@ -82,6 +82,22 @@
 - **Trigger**: Click delete icon in Actions column
 - **Sequence**: Confirmation dialog → DELETE /api/services/{name} → remove project
 - **Status**: ✅ Working
+
+### 2.5b `AI Generate` — ONE state-aware button slot per (service, recipe) (2026-09-26; scoped to the row's own path 2026-09-28)
+- **The slot, by state** (it is the SAME slot throughout, never an addition to it):
+
+  | row state | the slot | beside it |
+  |---|---|---|
+  | idle — the row's own newest job is gone | **robot** (enabled when files are missing, greyed when the recipe is complete) | — |
+  | the row's own job is running | a running/loading icon (inert) | **`Cancel`** → the job is cancelled and the robot returns |
+  | the row's own job is PAUSED | **`Check`** → opens the panel with the pause popup back, to answer and resume | **`Cancel`** → the paused job is cancelled and the robot returns |
+  | after the confirm (the resumed leg) | a running/loading icon | `Cancel` |
+  | the leg ends | the robot | — |
+- **The row acts only on the jobs ITS OWN PATH created** (`origin: 'standalone'`, i.e. the panel this robot opens — the one that sends no `user_name`). A `deploy`-origin job belongs to its **service card** (the pre-deploy session it opened), whose `Check` is the surface that can *continue the deploy* — the row's `Check` could only run the generation, so answering a deploy's pause here generated the files and silently skipped the deploy. A `fix` analysis belongs to its instance card. The job's own payload carries `origin`, so the row never has to guess.
+- **No busy guard**: with G33's collision token two generations for one recipe cannot overwrite each other, so another path's work does not grey or replace this row's robot.
+- **Why the slot follows the NEWEST job of its own path**: the robot is the only creator here and is absent while its own job exists — and a pause that has already been ANSWERED must not hold the slot (answering starts a new job, G27, while the answered parent is cancelled outright).
+- **`Cancel` covers a paused job too** (GRILLING G34): it only CANCELS — the record object stays, now `cancelled`, and leaves by the background cleanup contract. No page deletes records.
+- **Status**: ✅ 2026-09-26 (the full cycle) and re-verified 2026-09-28 on the rebuilt images: with a deploy-path pause (`gt-347`) live, every row shows the robot while its card keeps `Check`/`Delete`; a **standalone** job's own slots were then observed end-to-end — robot → `loading`+`Cancel` (running) → `cancelled`, and robot → `Check`+`Cancel` (paused on a compose conflict) → `cancelled`
 
 ### 2.6 File Browser (in project detail)
 - **Trigger**: Click file in file list
@@ -186,13 +202,30 @@ Each service card shows these buttons:
 - **Sequence**: Popconfirm → DELETE /api/users/{user}/{service}/{label} → remove service
 - **Status**: ✅ Working
 
+### 3.5.4 Paused Session Card (`Paused (llm_fix)` / `Paused (input)`)
+- **Trigger**: A generation leg reached a PAUSE — a compose conflict at `validate` (`compose_fix`) or an external credential at `env` (`input`). The leg is **TERMINAL**: it ended carrying a payload, and answering it starts the NEXT job (GRILLING G27)
+- **Sequence**: the panel/popup shows the pause prompt — the editable **guidance** (compose conflict) or one field per credential (external vars) — and `Submit` posts `POST /api/llm/jobs` with `{resume: <the carried payload>, values: <the operator's input>}`. The response is the NEW job's id, which the client follows; the card then tracks the current job. `POST /llm/jobs/{id}/input` no longer exists
+- **The card**: the note on the HEADER says what is waiting — **ONE LINE**, inline after the service name (`⚠ paused — <reason>`, and for an analysis-found fault "the analysis found the fault — Check to confirm the fix and restart"), with the long-form remedy in its tooltip (2026-09-26: it was a block alert that made the header 150 px against 48 px for a plain card); actions are **`Check`** (re-opens the panel, guide pre-filled for `llm_fix`, or the pause popup for `input`) and **`Delete`** (cancels the paused object and removes the record — a paused job IS cancellable, GRILLING G34). No `Cancel` — a paused leg has stopped
+- **Confirming a `llm_fix` restart** re-runs the path with `fix: true`, so the artifacts are emitted as **`.fix`** (G25), never `.base`
+- **Answering CONSUMES the leg it answered**: the new leg is created first, then the paused parent is **cancelled** — otherwise it keeps `paused` forever (a terminal leg is never rewritten), which is a paused object with nothing owning it and a record the cleanup contract can never take (GRILLING G30/G34). Verified live: `gt-340` → `cancelled` while `gt-341` ran
+- **Status**: ✅ GRILLING G27; verified live by T13 (rows 1–7) and T18, and re-verified 2026-09-26 by T26/T27 on the rebuilt images (the row's `Check` → the popup → `Fix the compose` → `docker-compose.fix.339.yml`; a card's `Delete` on a paused object → `cancelled`)
+
+### 3.5.5 Refused Session Card (`Refused (<code>)`)
+- **Trigger**: A deploy was refused before any work was accepted
+- **The two codes are distinct and each brings its own remedy**: `at_capacity` — the **-api**'s task pool (the host is doing docker work) → "cancel a task that has been hanging, then retry"; `generation_at_capacity` — the **gateway's own** generation pool (`GATEWAY_MAX_GENERATIONS`) → "wait for a running generation, or cancel one". Both render on the card HEADER with `Retry` + `Delete`
+- **Sequence**: the refusal is recorded on the pre-deploy session (`state: refused`, `reason: <code>`, `detail`), so the card survives a reload. `Retry` behaves per code: an `at_capacity` refusal stores the options the -api was SENT — **the URL and the password included**, so the retry replays the deployment the operator confirmed, not a variant of it (user ruling 2026-09-26) — and replays them, running **no** generation (G20); a `generation_at_capacity` refusal was refused *before anything was produced*, so its `Retry` seeds the panel from the record and **runs the generation again** — the record therefore carries the request it was made with, and the operator's own retry is let through the session's reservation. (For that to be complete, the *generation* request now carries the URL and the password too — `DeployForm` sends them with `deploy_metadata`, from the live form on the entry point and from the snapshot on the deploy-time call — because a refusal of that generation is exactly where the record is written. The standalone Source Projects Generate panel is the one path with nothing to store: it sends no `user_name`, so it records no session and has no card to retry from.)
+- **Status**: ✅ GRILLING G29; verified live by T19 (a real `503 generation_at_capacity` on a full pool, the card and its header alert) and, on the rebuilt images 2026-09-25, by the retry end-to-end — the button had rendered **disabled** because the record carried no options; after the fix Retry opened the seeded panel, ran generation job 333 to completion, and the deploy registered with the refused session removed.
+
 ### 3.6 Service Card Expansion
 - **Trigger**: Click collapsed service card
 - **Sequence**: Expands to show:
   - URL (clickable link → `/go/{service}-{user}-{label}.localhost`)
+  - `Subnet: <cidr>` when the -api knows it
+  - **`Task: <id>`** — this instance's own task (the -api records it at register): **clickable** while the record still resolves, **greyed** (with a tooltip) once the cleanup contract has taken it. The flag is the server's `task_available` on the status payload, so the card makes no per-instance probe (2026-09-26)
   - Test button (POST /api/users/{user}/{service}/{label}/test-curl)
   - Container names + status
-  - Deployment files (compose, nginx, env - clickable links to editor)
+  - Deployment files (compose, **nginx**, env — clickable links to the editor). `nginx:` was missing entirely until 2026-09-26: nginx is one of the three deployed paths (G13) and the -api records its source template on every entry, but the status payload never sent it
+  - **`LLM fix: <names…>`** — ONE line, clickable, scoped to the card's own RECIPE, and **hidden entirely** when that recipe has no `.fix` artifacts (2026-09-26; it used to be one row per file, listing another recipe's files)
   - Volumes (if available)
 - **Status**: ✅ Working
 
@@ -214,26 +247,40 @@ Each service card shows these buttons:
 - **Time filter**: 2-second window on `updated_at` timestamps prevents stale-task notifications on page load
 - **Status**: ✅ Working (global notification, not tied to Tasks page)
 
+### 4.0a ONE list holding both families (GRILLING G28)
+- The page is a **single table** with a `Source` column and a `Type` column, holding the gateway's generation jobs (`gt-<n>`, from `GET /api/llm/jobs`) **and** the -api's tasks (`api-…`, from `GET /api/tasks`) — the previous two-table split is reverted
+- Rows are newest-first by `created_at`; the ids are self-describing, so a link can name either family unambiguously
+- **Deep links**: `?job=<n>` opens that generation job's own step log, `?task=<id>` the -api task's log
+- **Status**: ✅ GRILLING G28; verified live by T21
+
 ### 4.1 Refresh Button
 - **Trigger**: Click "Refresh"
-- **Sequence**: GET /api/tasks → re-render task table
+- **Sequence**: GET /api/tasks **+** GET /api/llm/jobs → re-render the one list
 - **Auto-polling**: ✅ Every 5 seconds via usePolling
 - **Status**: ✅ Working
 
 ### 4.2 Logs Button
 - **Trigger**: Click "Logs" (eye icon) on a task row
-- **Sequence**: Opens SSE log drawer → GET /api/tasks/{task_id}/log (SSE stream) → live log display
-- **Status**: ⚠️ SSE reads global DOCKER_OPS_LOG file, not per-task filtered
+- **Sequence**: For an `-api` row: opens the SSE log drawer → `GET /api/tasks/{task_id}/log`, which streams the task's own **per-task log file** (`task-<id>.log`), falling back to the global `DOCKER_OPS_LOG` only when no per-task log exists. For a `gt-` row: opens the generation job's own step log (`gt-<id>.log`, streamed from the job's `events`)
+- **Status**: ✅ per-task logs on both sides (GRILLING G28)
 
 ### 4.3 Cancel Button
-- **Trigger**: Click cancel icon on pending/running task
-- **Sequence**: Popconfirm → DELETE /api/tasks/{task_id}
-- **Status**: ✅ Working
+- **Trigger**: Click the cancel icon — shown **only while a job is genuinely live**, using the server's own `job_live` set (`queued | running | awaiting_input`; a `paused` leg is terminal and offers no action here at all — it is answered where it was created, §4.5)
+- **Sequence**: For a `gt-` row: Popconfirm → `DELETE /api/llm/jobs/{id}`, which cancels **on the row** (so a delete landing on one worker stops a job running in another) and answers with the row's **resulting** status; the UI adopts that status rather than assuming success, so it cannot claim a cancellation that did not happen. For an `-api` row: `DELETE /api/tasks/{task_id}`
+- **Status**: ✅ GRILLING G24/G31; verified live by T14 and T20 (`DELETE /llm/jobs/334` → `cancelled`, and it stayed cancelled — the runner wrote `cancelled`, never `completed`; re-verified 2026-09-26 on `gt-346` — the row released its slot and no deploy was issued)
 
-### 4.4 Delete Button
-- **Trigger**: Click delete icon on any task
-- **Sequence**: Popconfirm → DELETE /api/tasks/{task_id}
-- **Status**: ✅ Working
+### 4.4 Delete Button — REMOVED (2026-09-25)
+- **Why**: the button labelled *Delete* called `DELETE /api/tasks/{task_id}`, which is the -api's **cancel**, not a purge — for any terminal row it answered **`409 Task already in terminal state`**, the client swallowed the rejection, and the list refreshed as if the row had gone. The operator was told a record was deleted that was still there.
+- **Now**: there is no Delete on a task row. A record leaves by the **cleanup contract** (GRILLING G30 — TTL 604800 s, count cap 1000, oldest-first, the log disposed with the record), which is the only mechanism either store has: the gateway exposes no delete at all, and the -api's route is a cancel.
+- **The live-only action is the same for both families** (§4.3): `pending`/`running` rows offer `Cancel`; terminal rows offer only `Logs`.
+
+### 4.5 Answer Button — REMOVED (2026-09-26); a pause is answered on the surface that owns it
+- **Why**: two answering surfaces for one pause is how an operator answers the wrong one of two views of the same job. A pause is now always answered where the work lives.
+- **Where a pause is answered now**:
+  - a **deploy-triggered** pause has its service card (`Check`, §3.5.4);
+  - the **standalone** *Generate Missing Files via LLM* path (which opens no session, so it has no card) is answered from its **own row on the Source Projects page**: the row's button slot turns into `Check` while a job is paused, and that opens the panel with the pause popup back (GRILLING G27).
+- **The paused row here offers `Logs` and nothing else** — no `Answer`, no `Cancel`. It is a record you read, not a surface you act on.
+- **Status**: ✅ 2026-09-26; verified live (T25: a paused `gt-338` row offering `Logs` only, no `Answer` anywhere on the page; T26: the row's `Check` → the popup → `Fix the compose` → the resumed leg `gt-339`)
 
 ---
 
@@ -327,7 +374,7 @@ Each service card shows these buttons:
 
 ### 9.1 Create Key Button
 - **Trigger**: Click "Create Key" button
-- **Sequence**: Opens modal → enter Label (required) → admins also see an optional "User ID" input (blank = own key, or pick a target user id) → POST /api/auth/keys → returns the one-time raw token
+- **Sequence**: Opens modal (always EMPTY — a cancelled create does not leave its fields behind) → enter Label (required) → admins also see an optional "Target" input taking a prefixed reference (`admin:1` / `end_user:7`; a bare number is an end user; blank = your own key, in your own id space) → POST /api/auth/keys → returns the one-time raw token. The list's Target column renders the resolved pair as `end_user:7` / `admin:1`.
 - **Status**: ✅ Working
 
 ### 9.2 One-Time Token Display + Copy

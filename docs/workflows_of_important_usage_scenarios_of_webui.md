@@ -696,7 +696,7 @@
 | Audit | `/audit` | Admin (AdminRoute) | Filterable audit table, CSV export |
 | User Management | `/users/manage` | Admin (AdminRoute) | Register, approve, role assignment, special users |
 | SSL Certs | `/ssl` | Admin (AdminRoute) | Upload & manage certificates |
-| API Keys | `/api-keys` | Authenticated (admins + viewers) | Create key (label; admin can set User ID), one-time token + Copy, list (admin sees all + User ID column; viewer sees own), Revoke |
+| API Keys | `/api-keys` | Authenticated (admins + viewers) | Create key (label; admin can set a prefixed Target — `admin:1` / `end_user:7`, blank = your own), one-time token + Copy, list (admin sees all + Target column; viewer sees own), Set as Default, Revoke |
 | Alert | `/alert` | Public | `acl_denied` / `token_expired` variants |
 
 ## Appendix: Known UI Behaviors

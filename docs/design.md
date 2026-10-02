@@ -397,14 +397,12 @@ _provision_gateway/
 │   │   │   │   ├── ServiceCard.tsx
 │   │   │   │   ├── ServiceList.tsx
 │   │   │   │   ├── AddServiceModal.tsx    # Repo URL / upload / template
-│   │   │   │   ├── FileEditor.tsx         # Monaco Editor wrapper
 │   │   │   │   └── FileUploader.tsx       # Drag & drop upload
 │   │   │   │
 │   │   │   ├── users/
 │   │   │   │   ├── UserCard.tsx
 │   │   │   │   ├── DeployForm.tsx         # Deploy service to user form
 │   │   │   │   ├── CloneUserModal.tsx     # Clone all from A → B
-│   │   │   │   ├── ServiceInstanceCard.tsx # Per-instance: status, URL, actions
 │   │   │   │   └── CurlTestPanel.tsx      # Test curl result display
 │   │   │   │
 │   │   │   ├── tasks/
@@ -698,9 +696,11 @@ GET /go/{hostname}
   → Edge-side /_set_token is a plain proxy to /api/auth/exchange, which swaps the code for the provision_token cookie via 302+Set-Cookie (v5 F3)
 
 POST /api/auth/keys
-  → Create API key for end-user programmatic access
-  → Admin can create for any user; viewer for self only
-  → Response: 201 { key, token, provision_token }
+  → Create API key for programmatic service access (an end user OR an admin)
+  → The target is a PREFIXED reference: end_user:<id> / admin:<id> (a bare id = end_user);
+    omitted = the caller's own target, in the caller's own id space
+  → Admin can create for any target; viewer for self only
+  → Response: 201 { key, token }
 
 GET /api/auth/keys
   → List API keys
@@ -982,8 +982,10 @@ POST /api/users/{user_name}/{service_name}/{label}/rebuild
 PUT /api/users/{user_name}/{service_name}/{label}/password
   Request:  { "passwd": "newsecret" }
   Response: 200 { "message": "Password updated. Nginx reloaded." }
-  → Gateway re-hashes password, re-writes .htpasswd, calls nginx -s reload
-  → This is done directly (not via provision-api) since provision-api doesn't have a password-change endpoint
+  → Delegated to provision-api (`PUT /users/{u}/services/{s}/{l}/password`), which re-hashes the
+    password, rewrites the .htpasswd, re-records the registry's `passwd` AND `passwd_plain`, and
+    reloads nginx (`DELETE` on the same path drops protection entirely: auth_basic is stripped from
+    the re-rendered conf). The plaintext is mandatory — the gate injects `Basic user:passwd_plain`.
 
 GET /api/users/{user_name}/{service_name}/{label}/url
   Response: 200 {
@@ -1629,7 +1631,7 @@ These features have been implemented in `_users_provision/` to fully support the
   □ DashboardPage (system health bar, user cards, task queue)
   □ UsersPage
   □ UserDetailPage (service instances, deploy form, clone modal)
-  □ ServiceInstanceCard
+  □ ServiceCard (session + instance, one widget — GRILLING G24)
   □ DeployForm
   □ CloneUserModal
   □ CurlTestPanel
@@ -1653,7 +1655,8 @@ These features have been implemented in `_users_provision/` to fully support the
   □ ServicesPage
   □ ServiceDetailPage
   □ AddServiceModal (Git / Upload / Template tabs)
-  □ FileEditor (Monaco Editor)
+  □ File editor pane (Monaco, inside UsersPage — the separate `FileEditor.tsx`
+    wrapper was deleted 2026-09-26: imported nowhere)
   □ FileUploader
   □ LLMConfigPanel
   □ ConfigGenerationPreview

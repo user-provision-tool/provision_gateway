@@ -1,7 +1,7 @@
 # Provision Gateway — Workflows of Important Usage Scenarios (APIs)
 
 > **Version**: 3.3
-> **Date**: 2026-08-24 (updated — cycle 20260824T173309Z v5 ACL-enforcement: §24.2 nginx ACL verify is now invoked by the edge `-nginx-acl` (internal per-service confs simple ACL-free; the `/_set_token` handoff comment updated to the edge-side relay); prior: G5 consistency: the legacy `Authorization: Bearer access_token/refresh_token` and `gateway_token` credentials are **removed** in v4 — every gateway API curl example below now authenticates with the `provision_token` session cookie (`-b /tmp/gw.cookies`, from Section 2/3 login) or the `X-Provision-Token` header (API clients); a Bearer header returns 401 live. Prior: v4 Service-ACL enforcement: cookie-only login (provision_token, token_type=cookie), Bearer access_token/refresh_token and gateway_token removed, no token-refresh flow, `/api/auth/logout` added; prior: API key management, `/api/auth/go/{hostname}` service-access redirect + ACL verify, two-token login cookies, multi-recipe deploy `project_root`, `/api/system/subnet-pool`)
+> **Date**: 2026-09-29 (updated — §24.3 added: calling a deployed service from an API client with the user's API key in `X-Provision-Token` (the edge now forwards the caller's header; precedence `cookie or header`, cookie first; how to read a 401's realm). Prior: 2026-08-24 — cycle 20260824T173309Z v5 ACL-enforcement: §24.2 nginx ACL verify is now invoked by the edge `-nginx-acl` (internal per-service confs simple ACL-free; the `/_set_token` handoff comment updated to the edge-side relay); prior: G5 consistency: the legacy `Authorization: Bearer access_token/refresh_token` and `gateway_token` credentials are **removed** in v4 — every gateway API curl example below now authenticates with the `provision_token` session cookie (`-b /tmp/gw.cookies`, from Section 2/3 login) or the `X-Provision-Token` header (API clients); a Bearer header returns 401 live. Prior: v4 Service-ACL enforcement: cookie-only login (provision_token, token_type=cookie), Bearer access_token/refresh_token and gateway_token removed, no token-refresh flow, `/api/auth/logout` added; prior: API key management, `/api/auth/go/{hostname}` service-access redirect + ACL verify, two-token login cookies, multi-recipe deploy `project_root`, `/api/system/subnet-pool`)
 > **Purpose**: Step-by-step API workflows for the most important usage scenarios, directly usable with `curl` or any HTTP client.
 
 ---
@@ -963,3 +963,42 @@ curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" \
 | 403, ACL denied | `acl_denied` | `302 /alert?reason=acl_denied&service={host}` | 403 |
 
 **Alert page targets:** `?reason=acl_denied` → "Access Denied — You do not have access to {service}"; `?reason=token_expired` → "API Token Expired". Both are served by the dashboard SPA at `/alert`.
+
+### 24.3 Calling a deployed service from an API client (the API key IS the credential)
+
+**Goal:** reach a deployed service programmatically — no browser, no cookie jar, no `/go/` hop — using the
+end user's API key. The key is a 1-year provision-token JWT (`POST /api/auth/keys`, returned once as
+`token`), presented in the `X-Provision-Token` header that `verify` reads (the "alternative to cookie for
+non-browser clients").
+
+```bash
+# 1) the key (dashboard → API Keys → Create Key, or POST /api/auth/keys)
+PROVISION_TOKEN=...            # a 1-year JWT, returned once at creation
+
+# 2) call the service — header only, NO cookie
+curl -s -i -H "X-Provision-Token: $PROVISION_TOKEN" -H 'Accept: application/json' \
+     http://example-multi-alice-1.localhost:${NGINX_HTTP_PORT:-80}/
+#   → 200 + the application's own response
+
+# the same key against a service the user may not use (no grant):
+#   → 403  (the ACL gate: acl_denied)
+# with a revoked or bogus key, or none at all:
+#   → 401 + WWW-Authenticate: Basic realm="subnet-acl"   (the GATE's challenge)
+# against a service the user MAY use but which deploys with auth_basic:
+#   → 200 expected (the edge injects the instance's Basic from verify's X-Service-Basic);
+#     a 401 whose realm is the INSTANCE's ("<service> - <user>") means the gate passed and the
+#     instance refused that injected credential — a deployment-side credential problem, not the ACL.
+```
+
+**Precedence:** `verify` reads `token = cookie or header` — the **cookie wins**. A request carrying both is
+judged on its cookie (a bad cookie is not rescued by a good header), so an API client should either send no
+cookie at all or make sure the one it sends is valid.
+
+**Where the header is handled:** the edge's `/_auth_jwt` subrequest forwards the CALLER's
+`X-Provision-Token` and relays the `Cookie` header separately
+(`nginx.acl/acl-helpers.conf.template`) — it used to forward the cookie's value *as* the header, which
+discarded a client's key and left a cookie-less API client unauthenticated (fixed 2026-09-29; guarded by
+`TestAclHelpersTemplate`).
+
+**The browser equivalent** is §24.1 (`/go/` → `/_set_token?code=` → cookie): same credential, delivered as a
+cookie instead of a header.

@@ -1,7 +1,7 @@
 # Provision Gateway — API Reference
 
-> **Version**: 2.4
-> **Date**: 2026-08-28 (updated — cycle 20260828T190332Z gateway source-project scan re-architecture: new `POST /api/services/{name}/recipes` (F27) and `GET /api/services/{name}/tree?dir=` (F28) endpoints added (400/404 semantics via ServiceNotFoundError); `GET /api/services/{name}/git/status` filters `.provision-state*`/`*.generated` (F29); prior: 2026-08-24 — cycle 20260824T173309Z v5 ACL-enforcement: `GET /api/auth/verify` is now invoked by the edge `-nginx-acl` `/_auth_jwt` — internal per-service confs are simple ACL-free and the `/__basic__/` short-circuit is removed (ACL-off = edge pass-through to native Basic); `GET /go/{hostname}` contract unchanged (F13) — the `/_set_token` relay now lives on the edge `-nginx-acl` (not service-side) and the no-JWT-in-URL guarantee is part of F13 (not F7); prior: v4 Service-ACL enforcement: three-credential token model dropped — `access_token`/`refresh_token`/`gateway_token` removed, `POST /api/auth/refresh` no longer exists, `POST /api/auth/logout` added, `/go/` issues a 30s exchange code with no JWT in URL; prior: From Template tab removed from UI / mode=template API-only (GAP-1), local-agent fields deferred at API level (GAP-2))
+> **Version**: 2.5
+> **Date**: 2026-08-28 (updated — 2026-09-26: §10 gains the `parent_job_id` field of the G27 `resume` contract (answering a pause CANCELS the leg it answered — G34) and the `paused` member of the cancellable set; generated compose/nginx artifacts carry the job's collision token in their names (GRILLING G33) — `docker-compose.base.<job>.yml`, `nginx.base.<job>.conf`, and the `.fix` family likewise; 2026-09-25: §10 LLM Generation Jobs added (create / list / poll / cancel, incl. the G27 `resume` contract that answers a pause by creating the next job, and the two distinct 503 refusal codes); cycle 20260828T190332Z gateway source-project scan re-architecture: new `POST /api/services/{name}/recipes` (F27) and `GET /api/services/{name}/tree?dir=` (F28) endpoints added (400/404 semantics via ServiceNotFoundError); `GET /api/services/{name}/git/status` filters `.provision-state*`/`*.generated` (F29); prior: 2026-08-24 — cycle 20260824T173309Z v5 ACL-enforcement: `GET /api/auth/verify` is now invoked by the edge `-nginx-acl` `/_auth_jwt` — internal per-service confs are simple ACL-free and the `/__basic__/` short-circuit is removed (ACL-off = edge pass-through to native Basic); `GET /go/{hostname}` contract unchanged (F13) — the `/_set_token` relay now lives on the edge `-nginx-acl` (not service-side) and the no-JWT-in-URL guarantee is part of F13 (not F7); prior: v4 Service-ACL enforcement: three-credential token model dropped — `access_token`/`refresh_token`/`gateway_token` removed, `POST /api/auth/refresh` no longer exists, `POST /api/auth/logout` added, `/go/` issues a 30s exchange code with no JWT in URL; prior: From Template tab removed from UI / mode=template API-only (GAP-1), local-agent fields deferred at API level (GAP-2))
 > **Base URL**: `http://provision-gateway:8770` (internal) / `http://localhost:8771/api` (via dashboard proxy)
 
 ---
@@ -17,6 +17,7 @@
 7. [Tasks](#7-tasks)
 8. [LLM Configuration](#8-llm-configuration)
 9. [Audit](#9-audit)
+10. [LLM Generation Jobs](#10-llm-generation-jobs)
 
 ---
 
@@ -374,6 +375,35 @@ NGINX `auth_request` subrequest endpoint for ACL-based service access control. N
 | `Cookie: provision_token=<JWT>` | Provision token from `/go/{hostname}` redirect |
 | `X-Provision-Token: <JWT>` | Alternative to cookie (for non-browser clients) |
 
+**Precedence.** The two are read as `token = cookie or header` — **the cookie wins**. A request that carries
+BOTH is therefore judged on its cookie: a valid cookie is honoured even next to a bogus header, and a bogus
+cookie is **not** rescued by a valid header (it fails as an invalid token).
+
+**The edge forwards the CLIENT's credential** (fixed 2026-09-29). The v5 edge's `/_auth_jwt` subrequest sends
+`proxy_set_header X-Provision-Token $http_x_provision_token;` — the caller's own header — and relays the
+`Cookie` header separately. It used to name `$cookie_provision_token` there, and `proxy_set_header` REPLACES
+the header, so a client's API key was discarded and replaced with the cookie's value (empty for a cookie-less
+client): a **valid** key then behaved exactly like no credential and the only route to a service was the
+browser's `/go/` → exchange-code → cookie handshake. `nginx.acl/acl-helpers.conf.template` carries the change
+and its reasoning; the -api's `TestAclHelpersTemplate` guards it. A worked request:
+
+```bash
+# A deployed service, from an API client: the user's API key in the header, NO cookie, no /go/ hop.
+# The key IS the provision-token JWT returned once by POST /api/auth/keys ("the alternative to cookie").
+curl -s -H "X-Provision-Token: $PROVISION_TOKEN" -H 'Accept: application/json' \
+     http://<service>-<user>-<label>.localhost:${NGINX_HTTP_PORT:-80}/
+# 200 + the application's own response      → the gate allowed it and injected X-Service-Basic upstream
+# 401 + WWW-Authenticate: Basic realm="subnet-acl"  → the GATE refused it (absent/invalid/revoked token)
+# 403                                        → the gate denied the ACL (not your service, no grant)
+# 401 + the INSTANCE's own realm             → the gate PASSED; the instance's auth_basic refused the
+#                                              injected credential (see the note below)
+```
+
+**Reading a 401 by its realm.** The gate's challenge is `realm="subnet-acl"`; an instance deployed with
+`auth_basic` challenges with its own realm (`"<service> - <user>"`). The realm therefore says WHICH layer
+refused the request — the only reliable way to tell "the ACL gate said no" from "the application said no".
+(A 502 means the gate allowed it and the internal nginx could not reach the instance's container.)
+
 **Response 200 (ACL passed):**
 - The v4 hybrid `X-Client-Type` rule (X-Provision-Token header ⇒ api / provision_token cookie ⇒ browser / Accept text/html ⇒ browser / else ⇒ api) determines the client type; `X-Client-Type` is set on every response, and `X-Auth-Action` is always present (incl. `unauthorized`).
 - In ACL-off mode the edge passes traffic through to the internal native Basic (`auth_basic`) — verify is only invoked in ACL mode (the internal per-service confs are simple ACL-free under v5, F6/F8).
@@ -452,58 +482,74 @@ mints a fresh 1-week `provision_token` cookie bound to the user's default key, a
 
 ### `POST /api/auth/keys`
 
-Create a new API key for end-user programmatic service access. Returns raw token (shown once only).
+Create a new API key for programmatic service access. Returns raw token (shown once only).
 
 **Request:**
 ```json
 {
   "label": "my-ci-key",
-  "user_id": 1
+  "user_id": "end_user:7"
 }
 ```
 | Field | Type | Description |
 |---|---|---|
 | `label` | string | Human-readable name for the key (required) |
-| `user_id` | int | Target end-user ID (admin only; viewers auto-use their own) |
+| `user_id` | string | **Prefixed target reference** (admin only): `end_user:<id>` or `admin:<id>`. A bare integer means `end_user`. Omitted/empty = the caller's OWN target, in the caller's own id space. |
+
+The prefix is not decoration: `admins` and `end_users` are separate id spaces, so `1` alone
+names two different people. Before the prefix, a bare id was resolved as an end user first, so an
+admin's blank "my own key" mint produced a key belonging to whichever end user held that id
+(observed: `sub 1 / alice / end_user` for an admin mint). The resolved space is stored on the key
+as `target_type` and carried in the token's `user_type` claim.
 
 **Response 201:**
 ```json
 {
   "key": {
-    "id": 1,
-    "label": "my-ci-key",
-    "key_prefix": "pg_...",
+    "id": 100,
     "user_id": 1,
-    "is_active": true,
-    "created_at": "2026-07-08T00:00:00Z"
+    "target_type": "admin",
+    "label": "my-ci-key",
+    "mask": "mTyeXbv8",
+    "is_default": true,
+    "created_at": "2026-09-29T17:31:53Z",
+    "expires_at": "2027-09-29T17:31:53Z",
+    "is_revoked": false,
+    "last_used_at": null
   },
-  "token": "pg_abc123...",
-  "provision_token": "eyJhbGciOi...",
+  "token": "eyJhbGciOi...",
   "message": "Save this token — it will not be shown again."
 }
 ```
 
 **Errors:**
 - `400` — label is required
-- `403` — Viewer attempting to create a key for another user
+- `400` — unknown target type (`expected one of: end_user, admin`) or an id that does not exist in that id space
+- `403` — Viewer attempting to create a key for another target
 
 ---
 
 ### `GET /api/auth/keys`
 
-List API keys. Admin sees all keys; viewers see only their own.
+List API keys. Admin sees all keys; viewers see only their own — matched on **both** halves of the
+reference (`user_id` + `target_type`), because an id-only filter would show an admin's keys to the
+end user who shares their id, and vice versa.
 
 **Response 200:**
 ```json
 {
   "keys": [
     {
-      "id": 1,
-      "label": "my-ci-key",
-      "key_prefix": "pg_abc...",
+      "id": 100,
       "user_id": 1,
-      "is_active": true,
-      "created_at": "2026-07-08T00:00:00Z"
+      "target_type": "admin",
+      "label": "my-ci-key",
+      "mask": "mTyeXbv8",
+      "is_default": true,
+      "created_at": "2026-09-29T17:31:53Z",
+      "expires_at": "2027-09-29T17:31:53Z",
+      "is_revoked": false,
+      "last_used_at": null
     }
   ]
 }
@@ -2109,3 +2155,95 @@ Query audit logs with filters.
   ]
 }
 ```
+
+---
+
+## 10. LLM Generation Jobs
+
+> Added 2026-09-25 with GRILLING G27–G31 / D1–D5. The gateway runs these itself (its own
+> SQLite store and its own generation pool); they are **not** `-api` tasks. Ids are `gt-<n>`
+> and appear in the one Tasks list beside the `-api`'s `api-…` records.
+
+**Statuses.** `queued` → `running` → `completed` | `failed` | `cancelled`, plus two
+**terminal pause** states that mean "the leg ENDED, an operator answer starts the next one":
+`paused` (the G27 leg; carries its payload in `result.pause`) and the legacy `awaiting_input`
+(a pre-G27 parked row; still answerable, still counted as live).
+
+### `POST /api/llm/jobs` — 202
+
+Creates a job. Body:
+
+```json
+{
+  "service_name": "dify",
+  "recipe_path": "docker",              // "" = the project root
+  "job_type": "generate_missing",       // 'generate_missing' | a single-category job | 'fix'
+  "prompt": "…",                        // required for an empty recipe
+  "selection": {"compose": ["docker-compose.fix.yml"], "nginx": "nginx.fix.conf", "env": [], "profiles": []},
+  "deploy_metadata": {"user_name": "alice", "label": "0", "domain": "localhost"},
+  "user_name": "alice", "label": "0",   // present ⇒ the job opens a PRE-DEPLOY SESSION
+  "use_global_proxy": true,
+  "env_reference": [],
+  "fix": true                           // a guided restart emits `.fix` (G25)
+}
+```
+
+**Answering a pause (G27).** A pause does **not** mutate its row — the answer posts here with
+the payload the leg carried, and this creates the **next** job:
+
+```json
+{
+  "resume": { "kind": "compose_fix" | "input",
+              "request": { …the carried request from result.pause.request… } },
+  "values": { "guidance": "…" } | { "OPENAI_API_KEY": "…" },
+  "parent_job_id": 338                  // the paused leg this answer CONSUMES
+}
+```
+
+The carried `request` **is** the new job's request (identity and `use_global_proxy` ride
+along with it); for `compose_fix` the faulty compose arrives **unselected** so the next leg
+regenerates it as `.fix`, and `values.guidance` becomes its prompt. The old
+`POST /llm/jobs/{id}/input` and the parked-state resume branch are **deleted**.
+
+`parent_job_id` names the leg being answered, and it is **cancelled** once the new job exists
+(GRILLING G34): a pause is terminal on its leg, so nothing else would ever rewrite that row —
+left alone it stays `paused` forever, which is a paused object with nothing owning it and a
+record the cleanup contract can never take (a paused record is never pruned, G30). It is
+cancelled, never deleted, and only when that job is still `paused` and carries the same
+(service, recipe). Omitting the field leaves the parent alone (an API-only caller keeps the old
+behaviour).
+
+Responses: `202` `{"job_id", "status", "job_type"}`; `400` invalid request;
+`409` `{"error": "combination_reserved", …}` when a pre-deploy session already holds the
+(user, service, recipe, label) — except when that session is the paused one this request is
+resuming; `503` a pool refusal, with the two distinct codes:
+`at_capacity` (the **-api**'s task pool) or `generation_at_capacity` (the **gateway's own**
+generation pool, `GATEWAY_MAX_GENERATIONS`), each `{"error", "detail", "running", "capacity"}`
+and each carrying its own remedy. A gateway refusal also writes a `refused` session with Retry.
+
+### `GET /api/llm/jobs` — 200
+
+`{"jobs": [ … ]}` — newest first, at most 200. The TTL sweep runs **on this read** (finished
+jobs older than `GATEWAY_JOB_TTL_SECONDS`, default 604800 s; the per-task log is deleted with
+the record). A `paused` record is never pruned.
+
+### `GET /api/llm/jobs/{job_id}` — 200
+
+One job for polling: `status`, `progress`, `phase`/`phase_index`/`phase_total`, `events`,
+`usage`, and `result` (`files`, `validations`, `env_name`, and — for a pause —
+`result.pause = {kind, ask, request}`). The TTL sweep also runs here. `404` if unknown.
+
+### `DELETE /api/llm/jobs/{job_id}` — 200
+
+Cancels a job. Cancellation is applied **on the row**, so a delete that lands on one worker
+stops a job running in another worker's event loop, and a cancelled row is never overwritten
+by the runner's own terminal write. The response is the row's **resulting** status:
+`{"job_id", "status"}`.
+
+The cancellable set is `CANCELLABLE_STATUSES` — `queued`, `running`, the legacy
+`awaiting_input`, **and `paused`** (GRILLING G27/G34). A `paused` job has stopped but still
+EXISTS, so cancelling it is a real transition to `cancelled` (progress `cancelled`, not
+`cancelling…`: no runner follows to write a final word), and that is what makes the record
+sweep-eligible at last — before this the DELETE no-opped and still answered `200` with
+`status: "paused"`, so a paused object could never leave. An already-terminal job answers with
+its own status unchanged, so a caller can never be told a cancellation happened when it did not.
