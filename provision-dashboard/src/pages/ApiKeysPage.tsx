@@ -9,6 +9,9 @@ const { Title, Text } = Typography
 interface ApiKey {
   id: number
   user_id: number
+  // Which id space `user_id` names: 'end_user' | 'admin'. The two tables have
+  // separate ids, so the pair — not the number alone — identifies the target.
+  target_type: string
   label: string
   mask: string | null
   is_default: boolean
@@ -27,6 +30,22 @@ export default function ApiKeysPage() {
   const [newUserId, setNewUserId] = useState('')
   const [createLoading, setCreateLoading] = useState(false)
   const [createdToken, setCreatedToken] = useState<string | null>(null)
+
+  // Opening or leaving the dialog starts a FRESH form. Without this, a cancelled
+  // (or failed) create leaves its Label/Target behind, and the next create
+  // silently reuses them — e.g. a Target left as `service:1` re-sends that 400.
+  const openCreate = () => {
+    setNewLabel('')
+    setNewUserId('')
+    setCreatedToken(null)
+    setCreateOpen(true)
+  }
+  const closeCreate = () => {
+    setNewLabel('')
+    setNewUserId('')
+    setCreatedToken(null)
+    setCreateOpen(false)
+  }
 
   const isAdmin = admin?.role === 'admin'
 
@@ -48,8 +67,11 @@ export default function ApiKeysPage() {
     setCreateLoading(true)
     try {
       const payload: any = { label: newLabel.trim() }
-      if (isAdmin && newUserId) {
-        payload.user_id = parseInt(newUserId)
+      if (isAdmin && newUserId.trim()) {
+        // A PREFIXED target reference (`end_user:7` / `admin:1`) — sent as typed,
+        // because the prefix is what names the id space. A bare number means an
+        // end user; blank means "me, in my own space" (no user_id sent at all).
+        payload.user_id = newUserId.trim()
       }
       const { data } = await client.post('/auth/keys', payload)
       message.success('API key created')
@@ -87,7 +109,10 @@ export default function ApiKeysPage() {
   const columns = [
     { title: 'ID', dataIndex: 'id', key: 'id', width: 60 },
     { title: 'Label', dataIndex: 'label', key: 'label' },
-    ...(isAdmin ? [{ title: 'User ID', dataIndex: 'user_id', key: 'user_id', width: 80 }] : []),
+    ...(isAdmin ? [{ title: 'Target', dataIndex: 'user_id', key: 'user_id', width: 130,
+      render: (_: number, record: ApiKey) => (
+        <Text code>{record.target_type || 'end_user'}:{record.user_id}</Text>
+      ) }] : []),
     { title: 'Mask', dataIndex: 'mask', key: 'mask', width: 90,
       render: (v: string | null) => v ? <Text code>{v}</Text> : '-' },
     { title: 'Default', dataIndex: 'is_default', key: 'is_default', width: 90,
@@ -125,7 +150,7 @@ export default function ApiKeysPage() {
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16, flexWrap: 'wrap', gap: 8 }}>
         <Title level={3} style={{ margin: 0 }}>API Keys</Title>
         <Space>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => { setCreateOpen(true); setCreatedToken(null) }}>Create Key</Button>
+          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>Create Key</Button>
           <Button onClick={fetchKeys}>Refresh</Button>
         </Space>
       </div>
@@ -144,11 +169,11 @@ export default function ApiKeysPage() {
       <Modal
         title="Create API Key"
         open={createOpen}
-        onCancel={() => { setCreateOpen(false); setCreatedToken(null) }}
+        onCancel={closeCreate}
         footer={createdToken ? [
-          <Button key="close" onClick={() => { setCreateOpen(false); setCreatedToken(null) }}>Close</Button>
+          <Button key="close" onClick={closeCreate}>Close</Button>
         ] : [
-          <Button key="cancel" onClick={() => setCreateOpen(false)}>Cancel</Button>,
+          <Button key="cancel" onClick={closeCreate}>Cancel</Button>,
           <Button key="create" type="primary" loading={createLoading} onClick={handleCreate}>Create</Button>
         ]}
       >
@@ -180,8 +205,13 @@ export default function ApiKeysPage() {
             </div>
             {isAdmin && (
               <div>
-                <Text strong>User ID (optional): </Text>
-                <Input placeholder="Leave blank for your own keys" value={newUserId} onChange={e => setNewUserId(e.target.value)} />
+                <Text strong>Target (optional): </Text>
+                <Input placeholder="blank = your own keys, or admin:1 / end_user:7"
+                       value={newUserId} onChange={e => setNewUserId(e.target.value)} />
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  Prefix the id with its kind: <Text code>admin:1</Text> or <Text code>end_user:7</Text>.
+                  A bare number is an end user. Blank creates the key for you — in your own id space.
+                </Text>
               </div>
             )}
             <Text type="secondary">Keys are valid for 1 year. You can create multiple keys with different labels for different purposes.</Text>

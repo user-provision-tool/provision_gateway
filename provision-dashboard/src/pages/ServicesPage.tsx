@@ -3,13 +3,13 @@ import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Typography, Card, Table, Button, Modal, Form, Input,
   Space, message, Tag, Empty, Tabs, Spin, Checkbox, Upload,
-  Tooltip, Select
+  Tooltip, Select, Popconfirm
 } from 'antd'
 import type { UploadProps } from 'antd'
 import {
   PlusOutlined, DeleteOutlined, FolderOpenOutlined,
   GithubOutlined, UploadOutlined, InboxOutlined, FileAddOutlined,
-  RobotOutlined, SettingOutlined
+  RobotOutlined, SettingOutlined, CheckOutlined, StopOutlined
 } from '@ant-design/icons'
 import Editor, { DiffEditor } from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
@@ -183,7 +183,71 @@ export default function ServicesPage() {
   // LLM generate-missing panel — the "Missing files" action now OPENS the
   // panel (design §Selection & UI L34-38) instead of triggering generation
   // directly. The panel holds the full selection + prompt UI.
-  const [genPanel, setGenPanel] = useState<{ name: string; recipePath: string } | null>(null)
+  //
+  // `resumeJobId` is the row's `Check`: the panel attaches to that paused leg,
+  // whose popup comes back to be answered and resumed.
+  const [genPanel, setGenPanel] = useState<{ name: string; recipePath: string; resumeJobId?: number | null } | null>(null)
+
+  // The non-terminal gateway generation jobs — the ROW's button slot is derived
+  // from these (task doc §4b). The list is polled silently: the slot changes on
+  // its own when a job starts, pauses or ends.
+  const [genJobs, setGenJobs] = useState<any[]>([])
+  const loadGenJobs = async () => {
+    try {
+      const { data } = await client.get('/llm/jobs')
+      setGenJobs(data.jobs || [])
+    } catch { /* the slot falls back to the robot — never block the page */ }
+  }
+  useEffect(() => {
+    loadGenJobs()
+    const timer = setInterval(loadGenJobs, 5000)
+    return () => clearInterval(timer)
+  }, [])
+
+  // The row's OWN job — the one THIS path created (`origin: 'standalone'`, i.e.
+  // the panel this robot opens, which sends no `user_name`). A job from another
+  // path is never the row's to show or to act on:
+  //
+  // - a `deploy` job's pause belongs to its SERVICE CARD (the pre-deploy session
+  //   it opened), and that card's `Check` is the surface that can CONTINUE the
+  //   deploy — this row could only run the generation, so answering here would
+  //   generate the files and silently skip the deploy;
+  // - a `fix` analysis belongs to the INSTANCE card it is about.
+  //
+  // And there is no busy guard: with G33's collision token two generations for
+  // one recipe cannot overwrite each other, so the row needs no "someone else is
+  // working here" state — it shows its own leg, or the robot. (Until 2026-09-28
+  // it keyed on the newest job of ANY path, which is how a deploy's pause
+  // appeared on the row as well as on its card.)
+  //
+  // Within its own jobs it follows the NEWEST non-terminal one: a `paused` leg
+  // counts (G27 — the leg stopped, the job exists, `Check` answers it), but an
+  // answered one must not keep the slot (answering starts a new job, and the
+  // answered parent is cancelled outright).
+  const rowJob = (serviceName: string, recipePath: string) => {
+    const key = recipePath ? `${serviceName}@@${recipePath}` : serviceName
+    const newest = genJobs
+      .filter(j => j.origin === 'standalone' &&
+        (j.recipe_path ? `${j.service_name}@@${j.recipe_path}` : j.service_name) === key)
+      .sort((a, b) => (b.id || 0) - (a.id || 0))[0]
+    if (!newest) return null
+    return ['queued', 'running', 'awaiting_input', 'paused'].includes(newest.status) ? newest : null
+  }
+
+  // The row's `Cancel` — the FIRST consumer of G34's rule. It covers a RUNNING
+  // job (as before) AND a PAUSED one, which the gateway used to answer with a
+  // silent 200 no-op. It only CANCELS: the record object stays, now `cancelled`,
+  // and leaves by the background cleanup contract — no page deletes records.
+  const cancelRowJob = async (id: number) => {
+    try {
+      const { data } = await client.delete(`/llm/jobs/${id}`)
+      if (data?.status === 'cancelled') message.success('Generation cancelled — the robot is back')
+      else message.warning(`Nothing to cancel — the job is already ${data?.status || 'stopped'}`)
+      loadGenJobs()
+    } catch (e: any) {
+      message.error(e.response?.data?.detail || 'Cancel failed')
+    }
+  }
 
   // Flatten multi-recipe projects into table rows with rowSpan on Name
   // MUST be before the early return (React hooks rule)
@@ -264,6 +328,30 @@ export default function ServicesPage() {
     },
     { title: 'AI Generate', key: 'actions',
       render: (_:any, r: TableRow) => {
+        // ONE SLOT, three states (task doc §4b), for the row's OWN work only
+        // (see `rowJob`). The robot is the ONLY creator of that work and is
+        // ABSENT while its job exists — `Check` and the running icon are the same
+        // slot, not additions to it — so the row cannot start a second job of its
+        // own, and "which job does the row mean" has one answer.
+        const job = rowJob(r.name, r.recipePath)
+        if (job) {
+          const paused = job.status === 'paused' || job.status === 'awaiting_input'
+          return <Space size={4}>
+            {paused ? (
+              <Tooltip title="Paused — open the panel to answer and resume">
+                <Button size="small" type="primary" icon={<CheckOutlined/>}
+                  onClick={()=>setGenPanel({ name: r.name, recipePath: r.recipePath, resumeJobId: job.id })}/>
+              </Tooltip>
+            ) : (
+              <Tooltip title={`gt-${job.id} is ${job.status} — the robot returns when it ends`}>
+                <Button size="small" icon={<RobotOutlined/>} loading disabled/>
+              </Tooltip>
+            )}
+            <Popconfirm title="Cancel this generation?" onConfirm={()=>cancelRowJob(job.id)}>
+              <Button size="small" danger icon={<StopOutlined/>}/>
+            </Popconfirm>
+          </Space>
+        }
         const genKey = r.recipePath ? `${r.name}@@${r.recipePath}` : r.name
         const missing = missingFilesMap[genKey] ?? null
         const checking = checkingMap[genKey] === true
@@ -333,13 +421,16 @@ export default function ServicesPage() {
         </Form>
       </Modal>
 
-      {/* LLM generate-missing panel (selection + prompt + job polling + review gate) */}
+      {/* LLM generate-missing panel (selection + prompt + job polling + review gate).
+          `resumeJobId` is the row's `Check`: the panel re-attaches to that paused
+          leg, so the pause popup comes back here — the surface that created it. */}
       <GenerateMissingPanel
         open={genPanel !== null}
         serviceName={genPanel?.name || ''}
         recipePath={genPanel?.recipePath || ''}
-        onClose={() => setGenPanel(null)}
-        onChanged={refreshServices}
+        resumeJobId={genPanel?.resumeJobId ?? null}
+        onClose={() => { setGenPanel(null); loadGenJobs() }}
+        onChanged={() => { refreshServices(); loadGenJobs() }}
       />
 
       {/* Recipe directories editor */}

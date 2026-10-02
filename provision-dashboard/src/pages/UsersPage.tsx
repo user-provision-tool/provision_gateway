@@ -1,11 +1,12 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Modal, Drawer, Checkbox } from 'antd'
-import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, SwapOutlined, UnorderedListOutlined, DashboardOutlined, GlobalOutlined } from '@ant-design/icons'
+import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Modal, Drawer, Checkbox, Popconfirm } from 'antd'
+import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, UnlockOutlined, SwapOutlined, UnorderedListOutlined, DashboardOutlined, GlobalOutlined, StopOutlined, RobotOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
 import client from '../api/client'
 import DeployForm from '../components/services/DeployForm'
+import ServiceCard from '../components/users/ServiceCard'
 
 const { Title, Text } = Typography
 
@@ -26,8 +27,154 @@ interface ServiceInstance {
   recipe_path?: string
   env_file_path?: string
   has_auth?: boolean; url?: string
-  status?: string  // "building" | "running" | "unknown"
+  status?: string  // "building" | "running" | "failed" | "unknown"
+  // Bounded failure reason, present only on a `failed` entry (GRILLING G10):
+  // {stage, message, at}. Instance-scoped state from the registry — the card
+  // never reads the task store.
+  // `reason` is a STABLE code from the -api (e.g. "at_capacity") — the card
+  // branches on it rather than pattern-matching the human-facing message.
+  failure?: { stage?: string; message?: string; reason?: string; at?: string }
+  // The task this instance came from, whether its log still exists, and whether
+  // its record still resolves — all three computed by the -api, which owns the
+  // registry and the tasks (llm-based-fix-todo.md §4/§5). `fix_available` false
+  // = log gone; `task_available` false = the RECORD is gone.
+  task_id?: string
+  fix_available?: boolean
+  task_available?: boolean
   volumes?: Record<string,string>
+}
+
+// The service VALUE the deploy panel expects: `name@@recipe_path`, or the bare
+// name for the project root. Both card kinds must seed it this way.
+//
+// `setPreselectedDeploy(sess.service_name)` alone dropped the recipe, so a
+// session on `example-service@@recipes/failbuild` reopened the panel on the
+// PROJECT ROOT — and the whole restart then ran against the root recipe: the
+// `.fix` compose, the rendered per-user compose and the nginx conf all landed
+// at the project root while the recipe dir kept none of them. Found live in
+// T13's re-run (2026-09-23): the instance came up on a root-recipe compose
+// instead of the fixed one.
+const sessionServiceValue = (s: { service_name: string; recipe_path?: string }) =>
+  s.recipe_path ? `${s.service_name}@@${s.recipe_path}` : s.service_name
+
+// The card header's status note — ONE LINE, inline after the service name
+// (ServiceCard rule 1). The long form rides in the tooltip: the remedy is worth
+// keeping, the height it cost is not. `nowrap` is load-bearing — a wrapped note
+// grows the header exactly like the block alert it replaces.
+function HeaderNote({ tone, text, detail }: {
+  tone: 'info' | 'warning' | 'error'; text: string; detail?: string
+}) {
+  const color = tone === 'error' ? '#cf1322' : tone === 'warning' ? '#d46b08' : '#0958d9'
+  return (
+    <Tooltip title={detail || undefined}>
+      <Text style={{ color, fontSize: 12, whiteSpace: 'nowrap' }}>
+        {tone === 'error' ? '✗' : '⚠'} {text}
+      </Text>
+    </Tooltip>
+  )
+}
+
+// The pre-deploy card's HEADER note (GRILLING G24 rule 2): whatever the operator
+// must know about a session is shown on the header, so it is visible whether the
+// card is folded or expanded. A `refused` session explains the refusal and its
+// remedy; a `paused` one says what it is waiting for.
+function SessionAlert({ sess }: { sess: any }) {
+  // G29: the GATEWAY's own pool refused — a different pool from the -api's,
+  // with a different remedy ("wait for a generation, or cancel one" versus
+  // "cancel a hanging task"). Same header, its own words: the card is the
+  // surface the operator actually reads, so an unlabelled `refused` would send
+  // them hunting for a docker task that does not exist.
+  if (sess.state === 'refused' && sess.reason === 'generation_at_capacity') {
+    return (
+      <HeaderNote
+        tone="warning"
+        text="generation pool was full — this generation was refused"
+        detail={sess.detail || 'Wait for a running generation to finish, or cancel one, then retry.'}
+      />
+    )
+  }
+  if (sess.state === 'refused' && sess.reason === 'at_capacity') {
+    return (
+      <HeaderNote
+        tone="warning"
+        text="platform was at capacity — this deploy was refused"
+        detail={sess.detail || 'Cancel a task that has been hanging, then retry.'}
+      />
+    )
+  }
+  if (sess.state === 'refused') {
+    return (
+      <HeaderNote
+        tone="error"
+        text={`refused (${sess.reason || 'unknown'})`}
+        detail={sess.detail || 'Retry to replay it, or Delete to remove the record.'}
+      />
+    )
+  }
+  if (sess.state === 'paused' && sess.reason === 'llm_fix') {
+    return (
+      <HeaderNote
+        tone="info"
+        text="the analysis found the fault — Check to confirm the fix and restart"
+        detail="Check opens the deploy panel with the fixing guide pre-filled. Confirming restarts the path, generating .fix files."
+      />
+    )
+  }
+  if (sess.state === 'paused') {
+    return (
+      <HeaderNote
+        tone="info"
+        text={`paused — ${sess.reason || 'awaiting you'}`}
+        detail="Check re-enters the paused path: the deploy panel, and the pause popup that is waiting for your input."
+      />
+    )
+  }
+  return null
+}
+
+// The failed instance card's HEADER note (GRILLING G24 rule 2). These used to
+// sit in the card BODY, where they were invisible whenever the card was folded —
+// and the at-capacity one is the whole remedy for a refusal, so hiding it until
+// the operator expands a card they have no reason to expand defeated it.
+//
+// ONE line, at most — it used to stack TWO alerts, because the two conditions
+// below fire together: a deploy refused for `at_capacity` holds no task, so its
+// log is gone by construction and the second alert always came with the first.
+// Folding them into one instruction is therefore the normal case, not a corner.
+function FailedAlert({ svc, isAnalyzing }: { svc: ServiceInstance; isAnalyzing: boolean }) {
+  if (svc.status !== 'failed') return null
+  // §4d (user ruling 2026-09-20): a deploy refused because the -api's task pool
+  // was full is retryable once something hanging is cancelled.
+  const atCapacity = svc.failure?.reason === 'at_capacity'
+  // Log-gone state (§5): the fix is unavailable and there is nothing to link to,
+  // so the header says what to do instead. The log is deliberately NOT persisted
+  // anywhere else.
+  const logGone = !svc.fix_available && !isAnalyzing
+  if (!atCapacity && !logGone) return null
+  if (atCapacity && logGone) {
+    return (
+      <HeaderNote
+        tone="warning"
+        text="platform at capacity and the task log is gone — cancel a hanging task, then remove this service and retry"
+        detail="The platform was at capacity, so this deploy was refused; a refused deploy holds no task, so there is no log to feed the LLM fix. Cancel a hanging task, then remove this service and retry."
+      />
+    )
+  }
+  if (atCapacity) {
+    return (
+      <HeaderNote
+        tone="warning"
+        text="platform was at capacity — cancel a hanging task, then retry"
+        detail="Cancel a task that has been hanging, then retry."
+      />
+    )
+  }
+  return (
+    <HeaderNote
+      tone="warning"
+      text="task log is gone, cannot fix the deployment files with LLM, just remove this service and retry"
+    />
+  )
 }
 
 export default function UsersPage() {
@@ -40,6 +187,66 @@ export default function UsersPage() {
   const deployParam = searchParams.get('deploy') || ''
   const [deployOpen, setDeployOpen] = useState(!!deployParam)
   const [preselectedDeploy, setPreselectedDeploy] = useState(deployParam || undefined)
+  const [preselectedUser, setPreselectedUser] = useState<string | undefined>(undefined)
+  // Retry pins the failed entry's label (§5.1/§5.2).
+  const [preselectedLabel, setPreselectedLabel] = useState<string | undefined>(undefined)
+  // Fix ANALYSES in flight (GRILLING G26). Computed gateway-side and read from
+  // /pre-deploy: while one runs the instance is still `failed` and no session
+  // exists yet, so neither store alone can express `failed + analyzing`.
+  const [analyses, setAnalyses] = useState<any[]>([])
+  // `check` on a `paused` session re-enters the paused path IN PLACE: the deploy
+  // panel opens attached to the parked job (so its pause popup is there) or, for
+  // an LLM-fix pause, pre-filled with the analysis's guide.
+  const [resumeJobId, setResumeJobId] = useState<number|null>(null)
+  const [fixingGuide, setFixingGuide] = useState<{guide:string; slot:string}|null>(null)
+  // §8b pre-deploy sessions: work that is NOT an instance yet, so it is stored
+  // by the GATEWAY, not the -api registry — a session rendered from the instance
+  // store would look registered. Closing the deploy panel keeps the session
+  // alive (explicitly not `close = cancel`); these cards are the way back.
+  const [sessions, setSessions] = useState<any[]>([])
+  // A REFUSED deployment's stored options, handed to the deploy panel so the
+  // operator confirms exactly what will be replayed (GRILLING G20).
+  const [retryOptions, setRetryOptions] = useState<Record<string, any> | null>(null)
+  // G29: for a GATEWAY-side refusal the retry is NOT a replay. The generation
+  // pool refused before anything was produced, so the retry has to run the
+  // generation again — the panel seeds itself from the record, and the pipeline
+  // must still run. (The -api's `at_capacity` refusal is the opposite: its
+  // options are the paths that were SENT, so the replay must not regenerate.)
+  const [retryRegenerate, setRetryRegenerate] = useState(false)
+  // G20 for the `check` restart: the paused session's own proxy setting, so the
+  // deploy panel opens with the tick the path was created with and the restart
+  // replays it instead of registering `build_args: {}`. Mirrors how the label is
+  // carried — it is the session's own value, not a fresh default.
+  const [preselectedUseGlobalProxy, setPreselectedUseGlobalProxy] = useState<boolean | null>(null)
+  // `.fix` artifacts found in the card's own RECIPE, keyed `service@@recipe` —
+  // shown alongside the deployed files so a fix is visible as PRESENT without
+  // opening the deploy panel (llm-based-fix-todo.md §6). They are already
+  // selectable in the panel's pickers, since the candidate scans match them.
+  //
+  // SCOPED TO THE RECIPE, not the service: these artifacts are recipe-level by
+  // design (GRILLING G33 — compose and nginx are user-agnostic names in the
+  // recipe dir; only env is per-user), so per-(user, label) isolation is not the
+  // right unit, but asking per SERVICE made a card list another recipe's fix
+  // file — a card on `recipes/conflict` showed `recipes/interp`'s.
+  const [fixFiles, setFixFiles] = useState<Record<string, string[]>>({})
+
+  // Load ONE recipe's `.fix` candidates (cached per service@@recipe).
+  const loadFixFiles = async (service: string, recipePath: string) => {
+    const cacheKey = recipePath ? `${service}@@${recipePath}` : service
+    if (!service || fixFiles[cacheKey]) return
+    try {
+      const { data } = await client.get(`/projects/${service}/file-sets`)
+      // `.` is the root recipe's key, as everywhere else this payload is read.
+      const cands = (data.candidates || {})[recipePath || '.'] || {}
+      const found = new Set<string>()
+      for (const kind of ['compose', 'nginx', 'env']) {
+        for (const n of ((cands as any)[kind] || [])) {
+          if (typeof n === 'string' && /\.fix(\.|$)/.test(n)) found.add(n)
+        }
+      }
+      setFixFiles(prev => ({ ...prev, [cacheKey]: Array.from(found).sort() }))
+    } catch { /* candidates are a nicety — never block the card */ }
+  }
   const [search, setSearch] = useState('')
   const [visiblePwds, setVisiblePwds] = useState<Record<string,boolean>>({})
 
@@ -95,7 +302,11 @@ export default function UsersPage() {
   const [rebuildProxy, setRebuildProxy] = useState(false)
   const [rebuildLoading, setRebuildLoading] = useState(false)
 
-  // Track which panels are currently expanded (for container-status refresh)
+  // Track which panels are currently expanded (for container-status refresh).
+  // Sessions and instances now share ONE `Collapse` per user, so they share this
+  // set too: a session's panel key is namespaced (`session:…`) against an
+  // instance's (`user-service-label`), so the two cannot collide — and the
+  // separate array the split used to need is gone with the split.
   const [expandedPanels, setExpandedPanels] = useState<string[]>([])
   // Timer ref for container-status refresh
   const refreshTimersRef = useRef<Record<string, ReturnType<typeof setInterval>>>({})
@@ -126,6 +337,14 @@ export default function UsersPage() {
       if (!expandedPanels.includes(k)) { clearInterval(timers[k]); delete timers[k] }
     }
     for (const key of expandedPanels) {
+      // A session's panel key is namespaced and belongs to no instance — it has
+      // no fix files of its own to show.
+      if (!key.startsWith('session:')) {
+        const { user, service, label } = parseServiceKey(key)
+        const svc = servicesRef.current.find(s =>
+          s.user_name === user && s.service_name === service && String(s.label) === String(label))
+        loadFixFiles(service, svc?.recipe_path || '')
+      }
       if (timers[key]) continue
       timers[key] = setInterval(() => {
         refreshServices()
@@ -134,7 +353,7 @@ export default function UsersPage() {
     return () => { for (const t of Object.values(refreshTimersRef.current)) clearInterval(t); refreshTimersRef.current = {} }
   }, [expandedPanels])
 
-  useEffect(() => { loadServices() }, [])
+  useEffect(() => { loadServices(); loadSessions() }, [])
 
   useEffect(() => {
     if (services.length === 0) return
@@ -182,14 +401,19 @@ export default function UsersPage() {
   ) => {
     const key = `${user}-${service}-${label}`
     try {
-      const envName = envFile || `.env.raw.${user}.${label}`
       const composeName = composeFile || `docker-compose.user-${user}.${label}.yml`
-      const [envRes, composeRes] = await Promise.all([
-        client.get(`/services/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: recipePath, filename: envName } }),
+      // Probe the env file ONLY when the registry records one — the retired
+      // `.env.raw.{user}.{label}` fallback probed (and named) a file that is not
+      // a deployment artifact, so it always reported "not there".
+      const probes = [
         client.get(`/services/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: recipePath, filename: composeName } }),
-      ])
+      ]
+      if (envFile) {
+        probes.push(client.get(`/services/${user}/${service}/${label}/per-user-file`, { params: { recipe_path: recipePath, filename: envFile } }))
+      }
+      const responses = await Promise.all(probes)
       let latestMod: number | null = null
-      for (const data of [envRes.data, composeRes.data]) {
+      for (const data of responses.map(r => r.data)) {
         if (data.exists && data.modified_at) {
           if (latestMod === null || data.modified_at > latestMod) {
             latestMod = data.modified_at
@@ -382,6 +606,9 @@ export default function UsersPage() {
       for (const s of (u.healthy_services||[])) all.push({...s, user_name: u.user_name})
       for (const s of (u.unhealthy_services||[])) all.push({...s, user_name: u.user_name})
       for (const s of (u.missing_services||[])) all.push({...s, user_name: u.user_name})
+      // Failed entries are their own bucket, classified from the registry
+      // status (never container health) — see failed-instance-state-todo.md §3.
+      for (const s of (u.failed_services||[])) all.push({...s, user_name: u.user_name})
     }
     return all
   }
@@ -395,6 +622,14 @@ export default function UsersPage() {
       const next = new Set([...prev].filter(k => live.has(k)))
       return next.size === prev.size ? prev : next
     })
+  }
+
+  const loadSessions = async () => {
+    try {
+      const { data } = await client.get('/pre-deploy')
+      setSessions(data.sessions || [])
+      setAnalyses(data.analyses || [])
+    } catch { /* sessions are additive — never block the page */ }
   }
 
   const loadServices = async () => {
@@ -414,32 +649,57 @@ export default function UsersPage() {
     } catch { /* silent */ }
   }, [])
 
-  // Auto-poll every 10s — silent refresh, no loading spinner
+  // Auto-poll every 10s — silent refresh, no loading spinner. Sessions and
+  // analyses poll with it: `failed + analyzing` is a LIVE gateway-side state, and
+  // a card that only learns about it on mount would show it never.
   useEffect(() => {
-    const interval = setInterval(refreshServices, 10000)
+    const interval = setInterval(() => { refreshServices(); loadSessions() }, 10000)
     return () => clearInterval(interval)
   }, [refreshServices])
 
-  const grouped = useMemo(() => {
-    const map: Record<string, ServiceInstance[]> = {}
+  // ONE grouping, TWO card kinds. A pre-deploy session is NOT a separate
+  // category: it is the same service card at an earlier point of the path, so it
+  // renders inside its own user's group, next to that user's instances. A user
+  // with only sessions gets a group of their own instead of a second section —
+  // which is also why the `Empty` state no longer has to sit beside a list of
+  // sessions on the same page.
+  const groups = useMemo(() => {
+    const q = search.toLowerCase()
+    const matches = (user: string, service: string) =>
+      !q || user.toLowerCase().includes(q) || service.toLowerCase().includes(q)
+    const order: string[] = []
+    const svcsByUser: Record<string, ServiceInstance[]> = {}
+    const sessByUser: Record<string, any[]> = {}
+    const ensure = (un: string) => {
+      if (!svcsByUser[un]) { svcsByUser[un] = []; sessByUser[un] = []; order.push(un) }
+    }
     for (const s of services) {
       const un = s.user_name || 'unknown'
-      if (!map[un]) map[un] = []
-      map[un].push(s)
+      ensure(un)
+      if (matches(un, s.service_name)) svcsByUser[un].push(s)
     }
-    if (!search) return map
-    const filtered: Record<string, ServiceInstance[]> = {}
-    const q = search.toLowerCase()
-    for (const [user, svcs] of Object.entries(map)) {
-      const match = svcs.filter(s =>
-        user.toLowerCase().includes(q) || s.service_name.toLowerCase().includes(q)
-      )
-      if (match.length > 0) filtered[user] = match
+    for (const sess of sessions) {
+      const un = sess.user_name || 'unknown'
+      ensure(un)
+      if (matches(un, sess.service_name)) sessByUser[un].push(sess)
     }
-    return filtered
-  }, [services, search])
+    return order
+      .map(un => ({ userName: un, svcs: svcsByUser[un], sessions: sessByUser[un] }))
+      .filter(g => g.svcs.length > 0 || g.sessions.length > 0)
+  }, [services, sessions, search])
 
-  const getBadge = (s: ServiceInstance, key?: string) => {
+  const getBadge = (s: ServiceInstance, key?: string, analyzing = false) => {
+    // Failed: its own state, read from the registry — never an ordinary
+    // "0 up, 1 down", which is what a failed entry used to look like.
+    // `+ analyzing` (GRILLING G26 row 2) is layered on from the GATEWAY's own
+    // analysis job while one runs: the instance is still `failed` in the -api
+    // registry at that moment, because nothing moves until the analysis
+    // succeeds, so the registry alone cannot express this state.
+    if (s.status === 'failed') {
+      const stage = s.failure?.stage ? ` (${s.failure.stage})` : ''
+      if (analyzing) return <Badge status="processing" text={`Failed${stage} + analyzing`}/>
+      return <Badge status="error" text={`Failed${stage}`}/>
+    }
     // Building: containers don't exist yet, don't show misleading "down" count
     if (s.status === 'building') return <Badge status="processing" text="Building..."/>
     // Deleting: persisted server-side in the registry (like 'building'), so it
@@ -454,6 +714,32 @@ export default function UsersPage() {
     if (!h&&!uh&&!m) return <Badge status="default" text="unknown"/>
     if (!uh&&!m) return <Badge status="success" text={`Running (${h})`}/>
     return <Badge status="warning" text={`${h} up, ${uh+m} down`}/>
+  }
+
+  // Cancel a `building` service by cancelling the -api task behind it (§4b).
+  // The task list carries each task's {user_name, service_name, label} target,
+  // so the card finds its own task rather than the registry carrying a task id.
+  const cancelBuilding = async (svc: ServiceInstance) => {
+    try {
+      const { data } = await client.get('/tasks')
+      const tasks = data.tasks || []
+      const task = tasks.find((t: any) =>
+        (t.status === 'running' || t.status === 'pending') &&
+        t.target?.user_name === svc.user_name &&
+        t.target?.service_name === svc.service_name &&
+        String(t.target?.label ?? '') === String(svc.label)
+      )
+      if (!task) {
+        message.warning('No running task found for this service — refreshing')
+        refreshServices()
+        return
+      }
+      await client.delete(`/tasks/${task.task_id}`)
+      message.success('Cancellation requested — the service will be marked failed')
+      refreshServices()
+    } catch (e: any) {
+      message.error(e.response?.data?.detail || 'Cancel failed')
+    }
   }
 
   const openPwdChange = (user:string, service:string, label:string) => {
@@ -471,6 +757,17 @@ export default function UsersPage() {
       setPwdModalOpen(false)
     } catch (err: any) { message.error(err.response?.data?.detail || 'Failed') }
     finally { setPwdLoading(false) }
+  }
+
+  // Drop the service's own auth_basic layer. The card keeps its ACL gate.
+  // Needed for a protected instance whose registry plaintext is gone: the gate
+  // can never satisfy that auth_basic again, so the layer has to come off.
+  const handleRemovePwd = async (user: string, service: string, label: string) => {
+    try {
+      await client.delete(`/services/${user}/${service}/${label}/password`)
+      message.success('Service password removed — auth_basic is off, the ACL gate still applies')
+      refreshServices()
+    } catch (err: any) { message.error(err.response?.data?.detail || 'Failed to remove the service password') }
   }
 
   const handleCloneAll = async () => {
@@ -515,6 +812,216 @@ export default function UsersPage() {
     return <span>{text.substring(0,idx)}<mark style={{background:'#ffd666',padding:'0 2px'}}>{text.substring(idx,idx+query.length)}</mark>{text.substring(idx+query.length)}</span>
   }
 
+  // The pre-deploy SESSION card — the same widget as an instance (GRILLING G24),
+  // differing only by status, rendered INSIDE its own user's group rather than in
+  // a section of its own. The session's two job-live/stopped states drive which
+  // actions exist — `cancel` belongs to a live job, `check`/`retry` to a stopped
+  // one, and they never appear together.
+  const renderSessionCard = (sess: any) => {
+
+    const key = `session:${sess.user_name}-${sess.service_name}-${sess.label}`
+    // CANCEL FOLLOWS THE JOB, not the card's label (G24 rule 4: "the
+    // cancel button is for canceling a job … when the job stopped the
+    // button should go away"). `job_live` is computed by the GATEWAY
+    // from the job's real status — a `job_id` alone cannot tell
+    // "parked, cancellable" from "finished an hour ago".
+    // (Corrected 2026-09-26: this used to add "and a paused session's
+    // job is genuinely live (parked in `awaiting_input`)" — true before
+    // G27, which made a pause TERMINAL. `job_live` deliberately
+    // excludes `paused`, which is exactly why a paused card offers
+    // `Check`/`Delete` and no `Cancel`.)
+    // Keying only on `generating` left a dead end: a paused card
+    // offered `delete`, the server answered "cancel it first", and no
+    // cancel existed. Found live in T14.
+    const isJobLive = !!sess.job_live
+    return (
+      <ServiceCard
+        key={key}
+        panelKey={key}
+        // The BADGE follows the session's own state; only the ACTIONS
+        // follow the job. A `paused` session whose job is parked for
+        // input is waiting on the OPERATOR — calling that "Generating…"
+        // (because the job is technically live) hides the one thing the
+        // card exists to say. Caught by T14 after `job_live` was
+        // introduced for the cancel gate.
+        badge={
+          <Badge
+            status={sess.state === 'generating' ? 'processing'
+                    : sess.state === 'refused' ? 'error' : 'warning'}
+            text={sess.state === 'generating' ? 'Generating…'
+                  : sess.state === 'refused' ? `Refused (${sess.reason || 'unknown'})`
+                  : `Paused (${sess.reason || 'awaiting you'})`}
+          />
+        }
+        title={<Text strong>{sess.service_name}</Text>}
+        label={<Tag>{sess.label}</Tag>}
+        headerExtra={<Text type="secondary">{sess.user_name}</Text>}
+        alert={<SessionAlert sess={sess} />}
+        actions={<>
+          {/* SESSION-ACTIONS-START — the unit test that guards "no
+              instance-only button on a pre-deploy card" reads this
+              region; keep the markers. */}
+          {/* retry — ONLY for a refused deployment. It replays the
+              EXACT stored options straight to the -api: no re-selection
+              and no generation pipeline, so files the rejected attempt
+              produced are reused as-is. */}
+          {sess.state === 'refused' && (
+            <Button size="small" type="primary"
+              disabled={!sess.options && sess.reason !== 'generation_at_capacity'}
+              onClick={() => {
+                const genRefusal = sess.reason === 'generation_at_capacity'
+                setRetryOptions(sess.options || null)
+                // A gateway refusal re-runs the deploy, generation
+                // included (G29) — see `retryRegenerate`. Its record
+                // may predate the fix and carry no options at all, so
+                // the button cannot depend on them: the session's own
+                // fields (user, service, label, proxy) are enough to
+                // open the panel on the same deployment.
+                setRetryRegenerate(genRefusal)
+                setPreselectedDeploy(sessionServiceValue(sess))
+                setPreselectedUser(sess.user_name)
+                setPreselectedLabel(String(sess.label))
+                // The refused options carry `use_global_proxy`
+                // themselves (they are replayed verbatim), so the
+                // session-level seed must not also fire — except for a
+                // generation refusal with no stored options, where the
+                // session column is the only source.
+                setPreselectedUseGlobalProxy(
+                  genRefusal && !sess.options ? !!sess.use_global_proxy : null)
+                setDeployOpen(true)
+              }}>Retry</Button>
+          )}
+          {/* check — re-enter the PAUSED PATH (G15): the deploy pane as
+              if never closed, PLUS the pause popup. For a generation
+              pause that is the panel attached to the parked job; for an
+              LLM-fix pause it is the panel pre-filled with the guide. */}
+          {sess.state === 'paused' && (
+            <Button size="small" type="primary" onClick={() => {
+              setPreselectedDeploy(sessionServiceValue(sess))
+              setPreselectedUser(sess.user_name)
+              setPreselectedLabel(String(sess.label))
+              // The session's proxy setting rides along with the
+              // label and the guide (G20): the restart is the SAME
+              // path, so it replays the options it was created with.
+              setPreselectedUseGlobalProxy(!!sess.use_global_proxy)
+              if (sess.reason === 'llm_fix') {
+                setFixingGuide({ guide: sess.guide || '', slot: sess.slot || 'compose' })
+              } else if (sess.job_id != null) {
+                setResumeJobId(sess.job_id)
+              }
+              setDeployOpen(true)
+            }}>Check</Button>
+          )}
+          {/* cancel — a JOB action, so it exists only while a job is
+              live. It used to render for every state and report
+              success unconditionally, so on a refused session (which
+              has no job by construction) it did nothing and claimed it
+              had. */}
+          {isJobLive && (
+            <Button size="small" danger onClick={async () => {
+              try {
+                if (sess.job_id == null) {
+                  message.warning('This session has no running job to cancel')
+                  return
+                }
+                const r = await client.delete(`/llm/jobs/${sess.job_id}`)
+                // The endpoint answers 200 for ANY existing job: it
+                // no-ops when the job has already stopped and still
+                // returns the row. Reporting success off the response
+                // alone is the same lie the `refused` session used to
+                // tell — this session's state is a MIRROR of the job,
+                // refreshed only by the periodic reconcile, so it can
+                // still read `generating` after the job failed. Read
+                // the status the server actually reports.
+                if (r.data?.status === 'cancelled') {
+                  message.success('Session cancelled')
+                } else {
+                  message.warning(
+                    `Nothing to cancel — the job is already ${r.data?.status || 'stopped'}`)
+                }
+                loadSessions()
+              } catch (e: any) {
+                const d = e.response?.data?.detail
+                message.error(typeof d === 'string' ? d : (d?.detail || 'Cancel failed'))
+              }
+            }}>Cancel</Button>
+          )}
+          {/* delete — removes the RECORD, and **implicitly cancels a
+              live job first** (user ruling 2026-09-23: "the delete
+              implicitly forcing a cancel first"). It used to be hidden
+              while a job was live, which made it depend on a second
+              button; deleting IS the operator saying "stop this and
+              forget it", so it is always offered and does the cancel
+              itself. */}
+          <Button size="small" danger onClick={async () => {
+            try {
+              const { data } = await client.delete(`/pre-deploy/${sess.user_name}/${sess.service_name}/${sess.label}`, {
+                params: { recipe_path: sess.recipe_path || '' },
+              })
+              message.success(data?.cancelled_job
+                ? 'Running job cancelled and session removed'
+                : 'Session removed')
+              loadSessions()
+            } catch (e: any) {
+              const d = e.response?.data?.detail
+              message.error(typeof d === 'string' ? d : (d?.detail || 'Delete failed'))
+            }
+          }}>Delete</Button>
+          {/* SESSION-ACTIONS-END */}
+        </>}
+      >
+        <Space direction="vertical" style={{ width: '100%' }} size="small">
+          <div>
+            <Text strong>Recorded paths (what the -api sees): </Text>
+            {sess.options
+              ? <Space wrap>
+                  <Tag color={sess.options.compose_file_paths?.length ? 'green' : 'red'}>
+                    compose: {sess.options.compose_file_paths?.join(', ') || 'none'}
+                  </Tag>
+                  <Tag color={sess.options.nginx_conf_file_path ? 'green' : 'red'}>
+                    nginx: {sess.options.nginx_conf_file_path || 'none'}
+                  </Tag>
+                  <Tag color={sess.options.env_files?.length ? 'green' : 'red'}>
+                    env: {sess.options.env_files?.join(', ') || 'none'}
+                  </Tag>
+                </Space>
+              : <Text type="secondary">none recorded yet</Text>}
+          </div>
+          {sess.job_id != null && (
+            <div>
+              <Text strong>Job: </Text>
+              {/* The Tasks page reads `?job=` and shows THIS gateway
+                  generation job's own step log. The link used to go to
+                  `/tasks?job=<id>` where nothing read the parameter,
+                  and the id is a GATEWAY job id — not one of the -api
+                  tasks that page lists — so it could not have resolved
+                  even if it had. */}
+              <Button type="link" size="small" style={{ padding: 0 }}
+                onClick={() => navigate(`/tasks?job=${sess.job_id}`)}>#{sess.job_id}</Button>
+            </div>
+          )}
+          {sess.task_id && (
+            <div>
+              <Text strong>Analysed the failed task: </Text>
+              {/* A real -api task with a real log — link it, so the
+                  evidence the analysis read is one click away. */}
+              <Button type="link" size="small" style={{ padding: 0 }}
+                onClick={() => navigate(`/tasks?task=${sess.task_id}`)}>
+                <Text code>{sess.task_id}</Text>
+              </Button>
+            </div>
+          )}
+          {sess.guide && (
+            <div>
+              <Text strong>Fixing guide from the analysis: </Text>
+              <Text code style={{ whiteSpace: 'pre-wrap', display: 'block', marginTop: 4 }}>{sess.guide}</Text>
+            </div>
+          )}
+        </Space>
+      </ServiceCard>
+    )
+  }
+
   return (
     <div>
       <div style={{display:'flex',justifyContent:'space-between',marginBottom:16,flexWrap:'wrap',gap:8}}>
@@ -541,26 +1048,42 @@ export default function UsersPage() {
         </Card>
       )}
 
-      {loading ? <Spin/> : Object.keys(grouped).length===0 ? (
+      {loading ? <Spin/> : groups.length===0 ? (
         <Card><Empty description={search?"No matches":"No services deployed"}/></Card>
       ) : (
-        Object.entries(grouped).map(([userName, userSvcs], idx) => {
+        groups.map(({ userName, svcs: userSvcs, sessions: userSessions }, idx) => {
           const isBusy = (s: any) => s.status === 'building' || s.status === 'deleting'
           const allHealthy = userSvcs.every(s => isBusy(s) || (Object.keys(s.unhealthy_containers||{}).length===0 && Object.keys(s.missing_containers||{}).length===0))
           const healthyCount = userSvcs.filter(s => Object.keys(s.healthy_containers||{}).length > 0 && Object.keys(s.unhealthy_containers||{}).length===0 && Object.keys(s.missing_containers||{}).length===0).length
           const buildingCount = userSvcs.filter(s => isBusy(s)).length
-          const unhealthyCount = userSvcs.length - healthyCount - buildingCount
+          // A failed entry is its own state, not "unhealthy" — it has no
+          // containers to be unhealthy about (failed-instance-state-todo.md §3).
+          const failedCount = userSvcs.filter(s => s.status === 'failed').length
+          const unhealthyCount = userSvcs.length - healthyCount - buildingCount - failedCount
+          // The group tag counts INSTANCES (it is a health summary, and a session
+          // has no containers to be healthy about); a user holding only sessions
+          // says so rather than reading "0 services (all healthy)".
+          const groupTag = userSvcs.length === 0
+            ? `${userSessions.length} pre-deploy`
+            : <>
+                {userSvcs.length} service{userSvcs.length>1?'s':''}{
+                  failedCount > 0
+                    ? ` (${healthyCount} healthy, ${failedCount} failed${unhealthyCount > 0 ? `, ${unhealthyCount} unhealthy` : ''})`
+                    : unhealthyCount > 0 ? ` (${healthyCount} healthy, ${unhealthyCount} unhealthy)` : ` (all healthy)`
+                }
+                {userSessions.length > 0 ? ` + ${userSessions.length} pre-deploy` : ''}
+              </>
           return (
-          <div key={userName} style={{marginBottom: idx<Object.keys(grouped).length-1?32:0, paddingBottom: idx<Object.keys(grouped).length-1?16:0, borderBottom: idx<Object.keys(grouped).length-1?'1px solid #f0f0f0':'none'}}>
+          <div key={userName} style={{marginBottom: idx<groups.length-1?32:0, paddingBottom: idx<groups.length-1?16:0, borderBottom: idx<groups.length-1?'1px solid #f0f0f0':'none'}}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
               <Space>
                 {isAdmin && <Checkbox
-                  checked={userSvcs.every(s => selectedKeys.has(`${s.user_name}-${s.service_name}-${s.label}`))}
+                  checked={userSvcs.length>0 && userSvcs.every(s => selectedKeys.has(`${s.user_name}-${s.service_name}-${s.label}`))}
                   indeterminate={userSvcs.some(s => selectedKeys.has(`${s.user_name}-${s.service_name}-${s.label}`)) && !userSvcs.every(s => selectedKeys.has(`${s.user_name}-${s.service_name}-${s.label}`))}
                   onChange={() => toggleSelectAll(userName)}
                 />}
                 <Title level={4} style={{margin:0}}>{highlight(userName, search)}</Title>
-                <Tag color={allHealthy?'green':'orange'}>{userSvcs.length} service{userSvcs.length>1?'s':''}{unhealthyCount > 0 ? ` (${healthyCount} healthy, ${unhealthyCount} unhealthy)` : ` (all healthy)`}</Tag>
+                <Tag color={failedCount > 0 ? 'red' : (userSvcs.length === 0 ? 'blue' : (allHealthy?'green':'orange'))}>{groupTag}</Tag>
               </Space>
               <Space>
                 {isAdmin && <>
@@ -573,32 +1096,127 @@ export default function UsersPage() {
             </div>
 
             <Collapse activeKey={expandedPanels} onChange={(keys) => setExpandedPanels(typeof keys === 'string' ? [keys] : keys)}>
+              {/* The same widget for both kinds (G24) — the session cards come
+                  first, because a session is the instance's own future and the
+                  operator's attention is on the work in flight. */}
+              {userSessions.map((sess) => renderSessionCard(sess))}
               {userSvcs.map((svc) => {
                 const key = `${svc.user_name}-${svc.service_name}-${svc.label}`
                 const isDeleting = svc.status === 'deleting' || deletingKeys.has(key)
                 const containers = {...svc.healthy_containers, ...svc.unhealthy_containers, ...svc.missing_containers}
                 const pwdVisible = visiblePwds[key] || false
+                // A fix ANALYSIS running for this instance (GRILLING G26). While
+                // one runs the -api entry is deliberately untouched — the
+                // instance is still `failed` there — so this card state comes
+                // from the gateway's own job, never from the registry.
+                const analysis = analyses.find((a: any) =>
+                  a.user_name === svc.user_name &&
+                  a.service_name === svc.service_name &&
+                  String(a.label) === String(svc.label))
+                const isAnalyzing = !!analysis
                 return (
-                  <Collapse.Panel
+                  <ServiceCard
                     key={key}
-                    header={<Space>
+                    panelKey={key}
+                    badge={getBadge(svc, key, isAnalyzing)}
+                    title={<Text strong>{highlight(svc.service_name, search)}</Text>}
+                    label={<Tag>{svc.label}</Tag>}
+                    headerExtra={<>
                       {isAdmin && <Checkbox checked={selectedKeys.has(key)} onChange={()=>toggleSelect(key)} onClick={(e:any)=>e.stopPropagation()}/>}
-                      {getBadge(svc, key)}
-                      <Text strong>{highlight(svc.service_name, search)}</Text>
-                      <Tag>{svc.label}</Tag>
                       {resourceStats[key] && Object.keys(svc.healthy_containers||{}).length > 0 && (
                         <span style={{marginLeft:8,display:'inline-flex',gap:6,alignItems:'center'}}>
                           {resourceStats[key].cpu && <Tag color="blue" style={{fontSize:11,margin:0}}><DashboardOutlined/> CPU {resourceStats[key].cpu}</Tag>}
                           {resourceStats[key].mem && <Tag color="purple" style={{fontSize:11,margin:0}}>RAM {resourceStats[key].mem}</Tag>}
                         </span>
                       )}
-                    </Space>}
-                    extra={
-                      <Space onClick={e=>e.stopPropagation()}>
-                        {isAdmin && <>
-                          {/* Actions are disabled while the instance is being
+                    </>}
+                    alert={<FailedAlert svc={svc} isAnalyzing={isAnalyzing} />}
+                    actions={isAdmin && <>
+                          {/* A `building` entry is cancellable (§4b). Under the hood
+                              this cancels the underlying -api task — the same
+                              operation the Tasks page button performs; the registry
+                              then moves building → failed ("cancelled by operator"). */}
+                          {svc.status === 'building' && (
+                            <Tooltip title="Cancel this build — the task is cancelled and the service is marked failed">
+                              <Button size="small" danger icon={<StopOutlined/>}
+                                onClick={()=>cancelBuilding(svc)}>Cancel</Button>
+                            </Tooltip>
+                          )}
+                          {/* An ANALYSIS in flight is cancellable too (G26 row 2):
+                              the LLM based fix button is gone while it runs, and
+                              cancelling simply returns the instance to `failed` —
+                              a clean no-op, because nothing has moved yet. */}
+                          {isAnalyzing && (
+                            <Tooltip title="Cancel the analysis — the service returns to failed">
+                              <Button size="small" danger icon={<StopOutlined/>}
+                                onClick={async () => {
+                                  try {
+                                    await client.delete(`/llm/jobs/${analysis.job_id}`)
+                                    message.success('Analysis cancelled')
+                                    loadSessions()
+                                  } catch (e: any) {
+                                    message.error(e.response?.data?.detail || 'Cancel failed')
+                                  }
+                                }}>Cancel</Button>
+                            </Tooltip>
+                          )}
+                          {/* A `failed` entry's actions belong HERE, not in the
+                              body: the body is detail, the header is what the
+                              operator acts on. */}
+                          {svc.status === 'failed' && !isAnalyzing && <>
+                            {svc.fix_available && (
+                              <Tooltip title="Analyse the failed task's log with the LLM and write a fixing guide — the deployment is then paused for you to confirm and restart it">
+                                <Button size="small" icon={<RobotOutlined/>}
+                                  onClick={async () => {
+                                    try {
+                                      await client.post('/llm/jobs', {
+                                        service_name: svc.service_name,
+                                        recipe_path: svc.recipe_path || '',
+                                        job_type: 'fix',
+                                        user_name: svc.user_name,
+                                        label: svc.label,
+                                      })
+                                      message.success('Analysing the failure — the card will pause with the guide when it finishes')
+                                      loadSessions()
+                                    } catch (e: any) {
+                                      const d = e.response?.data?.detail
+                                      message.error(typeof d === 'string' ? d : (d?.detail || 'Could not start the analysis'))
+                                    }
+                                  }}>LLM based fix</Button>
+                              </Tooltip>
+                            )}
+                            <Button size="small" type="primary" icon={<RocketOutlined/>}
+                              onClick={()=>{
+                                // The recipe rides along: retrying a failed
+                                // entry on a recipe subdir must reopen THAT
+                                // recipe, not the project root (T13, 2026-09-23).
+                                setPreselectedDeploy(sessionServiceValue(svc))
+                                setPreselectedUser(svc.user_name)
+                                setPreselectedLabel(svc.label)
+                                // A failed-entry Retry is not a session resume:
+                                // there is no paused session to carry a proxy
+                                // from, so the panel keeps its own default.
+                                setPreselectedUseGlobalProxy(null)
+                                setDeployOpen(true)
+                              }}>Retry</Button>
+                            <Button size="small" danger icon={<DeleteOutlined/>}
+                              onClick={()=>{
+                                setDelTarget({user_name:svc.user_name, service_name:svc.service_name, label:svc.label})
+                                setDelToken(Math.random().toString(36).slice(2,8))
+                                setDelInput(''); setDelOpen(true)
+                              }}>Delete</Button>
+                          </>}
+                          {/* The GENERIC set — stop/start, Rebuild, Redeploy,
+                              key, Dup, Delete. It is what a NORMAL instance
+                              offers, and it must not run alongside the `failed`
+                              set above: both carry a Delete, so a failed card
+                              rendered TWO of them (and a Rebuild/Redeploy/Dup
+                              it has no use for — Retry is a failed entry's
+                              designed recovery, §5.1). Found by trace T13's
+                              first look at the card.
+                              Actions are disabled while the instance is being
                               deleted (server status 'deleting' or optimistic). */}
-                          {svc.status !== 'building' && !isDeleting && <Tooltip title={Object.keys(svc.healthy_containers||{}).length > 0 ? 'Stop containers' : 'Start containers'}>
+                          {svc.status !== 'building' && svc.status !== 'failed' && !isDeleting && <Tooltip title={Object.keys(svc.healthy_containers||{}).length > 0 ? 'Stop containers' : 'Start containers'}>
                             <Button size="small" 
                               icon={Object.keys(svc.healthy_containers||{}).length > 0 ? <PauseOutlined/> : <CaretRightOutlined/>}
                               type={Object.keys(svc.healthy_containers||{}).length > 0 ? 'default' : 'primary'}
@@ -612,6 +1230,7 @@ export default function UsersPage() {
                               }}
                             />
                           </Tooltip>}
+                          {svc.status !== 'failed' && <>
                           <Button size="small" disabled={isDeleting} onClick={()=>{
                             setRebuildTarget({user:svc.user_name,service:svc.service_name,label:svc.label,noCache:false})
                             setRebuildProxy(false)
@@ -628,9 +1247,19 @@ export default function UsersPage() {
                           <Tooltip title="Change password">
                             <Button size="small" icon={<KeyOutlined/>} disabled={isDeleting} onClick={()=>openPwdChange(svc.user_name,svc.service_name,svc.label)}/>
                           </Tooltip>
+                          <Popconfirm
+                            title="Remove this service's password?"
+                            description="auth_basic is stripped from the instance; the ACL gate still applies."
+                            onConfirm={()=>handleRemovePwd(svc.user_name,svc.service_name,svc.label)}
+                          >
+                            <Tooltip title="Remove service password">
+                              <Button size="small" disabled={isDeleting} icon={<UnlockOutlined/>}/>
+                            </Tooltip>
+                          </Popconfirm>
                           <Tooltip title="Duplicate for another user">
                             <Button size="small" icon={<CopyOutlined/>} disabled={isDeleting} onClick={()=>{
-                              setPreselectedDeploy(svc.service_name)
+                              // Duplicate targets the same recipe the card shows.
+                              setPreselectedDeploy(sessionServiceValue(svc))
                               setDeployOpen(true)
                             }}>Dup</Button>
                           </Tooltip>
@@ -639,11 +1268,38 @@ export default function UsersPage() {
                             setDelToken(Math.random().toString(36).slice(2,8))
                             setDelInput(''); setDelOpen(true)
                           }}/>
-                        </>}
-                      </Space>
-                    }
+                          </>}
+                    </>}
                   >
                     <Space direction="vertical" style={{width:'100%'}} size="small">
+                      {svc.status === 'failed' && (
+                        <div style={{background:'#fff2f0', border:'1px solid #ffccc7', borderRadius:6, padding:'8px 12px'}}>
+                          <Space direction="vertical" size={4} style={{width:'100%'}}>
+                            <Space>
+                              <Text strong style={{color:'#cf1322'}}>Deployment failed</Text>
+                              {svc.failure?.stage && <Tag color="red">{svc.failure.stage}</Tag>}
+                              {svc.failure?.at && <Text type="secondary" style={{fontSize:12}}>{svc.failure.at}</Text>}
+                            </Space>
+                            {/* The ALERTS and the ACTIONS live on the card header
+                                (GRILLING G24): the header is visible folded, acts
+                                as the action surface, and is where the operator
+                                looks — the body is detail. What remains here is
+                                the failure's own detail: its stage, its time, and
+                                the -api's own message. */}
+                            {svc.failure?.message && (
+                              <Text code style={{whiteSpace:'pre-wrap', wordBreak:'break-all', fontSize:12}}>
+                                {svc.failure.message}
+                              </Text>
+                            )}
+                            {isAnalyzing && (
+                              <Text type="secondary">
+                                The LLM is analysing this failure's log — nothing has been
+                                changed yet. Cancel on the card header to go back to failed.
+                              </Text>
+                            )}
+                          </Space>
+                        </div>
+                      )}
                       <div>
                         <Text strong>URL: </Text>
                         <a href={buildServiceUrl(svc)} target="_blank" rel="noopener noreferrer">
@@ -653,6 +1309,27 @@ export default function UsersPage() {
                       </div>
                       {(svc as any).subnet && (
                         <div><Text strong>Subnet: </Text><Tag color="purple">{(svc as any).subnet}</Tag></div>
+                      )}
+                      {/* The instance's OWN task — the one that last acted on it
+                          (the -api stamps it at register and re-stamps it on
+                          rebuild). `task_available` is the SERVER's answer to
+                          "does that record still resolve?", so the card never
+                          probes per instance: clickable while it exists, GREYED
+                          once the cleanup contract has taken it (G30). */}
+                      {svc.task_id && (
+                        <div>
+                          <Text strong>Task: </Text>
+                          {svc.task_available === true ? (
+                            <Button type="link" size="small" style={{padding:0}}
+                              onClick={() => navigate(`/tasks?task=${svc.task_id}`)}>
+                              <Text code>{svc.task_id}</Text>
+                            </Button>
+                          ) : (
+                            <Tooltip title="the task record is gone — it left by the cleanup contract (TTL / cap)">
+                              <Text code type="secondary" style={{cursor:'not-allowed'}}>{svc.task_id}</Text>
+                            </Tooltip>
+                          )}
+                        </div>
                       )}
                       <div><Text strong>Containers: </Text>
                         <Space wrap>{Object.entries(containers).map(([n,s])=>{
@@ -674,15 +1351,35 @@ export default function UsersPage() {
                           // hardcoded '' resolved to the project root and made
                           // every file look missing).
                           const recipePath = svc.recipe_path || ''
-                          const envFile = baseName(svc.env_file_path) || `.env.raw.${svc.user_name}.${svc.label}`
+                          // The env file is whatever the -api recorded at
+                          // registration — never a guess. `.env.raw.{user}.{label}`
+                          // is the gateway's GENERATION INTERMEDIATE (a bare name
+                          // the -api copies to the canonical .env.{n}.{user}.{label}
+                          // and then records); it is not a deployment file and is
+                          // absent from the registry, so falling back to it printed
+                          // a path that never existed and opened an empty editor.
+                          // A deployment with no recorded env genuinely has none
+                          // (e.g. a compose with no ${VAR} surface) — say so.
+                          const envFile = baseName(svc.env_file_path)
                           const composeFile = baseName(svc.compose_file_path) || `docker-compose.user-${svc.user_name}.${svc.label}.yml`
+                          // nginx is one of the three deployed paths (G13) and
+                          // the -api records its path on the entry — the card
+                          // simply never read it. It sits beside the fix list that
+                          // already names `nginx.fix.conf`.
+                          const nginxFile = baseName(svc.nginx_conf_template_path)
                           const recipeHint = `PROVISION/source_projects/${svc.service_name}${recipePath ? '/' + recipePath : ''}`
+                          // ONE line, THIS recipe's own fix artifacts (§9). A
+                          // `.fix` is rare and specific, so an empty one renders
+                          // nothing at all rather than a `none` note.
+                          const recipeFixes = fixFiles[recipePath ? `${svc.service_name}@@${recipePath}` : svc.service_name] || []
                           return <>
                             <div style={{marginBottom:4}}>
                               <Text>.env: </Text>
-                              <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
-                                onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'env', envFile, recipePath)}>{envFile}</Text>
-                              <Text type="secondary" style={{fontSize:11}}> (in {recipeHint} dir)</Text>
+                              {envFile
+                                ? <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
+                                    onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'env', envFile, recipePath)}>{envFile}</Text>
+                                : <Text type="secondary">none — this deployment records no per-user env file</Text>}
+                              {envFile && <Text type="secondary" style={{fontSize:11}}> (in {recipeHint} dir)</Text>}
                             </div>
                             <div style={{marginBottom:4}}>
                               <Text>compose: </Text>
@@ -690,6 +1387,33 @@ export default function UsersPage() {
                                 onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'compose', composeFile, recipePath)}>{composeFile}</Text>
                               <Text type="secondary" style={{fontSize:11}}> (in {recipeHint} dir)</Text>
                             </div>
+                            <div style={{marginBottom:4}}>
+                              <Text>nginx: </Text>
+                              {nginxFile
+                                ? <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
+                                    onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'nginx', nginxFile, recipePath)}>{nginxFile}</Text>
+                                : <Text type="secondary">none — this deployment records no nginx conf</Text>}
+                              {nginxFile && <Text type="secondary" style={{fontSize:11}}> (in {recipeHint} dir)</Text>}
+                            </div>
+                            {recipeFixes.length > 0 && (
+                              <div style={{marginBottom:4}}>
+                                <Text>LLM fix: </Text>
+                                <Space size={4} wrap>
+                                  {recipeFixes.map(f => (
+                                    <Text key={f} code
+                                      style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline',
+                                              background:'#f6ffed', borderColor:'#b7eb8f'}}
+                                      onClick={() => openFileEditor(
+                                        svc.user_name, svc.service_name, svc.label,
+                                        // a `.fix` compose opens as compose, a
+                                        // `.fix` nginx as nginx
+                                        f.endsWith('.conf') ? 'nginx' : (f.startsWith('.env') ? 'env' : 'compose'),
+                                        f, recipePath)}>{f}</Text>
+                                  ))}
+                                </Space>
+                                <Text type="secondary" style={{fontSize:11}}> (in {recipeHint} dir)</Text>
+                              </div>
+                            )}
                           </>
                         })()}
                         {/* ssl */}
@@ -715,7 +1439,7 @@ export default function UsersPage() {
                         </div>
                       </div>}
                     </Space>
-                  </Collapse.Panel>
+                  </ServiceCard>
                 )
               })}
             </Collapse>
@@ -723,7 +1447,18 @@ export default function UsersPage() {
         )})
       )}
 
-      <DeployForm open={deployOpen} preselectedService={preselectedDeploy} onClose={()=>{setDeployOpen(false); setPreselectedDeploy(undefined); if(deployParam) setSearchParams({})}} onDeployed={(taskId: string, user: string, service: string, label: string)=>{
+      <DeployForm
+        open={deployOpen}
+        preselectedService={preselectedDeploy}
+        preselectedUser={preselectedUser}
+        preselectedLabel={preselectedLabel}
+        preselectedUseGlobalProxy={preselectedUseGlobalProxy}
+        initialOptions={retryOptions}
+        regenerate={retryRegenerate}
+        resumeJobId={resumeJobId}
+        fixingGuide={fixingGuide}
+        onClose={()=>{setDeployOpen(false); setPreselectedDeploy(undefined); setPreselectedUser(undefined); setPreselectedLabel(undefined); setPreselectedUseGlobalProxy(null); setRetryOptions(null); setRetryRegenerate(false); setResumeJobId(null); setFixingGuide(null); if(deployParam) setSearchParams({})}}
+        onDeployed={(taskId: string, user: string, service: string, label: string)=>{
         setDeployOpen(false); setPreselectedDeploy(undefined); if(deployParam) setSearchParams({});
         // Optimistic update: immediately show the new service as "building"
         const optimisticEntry: ServiceInstance = {

@@ -44,6 +44,44 @@ interface Props {
   stale?: FileSetStale
   needsEnv: boolean
   onChange: (next: FileSetSelectionData) => void
+  // §5b: clicking a SELECTED file's name opens it for view/edit. Saving forks
+  // into the `.fix` variant rather than writing back over the selection, so a
+  // repo-original is never rewritten by an edit made here.
+  onOpenFile?: (name: string) => void
+}
+
+export function fixVariantFor(name: string): string {
+  // Mirrors the gateway's FIX_FILENAME: the tag goes before the extension and
+  // is single-slotted (overwritten each round, never accumulated).
+  if (/\.env/.test(name) && !name.includes('.raw.')) {
+    const stem = name.split('.').slice(0, -1).join('.') || '.env'
+    return `${stem}.fix`
+  }
+  const m = name.match(/^(.*)\.([^.]+)$/)
+  return m ? `${m[1]}.fix.${m[2]}` : `${name}.fix`
+}
+
+/**
+ * Which generation phase a file belongs to, read off the NAME'S SHAPE.
+ *
+ * Never a table of exact names: a generated compose/nginx name carries the
+ * generation job's collision token — `docker-compose.base.337.yml`,
+ * `nginx.fix.<job>.conf` (GRILLING G33) — so the exact-name checks this replaces
+ * stopped matching the moment a token appeared. The two callers both treat a
+ * MISSING validation as "valid" (`ok = !v || v.valid`), so the failure mode was
+ * silent: every file rendered a green ✓ whatever its content.
+ *
+ * These are the platform's own candidate predicates (`_is_compose_candidate`,
+ * the nginx `*.conf` rule), which the gateway and the -api both use — the three
+ * MUST agree.
+ */
+export function phaseOfFile(filename: string): string {
+  const base = filename.split('/').pop() || filename
+  if (base.endsWith('.j2')) return phaseOfFile(base.slice(0, -3))
+  if (base.startsWith('docker-compose') || base.startsWith('compose')) return 'compose'
+  if (base.endsWith('.conf')) return 'nginx'
+  if (base.startsWith('.env')) return 'env'
+  return ''
 }
 
 function moveItem(list: string[], idx: number, dir: -1 | 1): string[] {
@@ -54,12 +92,13 @@ function moveItem(list: string[], idx: number, dir: -1 | 1): string[] {
   return next
 }
 
-function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled }: {
+function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled, onOpenFile }: {
   values: string[]
   candidates: string[]
   staleMark: (v: string) => boolean
   onOrderChange: (next: string[]) => void
   disabled: boolean
+  onOpenFile?: (name: string) => void
 }) {
   const remaining = candidates.filter(c => !values.includes(c))
   return (
@@ -68,7 +107,12 @@ function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled }
         <Space key={v} style={{ display: 'flex' }} size={4}>
           <Button size="small" icon={<ArrowUpOutlined />} disabled={disabled || i === 0} onClick={() => onOrderChange(moveItem(values, i, -1))} />
           <Button size="small" icon={<ArrowDownOutlined />} disabled={disabled || i === values.length - 1} onClick={() => onOrderChange(moveItem(values, i, 1))} />
-          <span style={{ fontFamily: 'monospace', fontSize: 13 }}>{v}</span>
+          {onOpenFile ? (
+            <Button type="link" size="small" style={{ padding: 0, fontFamily: 'monospace', fontSize: 13 }}
+              onClick={() => onOpenFile(v)}>{v}</Button>
+          ) : (
+            <span style={{ fontFamily: 'monospace', fontSize: 13 }}>{v}</span>
+          )}
           {staleMark(v) && <Tag color="red">stale</Tag>}
           <Button size="small" type="text" danger icon={<CloseOutlined />} disabled={disabled} onClick={() => onOrderChange(values.filter(x => x !== v))} />
         </Space>
@@ -81,11 +125,17 @@ function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled }
         onChange={(v) => { if (v) onOrderChange([...values, String(v)]) }}
         options={remaining.map(c => ({ value: c, label: c }))}
       />
+      {/* §1: `generate new` is the DEFAULT — an empty slot means the pipeline
+          generates one, and it contributes nothing to the deploy payload. Shown
+          explicitly here so "no selection" reads as a choice, not an oversight. */}
+      {values.length === 0 && (
+        <Tag color="blue" style={{ width: 'fit-content' }}>generate new — the pipeline will create one</Tag>
+      )}
     </Space>
   )
 }
 
-export default function FileSetSelection({ selection, candidates, stale, needsEnv, onChange }: Props) {
+export default function FileSetSelection({ selection, candidates, stale, needsEnv, onChange, onOpenFile }: Props) {
   const sel = selection
   const st = stale || {}
   const isStale = (cat: keyof FileSetStale, name: string) => (st[cat] || []).includes(name)
@@ -117,15 +167,20 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
           staleMark={(v) => isStale('compose', v)}
           onOrderChange={(next) => set({ compose: next })}
           disabled={false}
+          onOpenFile={onOpenFile}
         />
       </div>
 
       <div>
         <Typography.Text strong>Nginx config</Typography.Text>
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}> — optional</Typography.Text>
+        {/* NOT "optional": its absence is as fatal as a missing compose — the
+            instance deploys unroutable and the edge 502s the /go/ relay
+            (deploy-panel-selection-and-generation-todo.md §1). Leaving it at
+            `generate new` means the pipeline generates one. */}
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}> — or generate new</Typography.Text>
         <Select
           style={{ width: '100%', marginTop: 4 }}
-          placeholder="No nginx selected (optional)"
+          placeholder="generate new (none selected)"
           allowClear
           value={sel.nginx}
           onChange={(v) => set({ nginx: v || null })}
@@ -149,6 +204,7 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
             staleMark={(v) => isStale('env', v)}
             onOrderChange={(next) => set({ env: next })}
             disabled={false}
+            onOpenFile={onOpenFile}
           />
         ) : (
           <Alert

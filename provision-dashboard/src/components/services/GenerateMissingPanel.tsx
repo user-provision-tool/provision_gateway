@@ -1,10 +1,13 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Alert, Button, Divider, Input, Modal, Progress, Space, Spin, Tag, Typography, message } from 'antd'
 import Editor from '@monaco-editor/react'
 import client from '../../api/client'
 import { deriveProfiles } from '../../api/services'
-import { useGenerationJob } from '../../hooks/useGenerationJob'
+import { useGenerationJob, isPaused } from '../../hooks/useGenerationJob'
+import ExternalCredentialPrompt from './ExternalCredentialPrompt'
+import ComposeFixPrompt from './ComposeFixPrompt'
 import FileSetSelection, {
+  phaseOfFile,
   EMPTY_CANDIDATES,
   EMPTY_SELECTION,
   FileSetCandidates,
@@ -14,16 +17,17 @@ import FileSetSelection, {
 
 const { Text } = Typography
 
-const PHASE_FILENAME: Record<string, string> = {
-  compose: 'docker-compose.yml',
-  nginx: 'nginx.conf',
-  env: '.env',
-}
-
 interface Props {
   open: boolean
   serviceName: string
   recipePath: string
+  /**
+   * A paused job to re-attach to on open — the Source Projects row's `Check`
+   * sends this so the pause popup comes back and the leg can be answered and
+   * resumed (GRILLING G27: a pause is a terminal leg, and answering it starts
+   * the next one).
+   */
+  resumeJobId?: number | null
   onClose: () => void
   onChanged: () => void
 }
@@ -36,7 +40,7 @@ interface Props {
  * No-LLM mode: selection stays usable, prompt + generate greyed with the
  * fallback-strategy alert.
  */
-export default function GenerateMissingPanel({ open, serviceName, recipePath, onClose, onChanged }: Props) {
+export default function GenerateMissingPanel({ open, serviceName, recipePath, resumeJobId, onClose, onChanged }: Props) {
   const [loading, setLoading] = useState(true)
   const [llmActive, setLlmActive] = useState(false)
   const [candidates, setCandidates] = useState<FileSetCandidates>(EMPTY_CANDIDATES)
@@ -44,7 +48,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, on
   const [selection, setSelection] = useState<FileSetSelectionData>(EMPTY_SELECTION)
   const [needsEnv, setNeedsEnv] = useState(true)
   const [prompt, setPrompt] = useState('')
-  const { jobId, jobState, polling, startJob, cancelJob, reset } = useGenerationJob()
+  const { jobId, jobState, polling, startJob, cancelJob, submitInput, resumeJob, reset } = useGenerationJob()
 
   // Review/edit gate (design §Generation rules — human gate is final).
   const [reviewFiles, setReviewFiles] = useState<Record<string, string> | null>(null)
@@ -52,14 +56,29 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, on
   const [editorFile, setEditorFile] = useState<string | null>(null)
   const [editorContent, setEditorContent] = useState('')
   const [saving, setSaving] = useState(false)
+  // The resume target already attached in THIS open (see the init effect).
+  const resumedRef = useRef<number | null>(null)
 
   useEffect(() => {
-    if (!open) return
+    if (!open) { resumedRef.current = null; return }
     setLoading(true)
     setReviewFiles(null)
     setValidations({})
     setPrompt('')
     reset()
+    // Re-attach to a paused leg (the row's `Check`). The job runs in the GATEWAY,
+    // not the browser, so it outlives the panel that started it — without this
+    // the pause would have no surface here and nothing could answer it.
+    //
+    // ONCE per open, not on every run of this effect: it also fires when the
+    // operator changes the SERVICE inside the panel, and re-attaching then
+    // would show the previous recipe's pause popup over the new recipe's
+    // pickers. The ref is cleared on close, so reopening the row's `Check`
+    // attaches again.
+    if (resumeJobId != null && resumedRef.current !== resumeJobId) {
+      resumedRef.current = resumeJobId
+      resumeJob(resumeJobId)
+    }
     const params: Record<string, string> = {}
     if (recipePath) params.recipe_path = recipePath
     Promise.all([
@@ -83,7 +102,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, on
       setLlmActive(!!(cfg && (cfg.is_active || cfg.byok_configured)))
     }).catch(() => message.error('Failed to load file selection'))
       .finally(() => setLoading(false))
-  }, [open, serviceName, recipePath])
+  }, [open, serviceName, recipePath, resumeJobId])
 
   // Profiles recompute (GAP-2): profile candidates derive from the merged
   // compose — when the in-panel compose selection changes, refetch candidates
@@ -167,10 +186,12 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, on
     }
   }
 
-  const validationFor = (filename: string) => {
-    const phase = Object.keys(PHASE_FILENAME).find(p => PHASE_FILENAME[p] === filename) || ''
-    return (validations || {})[phase]
-  }
+  // Which phase produced this file — read off the NAME's SHAPE (`phaseOfFile`),
+  // never off an exact-name table. A generated compose/nginx name carries the
+  // job's collision token (`docker-compose.base.337.yml`, GRILLING G33), and the
+  // review gate reads a MISSING validation as "valid" (`ok = !v || v.valid`), so
+  // a table of exact names would fail SILENTLY: every file green.
+  const validationFor = (filename: string) => (validations || {})[phaseOfFile(filename)]
 
   const jobProgress = (jobState && jobState.phase_total && jobState.phase_total > 1)
     ? Math.round(((jobState.phase_index || 0) + (jobState.status === 'running' ? 0.5 : 0)) / jobState.phase_total * 100)
@@ -249,6 +270,26 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, on
                     </Space>
                   </Space>
                 )
+              ) : isPaused(jobState) ? (
+                // A paused job started HERE must be answerable here — the prompt is the shared
+                // one, so the pause is not a dead end on this surface (task doc §5).
+                // `isPaused` (either shape) and not `status === 'awaiting_input'`:
+                // G27 made a pause TERMINAL, so it arrives as `paused` and the
+                // legacy status check matched nothing — the panel then rendered
+                // the progress branch for a stopped leg, with no way to answer it.
+                ((jobState.pending_input) || {}).kind === 'compose_fix' ? (
+                  <ComposeFixPrompt
+                    jobState={jobState}
+                    onSubmit={submitInput}
+                    onCancel={cancelJob}
+                  />
+                ) : (
+                  <ExternalCredentialPrompt
+                    jobState={jobState}
+                    onSubmit={submitInput}
+                    onCancel={cancelJob}
+                  />
+                )
               ) : (
                 <Space direction="vertical" style={{ width: '100%' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -267,6 +308,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, on
               )}
             </div>
           )}
+
 
           <Space style={{ justifyContent: 'flex-end', width: '100%' }}>
             <Button onClick={onClose}>Close</Button>

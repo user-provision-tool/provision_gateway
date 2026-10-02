@@ -4,8 +4,12 @@ import { PlusOutlined, MinusCircleOutlined, GlobalOutlined, RobotOutlined } from
 import Editor from '@monaco-editor/react'
 import client from '../../api/client'
 import { deriveProfiles, getComposePreview } from '../../api/services'
-import { useGenerationJob } from '../../hooks/useGenerationJob'
+import { useGenerationJob, isPaused } from '../../hooks/useGenerationJob'
+import ExternalCredentialPrompt from './ExternalCredentialPrompt'
+import ComposeFixPrompt from './ComposeFixPrompt'
 import FileSetSelection, {
+  fixVariantFor,
+  phaseOfFile,
   EMPTY_CANDIDATES,
   EMPTY_SELECTION,
   FileSetCandidates,
@@ -14,6 +18,77 @@ import FileSetSelection, {
 } from './FileSetSelection'
 
 const { Text } = Typography
+
+/**
+ * GRILLING G29: TWO pools, TWO refusals, both persistent.
+ *
+ * `at_capacity` is the -api's (the HOST's docker pool is full); `generation_at_capacity`
+ * is the gateway's own generation pool (the LLM endpoint and cost). They carry stable
+ * codes precisely so the panel can show the RIGHT remedy — and the remedy text itself
+ * travels in the refusal's own `detail`, so it is never invented here.
+ *
+ * Both must take the PERSISTENT alert below rather than a toast: a refusal means nothing
+ * was accepted, and with no timeout on long builds a toast would scroll away before the
+ * operator could act on it (§4d).
+ */
+const REFUSAL_CODES = ['at_capacity', 'generation_at_capacity']
+const refusalOf = (err: any): { code: string; detail: string } | null => {
+  if (err?.response?.status !== 503) return null
+  const d = err?.response?.data?.detail
+  const code = (d && typeof d === 'object' && d.error) || err?.response?.data?.error
+  if (typeof code !== 'string' || !REFUSAL_CODES.includes(code)) return null
+  const detail = typeof d === 'string' ? d
+    : (typeof d?.detail === 'string' ? d.detail : '')
+  return { code, detail }
+}
+
+/**
+ * The platform's compose-naming convention — a compose is a file named `docker-compose*` or
+ * `compose*` with a YAML extension. This mirrors the -api's `_is_compose_name` /
+ * `_is_compose_candidate` (`lib/file_sets.py`); the two MUST agree.
+ *
+ * Matching on the extension alone is not harmless: it pulls in unrelated YAML shipped by the
+ * repo (a linter config, `ellipsis.yaml`) and the per-user rendered compose
+ * (`docker-compose.user-*.yml`). The preview then merges files that are not composes, `docker
+ * compose config` fails, the preview 502s — and because the deploy flow awaits it, the deploy
+ * never dispatches at all (measured: graphiti, whose repo ships `ellipsis.yaml`).
+ */
+function isComposeName(filename: string): boolean {
+  const base = filename.split('/').pop() || filename
+  const name = base.endsWith('.j2') ? base.slice(0, -3) : base
+  if (!(name.endsWith('.yml') || name.endsWith('.yaml'))) return false
+  if (!(name.startsWith('docker-compose') || name.startsWith('compose'))) return false
+  if (/^docker-compose\.user-/.test(name)) return false   // per-user rendered compose
+  return true
+}
+
+// The session/entry label this panel was opened ON, or null when the panel is
+// a free-standing deploy (no pin). Both call sites below — the open-time pin
+// and the submit-time re-assert — MUST agree on this, so the truth lives in one
+// predicate rather than in two copies that can drift.
+//
+// A pinned panel means "this (user, service, label) already exists and must be
+// reused, not drifted to a fresh label and orphaned" (failed-instance-state
+// todo §5.1/§5.2; a `Retry` from a failed card and a `check` on an LLM-fix
+// pause both arrive this way). `String()` because UsersPage passes `svc.label`
+// raw at one site, so a number can reach us in practice.
+function pinnedSessionLabel(preselectedLabel?: string | number | null): string | null {
+  return preselectedLabel !== undefined && preselectedLabel !== null && preselectedLabel !== ''
+    ? String(preselectedLabel)
+    : null
+}
+
+// The session's OWN proxy setting this panel was opened ON, or null for a
+// free-standing deploy. `check` on a paused LLM-fix session RE-ENTERS the path
+// the original deploy created, and G20 rules that a resumed path replays the
+// options it was created with — so the "Use global proxy" tick must come back
+// from the session, exactly as the label does. The open-time seed and the
+// submit-time re-assert both read THIS predicate, so the two cannot drift.
+function seedUseGlobalProxy(preselectedUseGlobalProxy?: boolean | null): boolean | null {
+  return preselectedUseGlobalProxy === undefined || preselectedUseGlobalProxy === null
+    ? null
+    : !!preselectedUseGlobalProxy
+}
 
 // Language detection for Monaco based on filename
 function getLanguage(filename: string): string {
@@ -29,13 +104,47 @@ interface DeployFormProps {
   onClose: () => void
   onDeployed: (taskId: string, user: string, service: string, label: string) => void
   preselectedService?: string
+  // Retry from a failed card prefills the user too, so the same
+  // (user, service, label) key is reused rather than drifting to a new one
+  // (failed-instance-state-todo.md §5.1/§5.2).
+  preselectedUser?: string
+  // Retry pins the FAILED entry's label so the retry replaces it instead of
+  // drifting to a new label (failed-instance-state-todo.md §5.1/§5.2).
+  preselectedLabel?: string
+  // A REFUSED deployment's stored options, applied verbatim so the panel shows
+  // exactly what the -api saw last time. The pickers are seeded from the paths
+  // that were SENT (not from `selection`), so files the generation path produced
+  // appear selected — the same options, from the -api's perspective.
+  initialOptions?: Record<string, any> | null
+  // G29: a GATEWAY-side refusal (`generation_at_capacity`) was refused *before*
+  // anything was produced, so its Retry must run the pipeline again — the pool
+  // is the only thing that was in the way. `initialOptions` still SEEDS the
+  // panel from the record; it just must not be read as "the work is already
+  // done". Without this the retry would deploy paths that were never generated.
+  regenerate?: boolean
+  // `check` on a `paused` pre-deploy session RE-ENTERS the paused path
+  // (GRILLING G15/G24): the panel opens attached to the parked generation job,
+  // which is what puts its pause popup on screen. Without this the button could
+  // only open a blank panel — the duplicate of `Retry` it used to be.
+  resumeJobId?: number | null
+  // `check` on an LLM-fix pause (GRILLING G26 row 5): the panel opens with the
+  // ANALYSIS's fixing guide as the prompt, and the restart runs in fixing mode
+  // so the generation emits `.fix` files rather than `.base` (G25).
+  fixingGuide?: { guide: string; slot: string } | null
+  // G20, applied to the `check` restart: the paused session's own proxy setting,
+  // so the panel opens with the tick the original deploy was created with and
+  // the restart replays it instead of registering `build_args: {}`.
+  preselectedUseGlobalProxy?: boolean | null
 }
 
-export default function DeployForm({ open, onClose, onDeployed, preselectedService }: DeployFormProps) {
+export default function DeployForm({ open, onClose, onDeployed, preselectedService, preselectedUser, preselectedLabel, initialOptions, regenerate, resumeJobId, fixingGuide, preselectedUseGlobalProxy }: DeployFormProps) {
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
   const [proxyEnabled, setProxyEnabled] = useState(false)
   const [httpsEnabled, setHttpsEnabled] = useState(false)
+  // At-capacity refusal (doc §4d) — persistent, not a toast. Carries WHICH pool
+  // refused, because the two remedies differ (G29).
+  const [atCapacity, setAtCapacity] = useState<{ code: string; detail: string } | null>(null)
   const [sources, setSources] = useState<{ name: string; files: string[]; has_compose_template?: boolean; recipes?: { path: string; label: string; is_root: boolean; template_files: string[] }[] }[]>([])
   const [deployableUsers, setDeployableUsers] = useState<{username:string,label:string}[]>([])
   const [sslDomains, setSslDomains] = useState<{domain:string, fullchain_path:string, privkey_path:string}[]>([])
@@ -47,6 +156,9 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   // still being fetched — Deploy must not run with an unresolved selection.
   const [fileSetLoading, setFileSetLoading] = useState(false)
   const [missingFiles, setMissingFiles] = useState<string[]>([])
+  // Values typed into the external-credential pause popup, keyed by variable
+  // name. Never persisted in component state beyond the submit.
+  // (external-credential values now live inside ExternalCredentialPrompt)
   const [generatingFiles, setGeneratingFiles] = useState(false)
   const [generatedFiles, setGeneratedFiles] = useState<Record<string,string>>({})
 
@@ -58,13 +170,28 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   const [selection, setSelection] = useState<FileSetSelectionData>(EMPTY_SELECTION)
   const [needsEnv, setNeedsEnv] = useState(true)
   const [prompt, setPrompt] = useState('')
+  // §5: the env REFERENCE picker — the generation CONTEXT for the `.raw`
+  // (base/example env files), used only while env is `generate new`. The
+  // "Interpolation env files" picker above is strictly the HANDOFF now: it is
+  // what gets passed to the -api when env is selected, and is no longer used as
+  // generation context. Optional; defaults to nothing.
+  const [envRefs, setEnvRefs] = useState<string[]>([])
   // Deploy-time per-user env generation (GAP-19): fresh SECRET_KEY per instance.
   const [perUserEnv, setPerUserEnv] = useState<string | null>(null)
+  // Fixing mode (GRILLING G25) is derived from the `fixingGuide` PROP, not from
+  // state: the guide is stable for the whole open session, whereas a state
+  // boolean set at init would be invisible to the async loaders that run in the
+  // same tick (their closures capture the pre-update value).
   // Editor modal for reviewing generated files (clickable → built-in editor)
   const [editorModalOpen, setEditorModalOpen] = useState(false)
   const [editorFileName, setEditorFileName] = useState('')
   const [editorContent, setEditorContent] = useState('')
   const [editorSaving, setEditorSaving] = useState(false)
+  // §5b: when the editor was opened from a PICKER, saving forks into the `.fix`
+  // variant instead of writing back over the selected file — that is what keeps
+  // the rotation rule honest (a repo-original selection is never rewritten by
+  // an edit made in the panel). After saving the picker switches to the fork.
+  const [editorFork, setEditorFork] = useState(false)
 
   // GAP-003: Auto-computed next label state
   const [nextLabel, setNextLabel] = useState<string>('0')
@@ -116,8 +243,9 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       if (selection.compose.length > 0) {
         composeFiles = selection.compose
       } else {
-        const plain = candidates.filter((f: string) =>
-          (f.endsWith('.yml') || f.endsWith('.yaml')) && !f.endsWith('.j2'))
+        // Convention, not extension: `ellipsis.yaml` and the per-user compose are not composes,
+        // and merging them makes the preview fail (see isComposeName).
+        const plain = candidates.filter((f: string) => isComposeName(f) && !f.endsWith('.j2'))
         if (plain.length > 0) {
           composeFiles = plain.map(pathFor)
         } else {
@@ -139,6 +267,17 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       setNextLabel('0')
       return
     }
+    // Retry from a failed card PINS the failed entry's own label: the entry
+    // keeps its (user, service, label) key, so a retry must replace it rather
+    // than drift to a fresh label and orphan the failed one
+    // (failed-instance-state-todo.md §5.1/§5.2). Allocation would otherwise
+    // return max+1, because the failed entry still counts.
+    if (preselectedLabel !== undefined && preselectedLabel !== '') {
+      setNextLabel(preselectedLabel)
+      form.setFieldsValue({ label: preselectedLabel })
+      setComputingLabel(false)
+      return
+    }
     setComputingLabel(true)
     try {
       const { data } = await client.get(`/services/${userName}/${serviceName}/next-label`)
@@ -157,6 +296,16 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   useEffect(() => {
     if (open) {
       const init = async () => {
+        // Seed the session's proxy tick SYNCHRONOUSLY, before the first await.
+        // The label pin used to sit at the END of this async `init()`, behind
+        // `await loadSources()`, which left a ~600 ms window where the field was
+        // wrong; a checkbox read at Confirm inside that window would submit
+        // `use_global_proxy: false` for a proxied session. Seeding first removes
+        // the window entirely for the normal open; the submit-time re-assert
+        // below covers the case where this effect never re-runs.
+        proxyTouchedRef.current = false
+        const seedProxy = seedUseGlobalProxy(preselectedUseGlobalProxy)
+        if (seedProxy !== null) form.setFieldsValue({ use_global_proxy: seedProxy })
         const sourcesData = await loadSources()
         loadProxyStatus()
         loadDeployableUsers()
@@ -174,20 +323,60 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         setNeedsEnv(true)
         setPrompt('')
         setPerUserEnv(null)
+        setAtCapacity(null)
+        // `check` on an LLM-fix pause (G26 row 5): the analysis's guide IS the
+        // prompt, and the restart runs in fixing mode so the generation emits
+        // `.fix` files (G25). The slot the analysis named goes to `generate new`
+        // — "only set the problematic one" — so the rest of the path is reused
+        // as it was. A later reset on service change does not clear this: the
+        // guide belongs to the pause, not to the picker.
+        if (fixingGuide) setPrompt(fixingGuide.guide || '')
+        // Re-attach to the parked generation job, which is what surfaces its
+        // pause popup (compose conflict / external credential) in this panel.
+        if (resumeJobId != null) genJob.resumeJob(resumeJobId)
         try {
           const { data: cfg } = await client.get('/llm/config')
           setLlmActive(!!(cfg && (cfg.is_active || cfg.byok_configured)))
         } catch { setLlmActive(false) }
         // Preselect service if provided
+        if (initialOptions) {
+          const f: Record<string, any> = {}
+          for (const k of ['user_name', 'label', 'domain', 'passwd', 'https', 'use_global_proxy']) {
+            if (initialOptions[k] !== undefined && initialOptions[k] !== null) f[k] = initialOptions[k]
+          }
+          const svc = initialOptions.service_name
+          if (svc) f.service_name = initialOptions.project_root && initialOptions.project_root !== svc
+            ? `${svc}@@${String(initialOptions.project_root).slice(String(svc).length + 1)}`
+            : svc
+          form.setFieldsValue(f)
+        }
+        if (preselectedUser) {
+          form.setFieldsValue({ user_name: preselectedUser })
+        }
         if (preselectedService) {
           form.setFieldsValue({ service_name: preselectedService })
           checkMissingFiles(preselectedService)
           fetchExpectedVolumes(preselectedService, sourcesData)
         }
+        // PIN the label on open, not only inside `computeNextLabel`.
+        //
+        // That helper honours `preselectedLabel`, but it only RUNS from the two
+        // Select onChange handlers — so a panel opened with a preselected
+        // service never called it, the field kept the form's initial `0`, and
+        // the pin was unreachable exactly when it was needed. A `Retry` from a
+        // failed card (failed-instance-state-todo.md §5.1/§5.2) and a `check`
+        // on an LLM-fix pause both arrive through this path, and both must
+        // reuse the entry's own (user, service, label) rather than drift to a
+        // fresh label and orphan it.
+        const pinnedOnOpen = pinnedSessionLabel(preselectedLabel)
+        if (pinnedOnOpen !== null) {
+          setNextLabel(pinnedOnOpen)
+          form.setFieldsValue({ label: pinnedOnOpen })
+        }
       }
       init()
     }
-  }, [open, preselectedService])
+  }, [open, preselectedService, preselectedUser])
 
   const loadSslDomains = async () => {
     try {
@@ -237,6 +426,36 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         profiles: entry.profiles || [],
       })
       setPerUserEnv(null)
+      if (initialOptions) {
+        // The SENT paths are the truth: a generated `.base` / `.raw` that went
+        // to the -api must show as SELECTED, not as `generate new`. This is what
+        // makes a refused Retry show "the exact same options from the -api's
+        // perspective". (First written with a bare replace() whose anchor did
+        // not match, so it silently never applied — caught by trace T2.)
+        const sentCompose = initialOptions.compose_file_paths
+          || (initialOptions.compose_file_path ? [initialOptions.compose_file_path] : null)
+        const sentEnv = initialOptions.env_files
+          || (initialOptions.env_file_path ? [initialOptions.env_file_path] : null)
+        setSelection(prev => ({
+          compose: Array.isArray(sentCompose) && sentCompose.length ? sentCompose : prev.compose,
+          nginx: initialOptions.nginx_conf_file_path || prev.nginx,
+          env: Array.isArray(sentEnv) && sentEnv.length ? sentEnv : prev.env,
+          profiles: initialOptions.profiles || prev.profiles,
+        }))
+      }
+      // G26 row 5 — `check` on an LLM-fix pause: the analysis named the faulty
+      // slot, so THAT slot goes to `generate new` and the rest of the path is
+      // reused as it stands. "Only the problematic one" is what keeps a fix from
+      // gratuitously regenerating files that were never at fault.
+      if (fixingGuide) {
+        const slot = fixingGuide.slot || 'compose'
+        setSelection(prev => ({
+          ...prev,
+          compose: slot === 'compose' ? [] : prev.compose,
+          nginx: slot === 'nginx' ? null : prev.nginx,
+          env: slot === 'env' ? [] : prev.env,
+        }))
+      }
     } catch { /* selection stays empty on failure */ }
     finally { setFileSetLoading(false) }
   }
@@ -304,6 +523,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     }
   }
 
+  // §6: the alert and the Generate button speak ONLY about this panel's
+  // selections — never about what the recipe happens to contain. `generate new`
+  // is the absence of a selection, so "ready to deploy" means all three slots
+  // name a specific file.
+  const eff = effectiveSelection()
+  const slotsSpecified = eff.compose.length > 0 && !!eff.nginx && eff.env.length > 0
+
   // Async generation job (ordered phases compose → nginx → env, one job).
   const genJob = useGenerationJob()
   const [genValidations, setGenValidations] = useState<Record<string, any>>({})
@@ -313,6 +539,33 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   // completed frame (no reset, no "review, then deploy" toast) until /users/deploy
   // returns; the manual Generate button keeps the review-gate behavior (feature 4).
   const deployAutoRunRef = useRef(false)
+  // Did the operator touch the "Use global proxy" checkbox in THIS panel? The
+  // session's tick is a DEFAULT a free-standing panel does not have — it is
+  // re-asserted at submit (like the pinned label) only while the field is still
+  // untouched, so an explicit toggle is never overridden.
+  const proxyTouchedRef = useRef(false)
+
+  // The proxy setting THIS submission must carry, for EVERY entry point.
+  //
+  // G20: a resumed path replays the options it was created with, so the
+  // session's OWN value (`preselectedUseGlobalProxy`, set by `check` on a paused
+  // session) is a DEFAULT that wins until the operator touches the box; an
+  // explicit toggle always wins. Both the deploy path (`handleDeploy`) and the
+  // generate path (`generateMissingFiles`) go through THIS predicate, so the two
+  // entry points cannot drift.
+  //
+  // The generate path used to omit `use_global_proxy` from its `startJob`
+  // payload entirely. The gateway then recorded the pre-deploy session that job
+  // creates with `use_global_proxy: false`, so a later `check` on that parked
+  // session replayed `false` while the panel's box had been ticked — found live
+  // on T12 (`finalgrill|probe-conflict||1`). The deploy path had already been
+  // fixed for exactly this (it populates `snap.use_global_proxy`); the generate
+  // entry point is the same class of request and was missed.
+  const effectiveUseGlobalProxy = (): boolean => {
+    const seeded = seedUseGlobalProxy(preselectedUseGlobalProxy)
+    if (seeded !== null && !proxyTouchedRef.current) return seeded
+    return !!form.getFieldValue('use_global_proxy')
+  }
 
   const generateMissingFiles = async () => {
     setGeneratingFiles(true)
@@ -324,7 +577,14 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         recipe_path: recipePath,
         job_type: 'generate_missing',
         prompt,
+        // G25 — the NAMING follows the TRIGGER: on a guided restart the
+        // generation emits `.fix` files, not `.base`.
+        ...(fixingGuide ? { fix: true } : {}),
         selection: effectiveSelection(),
+        // G20 — the session this job opens must record the proxy the panel is
+        // showing, or a `check` restart replays `false` (see
+        // `effectiveUseGlobalProxy`).
+        use_global_proxy: effectiveUseGlobalProxy(),
         user_name: form.getFieldValue('user_name') || '',
         label: form.getFieldValue('label') || '0',
         deploy_metadata: {
@@ -333,10 +593,38 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           label: form.getFieldValue('label') || '0',
           domain: form.getFieldValue('domain') || 'localhost',
           https: !!form.getFieldValue('https'),
+          // The URL and the credential belong here because they belong to the
+          // REFUSAL record: if the gateway's pool refuses this generation, that
+          // record is what the card's Retry replays, and a retry missing either
+          // is a different deployment (user ruling 2026-09-26).
+          passwd: form.getFieldValue('passwd') || '',
         },
       })
     } catch (err: any) {
-      message.error(err.response?.data?.detail || 'Failed to start generation job')
+      // §4d: a capacity refusal is NOT a failed generation — nothing was
+      // accepted, and the remedy is to cancel what is hanging. It must raise
+      // the SAME persistent alert as the deploy path (a toast would scroll
+      // away), and a structured `detail` must not be handed to message.error.
+      const d = err.response?.data?.detail
+      const refusal = refusalOf(err)
+      if (refusal) {
+        setAtCapacity(refusal)
+      } else {
+        // Structured 4xx details are OBJECTS — `{error, detail}` — and reading
+        // `detail` as a string collapsed every one of them into the generic
+        // "Failed to start generation job". The common case is the gateway's
+        // 409 `combination_reserved`, whose whole point is to say that a
+        // pre-deploy session already holds this (user, service, label) and must
+        // be checked, cancelled or deleted first. Printing the generic message
+        // hid exactly the instruction the operator needed.
+        message.error(
+          typeof d === 'string' ? d
+            : (typeof d?.detail === 'string' ? d.detail
+              : (typeof err.response?.data?.error === 'string' ? err.response.data.error
+                : (typeof err.response?.data?.detail === 'string' ? err.response.data.detail
+                  : 'Failed to start generation job')))
+        )
+      }
     } finally { setGeneratingFiles(false) }
   }
 
@@ -352,7 +640,17 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       recipe_path: recipePath,
       job_type: 'generate_missing',
       prompt,
+      // G25 — a guided restart generates `.fix` files, not `.base`.
+      ...(fixingGuide ? { fix: true } : {}),
+      // §5: the reference is CONTEXT for the env phase, not a handoff.
+      env_reference: envRefs,
       selection: effectiveSelection(),
+      // G20 — same as the generate entry point: the session this job opens must
+      // record the proxy. Read from the SNAPSHOT, never `form.getFieldValue`:
+      // `handleDeploy` already closed the panel (destroyOnClose), so the live
+      // form is gone here. `snap.use_global_proxy` was set by the shared
+      // `effectiveUseGlobalProxy` predicate at submit.
+      use_global_proxy: !!snap.use_global_proxy,
       user_name: snap.user_name || '',
       label: snap.label || '0',
       deploy_metadata: {
@@ -361,12 +659,22 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         label: snap.label || '0',
         domain: snap.domain || 'localhost',
         https: !!snap.https,
+        // Same as the entry-point payload above: the refusal record the card's
+        // Retry replays must carry the URL and the credential.
+        passwd: snap.passwd || '',
       },
     })
     if (!jobId) throw new Error('Failed to start generation job')
     for (let i = 0; i < 900; i++) {
       await new Promise(r => setTimeout(r, 1000))
-      const { data } = await client.get(`/llm/jobs/${jobId}`)
+      // G27: read the CURRENT id on every pass, never the one captured here.
+      // Answering a pause creates a NEW job, and a loop pinned to the id it
+      // started with polls a row that is terminal forever — while the popup,
+      // driven by the hook, already shows the resumed leg complete. The deploy
+      // was then never issued and the operator stared at "deploying the
+      // instance…" with nothing happening. Found live in T13.
+      const pollId = genJob.jobIdRef.current ?? jobId
+      const { data } = await client.get(`/llm/jobs/${pollId}`)
       if (data.status === 'completed') {
         const result = data.result || {}
         const name = result.env_name || null
@@ -376,7 +684,12 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         // Return the fresh results synchronously — React state updates are not
         // visible inside this still-running async flow, and the deploy payload
         // must reference the just-generated env.raw name + files NOW.
-        return { envName: name, files }
+        // G21 rule 3: hand back the selection AS THE PATH LEFT IT. A path that
+        // resumed after a pause reports only the file that leg produced (e.g.
+        // the env), so the caller's `files[...]` checks cannot see a compose
+        // regenerated EARLIER in the same path — which is exactly the conflict
+        // fix. Returning the selection is what carries it into the payload.
+        return { envName: name, files, selection: result.selection || null }
       }
       if (data.status === 'failed' || data.status === 'cancelled') {
         throw new Error(data.error || `Generation ${data.status}`)
@@ -405,26 +718,92 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     }
     const name = (st.result && st.result.env_name) || null
     if (name) setPerUserEnv(name)
+    // §6: the pickers FLIP to what was generated (not "remembered as last
+    // generated"), which is what makes the ready-alert appear and the Generate
+    // button disappear. Resetting a picker to `generate new` brings them back.
+    // G21 rule 3: adopt the selection AS THE PATH LEFT IT. The gateway reports
+    // it because a generated artifact REPLACES its slot — and on a resumed
+    // conflict fix the replacement is the `.fix` variant, which the hardcoded
+    // `.base` checks this used to do could never see. The deploy payload is
+    // built from THIS selection, so without the swap the deploy would still send
+    // the compose the pipeline just replaced.
+    const resultSel: any = (st.result && st.result.selection) || null
+    if (resultSel) {
+      setSelection(prev => {
+        const next: any = { ...prev }
+        // Adopt only slots the path actually reports: absent or EMPTY means
+        // "unchanged", not "cleared". A fix job's request carries no selection
+        // of its own, so reading `[]` as "clear" would wipe the operator's picks.
+        if (Array.isArray(resultSel.compose) && resultSel.compose.length) next.compose = resultSel.compose
+        if (typeof resultSel.nginx === 'string' && resultSel.nginx) next.nginx = resultSel.nginx
+        if (Array.isArray(resultSel.env) && resultSel.env.length) next.env = resultSel.env
+        return next
+      })
+    } else {
+      // No reported selection (an older row, or a job that carried none): fall
+      // back to what THIS run produced. Matched by the platform's own candidate
+      // predicates, never by exact name — a generated artifact carries the job's
+      // collision token (`docker-compose.base.337.yml`, GRILLING G33), so the
+      // exact-name lookups this replaces stopped firing the moment a token
+      // appeared, and the deploy kept the un-generated compose.
+      const producedCompose = Object.keys(files).find(isComposeName)
+      if (producedCompose) setSelection(prev => ({ ...prev, compose: [producedCompose] }))
+      // nginx: `*.conf` and NOT a template — the -api's own predicate, which the
+      // gateway's candidate scan mirrors (both engines MUST agree).
+      const producedNginx = Object.keys(files).find(n => n.endsWith('.conf') && !n.endsWith('.j2'))
+      if (producedNginx) setSelection(prev => ({ ...prev, nginx: producedNginx }))
+    }
     if (!isDeployAuto) genJob.reset()
   }, [genJob.jobState])
 
   // Save an edited generated file back to state + disk
+  // §5b: open a SELECTED file for view/edit. Fetch it from the recipe through
+  // the same project-files endpoint the generated-file editor uses.
+  const openSelectedFile = async (name: string) => {
+    const svcVal = form.getFieldValue('service_name') || ''
+    const { baseName, recipePath } = parseServiceValue(svcVal)
+    const path = recipePath ? `${recipePath}/${name}` : name
+    try {
+      const { data } = await client.get(`/projects/${baseName}/files/${path}`)
+      setEditorFileName(name)
+      setEditorContent(typeof data?.content === 'string' ? data.content : '')
+      setEditorFork(true)
+      setEditorModalOpen(true)
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || `Could not open ${name}`)
+    }
+  }
+
   const saveEditorFile = async () => {
     if (!editorFileName) return
     setEditorSaving(true)
     try {
+      const targetName = editorFork ? fixVariantFor(editorFileName) : editorFileName
       // Merge the edited content into the generated-files state
-      setGeneratedFiles(prev => ({ ...prev, [editorFileName]: editorContent }))
+      setGeneratedFiles(prev => ({ ...prev, [targetName]: editorContent }))
       // Persist to the service project on disk
       const svcVal = form.getFieldValue('service_name') || ''
       const { baseName, recipePath } = parseServiceValue(svcVal)
       await client.post('/projects/save-generated', {
         service_name: baseName,
         recipe_path: recipePath,
-        files: { [editorFileName]: editorContent },
+        files: { [targetName]: editorContent },
       })
-      message.success(`${editorFileName} saved`)
+      if (editorFork) {
+        // The picker switches to the fork automatically, so the next deploy
+        // uses the edited file without re-selecting anything.
+        setSelection(prev => ({
+          ...prev,
+          compose: prev.compose.map(p => (p === editorFileName ? targetName : p)),
+          nginx: prev.nginx === editorFileName ? targetName : prev.nginx,
+          env: prev.env.map(p => (p === editorFileName ? targetName : p)),
+        }))
+        message.success(`Saved as ${targetName} — the selection now uses it`)
+      } else {
+        message.success(`${editorFileName} saved`)
+      }
       setEditorModalOpen(false)
+      setEditorFork(false)
     } catch (err: any) {
       message.error(err.response?.data?.detail || 'Failed to save file')
     } finally {
@@ -440,6 +819,42 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     // destroyOnClose + the Form is preserve={false}, so once the panel is gone
     // every `form.getFieldValue` below would read empty.
     const snap: any = { ...values }
+    // ---- The label that is actually SENT is re-asserted HERE -----------------
+    //
+    // `values.label` is NOT authoritative whenever this panel was opened on a
+    // pinned entry. The open-time pin lives at the END of the async `init()`,
+    // behind `await loadSources()`, so for the first ~600 ms after the panel
+    // opens the (disabled) Label field still shows the Form's `initialValues`
+    // `label: '0'` — measured live: `0` at t=587 ms, correct and stable only
+    // from t=692 ms. The operator can neither see nor correct it (the field is
+    // disabled), and a Confirm inside that window submitted `request.label='0'`
+    // for a label-2 session, which generated `.env.raw.alice.0` instead of
+    // `.env.raw.alice.2`.
+    //
+    // Disabling Confirm until the pin applies would only shift the race (it
+    // still needs a "pin applied" signal, and the button has other async gates
+    // already). Reading the pin from the SAME source the open-time pin reads —
+    // the session/entry's own label, which is what `preselectedLabel` carries —
+    // at the last moment before the request is built makes an unpinned
+    // submission structurally impossible, however fast Confirm is clicked.
+    // `snap.label` feeds both the generation job and the deploy payload below,
+    // so re-asserting it once covers every consumer.
+    const pinnedAtSubmit = pinnedSessionLabel(preselectedLabel)
+    if (pinnedAtSubmit !== null) snap.label = pinnedAtSubmit
+    // ---- G20, the same shape for the proxy --------------------------------
+    //
+    // `check` on a paused LLM-fix session re-enters the path the original
+    // deploy created, so the restart must replay its proxy setting. Seeded from
+    // the session (not from `values`, which is only authoritative once the
+    // async open-time seed has run) UNLESS the operator toggled the box in this
+    // panel — an explicit choice always wins.
+    //
+    // The predicate is SHARED with the generate entry point
+    // (`effectiveUseGlobalProxy`), so the two cannot drift. `snap` is the
+    // carrier: every request built below (the generation job AND the deploy
+    // payload) reads it, and the panel is gone by then (destroyOnClose), so
+    // `form.getFieldValue` must not be read again after this point.
+    snap.use_global_proxy = effectiveUseGlobalProxy()
     // Close the deploy panel immediately — the Deploying… popup is the UI from
     // here on (it lives in this component, which stays mounted).
     onClose()
@@ -457,9 +872,34 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       // ---- Always-on generation (design §2): Deploy auto-runs whatever is
       // missing (compose/nginx + the per-user env.raw) BEFORE deploying —
       // no review pause on the Deploy path. ----
-      const needsGeneration =
+      // A REFUSED retry must NOT run the generation pipeline (GRILLING G20).
+      // Its options are already complete — they are the paths the -api was SENT.
+      // Running generation here is not merely wasteful: the refused deployment's
+      // OWN pre-deploy session reserves the combination (§8b), so the generation
+      // job is refused with 409 and the deploy never dispatches. Found live by
+      // trace T3 — the feature was self-blocking.
+      // §2/§4: a SELECTED env IS the handoff — "when the operator *did* select an
+      // env, that selection is the handoff instead" of the generated `.raw`. The
+      // condition used to force the per-user env generation even then, which
+      // contradicts the design AND made every Deploy pay a ~30s generation window
+      // before the deploy POST — measured across Rounds 24-25 of trace T5, where
+      // it also made a live capacity refusal unreachable.
+      const hasSelectedEnv = effectiveSelection().env.length > 0
+      // G13/G20: `generate new` means NOT SELECTED, and a deploy must send the
+      // -api ALL THREE paths — a refused deployment carries all three, because
+      // any slot left at `generate new` had a file generated and sent for it.
+      // So an unselected slot is a reason to generate, independently of what the
+      // recipe happens to contain on disk. Without `!slotsSpecified` a deploy
+      // whose nginx slot sat at `generate new` while an `nginx.conf` existed
+      // skipped generation entirely, and the payload carried NO nginx path at
+      // all — found live on `bob|probe-interp||3`.
+      // …except a GATEWAY refusal's retry (`regenerate`), whose record carries
+      // options only as a SEED: nothing was generated, so the pipeline must run.
+      const needsGeneration = (!initialOptions || regenerate) && (
+        !slotsSpecified ||
         missingFiles.length > 0 ||
-        (needsEnv && !perUserEnv)
+        (needsEnv && !perUserEnv && !hasSelectedEnv)
+      )
       if (needsGeneration && !hasSelectedCompose && missingFiles.length > 0 && !genJob.jobState) {
         message.error('Cannot deploy: missing essential files and no compose selected.')
         setLoading(false)
@@ -473,6 +913,29 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         const res = await generateMissingFilesForDeploy(snap)
         envName = (res && res.envName) || perUserEnv
         genNow = (res && res.files) || {}
+        // §6/§7: a `generate new` slot FLIPS to the file the generation just
+        // produced, so the selection that rides this deploy payload (and is
+        // persisted as the next default) names the generated file rather than
+        // leaving the slot unset. Without this the next deployment of the same
+        // service would regenerate instead of pre-selecting what was deployed.
+        // G21 rule 3 — adopt the selection the path reported, FIRST. The
+        // generated artifacts REPLACE their slots, and on a resumed path the
+        // replacement happened in an earlier leg, so it is only visible here.
+        const resSel = (res && res.selection) || null
+        if (resSel) {
+          if (Array.isArray(resSel.compose) && resSel.compose.length) sel.compose = resSel.compose
+          if (typeof resSel.nginx === 'string' && resSel.nginx) sel.nginx = resSel.nginx
+          if (Array.isArray(resSel.env) && resSel.env.length) sel.env = resSel.env
+        } else {
+          // No reported selection — name what THIS run produced instead, by
+          // PATTERN (GRILLING G33: a generated artifact carries the job's
+          // collision token, so the exact-name lookups this replaces stopped
+          // matching and the payload would keep the file the run just replaced).
+          const producedCompose = Object.keys(genNow).find(isComposeName)
+          if (producedCompose) sel.compose = [producedCompose]
+          const producedNginx = Object.keys(genNow).find(n => n.endsWith('.conf') && !n.endsWith('.j2'))
+          if (producedNginx) sel.nginx = producedNginx
+        }
       }
       // Merge previously generated (reviewed) files with the just-generated
       // ones — the Deploy auto-run MUST see them (compose/nginx are persisted
@@ -505,55 +968,39 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         selection: sel,
       }
 
-      // Add compose/nginx paths — the SELECTED set wins (multi, ordered);
-      // legacy single-path convention detection applies only when nothing is
-      // selected.
-      if (sel.compose.length > 0) {
-        payload.compose_file_paths = sel.compose
-      } else if (selectedService) {
-        // For a multi-recipe service, scope file lookup to the SELECTED recipe
-        // subdirectory. project_root already points into the recipe dir, so the
-        // template paths sent to the API are the bare filenames within it.
-        const recipePrefix = recipePath ? `${recipePath}/` : ''
-        const recipeFiles = recipePrefix
-          ? selectedService.files.filter((f: string) => f.startsWith(recipePrefix))
-          : selectedService.files
-        const pathFor = (f: string) => (recipePrefix ? f.slice(recipePrefix.length) : f)
-
-        const composeJ2 = recipeFiles.find((f: string) => f.endsWith('.yml.j2'))
-        // Fallback: look for regular (non-.j2) compose files that already exist in the project
-        const composeFile = recipeFiles.find((f: string) =>
-          (f.endsWith('.yml') || f.endsWith('.yaml')) && !f.endsWith('.j2'))
-
-        if (composeJ2) payload.compose_template_path = pathFor(composeJ2)
-        else if (gen['docker-compose.yml']) payload.compose_file_path = 'docker-compose.yml'
-        else if (composeFile) payload.compose_file_path = pathFor(composeFile)
+      // G20 — the deploy hands the -api ALL THREE paths: any slot left at
+      // `generate new` had a file generated and sent for it, so a refused
+      // deployment always carries all three. The gateway swaps a generated
+      // nginx into the selection, so this is normally already named; when it is
+      // not, take the nginx file this run produced rather than sending a
+      // deployment with no nginx at all — that instance would deploy unroutable
+      // and the edge would 502 its /go/ relay.
+      if (!sel.nginx) {
+        const produced = Object.keys(gen).find(n => n.endsWith('.conf') || n.endsWith('.conf.j2'))
+        if (produced) sel.nginx = produced
       }
 
-      // Nginx wiring applies in BOTH cases above: a selected compose set does
-      // NOT make nginx irrelevant. Without a per-user nginx conf the shared
-      // nginx has no route for the service and the edge 502s the /go/ relay.
-      // Preference: panel selection > LLM-generated nginx.conf (saved to the
-      // recipe by save-generated above) > recipe .conf.j2 template > plain
-      // recipe .conf.
-      {
-        const recipePrefixN = recipePath ? `${recipePath}/` : ''
-        const recipeFilesN = recipePrefixN
-          ? (selectedService?.files || []).filter((f: string) => f.startsWith(recipePrefixN))
-          : (selectedService?.files || [])
-        const pathForN = (f: string) => (recipePrefixN ? f.slice(recipePrefixN.length) : f)
-        const nginxJ2 = recipeFilesN.find((f: string) => f.endsWith('.conf.j2'))
-        const nginxFile = recipeFilesN.find((f: string) =>
-          f.endsWith('.conf') && !f.endsWith('.j2') && !f.endsWith('.generated'))
-        if (sel.nginx) {
-          payload.nginx_conf_file_path = sel.nginx
-        } else if (gen['nginx.conf']) {
-          payload.nginx_conf_file_path = 'nginx.conf'
-        } else if (nginxJ2) {
-          payload.nginx_conf_template_path = pathForN(nginxJ2)
-        } else if (nginxFile) {
-          payload.nginx_conf_file_path = pathForN(nginxFile)
-        }
+      // What was SELECTED is what is sent — no fallback chain
+      // (deploy-panel-selection-and-generation-todo.md §2). The panel cannot
+      // know which convention-matching file is the right base, and guessing
+      // picked a test overlay (graphiti's docker-compose.test.yml) or let a
+      // stale `.j2` shadow a newer plain file. A slot left at `generate new`
+      // contributes NOTHING here — the generation supplies it.
+      if (sel.compose.length > 0) {
+        payload.compose_file_paths = sel.compose
+      }
+      // nginx is no longer "optional": it is governed by the same rule, and its
+      // absence is as fatal as a missing compose (the instance would deploy
+      // unroutable and the edge would 502 the /go/ relay).
+      if (sel.nginx) {
+        payload.nginx_conf_file_path = sel.nginx
+      }
+      // A selected env is passed even when EMPTY: the only guard is presence,
+      // never size or content. An empty `--env-file` is exactly what the
+      // always-pass invariant wants, since it keeps compose's auto-read of the
+      // recipe `.env` overridden.
+      if (sel.env.length > 0) {
+        payload.env_files = sel.env
       }
 
       // Repeatable profiles (later wins is the compose CLI behavior).
@@ -593,7 +1040,18 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       onDeployed(data.task_id, snap.user_name, baseName, snap.label || '0')
       onClose()
     } catch (err: any) {
-      message.error(err.response?.data?.detail || 'Deploy failed')
+      const d = err.response?.data?.detail
+      // A capacity refusal is NOT a failed deploy — nothing was accepted, and
+      // the remedy is to cancel whatever is hanging. It gets a PERSISTENT
+      // alert instead of a toast (doc §4d): with no timeout on long builds
+      // (GRILLING G11), this is the only way saturation is discoverable. Both
+      // pools' codes land here (G29) — the -api's and the gateway's own.
+      const refusal = refusalOf(err)
+      if (refusal) {
+        setAtCapacity(refusal)
+      } else {
+        message.error(typeof d === 'string' ? d : 'Deploy failed')
+      }
     } finally {
       setLoading(false)
       setGenPopupOpen(false)
@@ -637,8 +1095,77 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     }
   }, [selectedServiceName, selectedUserName, selectedLabel, expectedVolumeKeys, userDataDir])
 
+  // External-credential pause (task doc §2): the shared prompt is rendered in BOTH surfaces that
+  // can be on screen while a job runs — this panel's inline progress area, and the separate
+  // "Deploying…" popup, which is what the auto-run deploy actually shows.
+  // Persistent at-capacity alert (doc §4d). Rendered on BOTH surfaces for the
+  // same reason the credential prompt is: the auto-run deploy CLOSES this panel
+  // and shows the "Deploying…" popup, so an alert living only in the panel body
+  // is invisible exactly when a generation is refused — found live, where the
+  // refusal produced no visible alert at all.
+  const renderAtCapacity = () => (
+    atCapacity ? (
+      <Alert
+        type="error"
+        showIcon
+        closable
+        onClose={()=>setAtCapacity(null)}
+        style={{marginBottom:16}}
+        message={atCapacity.code === 'generation_at_capacity'
+          ? "The generation pool is full — nothing was queued"
+          : "Platform is at capacity — nothing was queued"}
+        description={<>
+          {atCapacity.detail || (atCapacity.code === 'generation_at_capacity'
+            ? 'Wait for a running generation to finish, or cancel one.'
+            : 'Cancel a task that has been hanging, then retry.')}
+          <div style={{marginTop:6}}>
+            <Button size="small" onClick={()=>{ onClose(); window.location.href = '/tasks' }}>
+              {atCapacity.code === 'generation_at_capacity'
+                ? 'Go to Tasks and cancel a running generation'
+                : 'Go to Tasks and cancel a hanging task'}
+            </Button>
+          </div>
+        </>}
+      />
+    ) : null
+  )
+
+  const renderExternalPrompt = () => {
+    if (!(isPaused(genJob.jobState) && (genJob.jobState.pending_input || {}))) return null
+    // G27: the leg is TERMINAL. Its secondary button therefore DISMISSES this
+    // view — it must not offer to cancel a job that has already stopped, and it
+    // must not look like it did: the paused record stays on the Tasks page,
+    // where the pause can be answered again.
+    const _terminal = genJob.jobState.status === 'paused'
+    const _onCancel = _terminal ? () => genJob.reset() : genJob.cancelJob
+    const _label = _terminal ? 'Close' : 'Cancel'
+    // The pause has two kinds (§3b): awaiting the operator's credential
+    // VALUES, or awaiting an editable FIX GUIDANCE for a compose conflict.
+    return (genJob.jobState.pending_input || {}).kind === 'compose_fix' ? (
+      <ComposeFixPrompt
+        jobState={genJob.jobState}
+        onSubmit={genJob.submitInput}
+        onCancel={_onCancel}
+        cancelLabel={_label}
+      />
+    ) : (
+      <ExternalCredentialPrompt
+        jobState={genJob.jobState}
+        onSubmit={genJob.submitInput}
+        onCancel={_onCancel}
+        cancelLabel={_label}
+      />
+    )
+  }
+
   return (
     <>
+    {/* §4d's persistent at-capacity alert lives at the ROOT, not in a modal.
+        Rendered inside the panel or the "Deploying…" popup it was invisible
+        whenever the OTHER surface was the one on screen — measured: /api/llm/jobs
+        returned 503 while no alert appeared. Root-level cannot be hidden by
+        whichever modal happens to be open. */}
+    {renderAtCapacity()}
     <Modal
       title={`Deploy${selectedServiceName ? `: ${selectedServiceName}` : ''}`}
       open={open}
@@ -828,6 +1355,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
             stale={fileSetStale}
             needsEnv={needsEnv}
             onChange={setSelection}
+            onOpenFile={(name) => openSelectedFile(name)}
           />
 
           {/* ---- Deploy-time per-user env (pipeline env phase, design §2) ---- */}
@@ -853,12 +1381,34 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
             placeholder="Prompt for the generation agent (missing-files generation + deploy-time per-user env). You may include doc URLs — the agent fetches them."
           />
 
+          {/* §5: shown ONLY when env is `generate new` (an empty env slot). It
+              supplies the context the model reads to produce the per-user
+              `.raw`; selecting a handoff env above makes it irrelevant. */}
+          {eff.env.length === 0 && (fileSetCandidates.env || []).length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <Text strong>Env reference (generation context)</Text>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {' '}— base/example env files the model reads to produce the per-user env.
+                Not passed to the deployment.
+              </Text>
+              <Select
+                mode="multiple"
+                allowClear
+                style={{ width: '100%', marginTop: 4 }}
+                placeholder="None — the model works from the compose alone"
+                value={envRefs}
+                onChange={(v) => setEnvRefs(v as string[])}
+                options={(fileSetCandidates.env || []).map(c => ({ value: c, label: c }))}
+              />
+            </div>
+          )}
+
           {/* ---- Missing Files / LLM Generation ---- */}
           {checkingMissing ? (
             <div style={{padding:'8px 0'}}><Spin size="small" /> <span style={{fontSize:12,color:'#999'}}>Checking deployment readiness...</span></div>
           ) : checkError ? (
             <Alert type="error" message={`Deployment readiness check failed: ${checkError}`} style={{marginBottom:12}} />
-          ) : missingFiles.length > 0 ? (
+          ) : !slotsSpecified ? (
             <Alert
               type={Object.keys(generatedFiles).length > 0 ? 'success' : 'warning'}
               message={
@@ -895,6 +1445,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
                             <Button size="small" danger onClick={genJob.cancelJob}>Cancel</Button>
                           </div>
                         )}
+        {renderExternalPrompt()}
                         {genJob.jobState && (genJob.jobState.status === 'failed' || genJob.jobState.status === 'cancelled') && (
                           <div style={{marginTop:8}}>
                             <Text type="danger" style={{fontSize:12}}>{genJob.jobState.error || `Job ${genJob.jobState.status}`}</Text>
@@ -908,7 +1459,11 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
                       <Tag color="green">✓ Generated {Object.keys(generatedFiles).length} file(s)</Tag>
                       <div style={{marginTop:8}}>
                         {Object.keys(generatedFiles).map(fn => {
-                          const phase = fn === 'docker-compose.yml' ? 'compose' : fn === 'nginx.conf' ? 'nginx' : fn.startsWith('.env') ? 'env' : ''
+                          // By NAME SHAPE, not by a table of exact names — the
+                          // table this replaces listed `docker-compose.yml` and
+                          // `nginx.conf`, so it matched nothing a generation
+                          // actually produced and every row showed a green ✓.
+                          const phase = phaseOfFile(fn)
                           const v = (genValidations || {})[phase]
                           const ok = !v || v.valid === true
                           return (
@@ -941,7 +1496,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
               style={{marginBottom:12}}
             />
           ) : selectedServiceName ? (
-            <Alert type="success" message="All essential files present — ready to deploy" style={{marginBottom:12}} />
+            <Alert type="success" message="All necessary files are specified, ready for deployment" style={{marginBottom:12}} />
           ) : null}
 
           {/* ---- Generated File Editor Modal (Monaco) ---- */}
@@ -977,7 +1532,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
           {/* ---- Global Proxy ---- */}
           <Form.Item name="use_global_proxy" valuePropName="checked">
-            <Checkbox disabled={!proxyEnabled}>
+            <Checkbox disabled={!proxyEnabled} onChange={() => { proxyTouchedRef.current = true }}>
               <GlobalOutlined /> Use global proxy for this deployment
               {!proxyEnabled && <span style={{ color: '#999', fontSize: 12 }}> (enable in Settings first)</span>}
               {proxyEnabled && <span style={{ color: '#52c41a', fontSize: 12 }}> (proxy is enabled)</span>}
@@ -1008,25 +1563,84 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
               </Text>
             )}
             <Button type="primary" htmlType="submit" loading={loading} icon={<span>🚀</span>}
+              // `computingLabel` gates the submit too: the next-label call resolves through the
+              // -api's status computation and was measured taking ~3–6s, during which the
+              // (read-only) Label field still shows the PREVIOUS value. Submitting in that window
+              // sends the stale label — e.g. 0 for a pair that already has 0 — and the register
+              // then fails with "already registered", which is the collision the label work exists
+              // to prevent. The field already shows a spinner while computing; the button must
+              // agree with it.
+              // Both "no compose" clauses are waived on a GUIDED RESTART
+              // (`fixingGuide`): there, a compose left at `generate new` is the
+              // OPERATOR'S INSTRUCTION to regenerate the very file the analysis
+              // found fault with. The clauses exist to catch a forgotten
+              // selection — applying them here blocks the one action the whole
+              // analysis step exists to enable. Found live in T13: `check`
+              // opened the panel with the guide pre-filled and Deploy sat
+              // disabled with no way forward.
               disabled={!selectedUserName || !selectedServiceName || !!checkError || fileSetLoading
-                || (!fileSetLoading && (fileSetCandidates.compose || []).length > 0 && effectiveSelection().compose.length === 0)
-                || (missingFiles.length > 0 && Object.keys(generatedFiles).length === 0 && effectiveSelection().compose.length === 0)}>
+                || computingLabel
+                || (!fixingGuide && !fileSetLoading && (fileSetCandidates.compose || []).length > 0 && effectiveSelection().compose.length === 0)
+                || (!fixingGuide && missingFiles.length > 0 && Object.keys(generatedFiles).length === 0 && effectiveSelection().compose.length === 0)}>
               Deploy
             </Button>
           </Space>
+          {/* A DISABLED Deploy with no reason is a dead end — found live: a stored
+              selection whose files had gone missing (converted to `.j2` by the -api's
+              register-time conversion, or purged) left the button disabled with the
+              only signal a `stale` tag buried inside a picker, and the panel was
+              silently undeployable for two rounds of traces. Say why, next to the
+              button that is refusing. */}
+          {!loading && !selectedUserName && (
+            <Alert type="info" showIcon style={{ marginTop: 8 }}
+              message="Select a user and a service to deploy." />
+          )}
+          {/* GUIDED RESTART (`fixingGuide`) is WAIVED here exactly as it is on the
+              Deploy button (see the disabled condition above): the analysis
+              deliberately empties the faulty slot so the pipeline regenerates it,
+              and Deploy stays enabled for that to work. This alert's condition did
+              not carry the waiver, so a live `check` (G26 row 5) showed "No compose
+              file is selected … Pick a compose above to deploy" next to an ENABLED
+              Deploy — the message asserted the opposite of what the button does.
+              Found live in the consolidated round (deviation 4). Suppress it in
+              fixing mode; the (pre-filled) guide in the prompt is the real signal. */}
+          {!loading && selectedUserName && selectedServiceName && !fileSetLoading && !computingLabel && !fixingGuide
+            && (fileSetCandidates.compose || []).length > 0 && effectiveSelection().compose.length === 0 && (
+            <Alert type="warning" showIcon style={{ marginTop: 8 }}
+              message="No compose file is selected for this deployment"
+              // Two very different causes reach this same alert, so it must not
+              // assert one of them. The condition is "candidates exist but none
+              // is selected", which covers BOTH a stored selection whose files
+              // vanished AND a recipe that simply has no stored selection yet.
+              // It used to claim the first unconditionally — telling the operator
+              // to hunt for "stale entries tagged in the picker" on a brand-new
+              // recipe where nothing is stale and none exist. Found live in
+              // Round 34 while deploying a fresh fixture (defect 12).
+              description={
+                ((fileSetStale || {}).compose || []).length > 0
+                  ? 'The stored selection names files that no longer exist (they may have been converted to .j2 templates or removed). Pick a compose above — the stale entries are tagged in the picker.'
+                  : 'This recipe has no stored selection yet. Pick a compose above to deploy.'
+              } />
+          )}
         </Space>
       </Form>
     </Modal>
 
     {/* ---- Deploy progress popup (design §8.3) — closeable anytime ---- */}
     <Modal
-      title="Deploying…"
+      title={isPaused(genJob.jobState) ? 'Paused — waiting for you' : 'Deploying…'}
       open={genPopupOpen}
       onCancel={() => setGenPopupOpen(false)}
       footer={null}
       width={560}
     >
       <Space direction="vertical" style={{ width: '100%' }} size={6}>
+        {/* The pause is rendered here too: during the auto-run deploy this popup
+            is the visible surface, and a paused leg matches none of the statuses
+            below — without this the popup would sit empty (titled "Deploying…")
+            while the deployment waits for the operator. G27 made that leg
+            TERMINAL, so the pause no longer arrives as `awaiting_input`. */}
+        {renderExternalPrompt()}
         {genJob.jobState && (genJob.jobState.status === 'queued' || genJob.jobState.status === 'running' || genJob.jobState.status === 'completed') && (
           <>
             {genJob.jobState.status === 'completed' ? (
