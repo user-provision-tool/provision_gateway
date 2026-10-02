@@ -410,6 +410,31 @@ async def change_user_password(
     return result
 
 
+@router.delete("/{user_name}/{service_name}/{label}/password")
+async def remove_user_password(
+    user_name: str, service_name: str, label: str,
+    current_admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Remove a service's password protection (delegated to provision-api).
+
+    auth_basic is stripped from the instance's rendered conf and the registry's
+    passwd/passwd_plain/htpasswd_path are cleared. The ACL gate keeps protecting
+    the service; only the instance's own second layer goes.
+    """
+    try:
+        result = await provision_service.remove_user_password(user_name, service_name, label)
+    except Exception as e:
+        raise HTTPException(502, f"provision-api error: {e}")
+
+    audit_service.log_action(
+        db, action="password_remove", admin_id=current_admin["id"],
+        target_user=user_name, target_service=service_name,
+        target_label=label, status="success",
+    )
+    return result
+
+
 @router.get("/{user_name}/{service_name}/{label}/containers/{container}/logs")
 async def get_container_logs(
     user_name: str, service_name: str, label: str, container: str,

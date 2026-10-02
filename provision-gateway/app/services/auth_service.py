@@ -158,7 +158,7 @@ def create_admin(
     db.add(admin)
     db.flush()
     try:
-        create_api_key(db, admin.id, "Default", is_default=True)
+        create_api_key(db, admin.id, "Default", is_default=True, target_type="admin")
     except Exception:
         pass
     db.commit()
@@ -384,30 +384,81 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def _target_identity(db: Session, user_id: int) -> tuple[str, str, str]:
+TARGET_TYPES = ("end_user", "admin")
+
+
+def format_target_ref(user_id: int, target_type: str = "end_user") -> str:
+    """Render the canonical prefixed target reference, e.g. ``admin:1``."""
+    return f"{target_type}:{user_id}"
+
+
+def parse_target_ref(ref) -> tuple[int, str]:
+    """Parse a key target reference into ``(user_id, target_type)``.
+
+    The reference is PREFIXED: ``end_user:7`` or ``admin:1``. A bare integer (or
+    bare digit string) means ``end_user`` — the pre-prefix syntax, kept so every
+    existing caller, stored row and API client keeps working unchanged.
+
+    The prefix is what makes the target unambiguous: ``admins`` and ``end_users``
+    have separate id spaces, so ``1`` alone names two different people.
+    """
+    if isinstance(ref, bool):  # bool is an int subclass; never a valid id
+        raise ValueError("Invalid target id")
+    if isinstance(ref, int):
+        return ref, "end_user"
+    text_ref = str(ref or "").strip()
+    if not text_ref:
+        raise ValueError("Invalid target id: empty")
+    if ":" in text_ref:
+        prefix, _, number = text_ref.partition(":")
+        prefix = prefix.strip().lower()
+        if prefix not in TARGET_TYPES:
+            raise ValueError(
+                f"Unknown target type '{prefix}' (expected one of: {', '.join(TARGET_TYPES)})"
+            )
+        number = number.strip()
+    else:
+        prefix, number = "end_user", text_ref
+    if not number.isdigit():
+        raise ValueError(f"Invalid target id '{number}': expected an integer")
+    return int(number), prefix
+
+
+def _target_identity(db: Session, user_id: int,
+                     target_type: str = "end_user") -> tuple[str, str, str]:
     """Return (user_type, email, role) for a key's target user.
 
-    API keys may target end_users or admins (GAP-07: mint with the target's
-    real user_type so admin keys are not dead on arrival).
+    ``target_type`` names the id space EXPLICITLY. API keys may target end_users
+    or admins (GAP-07: mint with the target's real user_type so admin keys are
+    not dead on arrival) — but the two tables' ids collide (id 1 is a different
+    person in each), so resolving by id alone is a guess. That guess used to
+    prefer ``EndUser``, which silently minted an admin's "own" key for whichever
+    end user held the same id. Unknown targets raise rather than falling back to
+    a nameless identity.
     """
-    end_user = db.query(EndUser).filter(EndUser.id == user_id).first()
-    if end_user is not None:
-        return ("end_user", end_user.username, end_user.role or "viewer")
-    admin = db.query(AdminUser).filter(AdminUser.id == user_id).first()
-    if admin is not None:
+    if target_type == "admin":
+        admin = db.query(AdminUser).filter(AdminUser.id == user_id).first()
+        if admin is None:
+            raise ValueError(f"No admin with id {user_id}")
         return ("admin", admin.email, admin.role or "admin")
-    return ("end_user", "", "viewer")
+    end_user = db.query(EndUser).filter(EndUser.id == user_id).first()
+    if end_user is None:
+        raise ValueError(f"No end user with id {user_id}")
+    return ("end_user", end_user.username, end_user.role or "viewer")
 
 
-def _lazy_evict_api_keys(db: Session, user_id: int) -> int:
+def _lazy_evict_api_keys(db: Session, user_id: int, target_type: str = "end_user") -> int:
     """Lazy eviction: drop the user's oldest revoked/expired keys to make room.
+
+    Scoped to the target's id space, like every other key query: the same
+    numeric id exists for an end user and an admin.
 
     Returns the number of keys evicted (v4 §6.1.6).
     """
     now = _db_utcnow()
     removable = (
         db.query(ApiKey)
-        .filter(ApiKey.user_id == user_id)
+        .filter(ApiKey.user_id == user_id, ApiKey.target_type == target_type)
         .filter((ApiKey.is_revoked.is_(True)) | (ApiKey.expires_at <= now))
         .order_by(ApiKey.created_at.asc())
         .all()
@@ -422,35 +473,48 @@ def _lazy_evict_api_keys(db: Session, user_id: int) -> int:
 
 
 def create_api_key(db: Session, user_id: int, label: str,
-                   is_default: bool = False) -> tuple[ApiKey, str]:
+                   is_default: bool = False,
+                   target_type: str = "end_user") -> tuple[ApiKey, str]:
     """Create a new API key — a 1-year JWT provision token carrying its own
     api_key_id. Only the hash + a short mask are stored (v4 §6.1.1-6.1.3).
+
+    ``target_type`` names the id space the key targets (``end_user`` | ``admin``);
+    it is stored on the row and the token so the key can say which space its
+    ``user_id`` is in. Every filter here carries both halves — the id alone is
+    not unique across the two id spaces.
 
     Enforces a 1000-key cap with lazy eviction (v4 §6.1.6). Returns (ApiKey, raw_token).
     """
     # --- Cap check with lazy eviction ---
-    count = db.query(ApiKey).filter(ApiKey.user_id == user_id).count()
+    count = db.query(ApiKey).filter(
+        ApiKey.user_id == user_id, ApiKey.target_type == target_type
+    ).count()
     if count >= MAX_API_KEYS_PER_USER:
-        _lazy_evict_api_keys(db, user_id)
-        count = db.query(ApiKey).filter(ApiKey.user_id == user_id).count()
+        _lazy_evict_api_keys(db, user_id, target_type)
+        count = db.query(ApiKey).filter(
+            ApiKey.user_id == user_id, ApiKey.target_type == target_type
+        ).count()
         if count >= MAX_API_KEYS_PER_USER:
             raise ValueError("API key limit reached (1000 keys per user)")
 
     # G2: when creating a DEFAULT key, clear any (stale) existing default for
-    # the user first — the partial unique index on (user_id) WHERE is_default
-    # would otherwise reject the insert (e.g. a re-registered user inheriting a
-    # default orphaned by SQLite id-reuse).
+    # the target first — the partial unique index on (user_id, target_type)
+    # WHERE is_default would otherwise reject the insert (e.g. a re-registered
+    # user inheriting a default orphaned by SQLite id-reuse).
     if is_default:
         db.query(ApiKey).filter(
-            ApiKey.user_id == user_id, ApiKey.is_default.is_(True)
+            ApiKey.user_id == user_id,
+            ApiKey.target_type == target_type,
+            ApiKey.is_default.is_(True),
         ).update({"is_default": False})
 
-    # Resolve the target's real identity for the token (GAP-07).
-    user_type, email, role = _target_identity(db, user_id)
+    # Resolve the target's real identity for the token (GAP-07 + the prefix).
+    user_type, email, role = _target_identity(db, user_id, target_type)
 
     # Insert row first so we can bind its id into the token.
     key = ApiKey(
         user_id=user_id,
+        target_type=target_type,
         label=label,
         is_default=is_default,
         token_hash="",
@@ -469,19 +533,32 @@ def create_api_key(db: Session, user_id: int, label: str,
 
 
 def set_default_api_key(db: Session, key_id: int) -> bool:
-    """Mark *key_id* as the user's default (and un-default others). Returns True on success."""
+    """Mark *key_id* as its target's default (un-defaulting the target's others).
+
+    Scoped to ``(user_id, target_type)``: promoting an admin's key must not
+    un-default the end user who happens to share the numeric id. Returns True on
+    success.
+    """
     key = db.query(ApiKey).filter(ApiKey.id == key_id).first()
     if key is None:
         return False
-    # Clear any existing default for this user
-    db.query(ApiKey).filter(ApiKey.user_id == key.user_id).update({"is_default": False})
+    # Clear any existing default for this target (both halves of the reference).
+    db.query(ApiKey).filter(
+        ApiKey.user_id == key.user_id,
+        ApiKey.target_type == key.target_type,
+    ).update({"is_default": False})
     key.is_default = True
     db.commit()
     return True
 
 
-def get_or_create_default_key(db: Session, user_id: int) -> ApiKey:
-    """Return the user's default API key, creating/auto-promoting as needed.
+def get_or_create_default_key(db: Session, user_id: int,
+                              target_type: str = "end_user") -> ApiKey:
+    """Return the target's default API key, creating/auto-promoting as needed.
+
+    ``target_type`` is the caller's OWN space (login/exchange pass their token's
+    ``user_type``): without it an admin's login would bind to the end user who
+    shares their id.
 
     - If a valid default exists, return it.
     - If the default is revoked/expired, auto-promote the oldest valid key or
@@ -491,7 +568,8 @@ def get_or_create_default_key(db: Session, user_id: int) -> ApiKey:
 
     default = (
         db.query(ApiKey)
-        .filter(ApiKey.user_id == user_id, ApiKey.is_default.is_(True))
+        .filter(ApiKey.user_id == user_id, ApiKey.target_type == target_type,
+                ApiKey.is_default.is_(True))
         .first()
     )
     if default is not None and not default.is_revoked and _db_naive(default.expires_at) > now:
@@ -500,7 +578,8 @@ def get_or_create_default_key(db: Session, user_id: int) -> ApiKey:
     # Promote oldest valid key to default if one exists.
     valid = (
         db.query(ApiKey)
-        .filter(ApiKey.user_id == user_id, ApiKey.is_revoked.is_(False))
+        .filter(ApiKey.user_id == user_id, ApiKey.target_type == target_type,
+                ApiKey.is_revoked.is_(False))
         .filter(ApiKey.expires_at > now)
         .order_by(ApiKey.created_at.asc())
         .all()
@@ -514,15 +593,23 @@ def get_or_create_default_key(db: Session, user_id: int) -> ApiKey:
         return valid[0]
 
     # No valid key: create a new default.
-    key, _ = create_api_key(db, user_id, "Default", is_default=True)
+    key, _ = create_api_key(db, user_id, "Default", is_default=True,
+                            target_type=target_type)
     return key
 
 
-def list_api_keys(db: Session, user_id: int | None = None) -> list[ApiKey]:
-    """List API keys. If user_id is None, return all (admin)."""
+def list_api_keys(db: Session, user_id: int | None = None,
+                  target_type: str | None = None) -> list[ApiKey]:
+    """List API keys.
+
+    ``user_id is None`` returns all keys (the admin view). Otherwise the filter
+    carries BOTH halves of the reference — an id-only filter would show an
+    admin's keys to the end user who shares their id (and vice versa).
+    """
     q = db.query(ApiKey)
     if user_id is not None:
-        q = q.filter(ApiKey.user_id == user_id)
+        q = q.filter(ApiKey.user_id == user_id,
+                     ApiKey.target_type == (target_type or "end_user"))
     return q.order_by(ApiKey.is_default.desc(), ApiKey.created_at.desc()).all()
 
 
@@ -547,23 +634,28 @@ def get_api_key_by_id(db: Session, key_id: int) -> ApiKey | None:
     return db.query(ApiKey).filter(ApiKey.id == key_id).first()
 
 
-def user_has_default_key(db: Session, user_id: int) -> bool:
-    """Return True if *user_id* currently owns a default key (v4 §6.1.6)."""
+def user_has_default_key(db: Session, user_id: int,
+                         target_type: str = "end_user") -> bool:
+    """Return True if the target currently owns a default key (v4 §6.1.6)."""
     return (
         db.query(ApiKey)
-        .filter(ApiKey.user_id == user_id, ApiKey.is_default.is_(True))
+        .filter(ApiKey.user_id == user_id, ApiKey.target_type == target_type,
+                ApiKey.is_default.is_(True))
         .first()
     ) is not None
 
 
-def delete_api_keys_for_user(db: Session, user_id: int) -> int:
-    """Delete every API key owned by *user_id* (used when deleting the user).
+def delete_api_keys_for_user(db: Session, user_id: int,
+                             target_type: str = "end_user") -> int:
+    """Delete every API key owned by the target (used when deleting the user).
 
-    v4 §6.1.3 / G2: user deletion must cascade to api_keys, otherwise SQLite
-    id-reuse orphans stale ``is_default=1`` rows onto the next user. Returns the
-    number of keys deleted.
+    Scoped to the id space: deleting end user 1 must not take the admin 1's keys
+    with it. v4 §6.1.3 / G2: user deletion must cascade to api_keys, otherwise
+    SQLite id-reuse orphans stale ``is_default=1`` rows onto the next user.
+    Returns the number of keys deleted.
     """
-    keys = db.query(ApiKey).filter(ApiKey.user_id == user_id).all()
+    keys = db.query(ApiKey).filter(ApiKey.user_id == user_id,
+                                   ApiKey.target_type == target_type).all()
     count = len(keys)
     for key in keys:
         db.delete(key)
@@ -572,31 +664,40 @@ def delete_api_keys_for_user(db: Session, user_id: int) -> int:
     return count
 
 
-def create_default_api_key(db: Session, user_id: int) -> tuple[ApiKey, str]:
-    """Create a default API key for a user (called at registration / first login)."""
-    return create_api_key(db, user_id, "Default", is_default=True)
+def create_default_api_key(db: Session, user_id: int,
+                           target_type: str = "end_user") -> tuple[ApiKey, str]:
+    """Create a default API key for a target (called at registration / first login)."""
+    return create_api_key(db, user_id, "Default", is_default=True,
+                          target_type=target_type)
 
 
 def backfill_default_keys(db: Session) -> int:
-    """Backfill an is_default flag for existing users that lack a default key.
+    """Backfill an is_default flag for existing targets that lack a default key.
 
-    Picks the user's oldest valid key as default; creates one if none exist
-    (v4 §6.1.3/6.1.5, review GAP-25). Returns the number of users backfilled.
+    Picks the target's oldest valid key as default; creates one if none exist
+    (v4 §6.1.3/6.1.5, review GAP-25). Iterates TARGETS (``user_id`` +
+    ``target_type``), not bare ids, so the two id spaces keep separate defaults.
+    Returns the number of targets backfilled.
     """
     now = _db_utcnow()
-    user_ids = {k.user_id for k in db.query(ApiKey.user_id).all()}
+    targets = {
+        (row[0], row[1] or "end_user")
+        for row in db.query(ApiKey.user_id, ApiKey.target_type).all()
+    }
     backfilled = 0
-    for uid in user_ids:
+    for uid, target_type in targets:
         has_default = (
             db.query(ApiKey)
-            .filter(ApiKey.user_id == uid, ApiKey.is_default.is_(True))
+            .filter(ApiKey.user_id == uid, ApiKey.target_type == target_type,
+                    ApiKey.is_default.is_(True))
             .first()
         )
         if has_default is not None:
             continue
         valid = (
             db.query(ApiKey)
-            .filter(ApiKey.user_id == uid, ApiKey.is_revoked.is_(False))
+            .filter(ApiKey.user_id == uid, ApiKey.target_type == target_type,
+                    ApiKey.is_revoked.is_(False))
             .filter(ApiKey.expires_at > now)
             .order_by(ApiKey.created_at.asc())
             .all()
@@ -607,7 +708,8 @@ def backfill_default_keys(db: Session) -> int:
             backfilled += 1
         else:
             try:
-                create_api_key(db, uid, "Default", is_default=True)
+                create_api_key(db, uid, "Default", is_default=True,
+                               target_type=target_type)
                 backfilled += 1
             except Exception:
                 pass

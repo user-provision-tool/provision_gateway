@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import httpx
+from fastapi import HTTPException
 from typing import Any
 
 from ..config import settings
@@ -48,6 +49,42 @@ class ProvisionService:
                     response=resp,
                 )
             return resp.json()
+
+    @staticmethod
+    def as_http_error(exc: Exception) -> HTTPException:
+        """Map a provision-api failure to the gateway's own HTTP status.
+
+        A capacity refusal (doc §4d) must NOT be folded into the generic 502:
+        its meaning is "nothing was accepted — cancel a hanging task and
+        retry", and the dashboard branches on that. Everything else stays 502.
+        """
+        resp = getattr(exc, "response", None)
+        if resp is not None and resp.status_code == 503:
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            # The -api emits TWO shapes for the same refusal: a FLAT body from
+            # the TaskCapacityError exception handler (`{"error": "at_capacity"}`)
+            # and a NESTED one from any `HTTPException(503, {...})` call site
+            # (`{"detail": {"error": "at_capacity"}}`). Only the flat form was
+            # recognised, so a nested refusal was silently folded into a generic
+            # 502 — losing exactly the signal §4d says must survive. Found by
+            # testing this wiring directly (Round 20) after nine failed attempts
+            # to produce a live refusal.
+            _inner = body.get("detail") if isinstance(body.get("detail"), dict) else {}
+            if body.get("error") == "at_capacity" or _inner.get("error") == "at_capacity":
+                body = {**body, **{k: v for k, v in _inner.items() if k not in body}}
+                return HTTPException(
+                    503,
+                    {
+                        "error": "at_capacity",
+                        "detail": body.get("detail") or str(exc),
+                        "running": body.get("running"),
+                        "capacity": body.get("capacity"),
+                    },
+                )
+        return HTTPException(502, f"provision-api error: {exc}")
 
     # ---- Users ----
 
@@ -105,6 +142,20 @@ class ProvisionService:
             "PUT",
             f"/users/{user_name}/services/{service_name}/{label}/password",
             json_data={"passwd": passwd},
+        )
+
+    async def remove_user_password(
+        self, user_name: str, service_name: str, label: str
+    ) -> dict[str, Any]:
+        """Drop a service's password protection (proxy to provision-api).
+
+        The exit for a protected service whose registry plaintext was lost: the
+        gate can never satisfy that auth_basic again, and bcrypt cannot give the
+        password back at `http_basic`. The ACL gate stays in force.
+        """
+        return await self._request(
+            "DELETE",
+            f"/users/{user_name}/services/{service_name}/{label}/password",
         )
 
     async def nginx_reconnect_all(self) -> dict[str, Any]:
@@ -169,6 +220,14 @@ class ProvisionService:
 
     async def get_task(self, task_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/tasks/{task_id}")
+
+    async def get_task_log(self, task_id: str) -> dict[str, Any]:
+        """The task's log, WHOLE — the `LLM based fix` context (§1).
+
+        404s when the task or its log is gone, which the caller surfaces as the
+        documented "task log is gone" state rather than a degraded fix.
+        """
+        return await self._request("GET", f"/tasks/{task_id}/logfile")
 
     async def cancel_task(self, task_id: str) -> dict[str, Any]:
         return await self._request("DELETE", f"/tasks/{task_id}")

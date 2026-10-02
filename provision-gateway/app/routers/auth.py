@@ -100,8 +100,10 @@ def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
     # Bind the provision token to the user's default key (D7: auto-create/promote).
     # G4 (v4 §6.1.5): admins get a default key too — their token binds to it so
     # it is revocable (R1); get_or_create_default_key auto-creates one on login
-    # for pre-G4 admins that never got a key at registration.
-    default_key = auth_service.get_or_create_default_key(db, user_id)
+    # for pre-G4 admins that never got a key at registration. The user's OWN id
+    # space is passed: without it an admin's login binds to the end user who
+    # shares their numeric id.
+    default_key = auth_service.get_or_create_default_key(db, user_id, user_type)
     api_key_id = default_key.id
 
     provision_token = auth_service.create_provision_token(
@@ -326,9 +328,16 @@ def create_key(
     current_user: dict = Depends(require_gateway_token),
     db: Session = Depends(get_db),
 ):
-    """Generate a new API key. Admin can create for any user; viewer for self.
+    """Generate a new API key. Admin can create for any target; viewer for self.
 
-    Request body: {"label": "my-key", "user_id": 1}  (user_id is optional for viewers)
+    Request body: ``{"label": "my-key", "user_id": "end_user:7"}`` — ``user_id``
+    is a PREFIXED target reference, ``end_user:<id>`` or ``admin:<id>``. A bare
+    integer means ``end_user`` (the pre-prefix syntax, kept for compatibility).
+
+    Omitted or blank means the caller's OWN target, resolved in the caller's own
+    id space — so an admin's blank mint is an ADMIN key. (Before the prefix it
+    fell back to a bare id that ``_target_identity`` resolved as an end user, so
+    an admin's "own" key silently belonged to whoever held that id.)
 
     The API key IS the provision token — a 1-year JWT carrying its own
     api_key_id and the target's real user_type (GAP-07) — so the returned
@@ -338,17 +347,31 @@ def create_key(
     if not label:
         raise HTTPException(400, "label is required")
 
-    # Determine target user_id
     is_admin = current_user["role"] == "admin"
-    target_user_id = req.get("user_id", current_user["id"]) if is_admin else current_user["id"]
+    own = (current_user["id"], current_user.get("user_type", "end_user"))
 
-    if not is_admin and target_user_id != current_user["id"]:
+    raw_target = req.get("user_id")
+    if raw_target is None or str(raw_target).strip() == "":
+        target_user_id, target_type = own
+    else:
+        try:
+            target_user_id, target_type = auth_service.parse_target_ref(raw_target)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    if not is_admin and (target_user_id, target_type) != own:
         raise HTTPException(403, "Viewers can only create keys for themselves")
 
-    key, raw_token = auth_service.create_api_key(db, target_user_id, label)
+    try:
+        key, raw_token = auth_service.create_api_key(
+            db, target_user_id, label, target_type=target_type
+        )
+    except ValueError as e:
+        # The prefixed target names an id that does not exist in that id space.
+        raise HTTPException(400, str(e))
 
-    # G8 (v4 §6.1.6): a new key becomes default only if the user has no default.
-    if not auth_service.user_has_default_key(db, target_user_id):
+    # G8 (v4 §6.1.6): a new key becomes default only if the target has no default.
+    if not auth_service.user_has_default_key(db, target_user_id, target_type):
         auth_service.set_default_api_key(db, key.id)
 
     return {
@@ -371,8 +394,14 @@ def list_keys(
     ``gateway_token`` cookie.
     """
     is_admin = current_user["role"] == "admin"
-    user_id = None if is_admin else current_user["id"]
-    keys = auth_service.list_api_keys(db, user_id)
+    if is_admin:
+        keys = auth_service.list_api_keys(db)
+    else:
+        # Both halves of the reference: an id-only filter would list an admin's
+        # keys to the end user who shares their id.
+        keys = auth_service.list_api_keys(
+            db, current_user["id"], current_user.get("user_type", "end_user")
+        )
     return {"keys": [k.to_dict() for k in keys]}
 
 
@@ -417,7 +446,9 @@ def delete_key(
         raise HTTPException(404, "Key not found")
 
     is_admin = current_user["role"] == "admin"
-    if not is_admin and key.user_id != current_user["id"]:
+    if not is_admin and (key.user_id, key.target_type) != (
+        current_user["id"], current_user.get("user_type", "end_user")
+    ):
         raise HTTPException(403, "You can only revoke your own keys")
 
     try:
@@ -439,7 +470,9 @@ def set_default_key(
         raise HTTPException(404, "Key not found")
 
     is_admin = current_user["role"] == "admin"
-    if not is_admin and key.user_id != current_user["id"]:
+    if not is_admin and (key.user_id, key.target_type) != (
+        current_user["id"], current_user.get("user_type", "end_user")
+    ):
         raise HTTPException(403, "You can only manage your own keys")
 
     if not auth_service.set_default_api_key(db, key_id):
@@ -547,8 +580,9 @@ def exchange(request: Request, db: Session = Depends(get_db)):
             https = False
 
     # Bind the fresh 1-week provision token to the user's default key (D7).
-    # G4: admins bind to their default key too (revocable, R1).
-    default_key = auth_service.get_or_create_default_key(db, user_id)
+    # G4: admins bind to their default key too (revocable, R1). The code's own
+    # user_type names the id space (see login).
+    default_key = auth_service.get_or_create_default_key(db, user_id, user_type)
     api_key_id = default_key.id
 
     provision_token = auth_service.create_provision_token(
@@ -643,7 +677,8 @@ def register_end_user(
     db.flush()
     # v4 §6.1.3: default key created at registration (not first login).
     try:
-        auth_service.create_api_key(db, user.id, "Default", is_default=True)
+        auth_service.create_api_key(db, user.id, "Default", is_default=True,
+                                    target_type="end_user")
     except Exception:
         pass
     db.commit()
@@ -726,7 +761,7 @@ def delete_end_user(
     user = db.query(EndUser).filter(EndUser.id == user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
-    auth_service.delete_api_keys_for_user(db, user.id)
+    auth_service.delete_api_keys_for_user(db, user.id, "end_user")
     db.delete(user)
     db.commit()
     return {"deleted": True}
