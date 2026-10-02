@@ -140,9 +140,11 @@ async def deploy_user(
 ):
     """Deploy a service to a user (proxied to provision-api POST /users).
 
-    Compose is the root of the dependency graph (design §Dependency graph):
-    deploy hard-gates on compose presence only — nginx is optional. Returns
-    400 if the deploy would fail due to a missing compose source.
+    Compose is the root of the dependency graph (design §Dependency graph), and
+    GRILLING G13 hard-gates on **all three** paths — compose, nginx and env — so
+    a deploy that would send an unselected slot is refused with 400 rather than
+    quietly picking a convention match. (Corrected 2026-09-26: this said
+    "hard-gates on compose presence only — nginx is optional".)
     A successful submission persists the file-set selection as the new
     default (design §Selection & UI L43-46: persist on 202 accept, not task
     completion). All DB work uses short-lived sessions so no connection is
@@ -182,8 +184,18 @@ async def deploy_user(
         except FileSetError:
             pass  # selection persistence is best-effort — deploy still proceeds
 
-    # Inject global proxy into build_args if requested
-    use_global_proxy = req.pop("use_global_proxy", False)
+    # Inject global proxy into build_args if requested.
+    #
+    # Capture the value BEFORE popping it. `req` is mutated here, and the
+    # at-capacity refusal below records `options=dict(req)` — so popping first
+    # meant the refused options carried NO `use_global_proxy` key. The Retry
+    # prefill seeds that key from the options (DeployForm L248) and skips a
+    # missing one, so the toggle came back OFF and the retried deploy was sent
+    # with `use_global_proxy: false` and no proxy build args — **the proxy was
+    # silently lost on Retry**. Found by trace T3 in Round 18, comparing the
+    # refused `options` against the captured Retry payload.
+    use_global_proxy = req.get("use_global_proxy", False)
+    req.pop("use_global_proxy", None)
     if use_global_proxy:
         from ..services.proxy_service import inject_proxy_build_args, has_active_proxy
         from ..database import SessionLocal
@@ -221,6 +233,14 @@ async def deploy_user(
         finally:
             db.close()
 
+    # §8b HANDOFF ORDER — REMOVE THEN ADD. The pre-deploy session is dropped
+    # BEFORE the -api registers, because the other order leaves the same service
+    # with two cards (ours and the -api's) for the window between the writes.
+    from ..services import pre_deploy_registry as _pdr
+    _pdr.remove_session(
+        req.get("user_name") or "", req.get("service_name") or "",
+        _pdr_recipe_path(req), str(req.get("label", "0")),
+    )
     try:
         result = await provision_service.register_user(**req)
     except Exception as e:
@@ -234,7 +254,30 @@ async def deploy_user(
             status="failure",
             error_message=str(e),
         )
-        raise HTTPException(502, f"provision-api error: {e}")
+        # The refusal is recorded on the GATEWAY-side pre-deploy record, so the
+        # card that already exists for this (user, service, label) can say why
+        # and offer the remedy. It is not an instance failure: the -api never
+        # created an entry — `submit()` refused before any task ran.
+        _mapped = provision_service.as_http_error(e)
+        if isinstance(_mapped.detail, dict) and _mapped.detail.get("error") == "at_capacity":
+            try:
+                from ..services import pre_deploy_registry as _pdr
+                _pdr.mark_refused(
+                    user=req.get("user_name") or "",
+                    service=req.get("service_name") or "",
+                    recipe_path=_pdr_recipe_path(req),
+                    label=str(req.get("label", "0")),
+                    reason="at_capacity",
+                    detail=_mapped.detail.get("detail") or str(e),
+                    # `use_global_proxy` was popped out of `req` above, so it
+                    # must be put BACK for the Retry prefill to restore the
+                    # toggle — otherwise the retried deploy runs without the
+                    # proxy that the refused one had (see the note at the pop).
+                    options=_pdr.refusal_options(req, use_global_proxy=use_global_proxy),
+                )
+            except Exception:
+                pass
+        raise _mapped
 
     _log_action_short(
         action="register",
@@ -271,13 +314,37 @@ async def get_next_label(
         # If user not found or provision-api unreachable, start at 0
         return {"label": "0", "source": "default"}
 
-    # Collect all services from provision-api response
+    # Collect all services from provision-api response.
+    #
+    # The -api returns user_status as a LIST OF USER OBJECTS, each carrying the three
+    # service lists nested one level below it (`api.py` `_compute_status` →
+    # `_status_for_user`):
+    #     {"user_status": [{"user_name": ..., "summary": {...},
+    #                       "healthy_services": [...], "unhealthy_services": [...],
+    #                       "missing_services": [...]}]}
+    # Reading that as a flat list of service entries compares `service_name` against
+    # user objects, matches nothing, and silently answers "0" for every pair — which is
+    # what happened until this flattening was added. A dict of the three lists, and a
+    # plain flat list of service entries, are both still accepted so the parser does not
+    # depend on one shape.
     services_raw = result.get("user_status", result if isinstance(result, list) else [])
     if isinstance(services_raw, dict):
-        # Handle nested structure
         services_raw = services_raw.get("healthy_services", []) + \
                        services_raw.get("unhealthy_services", []) + \
                        services_raw.get("missing_services", [])
+    else:
+        flat: list[dict] = []
+        for entry in services_raw:
+            if not isinstance(entry, dict):
+                continue
+            nested = [entry.get("healthy_services"), entry.get("unhealthy_services"),
+                      entry.get("missing_services")]
+            if any(isinstance(v, list) for v in nested):
+                for v in nested:
+                    flat.extend(v or [])
+            else:
+                flat.append(entry)  # already a flat service entry
+        services_raw = flat
 
     existing_labels: list[int] = []
     for entry in services_raw:
@@ -326,8 +393,18 @@ async def rebuild_user_service(
     db: Session = Depends(get_db),
 ):
     """Rebuild a user's service instance."""
-    # Inject global proxy into build_args if requested
-    use_global_proxy = req.pop("use_global_proxy", False)
+    # Inject global proxy into build_args if requested.
+    #
+    # Capture the value BEFORE popping it. `req` is mutated here, and the
+    # at-capacity refusal below records `options=dict(req)` — so popping first
+    # meant the refused options carried NO `use_global_proxy` key. The Retry
+    # prefill seeds that key from the options (DeployForm L248) and skips a
+    # missing one, so the toggle came back OFF and the retried deploy was sent
+    # with `use_global_proxy: false` and no proxy build args — **the proxy was
+    # silently lost on Retry**. Found by trace T3 in Round 18, comparing the
+    # refused `options` against the captured Retry payload.
+    use_global_proxy = req.get("use_global_proxy", False)
+    req.pop("use_global_proxy", None)
     if use_global_proxy:
         from ..services.proxy_service import inject_proxy_build_args, has_active_proxy
         if not has_active_proxy(db):
@@ -792,3 +869,15 @@ async def get_volume_usage(
         "user_data_dir": str(user_data_dir),
         "volumes": volumes,
     }
+
+def _pdr_recipe_path(req: dict) -> str:
+    """The recipe subdir a deploy request addresses ('' = project root).
+
+    The pre-deploy key must match the one the generation used, so it is derived
+    the same way: `project_root` is "<service>/<recipe>" for a sub-recipe.
+    """
+    root = (req.get("project_root") or "").strip("/")
+    service = (req.get("service_name") or "").strip("/")
+    if root and service and root.startswith(service + "/"):
+        return root[len(service) + 1:]
+    return ""
