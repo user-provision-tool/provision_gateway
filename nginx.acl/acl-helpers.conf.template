@@ -17,8 +17,11 @@
 #                 location must be reachable from the client (design v5 §4.3
 #                 helper sketch + §8.8). The gate is `location /`-only (F11), so
 #                 this exact-match location is never auth_request-gated; the
-#                 exchange validates the 30s one-time code before minting a
-#                 cookie, so the exposure is code-protected by design.
+#                 exchange validates the 30s SIGNED code before minting a
+#                 cookie, so the exposure is code-protected by design. The code
+#                 is NOT single-use: it is a stateless JWT, so the same code may
+#                 be exchanged more than once inside its 30 s window (ruling
+#                 2026-09-29 — the window, not a one-shot store, is the guarantee).
 #   @auth_401   — the challenge: native Basic dialog for API clients, portal
 #                 redirect for browsers. ACL-on only.
 #   @auth_403   — access denied (not in user's ACL / unknown service): API
@@ -38,7 +41,25 @@ location = /_auth_jwt {
     proxy_pass_request_body off;
     proxy_set_header Content-Length "";
     proxy_set_header X-Original-URI $request_uri;
-    proxy_set_header X-Provision-Token $cookie_provision_token;
+    # The credential, from the CLIENT: an API key presented as
+    # `X-Provision-Token: <JWT>` (api_references.md `GET /api/auth/verify` — "the
+    # alternative to cookie, for non-browser clients"; features.md ACL2/ACL4).
+    #
+    # `$http_x_provision_token` — NOT `$cookie_provision_token`. `proxy_set_header`
+    # REPLACES the header, so naming the cookie here discarded whatever the client
+    # sent and handed `verify` the cookie's value (empty for a cookie-less API
+    # client): a VALID key then behaved exactly like no credential and the only
+    # route to a service was the browser's /go/ → exchange-code → cookie dance.
+    # It also mis-classified browsers: once any cookie value existed to fill this
+    # header, `verify`'s hybrid rule ("non-empty X-Provision-Token ⇒ api") saw an
+    # api client, so a browser with an expired cookie got the Basic 401 challenge
+    # instead of the portal login redirect.
+    #
+    # The browser flow is untouched: `Cookie: $http_cookie` (below) is relayed
+    # separately and `verify` reads `token = cookie or header`, cookie first — and
+    # with no client header this stays EMPTY, so the client-type rule still reads
+    # `browser` for cookie/text-html requests.
+    proxy_set_header X-Provision-Token $http_x_provision_token;
     proxy_set_header Cookie $http_cookie;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-Proto $scheme;
@@ -54,6 +75,18 @@ location = /_auth_jwt {
 # 200/201/204/206/301/302/303/304/307/308 unless `always` is present — a 401
 # would otherwise reach the client with NO WWW-Authenticate header, breaking
 # the native Basic dialog contract for API clients (F3).
+#
+# WHAT THE CHALLENGE IS AND IS NOT (2026-09-29). It is native-dialog COVER: it
+# makes a human client (a browser's own dialog, a curl `-u` prompt) ask for a
+# username/password instead of showing a bare 401. It is NOT a supported
+# credential: `verify` reads the `provision_token` cookie and the
+# `X-Provision-Token` header and NOTHING else — no `Authorization` header is
+# consulted anywhere on this path — so a client that obeys this challenge and
+# re-sends Basic credentials loops on 401. The supported API route is the key in
+# `X-Provision-Token` (relayed above); the username:password pair belongs to the
+# INSTANCE's own nginx (`auth_basic` + its htpasswd), which the edge injects
+# upstream as `X-Service-Basic` after the gate passes. Changing this challenge to
+# something else is a user ruling, not a local edit.
 location @auth_401 {
     # Browser vs API decided by the gateway in X-Client-Type (F9).
     if ($client_type = api) {
@@ -79,7 +112,8 @@ location @auth_403 {
 
 # --- login-URL exchange (F7): token-less by construction; both modes ---
 # Browser-reachable (NOT internal): the /go/ 303 lands the client directly on
-# this URL (design v5 §4.3/§8.8); the 30s one-time code is the credential.
+# this URL (design v5 §4.3/§8.8); the 30s signed code is the credential (not
+# single-use — the window is the guarantee; see the note at /_auth_jwt).
 location = /_set_token {
     resolver 127.0.0.11 valid=30s ipv6=off;
     proxy_pass_request_body off;
@@ -88,6 +122,7 @@ location = /_set_token {
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    # Forward the signed one-time login token as-is: /go/<token>
+    # Forward the signed 30 s exchange code as-is — the `?code=` the /go/ 303
+    # handed the client (no JWT rides in the URL; F13).
     proxy_pass http://subnet-acl-gateway:8770/api/auth/exchange$is_args$args;
 }
