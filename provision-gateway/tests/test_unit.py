@@ -1076,6 +1076,48 @@ class TestPerUserFileEndpoints:
             ))
         assert exc.value.status_code == 400
 
+    def test_next_label_reads_the_nested_user_status_shape(self, monkeypatch):
+        """Regression guard (task doc §1): the -api's real shape must yield the next label.
+
+        `_compute_status` returns `{"user_status": [<per-user object>]}`, and each object
+        carries `healthy_services`/`unhealthy_services`/`missing_services` NESTED inside it.
+        The old parser expected a dict of those three lists (or a flat list of service
+        entries), matched nothing, and answered "0" for every pair — including pairs that
+        already had label 0 deployed, which made a second instance impossible to create.
+        """
+        import asyncio
+        from app.routers import users as users_router
+
+        async def fake_get_user(user_name):
+            return {"user_status": [{
+                "user_name": user_name,
+                "summary": {"healthy_services_#": 2},
+                "healthy_services": [{"service_name": "example-mcp", "label": "0"}],
+                "unhealthy_services": [{"service_name": "example-mcp", "label": "1"}],
+                "missing_services": [],
+            }]}
+
+        monkeypatch.setattr(users_router.provision_service, "get_user", fake_get_user)
+
+        result = asyncio.run(users_router.get_next_label("bob", "example-mcp", {"id": 1}))
+        assert result["label"] == "2", result
+
+    def test_next_label_zero_when_service_has_no_instances(self, monkeypatch):
+        """A service the user has never deployed still starts at 0."""
+        import asyncio
+        from app.routers import users as users_router
+
+        async def fake_get_user(user_name):
+            return {"user_status": [{
+                "user_name": user_name,
+                "healthy_services": [{"service_name": "other", "label": "3"}],
+                "unhealthy_services": [], "missing_services": [],
+            }]}
+
+        monkeypatch.setattr(users_router.provision_service, "get_user", fake_get_user)
+        result = asyncio.run(users_router.get_next_label("bob", "example-mcp", {"id": 1}))
+        assert result["label"] == "0", result
+
     def test_per_user_file_endpoints_are_coroutine(self):
         """The new per-user-file GET/PUT are async handlers."""
         from app.routers.users import get_per_user_file, save_per_user_file
@@ -1091,14 +1133,42 @@ class TestPerUserFileEndpoints:
             f"per-user-file routes missing from users router. Routes: {routes}"
         )
 
+    def test_frontend_never_fabricates_the_env_file_path(self):
+        """The Deployment Files card must show the -api's RECORDED env path.
+
+        `.env.raw.{user}.{label}` (UsersPage's retired fallback) is the gateway's
+        generation INTERMEDIATE: the -api copies it to the canonical
+        `.env.{n}.{user}.{label}` and records THAT path in the registry
+        (provisioner `entry["env_files"] = _env_files_used`). The raw name is
+        recorded nowhere and, for a compose with no `${VAR}` surface, was never
+        generated either — so the card printed a path that had never existed and
+        clicking it opened an empty editor with a "file does not exist" alert
+        (live: bob/example-mcp/0). A deployment with no recorded env has none;
+        the card must say so instead of guessing.
+        """
+        users_page = (_DASH / "src" / "pages" / "UsersPage.tsx").read_text()
+        assert ".env.raw.${" not in users_page, (
+            "UsersPage fabricates the gateway's generation-intermediate env name "
+            "(.env.raw.{user}.{label}); use baseName(svc.env_file_path) from the registry"
+        )
+        # The link is conditional on the registry value — an absent env file must
+        # render as text, not as a link into an empty editor.
+        assert "baseName(svc.env_file_path)" in users_page
+        assert "records no per-user env file" in users_page
+
     def test_frontend_no_longer_calls_retired_deployment_files(self):
-        """UsersPage/FileEditor must use the per-user-file endpoints keyed by
-        (recipe_path, filename), never the retired /deployment-files ones."""
+        """UsersPage must use the per-user-file endpoints keyed by
+        (recipe_path, filename), never the retired /deployment-files ones.
+
+        The FileEditor leg was RETIRED 2026-09-26 with the file itself: the
+        component was imported nowhere (UsersPage edits files through its own
+        Monaco pane), so its half of this guard had nothing left to guard. The
+        substance — the live page's calls — is unchanged.
+        """
         _dash = _DASH
         users_page = (_dash / "src" / "pages" / "UsersPage.tsx").read_text()
-        file_editor = (_dash / "src" / "components" / "services" / "FileEditor.tsx").read_text()
         users_api = (_dash / "src" / "api" / "users.ts").read_text()
-        for name, content in [("UsersPage.tsx", users_page), ("FileEditor.tsx", file_editor), ("api/users.ts", users_api)]:
+        for name, content in [("UsersPage.tsx", users_page), ("api/users.ts", users_api)]:
             assert "deployment-files" not in content, f"{name} still calls retired /deployment-files endpoints"
         # The dirty-check probes the per-user files INSIDE the instance's recipe
         # dir (the recipe subdir comes from the -api; a hardcoded '' resolved to
@@ -1107,7 +1177,9 @@ class TestPerUserFileEndpoints:
         assert "recipe_path: recipePath" in users_page
         assert "recipe_path: editorFile.recipePath" in users_page
         assert "recipe_path: ''" not in users_page
-        assert "per-user-file" in file_editor
+        # These two wrappers still exist (they are kept pending the user's word —
+        # nothing imports them since FileEditor went), so the guard on them stays
+        # until they go, rather than being silently loosened now.
         assert "getPerUserFile" in users_api and "savePerUserFile" in users_api
 
 
@@ -3755,6 +3827,10 @@ class TestG2OneDefaultPerUser:
         Base.metadata.create_all(bind=eng)
         Session = sessionmaker(bind=eng)
         db = Session()
+        # The target must exist: identity is resolved in an explicit id space now.
+        from app.models.end_user import EndUser
+        db.add(EndUser(id=1, username="u1", password_hash="x"))
+        db.commit()
         k1, _ = auth_service.create_api_key(db, 1, "a", is_default=True)
         k2, _ = auth_service.create_api_key(db, 1, "b", is_default=True)
         count = db.query(ApiKey).filter(
@@ -3775,6 +3851,10 @@ class TestG2OneDefaultPerUser:
         Base.metadata.create_all(bind=eng)
         Session = sessionmaker(bind=eng)
         db = Session()
+        # The target must exist: identity is resolved in an explicit id space now.
+        from app.models.end_user import EndUser
+        db.add(EndUser(id=1, username="u1", password_hash="x"))
+        db.commit()
         auth_service.create_api_key(db, 1, "a", is_default=True)
         auth_service.create_api_key(db, 1, "b")
         deleted = auth_service.delete_api_keys_for_user(db, 1)
@@ -3794,6 +3874,10 @@ class TestG2OneDefaultPerUser:
         Base.metadata.create_all(bind=eng)
         Session = sessionmaker(bind=eng)
         db = Session()
+        # The target must exist: identity is resolved in an explicit id space now.
+        from app.models.end_user import EndUser
+        db.add(EndUser(id=5, username="u5", password_hash="x"))
+        db.commit()
         auth_service.create_api_key(db, 5, "Default", is_default=True)
         auth_service.delete_api_keys_for_user(db, 5)
         # new user reuses id 5 (SQLite autoincrement reuse after delete)
@@ -3802,6 +3886,143 @@ class TestG2OneDefaultPerUser:
             ApiKey.user_id == 5, ApiKey.is_default.is_(True)
         ).count()
         assert count == 1
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Prefixed key targets — `end_user:<id>` / `admin:<id>` (the id collision)
+# ---------------------------------------------------------------------------
+
+
+class TestPrefixedKeyTargets:
+    """An API key's target is a PREFIXED reference.
+
+    ``admins`` and ``end_users`` are separate id spaces, so a bare id names two
+    different people. Before the prefix, ``_target_identity`` preferred EndUser,
+    so an admin's blank mint ("leave blank for your own keys") produced a key
+    belonging to whichever end user held the admin's numeric id — observed live
+    2026-09-29 as ``api_keys.id 91, label round-t31-admin, user_id 1`` carrying
+    the claims ``sub 1 / alice / end_user``.
+    """
+
+    def _db(self, tmp_path):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.database import Base
+        from app.models.admin import AdminUser
+        from app.models.api_key import ApiKey  # noqa: F401
+        from app.models.end_user import EndUser
+        eng = create_engine(f"sqlite:///{tmp_path/'p.db'}")
+        Base.metadata.create_all(bind=eng)
+        db = sessionmaker(bind=eng)()
+        # The collision, by construction: id 1 in BOTH tables.
+        db.add(EndUser(id=1, username="alice", password_hash="x", role="viewer"))
+        db.add(AdminUser(id=1, email="admin@subnet-acl.local", password_hash="x",
+                         role="admin"))
+        db.commit()
+        return db
+
+    def test_bare_id_means_end_user(self):
+        """The pre-prefix syntax keeps working for every existing caller/client."""
+        from app.services.auth_service import parse_target_ref
+        assert parse_target_ref(7) == (7, "end_user")
+        assert parse_target_ref("7") == (7, "end_user")
+
+    def test_prefixed_refs_parse(self):
+        from app.services.auth_service import parse_target_ref
+        assert parse_target_ref("end_user:7") == (7, "end_user")
+        assert parse_target_ref("admin:1") == (1, "admin")
+        assert parse_target_ref("ADMIN:1") == (1, "admin")
+        assert parse_target_ref(" admin : 1 ") == (1, "admin")
+
+    def test_bad_refs_are_rejected(self):
+        import pytest
+        from app.services.auth_service import parse_target_ref
+        for bad in ("", "   ", "service:1", "admin:", "admin:x", "1.5", True):
+            with pytest.raises(ValueError):
+                parse_target_ref(bad)
+
+    def test_identity_resolves_the_requested_space(self, tmp_path):
+        db = self._db(tmp_path)
+        from app.services.auth_service import _target_identity
+        assert _target_identity(db, 1, "admin") == (
+            "admin", "admin@subnet-acl.local", "admin")
+        assert _target_identity(db, 1, "end_user") == ("end_user", "alice", "viewer")
+        db.close()
+
+    def test_unknown_target_raises(self, tmp_path):
+        import pytest
+        db = self._db(tmp_path)
+        from app.services.auth_service import _target_identity
+        with pytest.raises(ValueError):
+            _target_identity(db, 99, "end_user")
+        with pytest.raises(ValueError):
+            _target_identity(db, 99, "admin")
+        db.close()
+
+    def test_admin_key_for_a_colliding_id_is_an_admin_key(self, tmp_path):
+        """THE regression: id 1 is both an end user and the admin."""
+        db = self._db(tmp_path)
+        from app.services import auth_service
+        key, raw = auth_service.create_api_key(db, 1, "mine", target_type="admin")
+        assert key.target_type == "admin"
+        assert key.user_id == 1
+        payload = auth_service.decode_gateway_token(raw)
+        assert payload["user_type"] == "admin"
+        assert payload["email"] == "admin@subnet-acl.local"
+        assert payload["role"] == "admin"
+        db.close()
+
+    def test_each_id_space_keeps_its_own_default(self, tmp_path):
+        """The (user_id, target_type) index: one default per TARGET, not per id."""
+        db = self._db(tmp_path)
+        from app.services import auth_service
+        from app.models.api_key import ApiKey
+        auth_service.create_api_key(db, 1, "alice-default", is_default=True)
+        auth_service.create_api_key(db, 1, "admin-default", is_default=True,
+                                    target_type="admin")
+        defaults = (db.query(ApiKey)
+                    .filter(ApiKey.user_id == 1, ApiKey.is_default.is_(True)).all())
+        assert {k.target_type for k in defaults} == {"end_user", "admin"}
+        db.close()
+
+    def test_listing_is_scoped_to_the_id_space(self, tmp_path):
+        """An id-only filter would show one id space's keys to the other."""
+        db = self._db(tmp_path)
+        from app.services import auth_service
+        auth_service.create_api_key(db, 1, "alice-key")
+        auth_service.create_api_key(db, 1, "admin-key", target_type="admin")
+        assert [k.label for k in auth_service.list_api_keys(db, 1, "end_user")] == ["alice-key"]
+        assert [k.label for k in auth_service.list_api_keys(db, 1, "admin")] == ["admin-key"]
+        assert len(auth_service.list_api_keys(db)) == 2
+        db.close()
+
+    def test_promoting_the_admin_key_leaves_the_end_user_default(self, tmp_path):
+        db = self._db(tmp_path)
+        from app.services import auth_service
+        from app.models.api_key import ApiKey
+        alice_default, _ = auth_service.create_api_key(db, 1, "alice-default",
+                                                       is_default=True)
+        auth_service.create_api_key(db, 1, "admin-1", target_type="admin")
+        admin_second, _ = auth_service.create_api_key(db, 1, "admin-2",
+                                                      target_type="admin")
+        auth_service.set_default_api_key(db, admin_second.id)
+        db.refresh(alice_default)
+        assert alice_default.is_default is True
+        assert {k.label for k in db.query(ApiKey).filter(ApiKey.is_default.is_(True)).all()} == {
+            "alice-default", "admin-2"
+        }
+        db.close()
+
+    def test_deleting_an_end_user_leaves_the_admin_keys(self, tmp_path):
+        """Deleting end user 1 must not take admin 1's keys with it."""
+        db = self._db(tmp_path)
+        from app.services import auth_service
+        from app.models.api_key import ApiKey
+        auth_service.create_api_key(db, 1, "alice-key")
+        auth_service.create_api_key(db, 1, "admin-key", target_type="admin")
+        assert auth_service.delete_api_keys_for_user(db, 1, "end_user") == 1
+        assert [k.label for k in db.query(ApiKey).all()] == ["admin-key"]
         db.close()
 
 
@@ -3999,11 +4220,17 @@ class TestGenerationJobs:
         # DB (a synchronize_session=False DELETE makes expired reads raise).
         return sessionmaker(bind=eng, expire_on_commit=False)
 
-    def test_phase_order_is_compose_nginx_env(self):
-        """generate_missing = compose → nginx → env (dependency order)."""
+    def test_phase_order_is_compose_validate_nginx_env(self):
+        """generate_missing = compose → validate → nginx → env.
+
+        `validate` is §3b's compose-conflict check: it must run AFTER the
+        compose exists and BEFORE anything is built on it.
+        """
         from app.services.generation_jobs import GenerationJobManager
         m = GenerationJobManager()
-        assert m._compute_phases("generate_missing", {}) == ["compose", "nginx", "env"]
+        phases = m._compute_phases("generate_missing", {})
+        assert phases == ["compose", "validate", "nginx", "env"]
+        assert phases.index("validate") == phases.index("compose") + 1
 
     def test_compute_phases_single_category(self):
         """Single-category jobs map to exactly one phase."""
@@ -4013,6 +4240,65 @@ class TestGenerationJobs:
         assert m._compute_phases("category", {"category": "nginx_conf"}) == ["nginx"]
         assert m._compute_phases("category", {"category": "env_file"}) == ["env"]
         assert m._compute_phases("category", {"category": "compose"}) == ["compose"]
+
+    def test_unselected_slot_is_generated_on_a_deploy_scoped_run(self, tmp_path, monkeypatch):
+        """G13/G20 — `generate new` means NOT SELECTED, and the SELECTION SET
+        decides the work, not the disk.
+
+        A deploy must hand the -api ALL THREE paths: a refused deployment
+        always carries all three, because any slot left at `generate new` had a
+        file generated and sent for it. So an unselected nginx is generated even
+        when an `nginx.conf` already sits in the recipe.
+
+        Found live on `bob|probe-interp||3`: its refused options carried compose
+        + env and NO nginx, because the nginx phase was skipped on disk
+        presence, `selection.nginx` stayed null, and the payload dropped the
+        key entirely.
+        """
+        from pathlib import Path
+        from app.config import settings
+        from app.services.generation_jobs import GenerationJobManager
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", Path(tmp_path))
+        recipe = tmp_path / "svc"
+        recipe.mkdir()
+        # BOTH files exist on disk — the disk scan finds nothing "missing".
+        (recipe / "docker-compose.yml").write_text("services: {}\n")
+        (recipe / "nginx.conf").write_text("server {}\n")
+
+        req = {
+            "service_name": "svc",
+            "user_name": "bob",
+            "label": "3",
+            "selection": {"compose": ["docker-compose.yml"], "nginx": None, "env": []},
+        }
+        phases = GenerationJobManager._compute_phases("generate_missing", req)
+        assert "nginx" in phases, (
+            "an unselected nginx must be generated on a deploy-scoped run — "
+            "otherwise the -api is sent a deployment with no nginx at all"
+        )
+
+        # A SELECTED nginx is reused, not regenerated, when it is on disk.
+        req["selection"]["nginx"] = "nginx.conf"
+        assert "nginx" not in GenerationJobManager._compute_phases("generate_missing", req)
+
+    def test_standalone_generate_keeps_the_disk_reading(self, tmp_path, monkeypatch):
+        """The Source Projects panel sends no `user_name`; for it, "missing" is
+        exactly what its action means, so an unselected slot that EXISTS on disk
+        is not regenerated."""
+        from pathlib import Path
+        from app.config import settings
+        from app.services.generation_jobs import GenerationJobManager
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", Path(tmp_path))
+        recipe = tmp_path / "svc"
+        recipe.mkdir()
+        (recipe / "docker-compose.yml").write_text("services: {}\n")
+        (recipe / "nginx.conf").write_text("server {}\n")
+
+        req = {"service_name": "svc", "skip_env": True,
+               "selection": {"compose": [], "nginx": None, "env": []}}
+        assert GenerationJobManager._compute_phases("generate_missing", req) == []
 
     def test_compute_phases_unknown_raises(self):
         """Unknown categories must raise GenerationJobError (router → 400)."""
@@ -4042,7 +4328,7 @@ class TestGenerationJobs:
         assert job.id is not None
         assert job.status == "queued"
         assert job.phase == "compose"
-        assert job.phase_total == 3
+        assert job.phase_total == 4  # compose → validate → nginx → env (§3b)
         assert job.progress == "queued"
         m._run_job.assert_awaited_once()
 
@@ -4096,6 +4382,46 @@ class TestGenerationJobs:
         again = m.cancel_job(db, done.id)
         assert again.status == JOB_STATUS_COMPLETED
         assert m.cancel_job(db, 99999) is None
+
+    def test_cancel_job_covers_a_paused_leg(self, tmp_path):
+        """A `paused` job IS cancellable (GRILLING G27 + G34).
+
+        G27 made a pause a TERMINAL LEG: the job has STOPPED but still EXISTS.
+        The guard used to list only queued/running/awaiting_input, so a DELETE on
+        a paused job changed nothing and still answered 200 with
+        `status: "paused"` — the card's Delete could not end the leg, and the
+        record could never become sweep-eligible.
+
+        The paused leg has NO runner, so it must also stay out of `_cancelled`:
+        nothing would ever clear that id (only a terminal status write does), and
+        a stale id there cancels a later job that reused the number.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock
+        from app.services.generation_jobs import (
+            GenerationJobManager, JOB_STATUS_CANCELLED, JOB_STATUS_PAUSED,
+        )
+
+        async def scenario():
+            Session = self._make_session(tmp_path)
+            db = Session()
+            m = GenerationJobManager()
+            m._run_job = AsyncMock()
+            parked = m.create_job(db, "a", "", "env_file", {"category": "env_file", "prompt": "x"})
+            parked.status = JOB_STATUS_PAUSED
+            db.commit()
+            return parked, m, db
+
+        parked, m, db = asyncio.run(scenario())
+        assert JOB_STATUS_PAUSED in m.CANCELLABLE_STATUSES
+        out = m.cancel_job(db, parked.id)
+        assert out.status == JOB_STATUS_CANCELLED
+        assert out.updated_at is not None
+        # Its LAST word — no runner follows to write another.
+        assert out.progress == "cancelled"
+        assert parked.id not in m._cancelled, "a paused leg has no runner to discard"
+        # And it is now sweep-eligible (the point of the cancel).
+        assert JOB_STATUS_CANCELLED in m._TERMINAL
 
     def test_prune_finished_ttl(self, tmp_path):
         """Finished jobs older than the TTL are pruned; recent ones stay."""
@@ -4162,6 +4488,114 @@ class TestGenerationJobs:
         assert m.get_job(db2, did).status == JOB_STATUS_COMPLETED
         assert m._tasks == {} and m._cancelled == set()
 
+    # ── external credentials: never minted, pause + resume (task doc §1/§2) ──
+
+    def test_apply_env_kvs_external_is_operator_supplied(self):
+        """`external` is never minted and never taken from the model's value.
+
+        A random string for an externally-issued credential looks configured and
+        fails at first use — worse than an empty one — and a placeholder the model
+        invented (`sk-...`) is exactly the same trap.
+        """
+        from app.services.generation_jobs import _apply_env_kvs
+
+        kvs = {
+            "OPENAI_API_KEY": {"env_type": "external", "value": None},
+            "DB_PASSWORD": {"env_type": "secret", "value": None},
+        }
+        supplied = _apply_env_kvs("BASE=1", kvs, external_values={"OPENAI_API_KEY": "sk-real"})
+        assert "OPENAI_API_KEY=sk-real" in supplied
+        assert "DB_PASSWORD=\n" not in supplied + "\n"  # the secret IS minted
+
+        # No operator value → EMPTY, and identically so on a second run. The
+        # check is on the external entry alone: a sibling `secret` in the same
+        # map is minted randomly by design and would differ between runs.
+        only_external = {"OPENAI_API_KEY": {"env_type": "external", "value": None}}
+        unsupplied = _apply_env_kvs("BASE=1", only_external)
+        assert unsupplied == "BASE=1\nOPENAI_API_KEY=\n", unsupplied
+        assert _apply_env_kvs("BASE=1", only_external) == unsupplied  # no mint
+
+        # A value the MODEL put on an external entry is discarded outright.
+        invented = _apply_env_kvs("", {"K": {"env_type": "external", "value": "sk-invented"}})
+        assert "sk-invented" not in invented
+
+    def test_mechanical_env_precedence_empty_is_not_set(self, tmp_path, monkeypatch):
+        """An EMPTY in-file value counts as not set; a non-empty one is respected (G16 / §2b).
+
+        The guard used to be presence, so `NEO4J_PORT=` stayed empty while compose would have
+        substituted its own default at every `${NEO4J_PORT:-…}` site — the env file then disagreed
+        with the value the instance actually ran on.
+        """
+        from app.config import settings
+        from app.services.generation_jobs import GenerationJobManager
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", Path(tmp_path))
+        recipe = tmp_path / "myapp"
+        recipe.mkdir()
+        (recipe / "docker-compose.yml").write_text(
+            "services:\n"
+            "  app:\n"
+            "    image: x\n"
+            "    environment:\n"
+            "      - EMPTY_ONE=${EMPTY_ONE:-from-compose}\n"
+            "      - SET_ONE=${SET_ONE:-from-compose}\n"
+            "      - NO_DEFAULT=${NO_DEFAULT}\n"
+        )
+        # The base env file: one empty, one explicitly set.
+        (recipe / ".env.example").write_text("EMPTY_ONE=\nSET_ONE=explicit\nNO_DEFAULT=\n")
+
+        m = GenerationJobManager()
+        out = m._mechanical_env(
+            "myapp", "",
+            {"selection": {"compose": ["docker-compose.yml"], "env": [".env.example"]}},
+        )
+        assert out is not None
+        vals = dict(l.split("=", 1) for l in out.strip().splitlines())
+        assert vals["EMPTY_ONE"] == "from-compose"      # empty ⇒ not set ⇒ compose default
+        assert vals["SET_ONE"] == "explicit"            # non-empty ⇒ respected
+        assert vals["NO_DEFAULT"] == ""                 # no default to write
+
+    def test_unfilled_external_keeps_the_base_value(self):
+        """A bypassed pause must not blank a value the base files already carry.
+
+        The pause makes this unreachable through the UI (Submit stays disabled until every
+        required field is filled), but an API-only caller can reach the write without one —
+        and blanking an existing value would silently break the instance.
+        """
+        from app.services.generation_jobs import _apply_env_kvs, _unfilled_externals
+
+        kvs = {"OPENAI_API_KEY": {"env_type": "external", "value": None}}
+        mech = "OPENAI_API_KEY=from-the-base-file\n"
+        assert _apply_env_kvs(mech, kvs) == "OPENAI_API_KEY=from-the-base-file\n"
+        assert _unfilled_externals(kvs, None) == ["OPENAI_API_KEY"]
+        # Supplied values still win, and then nothing is reported as unfilled.
+        assert _apply_env_kvs(mech, kvs, external_values={"OPENAI_API_KEY": "sk-real"}) == \
+            "OPENAI_API_KEY=sk-real\n"
+        assert _unfilled_externals(kvs, {"OPENAI_API_KEY": "sk-real"}) == []
+
+    def test_awaiting_input_survives_restart_recovery(self, tmp_path):
+        """A paused job is NOT 'interrupted': it is durable by design."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from app.services.generation_jobs import (
+            GenerationJobManager, JOB_STATUS_AWAITING_INPUT,
+        )
+
+        async def scenario():
+            maker = self._make_session(tmp_path)
+            db = maker()
+            m = GenerationJobManager()
+            m._run_job = AsyncMock()
+            paused = m.create_job(db, "a", "", "env_file", {"category": "env_file"})
+            paused.status = JOB_STATUS_AWAITING_INPUT
+            paused.pending_input = '{"vars": ["OPENAI_API_KEY"]}'
+            db.commit()
+            recovered = m.recover_stale_jobs(db)
+            return recovered, paused.id, maker, m
+
+        recovered, jid, maker, m = asyncio.run(scenario())
+        assert recovered == 0
+        assert m.get_job(maker(), jid).status == JOB_STATUS_AWAITING_INPUT
 
 # ---------------------------------------------------------------------------
 # Tests for GAP-21 — LLM agent tool loop (closed allowlist, rounds cap,
@@ -4448,9 +4882,12 @@ class TestFileSetSelection:
         assert "ArrowUpOutlined" in src and "ArrowDownOutlined" in src
         assert "merge order" in src
 
-    def test_nginx_single_select_optional(self):
+    def test_nginx_is_not_optional(self):
+        """nginx's absence is as fatal as a missing compose (§1) — the picker
+        must not call it optional; an unset slot means `generate new`."""
         src = self._src()
-        assert "No nginx selected (optional)" in src
+        assert "No nginx selected (optional)" not in src
+        assert "generate new" in src
         assert "allowClear" in src
 
     def test_env_disabled_without_needs_env(self):
@@ -4989,3 +5426,2668 @@ class TestGeneratedComposeFeedsOtherPhases:
             "services:\n  rendered:\n    image: z\n")
         ctx = self._ctx(tmp_path, monkeypatch, "nginx", {"selection": {}})
         assert ctx["compose_service_names"] == ["n8n"], ctx["compose_service_names"]
+
+
+class TestFailedBucketPassthrough:
+    """The gateway must forward the -api's `failed_services` bucket unchanged.
+
+    The dashboard's failed card reads the failed bucket from the same per-user
+    object it already consumes, so the gateway must not reshape or drop it
+    (failed-instance-state-todo.md §3 / §7).
+    """
+
+    def test_list_users_forwards_the_failed_bucket(self, monkeypatch):
+        import asyncio
+        from app.routers import users as users_router
+
+        failed_entry = {
+            "service_name": "graphiti", "label": "0", "status": "failed",
+            "failure": {"stage": "build", "message": "GRAPHITI_VERSION: parameter not set",
+                        "at": "2026-09-19T00:00:00+00:00"},
+            "container_names": [], "healthy_containers": {},
+            "unhealthy_containers": {}, "missing_containers": {},
+            "env_file_path": "/srv/x/.env.1.u.0",
+        }
+
+        async def fake_list_users():
+            return {"user_status": [{
+                "user_name": "u",
+                "summary": {"expected_services_#": 1, "healthy_services_#": 0,
+                            "unhealthy_services_#": 0, "failed_services_#": 1},
+                "healthy_services": [], "unhealthy_services": [], "missing_services": [],
+                "failed_services": [failed_entry],
+            }]}
+
+        monkeypatch.setattr(users_router.provision_service, "list_users", fake_list_users)
+        # The handler syncs end-users into the gateway DB; stub the session so
+        # the test exercises only the passthrough.
+        import app.database as db_mod
+
+        class _Q:
+            def all(self):
+                return []
+        class _DB:
+            def query(self, *a, **k):
+                return _Q()
+            def add(self, *a, **k):
+                pass
+            def commit(self):
+                pass
+            def close(self):
+                pass
+        monkeypatch.setattr(db_mod, "SessionLocal", lambda: _DB())
+
+        result = asyncio.run(
+            users_router.list_users(request=None, current_user={"role": "admin", "id": 1})
+        )
+        user = result["users"][0]
+        assert user["failed_services"] == [failed_entry], (
+            "the failed bucket (and its reason payload) must survive the gateway untouched"
+        )
+
+    def test_capacity_refusal_is_not_folded_into_502(self):
+        """A 503 at_capacity from the -api must keep its own status (§4d)."""
+        import httpx
+        from app.services.provision_service import provision_service
+
+        req = httpx.Request("POST", "http://x/users")
+        resp = httpx.Response(
+            503, request=req,
+            json={"detail": "at capacity: 4 task(s) running (limit 4); cancel a task",
+                  "error": "at_capacity", "running": 4, "capacity": 4},
+        )
+        exc = httpx.HTTPStatusError("boom", request=req, response=resp)
+        mapped = provision_service.as_http_error(exc)
+        assert mapped.status_code == 503
+        assert mapped.detail["error"] == "at_capacity"
+        assert mapped.detail["running"] == 4
+
+    def test_other_provision_errors_stay_502(self):
+        import httpx
+        from app.services.provision_service import provision_service
+
+        req = httpx.Request("POST", "http://x/users")
+        resp = httpx.Response(409, request=req, json={"detail": "already registered"})
+        exc = httpx.HTTPStatusError("boom", request=req, response=resp)
+        mapped = provision_service.as_http_error(exc)
+        assert mapped.status_code == 502
+
+
+class TestFailedCardSourceGuards:
+    """Source-level guards for the failed card (mirrors the UsersPage guards).
+
+    The card's own state must come from the registry (via the failed bucket) —
+    the task store stays a drill-down. The Cancel action on a *building* card is
+    the one place a task lookup is legitimate, and it is a lookup to cancel.
+    """
+
+    def _users_page(self) -> str:
+        return (_DASH / "src" / "pages" / "UsersPage.tsx").read_text()
+
+    def test_failed_bucket_is_consumed(self):
+        src = self._users_page()
+        assert "failed_services" in src, "the dashboard must consume the -api's failed bucket"
+
+    def test_failed_card_renders_reason_and_both_actions(self):
+        src = self._users_page()
+        assert "Deployment failed" in src
+        assert "svc.failure?.message" in src
+        assert "svc.failure?.stage" in src
+        assert "Retry</Button>" in src
+        assert "Delete</Button>" in src
+
+    def test_failed_status_is_its_own_badge(self):
+        src = self._users_page()
+        assert "s.status === 'failed'" in src
+
+    def test_building_card_is_cancellable(self):
+        src = self._users_page()
+        assert "cancelBuilding" in src
+        assert "svc.status === 'building'" in src
+        # Cancel goes through the existing task-cancel endpoint — no new machinery.
+        assert "tasks/${task.task_id}" in src
+
+    def test_failed_card_state_does_not_read_the_task_log(self):
+        """The failure reason is read off the instance, never fetched."""
+        src = self._users_page()
+        assert "svc.failure" in src
+        idx = src.find("Deployment failed")
+        window = src[max(0, idx - 2000): idx + 2000]
+        assert "/log" not in window, "the failed card must not read a task log for its state"
+
+    def test_capacity_refusal_is_a_persistent_alert(self):
+        """§4d: saturation is a persistent alert, not a transient toast."""
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert "at_capacity" in src
+        assert "atCapacity" in src
+        assert "Platform is at capacity" in src
+
+
+class TestLLMBasedFix:
+    """`LLM based fix` is the ANALYSIS step (GRILLING G26).
+
+    It reads the failed task's log plus the deployment context and returns a
+    FIXING GUIDE. It writes no files: the `.fix` variants come from the
+    restarted path that `check` triggers (G25), which is also the only route
+    past the operator's confirmation. This class used to assert the opposite —
+    that a fix job ran compose/validate/nginx/env and wrote the `.fix` files
+    itself — and those assertions had to change with the model.
+    """
+
+    def test_fix_filenames_follow_the_raw_pattern(self):
+        """`.fix` sits directly after the stem, is single-slotted (not numbered,
+        apart from the job's collision token — GRILLING G33)."""
+        from app.services.generation_jobs import FIX_FILENAME, PHASE_FILENAME
+        assert FIX_FILENAME["compose"] == "docker-compose.fix.{token}.yml"
+        assert FIX_FILENAME["nginx"] == "nginx.fix.{token}.conf"
+        assert FIX_FILENAME["env"] == ".env.fix"
+        # ...and never collide with the originals they correct.
+        for phase, name in FIX_FILENAME.items():
+            assert name.format(token=7) != PHASE_FILENAME[phase].format(token=7)
+            assert "fix1" not in name and "fix2" not in name
+
+    def test_fix_job_is_analysis_only(self):
+        """The fix job runs ONE phase and it produces no files (G26).
+
+        A fix that wrote files would write them outside the operator's
+        confirmation, and `check`'s restart would then write them a second time.
+        """
+        from app.services.generation_jobs import generation_jobs as gj
+        phases = gj._compute_phases("fix", {"fix": True})
+        assert phases == ["analyze"]
+        # None of the file-producing phases may run here.
+        for file_phase in ("compose", "validate", "nginx", "env"):
+            assert file_phase not in phases
+
+    def test_fix_job_is_analysis_only_regardless_of_skip_env(self):
+        """`skip_env` cannot re-introduce a file phase — there are none."""
+        from app.services.generation_jobs import generation_jobs as gj
+        assert gj._compute_phases("fix", {"fix": True, "skip_env": True}) == ["analyze"]
+        assert gj._compute_phases("fix", {"fix": True, "skip_env": False}) == ["analyze"]
+
+    def test_fix_candidates_are_offered_by_the_existing_scans(self):
+        """No predicate change was needed — verify that claim directly."""
+        from app.services.file_sets import (
+            _is_compose_candidate, _is_nginx_candidate, _is_env_candidate,
+        )
+        from app.services.generation_jobs import FIX_FILENAME
+        assert _is_compose_candidate(FIX_FILENAME["compose"])
+        assert _is_nginx_candidate(FIX_FILENAME["nginx"])
+        assert _is_env_candidate(FIX_FILENAME["env"])
+
+    def test_task_log_is_injected_whole_into_the_context(self):
+        """The log is fed entire — not truncated, not summarised (§1)."""
+        from app.services.generation_jobs import generation_jobs as gj
+        import inspect
+        src = inspect.getsource(gj._build_context)
+        assert "__failed_task_log__.txt" in src
+        assert "task_log" in src
+
+    def test_fix_endpoint_requires_a_failed_instance(self):
+        """Availability is decided by the -api; the gateway must respect it."""
+        import inspect
+        from app.routers import llm as llm_router
+        src = inspect.getsource(llm_router._enrich_fix_request)
+        assert 'entry.get("status") != "failed"' in src
+        assert "fix_available" in src
+        assert "task_log_gone" in src
+
+
+class TestConflictingDefaults:
+    """§3b detection: one name, two sites, two different defaults."""
+
+    def _compose(self, tmp_path, text):
+        p = tmp_path / "docker-compose.yml"
+        p.write_text(text)
+        return p
+
+    def test_detects_the_graphiti_case(self, tmp_path):
+        from app.utils.var_scan import conflicting_defaults
+        p = self._compose(tmp_path, (
+            "services:\n"
+            "  graph:\n"
+            "    environment:\n"
+            "      - NEO4J_URI=bolt://neo4j:${NEO4J_PORT:-7687}\n"
+            "  neo4j:\n"
+            "    healthcheck:\n"
+            "      test: wget -qO- http://localhost:${NEO4J_PORT:-7474} || exit 1\n"
+        ))
+        found = conflicting_defaults([p])
+        assert [c["name"] for c in found] == ["NEO4J_PORT"]
+        assert found[0]["defaults"] == ["7474", "7687"]
+        # Site-by-site, so the pause can show WHERE each default came from.
+        assert {s["default"] for s in found[0]["sites"]} == {"7474", "7687"}
+
+    def test_a_single_default_is_not_flagged(self, tmp_path):
+        from app.utils.var_scan import conflicting_defaults
+        p = self._compose(tmp_path, (
+            "services:\n  a:\n    environment:\n"
+            "      - X=${FOO:-1}\n      - Y=${FOO:-1}\n"
+        ))
+        assert conflicting_defaults([p]) == []
+
+    def test_a_no_default_site_is_not_a_conflict(self, tmp_path):
+        """`${V}` (required) beside `${V:-x}` is NOT two meanings — one default."""
+        from app.utils.var_scan import conflicting_defaults
+        p = self._compose(tmp_path, (
+            "services:\n  a:\n    environment:\n"
+            "      - A=${V}\n      - B=${V:-x}\n"
+        ))
+        assert conflicting_defaults([p]) == []
+
+    def test_scan_is_source_agnostic_across_files(self, tmp_path):
+        from app.utils.var_scan import conflicting_defaults
+        a = tmp_path / "docker-compose.yml"
+        b = tmp_path / "docker-compose.override.yml"
+        a.write_text("services:\n  a:\n    environment:\n      - X=${P:-1}\n")
+        b.write_text("services:\n  b:\n    environment:\n      - Y=${P:-2}\n")
+        found = conflicting_defaults([a, b])
+        assert [c["name"] for c in found] == ["P"]
+        assert {s["file"] for s in found[0]["sites"]} == {
+            "docker-compose.yml", "docker-compose.override.yml",
+        }
+
+    def test_missing_file_is_ignored(self, tmp_path):
+        from app.utils.var_scan import conflicting_defaults
+        assert conflicting_defaults([tmp_path / "nope.yml"]) == []
+
+
+class TestDeployPanelSemantics:
+    """§3/§4 naming and rotation rules for `generate new` vs fixing."""
+
+    def test_generate_new_writes_base_names(self):
+        """`generate new` must not impersonate a repo file (§3), and its name
+        carries the JOB's collision token (GRILLING G33).
+
+        The token is what makes a parallel generation for the same recipe — a
+        pair whose reservation keys differ only by user or label — unable to
+        address the same path. `env` has none on purpose: it is per-user
+        (`.env.raw.{user}.{label}`) and already collision-free.
+        """
+        from app.services.generation_jobs import PHASE_FILENAME, _phase_names
+        assert PHASE_FILENAME["compose"] == "docker-compose.base.{token}.yml"
+        assert PHASE_FILENAME["nginx"] == "nginx.base.{token}.conf"
+        assert PHASE_FILENAME["env"] == ".env"
+        assert _phase_names(337, fix=False) == {
+            "compose": "docker-compose.base.337.yml",
+            "nginx": "nginx.base.337.conf",
+            "env": ".env",
+        }
+        # The token goes BEFORE the extension, so the candidate predicates still
+        # match and the file stays selectable everywhere it was.
+        from app.services.file_sets import _is_compose_candidate, _is_nginx_candidate
+        assert _is_compose_candidate(_phase_names(337, fix=False)["compose"])
+        assert _is_nginx_candidate(_phase_names(337, fix=False)["nginx"])
+
+    def test_each_job_gets_its_own_names(self):
+        """Two jobs never address the same path (GRILLING G33).
+
+        The defect this closes: the artifacts are RECIPE-LEVEL and user-agnostic,
+        so two generations whose keys differ only by user or label wrote the same
+        two files — last writer wins, and one run validated a compose another had
+        just replaced.
+        """
+        from app.services.generation_jobs import _phase_names
+        a, b = _phase_names(101, fix=False), _phase_names(102, fix=False)
+        for phase in ("compose", "nginx"):
+            assert a[phase] != b[phase], f"{phase} collides between two jobs"
+
+    def test_the_collision_token_is_not_a_link_to_the_job(self):
+        """The token is a UNIQUENESS device, nothing else (user ruling).
+
+        No ownership, no lifecycle, no cleanup keyed on the job's existence: the
+        generated files belong to the RECIPE and outlive the job. The gateway's
+        only unlink on the job path is the job's own log.
+        """
+        import inspect
+        from app.services import generation_jobs as gjmod
+        src = inspect.getsource(gjmod)
+        # The one `unlink` in the module is the job log's (G30's contract: the
+        # log is disposed with its record) — never an artifact's.
+        assert src.count(".unlink()") == 1
+        assert "_phase_names" in src and "NEVER auto-deleted" in src
+
+    def test_base_and_fix_families_are_distinct(self):
+        """`.base` = generated new; `.fix` = a correction. Never the same file."""
+        from app.services.generation_jobs import FIX_FILENAME, PHASE_FILENAME
+        for phase in ("compose", "nginx"):
+            assert PHASE_FILENAME[phase] != FIX_FILENAME[phase]
+            assert ".base" in PHASE_FILENAME[phase]
+            assert ".fix" in FIX_FILENAME[phase]
+
+    def test_env_phase_never_returns_none(self):
+        """§4: the phase always produces the `.raw`, even when it is empty."""
+        import inspect
+        from app.services.generation_jobs import GenerationJobManager
+        src = inspect.getsource(GenerationJobManager._mechanical_env)
+        assert "return \"\"" in src
+        assert "return None" not in src
+
+
+class TestComposeValidationPause:
+    """§3b: the validate phase pauses on a conflicting-defaults compose."""
+
+    def test_validate_runs_between_compose_and_nginx(self):
+        """`validate` sits directly after `compose` on every path that generates
+        one. The `fix` job type is deliberately NOT in this list any more: it is
+        the analysis step and generates no compose to validate (G26)."""
+        from app.services.generation_jobs import GenerationJobManager
+        m = GenerationJobManager()
+        for job_type, req in (("generate_missing", {}), ("generate_missing", {"fix": True})):
+            phases = m._compute_phases(job_type, req)
+            assert "validate" in phases, (job_type, req)
+            assert phases.index("validate") == phases.index("compose") + 1, (job_type, req)
+
+    def test_pause_carries_guidance_and_a_compose_fix_kind(self):
+        """The prompt area is pre-filled from the scan, site by site (§3b)."""
+        import inspect
+        from app.services.generation_jobs import GenerationJobManager
+        src = inspect.getsource(GenerationJobManager._run_job)
+        assert '"kind": "compose_fix"' in src
+        assert '"guidance": _guidance' in src
+        # Derived from the scan, not from a name list.
+        assert "conflicting_defaults" in src
+        # The pause must come BEFORE the nginx phase can build on the compose.
+        assert "awaiting_input" in src
+
+class TestSelectedFileFork:
+    """§5b: editing a SELECTED file forks into its `.fix` variant."""
+
+    def test_fork_name_follows_the_fix_convention(self):
+        """The tag goes before the extension and is single-slotted."""
+        src = (_DASH / "src" / "components" / "services" / "FileSetSelection.tsx").read_text()
+        assert "export function fixVariantFor" in src
+        assert "fix1" not in src and "fix2" not in src
+        from app.services.generation_jobs import FIX_FILENAME
+        for name in FIX_FILENAME.values():
+            assert ".fix" in name
+
+    def test_save_forks_instead_of_overwriting_the_selection(self):
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert "editorFork" in src
+        assert "fixVariantFor(editorFileName)" in src
+        assert "the selection now uses it" in src
+
+    def test_picker_names_are_clickable(self):
+        fs = (_DASH / "src" / "components" / "services" / "FileSetSelection.tsx").read_text()
+        df = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert "onOpenFile" in fs
+        assert "openSelectedFile" in df
+
+
+class TestEnvReferencePicker:
+    """§5: the env REFERENCE is generation context, never a handoff."""
+
+    def test_gateway_uses_the_reference_only_when_env_is_generate_new(self):
+        import inspect
+        from app.services.generation_jobs import GenerationJobManager
+        src = inspect.getsource(GenerationJobManager._build_context)
+        assert "env_reference" in src
+        # sel_env (the handoff) wins when present.
+        assert "list(sel_env) or [" in src
+
+    def test_dashboard_renders_the_picker_only_for_generate_new(self):
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert "Env reference (generation context)" in src
+        assert "eff.env.length === 0" in src, "shown only when env is `generate new`"
+        assert "env_reference: envRefs" in src
+
+    def test_reference_is_not_part_of_the_handoff(self):
+        """It must not ride the deploy payload — only the generation request."""
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert "payload.env_reference" not in src
+
+
+class TestPreDeployRegistry:
+    """§8b: pre-deploy sessions live in the gateway, never the -api registry."""
+
+    def _store(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.services import pre_deploy_registry as pdr
+        return pdr
+
+    def test_add_get_remove_roundtrip(self, tmp_path, monkeypatch):
+        pdr = self._store(tmp_path, monkeypatch)
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="generating", job_id=7)
+        row = pdr.get_session("alice", "myapp", "", "0")
+        assert row["state"] == "generating" and row["job_id"] == 7
+        assert pdr.is_reserved("alice", "myapp", "", "0") is True
+        assert pdr.remove_session("alice", "myapp", "", "0") is True
+        assert pdr.get_session("alice", "myapp", "", "0") is None
+
+    def test_reason_is_carried_for_the_paused_state(self, tmp_path, monkeypatch):
+        """The three pause sub-cases resume on different surfaces (§8b)."""
+        pdr = self._store(tmp_path, monkeypatch)
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="paused", job_id=None, reason="review")
+        assert pdr.get_session("alice", "myapp", "", "0")["reason"] == "review"
+
+    def test_reconcile_drops_a_session_that_registered(self, tmp_path, monkeypatch):
+        pdr = self._store(tmp_path, monkeypatch)
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="generating", job_id=1)
+        rep = pdr.reconcile({"alice|myapp||0"}, live_job_ids={1})
+        assert rep["dropped_registered"] == ["alice|myapp||0"]
+        assert pdr.list_sessions() == []
+
+    def test_reconcile_keeps_a_live_session(self, tmp_path, monkeypatch):
+        pdr = self._store(tmp_path, monkeypatch)
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="generating", job_id=42)
+        rep = pdr.reconcile(set(), live_job_ids={42})
+        assert rep["remaining"] == 1
+        assert pdr.list_sessions()[0]["job_id"] == 42
+
+    def test_reconcile_drops_a_stale_session(self, tmp_path, monkeypatch):
+        """No live job and no registry entry ⇒ nothing is working on it.
+
+        `generating` is the state this rule is FOR: the session claims a job is
+        running, the job is gone, and the -api never registered anything, so the
+        card is a ghost. (It used to be asserted for `paused`, which pinned the
+        opposite of G26 — see the test below.)
+        """
+        pdr = self._store(tmp_path, monkeypatch)
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="generating", job_id=99)
+        rep = pdr.reconcile(set(), live_job_ids={1, 2})
+        assert rep["dropped_stale"] == ["alice|myapp||0"]
+        assert pdr.list_sessions() == []
+
+    def test_reconcile_keeps_a_paused_session_with_its_guide(self, tmp_path, monkeypatch):
+        """G26: a paused session is the ANALYSIS's whole product — it survives.
+
+        The handoff writes the session and THEN requests the full delete of the
+        -api entry, so a `paused` session has no registry entry by construction,
+        and its analysis job has already completed by the time it is written.
+        Both stale rules therefore match it, and it used to be dropped within one
+        90s pass — taking the fixing guide and the failed task's id with it, which
+        made `check` unreachable and left the failed instance with no way back.
+        """
+        pdr = self._store(tmp_path, monkeypatch)
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="paused", reason="llm_fix", job_id=99,
+                        guide="NEO4J_PORT is taken; move it", task_id="task-7",
+                        slot="compose")
+        rep = pdr.reconcile(set(), live_job_ids={1, 2})
+        assert rep["dropped_stale"] == [], "a pause is waiting, not stale"
+        assert rep["remaining"] == 1
+        row = pdr.get_session("alice", "myapp", "", "0")
+        # The three things the resume needs, all still there.
+        assert row["guide"] == "NEO4J_PORT is taken; move it"
+        assert row["task_id"] == "task-7"
+        assert row["slot"] == "compose"
+
+    def test_key_includes_the_recipe_path(self, tmp_path, monkeypatch):
+        """Two recipes of one service are two sessions, not one."""
+        pdr = self._store(tmp_path, monkeypatch)
+        pdr.add_session(user="alice", service="myapp", recipe_path="docker", label="0", state="generating")
+        pdr.add_session(user="alice", service="myapp", recipe_path="web", label="0", state="generating")
+        assert len(pdr.list_sessions()) == 2
+
+
+class TestPreDeployWiring:
+    """§8b wiring: session lifecycle, handoff order and the card actions."""
+
+    def test_session_opens_on_a_deploy_scoped_job(self):
+        import inspect
+        from app.routers import llm as llm_router
+        src = inspect.getsource(llm_router.create_generation_job)
+        assert "add_session" in src
+        # The standalone Generate panel has no user/label → no session. The
+        # predicate is `job_origin` (2026-09-28): ONE home for "who owns this
+        # job", shared with the `origin` the job's own payload carries, so the
+        # session a job opens and the surface that may act on it cannot drift.
+        assert "_session_scoped = job_origin(req, job_type) == JOB_ORIGIN_DEPLOY" in src
+
+    def test_reserved_combination_is_refused(self):
+        import inspect
+        from app.routers import llm as llm_router
+        src = inspect.getsource(llm_router.create_generation_job)
+        assert "is_reserved" in src and "combination_reserved" in src
+
+    def test_a_guided_restart_resumes_its_own_pause(self, tmp_path, monkeypatch):
+        """G26 row 5: `check` confirms the guide and restarts the path.
+
+        The paused session reserves the combination it has to generate FOR, so
+        the reservation must not refuse the resume — otherwise the operator opens
+        the panel from the paused card, confirms, and gets a 409 with no way
+        forward. The exemption is narrow: it needs BOTH a `paused` session and a
+        guided restart, so a competing generation is still refused.
+        """
+        import asyncio
+        from fastapi import HTTPException
+        from app.routers import llm as llm_router
+        from app.services import pre_deploy_registry as pdr
+
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(llm_router, "log_action", lambda *a, **k: None)
+
+        class _Job:
+            id, status = 77, "queued"
+
+        seen = {}
+        monkeypatch.setattr(llm_router.generation_jobs, "create_job",
+                            lambda db, s, r, jt, req: (seen.update(req=req), _Job())[1])
+
+        def _paused():
+            pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                            state="paused", reason="llm_fix", job_id=5,
+                            guide="move NEO4J_PORT", task_id="task-7", slot="compose")
+
+        base = {"service_name": "myapp", "recipe_path": "", "job_type": "generate_missing",
+                "user_name": "alice", "label": "0"}
+        admin = {"id": 1, "role": "admin"}
+
+        _paused()
+        out = asyncio.run(llm_router.create_generation_job(
+            {**base, "fix": True}, admin, None))
+        assert out["job_id"] == 77, "the guided restart must be allowed through"
+        assert seen["req"]["fix"] is True, "the fixing flag must reach the job"
+
+        # Same combination, but NOT a guided restart ⇒ the reservation stands.
+        _paused()
+        with pytest.raises(HTTPException) as ei:
+            asyncio.run(llm_router.create_generation_job({**base, "fix": False}, admin, None))
+        assert ei.value.status_code == 409
+        assert ei.value.detail["error"] == "combination_reserved"
+
+        # A LIVE generation is reserved even against a guided restart: the
+        # exemption is for resuming a WAITING session, not for clobbering a job.
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="generating", job_id=6)
+        with pytest.raises(HTTPException) as ei2:
+            asyncio.run(llm_router.create_generation_job({**base, "fix": True}, admin, None))
+        assert ei2.value.status_code == 409
+
+    def test_handoff_is_remove_then_add(self):
+        """The other order leaves two cards for the window between the writes."""
+        import inspect
+        from app.routers import users as users_router
+        src = inspect.getsource(users_router.deploy_user)
+        rm = src.index("remove_session")
+        call = src.index("register_user")
+        assert rm < call, "the session must be removed BEFORE the -api registers"
+
+    def test_delete_implicitly_cancels_a_live_job_first(self, monkeypatch, tmp_path):
+        """User ruling (2026-09-23): *"the delete implicitly forcing a cancel
+        first"*.
+
+        The record used to REFUSE with a 409 while its job was live, telling the
+        operator to cancel first — which made `delete` a dead end whenever no
+        cancel was on screen, and made one button's meaning depend on another's.
+        Deleting is the operator saying "stop this and forget it", so the two
+        are one action: cancel the job (never orphan it — the reason the guard
+        existed), then drop the record.
+
+        Behavioural: it drives the real endpoint against a real live job.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.database import Base
+        import app.database as database
+        from app.services import pre_deploy_registry as pdr
+        from app.services.generation_jobs import GenerationJob, generation_jobs
+        from app.routers import pre_deploy as pd
+
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        eng = create_engine(f"sqlite:///{tmp_path}/jobs.db")
+        Base.metadata.create_all(eng)
+        S = sessionmaker(bind=eng, expire_on_commit=False)
+        monkeypatch.setattr(database, "SessionLocal", S)
+
+        db = S()
+        job = GenerationJob(service_name="myapp", job_type="generate_missing",
+                            status="awaiting_input", request="{}", progress="parked")
+        db.add(job); db.commit()
+        jid = job.id
+        db.close()
+
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="paused", reason="compose_fix", job_id=jid)
+
+        res = asyncio.run(pd.delete_pre_deploy("alice", "myapp", "0", ""))
+
+        assert res["deleted"] is True
+        assert res["cancelled_job"] is True, "a live job must be cancelled, not orphaned"
+        assert generation_jobs.job_status(jid) == "cancelled"
+        assert pdr.list_sessions() == [], "the record is gone with the job"
+
+    def test_delete_cancels_a_paused_job_too(self, monkeypatch, tmp_path):
+        """The card's Delete ends a PAUSED leg as well (GRILLING G34).
+
+        The guard listed `queued|running|awaiting_input`, so a job paused under
+        G27 — the status every new pause is written with — was SKIPPED: the card
+        disappeared and its object stayed `paused` with nothing owning it. That
+        is the state this rule forbids, and how the five orphaned paused jobs
+        (gt-315/316/325/328/332) arose.
+        """
+        import asyncio
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.database import Base
+        import app.database as database
+        from app.services import pre_deploy_registry as pdr
+        from app.services.generation_jobs import GenerationJob, generation_jobs
+        from app.routers import pre_deploy as pd
+
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        eng = create_engine(f"sqlite:///{tmp_path}/jobs.db")
+        Base.metadata.create_all(eng)
+        S = sessionmaker(bind=eng, expire_on_commit=False)
+        monkeypatch.setattr(database, "SessionLocal", S)
+
+        db = S()
+        job = GenerationJob(service_name="myapp", job_type="generate_missing",
+                            status="paused", request="{}", progress="waiting for input")
+        db.add(job); db.commit()
+        jid = job.id
+        db.close()
+
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="paused", reason="input", job_id=jid)
+
+        res = asyncio.run(pd.delete_pre_deploy("alice", "myapp", "0", ""))
+
+        assert res["deleted"] is True
+        assert res["cancelled_job"] is True, "a paused job must be cancelled, not orphaned"
+        assert generation_jobs.job_status(jid) == "cancelled"
+        assert pdr.list_sessions() == []
+
+    def test_delete_is_a_plain_delete_when_nothing_is_live(self, monkeypatch, tmp_path):
+        """No live job ⇒ nothing to cancel; the record is simply dropped."""
+        import asyncio
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.database import Base
+        import app.database as database
+        from app.services import pre_deploy_registry as pdr
+        from app.services.generation_jobs import GenerationJob
+        from app.routers import pre_deploy as pd
+
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        eng = create_engine(f"sqlite:///{tmp_path}/jobs.db")
+        Base.metadata.create_all(eng)
+        S = sessionmaker(bind=eng, expire_on_commit=False)
+        monkeypatch.setattr(database, "SessionLocal", S)
+
+        db = S()
+        job = GenerationJob(service_name="myapp", job_type="generate_missing",
+                            status="completed", request="{}", progress="done")
+        db.add(job); db.commit()
+        jid = job.id
+        db.close()
+
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="paused", reason="llm_fix", job_id=jid, guide="g")
+
+        res = asyncio.run(pd.delete_pre_deploy("alice", "myapp", "0", ""))
+
+        assert res == {"deleted": True, "cancelled_job": False}
+        assert pdr.list_sessions() == []
+
+    def test_startup_reconciles_sessions(self):
+        from app import main as _m
+        import inspect
+        assert "reconcile" in inspect.getsource(_m.lifespan)
+
+    def test_recipe_path_is_part_of_the_session_key(self):
+        from app.routers.users import _pdr_recipe_path
+        assert _pdr_recipe_path({"project_root": "myapp/docker", "service_name": "myapp"}) == "docker"
+        assert _pdr_recipe_path({"project_root": "myapp", "service_name": "myapp"}) == ""
+
+
+class TestPreDeployCardSourceGuards:
+    """§8b/G24: the pre-deploy card IS the service card.
+
+    These are STRUCTURAL guards, not behavioural verification — the behaviour is
+    verified live by trace **T14** (browser: one widget, per-status buttons, an
+    honest cancel). What they protect is the shape that MADE the old card's
+    defects possible: a separate widget, and a `Cancel` that rendered for every
+    state and reported success with no job behind it.
+
+    The old `test_renders_both_documented_states` asserted the bespoke card's
+    badge strings ("pre-deploy generating…"). Those strings are gone because the
+    card is gone; asserting them again would have pinned the defect in place.
+    """
+
+    def _page(self) -> str:
+        return (_DASH / "src" / "pages" / "UsersPage.tsx").read_text()
+
+    def _session_actions(self) -> str:
+        src = self._page()
+        start = src.index("SESSION-ACTIONS-START")
+        end = src.index("SESSION-ACTIONS-END")
+        return src[start:end]
+
+    def test_reads_the_pre_deploy_endpoint_not_the_registry(self):
+        src = self._page()
+        assert "/pre-deploy" in src
+        assert "loadSessions" in src
+
+    def test_both_card_kinds_use_the_SAME_widget(self):
+        """G24 rule 1 — one widget, differing only by status.
+
+        The sessions map and the instances map both render `<ServiceCard>`; a
+        second bespoke card is exactly what produced the divergences.
+        """
+        src = self._page()
+        assert "components/users/ServiceCard" in src
+        assert src.count("<ServiceCard") >= 2
+        # The old bespoke `<Card size="small" ... borderColor: '#91caff'>` is gone.
+        assert "#91caff" not in src
+
+    def test_renders_all_three_session_states(self):
+        src = self._page()
+        assert "Generating…" in src
+        assert "Paused (" in src, "a paused session carries its reason"
+        assert "Refused (" in src, "a refused session carries its reason"
+
+    def test_has_check_cancel_and_delete(self):
+        src = self._page()
+        for action in (">Check</Button>", ">Cancel</Button>", ">Delete</Button>"):
+            assert action in src, action
+
+    def test_cancel_is_gated_on_a_live_job(self):
+        """G24 rule 4 — `cancel` belongs to a JOB, so it exists only while one
+        is live, and it must never claim success when there is none."""
+        actions = self._session_actions()
+        assert "isJobLive &&" in actions, "cancel must be gated on a live job"
+        assert "if (sess.job_id == null)" in actions, (
+            "the old handler reported success with no job at all"
+        )
+
+    def test_delete_is_always_offered_and_reports_the_cancel(self):
+        """User ruling (2026-09-23): delete implicitly cancels first, so it is
+        NOT hidden while a job is live (it used to be, which made it depend on a
+        second button), and it must say so when it had to cancel."""
+        actions = self._session_actions()
+        assert "!isJobLive &&" not in actions, (
+            "delete must not be gated on the job — it does the cancel itself"
+        )
+        assert "cancelled_job" in actions, (
+            "the message must distinguish a cancel-and-delete from a plain delete"
+        )
+
+    def test_no_instance_only_actions_on_a_session_card(self):
+        """G24 rule 3 — `Rebuild`, `pause/play`, `Redeploy`, `key` and `Dup` are
+        instance-only; a pre-deploy card must not inherit them."""
+        actions = self._session_actions()
+        for btn in (">Rebuild</Button>", "Redeploy</Button>", ">Dup</Button>", "KeyOutlined"):
+            assert btn not in actions, f"{btn} must not appear on a pre-deploy card"
+
+    def test_delete_sends_the_recipe_path(self):
+        """The key includes the recipe path, so the delete must pass it too."""
+        src = self._page()
+        assert "recipe_path: sess.recipe_path" in src
+
+    def test_a_generation_refusals_retry_is_not_gated_on_its_options(self):
+        """G29: the gateway refusal's own Retry, which was a dead control.
+
+        Two things had to be true and neither was. (1) The refusal's RECORD was
+        written with no options (see the gateway test above), so `!sess.options`
+        greyed the button out. (2) Even with options, a replay is wrong here: the
+        generation is what the pool refused, so nothing exists to replay — the
+        retry has to run the pipeline. The record may also predate the fix and
+        still carry no options, which is why the escape is by REASON.
+        """
+        actions = self._session_actions()
+        assert "sess.reason !== 'generation_at_capacity'" in actions, (
+            "a gateway refusal must be retryable even with no stored options")
+        assert "setRetryRegenerate(genRefusal)" in actions, (
+            "the panel must be told to regenerate for a gateway refusal")
+        form = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert "(!initialOptions || regenerate) && (" in form, (
+            "an options-carrying retry must still run the generation when it is a "
+            "gateway refusal")
+
+    def test_the_generation_payload_carries_the_url_and_the_password(self):
+        """The refusal record can only be as complete as the REQUEST it is built
+        from (user ruling 2026-09-26: *"for supporting retry, the password / url
+        should indeed be stored!"*).
+
+        The deploy path's generation request carried `domain`/`https` but **not**
+        the password, so a `generation_at_capacity` refusal — the only kind with a
+        card and a Retry — could never have pre-filled it, whatever the gateway
+        stored. Both of this form's generation payloads must therefore carry it:
+        the entry-point one (reads the live form) and the deploy-time one (reads
+        the snapshot, because `destroyOnClose` has already taken the form away).
+        """
+        form = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert "passwd: form.getFieldValue('passwd') || ''" in form, (
+            "the entry-point generation payload must carry the password")
+        assert "passwd: snap.passwd || ''" in form, (
+            "…and the deploy-time one, from the snapshot the closed panel left")
+        assert form.count("domain: form.getFieldValue('domain')") + \
+            form.count("domain: snap.domain") >= 2, "both payloads carry the URL"
+
+
+class TestServiceCardsAndTaskLifecycle:
+    """The 2026-09-26 service-card / task-lifecycle changes (task doc §1-§4b).
+
+    Structural guards, not behavioural verification: the behaviour is verified
+    live by traces T23-T30. What these protect is the SHAPE of each fix — the
+    separate session section, the block alerts, the exact-name generated-file
+    lookups and the `Answer` action are all things a later edit could quietly
+    reintroduce, and each of them was a user-visible defect.
+    """
+
+    def _page(self, rel: str) -> str:
+        return (_DASH / "src" / rel).read_text()
+
+    def test_sessions_render_inside_the_per_user_groups(self):
+        """§1: a session is NOT a category — it is a card of another status.
+
+        Its own heading and its own `<Collapse>` are gone; the ONE grouping
+        carries both kinds, so a user holding only sessions gets a group instead
+        of a second section beside an `Empty` instance list.
+        """
+        src = self._page("pages/UsersPage.tsx")
+        assert "Pre-deploy sessions" not in src, "the separate section is gone"
+        assert "expandedSessions" not in src, "…and so is its own expanded set"
+        # ONE grouping, carrying both kinds.
+        assert "sessByUser" in src and "svcsByUser" in src
+        assert "{userSessions.map((sess) => renderSessionCard(sess))}" in src
+
+    def test_the_card_header_alert_is_one_inline_line(self):
+        """§2-3: the note lives IN the header row, after the name, and is ONE
+        line — no block, no stacked pair, no height growth."""
+        card = self._page("components/users/ServiceCard.tsx")
+        assert "<Alert" not in card
+        # …inside the title Space of the rendered header, not on a line below it.
+        header = card[card.index("header={"):card.index("extra={")]
+        assert "{alert}" in header and header.index("{alert}") > header.index("<Space>")
+        assert "marginTop: 6" not in card, "the block below the title row is gone"
+        page = self._page("pages/UsersPage.tsx")
+        assert "whiteSpace: 'nowrap'" in page, "a wrapped note grows the header too"
+        assert page.count("<HeaderNote") >= 6, "both card kinds use the one-line note"
+        # The failed card's two conditions fold into ONE line: a deploy refused
+        # for `at_capacity` holds no task, so its log is gone by construction.
+        assert "atCapacity && logGone" in page
+
+    def test_tasks_page_polls_silently_and_has_no_answer(self):
+        """§4: the first load alone may show the spinner; `Answer` is gone."""
+        src = self._page("pages/TasksPage.tsx")
+        assert "firstLoadRef" in src, "re-polls must not touch the table spinner"
+        assert ">Answer</Button>" not in src
+        assert "openAnswer" not in src and "answerOpen" not in src
+        assert "useGenerationJob" not in src, "the answer modal's hook went with it"
+
+    def test_tasks_page_names_the_family_core(self):
+        """§7: DISPLAY ONLY — the tag and the subtitle read `core`; the record
+        ids keep their `api-…` prefix (GRILLING G28 stands untouched)."""
+        src = self._page("pages/TasksPage.tsx")
+        assert "'gateway' | 'core'" in src
+        assert "source: 'core' as const" in src
+        assert "'-api'" not in src, "the old family name must be gone from the display"
+        assert "<Title level={5}" in src and "core task queue" in src
+
+    def test_source_projects_row_is_one_state_aware_slot(self):
+        """§4b: robot → running → Check → running → robot, with a `Cancel` that
+        covers a paused job as well as a running one."""
+        src = self._page("pages/ServicesPage.tsx")
+        assert "rowJob" in src and "loadGenJobs" in src
+        # `paused` is non-terminal for the row: it is what `Check` answers.
+        assert "'paused'" in src and "CheckOutlined" in src
+        # …but only while it is the NEWEST job OF THE ROW'S OWN PATH. A job from
+        # another path is never the row's to act on (see the ownership test
+        # below), and an already-answered pause must not hold the slot either.
+        assert "const newest = genJobs" in src
+        assert "j.origin === 'standalone' &&" in src
+        assert "return ['queued', 'running', 'awaiting_input', 'paused'].includes(newest.status) ? newest : null" in src
+        assert "cancelRowJob" in src
+        # It only CANCELS — no page deletes records.
+        assert "client.delete(`/llm/jobs/${id}`)" in src
+        # …and the panel is opened ON the paused job, so its popup comes back.
+        assert "resumeJobId={genPanel?.resumeJobId ?? null}" in src
+        panel = self._page("components/services/GenerateMissingPanel.tsx")
+        # ONCE per open: the init effect also runs on a service change inside the
+        # panel, and re-attaching then would put the previous recipe's pause
+        # popup over the new recipe's pickers.
+        assert "if (resumeJobId != null && resumedRef.current !== resumeJobId)" in panel
+        assert "resumeJob(resumeJobId)" in panel
+        # The panel must render the prompt for a pause of EITHER shape (G27 made
+        # the new one `paused`, which `status === 'awaiting_input'` matched never).
+        assert "isPaused(jobState)" in panel
+
+    def test_one_acting_surface_per_path(self):
+        """The row acts only on jobs its OWN path created.
+
+        Found live 2026-09-28: the leave-behind pause (`gt-347`) was created by
+        the DEPLOY path — its request carries `user_name`, which is why it opened
+        a pre-deploy session — yet it also appeared on the Source Projects row of
+        `example-service@@recipes/slowbuild`, because that rule keyed on the
+        newest job of ANY path. The row's `Check` can only run the generation
+        (the deploy lived in the panel that started it), so answering there
+        generates the files and silently skips the deploy; the card's `Check`
+        re-opens the DEPLOY panel and continues it.
+
+        Ownership is RECORDED on the job (its `job_type` and the request it was
+        created with are persisted), not inferred from the absence of a session:
+        `job_origin` is the one place that decides, and the create path uses the
+        same helper for the session it opens.
+        """
+        from app.models.generation_job import (
+            JOB_ORIGIN_DEPLOY, JOB_ORIGIN_FIX, JOB_ORIGIN_STANDALONE, job_origin,
+        )
+        # The three paths, by the signature each sends.
+        assert job_origin({"user_name": "asynctest", "label": "0"}, "generate_missing") == JOB_ORIGIN_DEPLOY
+        assert job_origin({"user_name": "", "label": "0"}, "generate_missing") == JOB_ORIGIN_STANDALONE
+        assert job_origin({}, "generate_missing") == JOB_ORIGIN_STANDALONE
+        # …and a `fix` job is the instance card's, whichever way it is sent.
+        assert job_origin({"user_name": "alice"}, "fix") == JOB_ORIGIN_FIX
+        # A persisted request row is the string form; it must read the same.
+        assert job_origin('{"user_name": "bob"}', "generate_missing") == JOB_ORIGIN_DEPLOY
+        assert job_origin("", "generate_missing") == JOB_ORIGIN_STANDALONE
+        assert job_origin(None, None) == JOB_ORIGIN_STANDALONE
+        # The payload carries it, so the row never has to guess…
+        model = Path(__file__).parent.parent / "app" / "models" / "generation_job.py"
+        assert '"origin": job_origin(self.request, self.job_type)' in model.read_text()
+        # …and the session the create path opens uses the SAME predicate.
+        import inspect
+        from app.routers import llm as _llm
+        create_src = inspect.getsource(_llm.create_generation_job)
+        assert "_session_scoped = job_origin(req, job_type) == JOB_ORIGIN_DEPLOY" in create_src
+
+    def test_generated_file_names_are_matched_by_shape_not_by_name(self):
+        """GRILLING G33: a generated name carries the job's token, so every
+        exact-name lookup would silently stop matching.
+
+        Two of the three failures were SILENT because a missing validation reads
+        as "valid" (`ok = !v || v.valid`): the review gate and the generated-file
+        list would have shown every file green.
+        """
+        helper = self._page("components/services/FileSetSelection.tsx")
+        assert "export function phaseOfFile" in helper
+        for rel in ("components/services/GenerateMissingPanel.tsx",
+                    "components/services/DeployForm.tsx"):
+            src = self._page(rel)
+            assert "phaseOfFile(" in src, f"{rel} must map phases by shape"
+            assert "files['docker-compose.base.yml']" not in src
+            assert "genNow['docker-compose.base.yml']" not in src
+            assert "fn === 'nginx.conf'" not in src
+
+    def test_the_card_shows_the_task_link_and_the_nginx_row(self):
+        """§6/§10: `Task: <id>` (greyed when the record is gone) and a clickable
+        `nginx:` row — both were simply absent from the instance card."""
+        src = self._page("pages/UsersPage.tsx")
+        assert "task_available" in src
+        assert "navigate(`/tasks?task=${svc.task_id}`)" in src
+        assert "cursor:'not-allowed'" in src, "the greyed (record gone) state"
+        assert "<Text>nginx: </Text>" in src
+        assert "nginx_conf_template_path" in src
+
+    def test_the_fix_field_is_recipe_scoped_and_hidden_when_empty(self):
+        """§9: ONE clickable `LLM fix:` line, this recipe's own artifacts only,
+        and nothing at all when it has none."""
+        src = self._page("pages/UsersPage.tsx")
+        assert "recipeFixes" in src
+        assert "recipeFixes.length > 0 &&" in src
+        # The cache key carries the recipe; the scan reads THAT recipe's entry.
+        assert "loadFixFiles = async (service: string, recipePath: string)" in src
+        assert "(data.candidates || {})[recipePath || '.']" in src
+        assert "LLM fix" in src
+
+    def test_answering_a_pause_consumes_the_leg_it_answered(self):
+        """GRILLING G27 + G34: the answer ends the leg it answered.
+
+        A pause is TERMINAL on its leg, so the job it belongs to keeps `paused`
+        forever — nothing else ever writes that row. Left alone that is a paused
+        object with nothing owning it: the Source Projects row offered `Check`
+        for work already done (a re-answer spawned a duplicate leg), and a paused
+        record is never swept (G30), so it could never leave. Found live in T26
+        on gt-338 after `Fix the compose` resumed it into gt-339.
+
+        Cancelled, never deleted — the same transition every other surface uses.
+        """
+        import inspect
+        from app.routers import llm as _llm
+        src = inspect.getsource(_llm.create_generation_job)
+        # Read BEFORE `req` is replaced by the carried request.
+        assert "_answered_job_id = req.get(\"parent_job_id\")" in src
+        assert src.index("_answered_job_id = req.get") < src.index("req = carried")
+        # Acted on AFTER the new leg exists — a failed create must not consume
+        # the pause it was answering.
+        assert src.index("job = generation_jobs.create_job") < src.index("_gj.cancel_job(_db")
+        # Only its own parked leg, and cancelled (never removed).
+        assert "_parent.status == _PAUSED" in src
+        assert "_parent.service_name == service_name" in src
+        assert "unlink" not in src.split("_answered_job_id")[2], "cancel, never delete"
+        # …and the client names it.
+        hook = self._page("hooks/useGenerationJob.ts")
+        assert "parent_job_id: jobId" in hook
+
+
+class TestValidateRunsForASelectedCompose:
+    """§3b validates the compose IN PLAY, not only a freshly generated one."""
+
+    def test_validate_runs_when_a_compose_is_selected(self):
+        from app.services.generation_jobs import GenerationJobManager
+        m = GenerationJobManager()
+        # Compose already on disk (so not "missing") but selected for use.
+        import unittest.mock as _m
+        with _m.patch.object(GenerationJobManager, "_recipe_missing", return_value=["nginx.conf"]):
+            phases = m._compute_phases("generate_missing", {
+                "selection": {"compose": ["docker-compose.yml"]},
+            })
+        assert "validate" in phases, "the operator's own selected compose can carry the conflict"
+        assert "compose" not in phases, "nothing to generate — it already exists"
+
+    def test_no_validate_when_no_compose_is_in_play(self):
+        from app.services.generation_jobs import GenerationJobManager
+        import unittest.mock as _m
+        m = GenerationJobManager()
+        with _m.patch.object(GenerationJobManager, "_recipe_missing", return_value=["nginx.conf"]):
+            phases = m._compute_phases("generate_missing", {"selection": {}})
+        assert "validate" not in phases
+
+
+class TestFixValidatesItsOwnOutput:
+    """A fix must not re-pause on the conflict it was invoked to repair.
+
+    Found live: the conflict_fix job validated the ORIGINAL selection, re-detected
+    the same NEO4J_PORT conflict and parked in `awaiting_input` forever, even
+    though its compose phase had already written the corrected
+    `docker-compose.fix.yml`.
+    """
+
+    def test_validate_prefers_the_file_the_fix_produced(self):
+        import inspect
+        from app.services.generation_jobs import GenerationJobManager
+        src = inspect.getsource(GenerationJobManager._run_job)
+        assert "_produced" in src
+        assert "_produced or (_sel.get(\"compose\") or [])" in src
+        # ...and it must look for the file THIS JOB wrote — its token-bearing
+        # name (GRILLING G33), never the phase name and never the raw template.
+        assert '_fix_compose = _names["compose"]' in src
+
+
+class TestPreDeployReconcileIsPeriodic:
+    """A stale session must not reserve its combination forever.
+
+    Found live: `reconcile` ran ONLY at startup, so a completed generation the
+    operator never deployed kept its key reserved and every later generation for
+    it was refused with 409 until the gateway restarted — which blocked a deploy
+    verification three times.
+
+    **The three source guards that used to live here all passed while the sweep
+    was in fact a complete no-op.** The loop called `get_job(int(jid))` without
+    its `db` argument, the `TypeError` was swallowed by the surrounding
+    `except Exception`, and nothing was ever dropped — for every pass, forever.
+    A test that greps for `reconcile`/`asyncio.sleep` cannot see that. These
+    drive the real functions against a real job row. (Found live in T13,
+    chasing a `paused` session the sweep should have dropped minutes earlier.)
+    """
+
+    def _db(self, tmp_path, monkeypatch):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.database import Base
+        import app.database as database
+        eng = create_engine(f"sqlite:///{tmp_path}/jobs.db")
+        Base.metadata.create_all(eng)
+        S = sessionmaker(bind=eng, expire_on_commit=False)
+        monkeypatch.setattr(database, "SessionLocal", S)
+        return S
+
+    def _job(self, S, status: str) -> int:
+        from app.services.generation_jobs import GenerationJob
+        db = S()
+        job = GenerationJob(service_name="probe", job_type="generate_missing",
+                            status=status, request="{}", progress="x")
+        db.add(job)
+        db.commit()
+        jid = job.id
+        db.close()
+        return jid
+
+    @staticmethod
+    def _live_set(pdr, generation_jobs) -> set:
+        """Exactly what `_pre_deploy_reconcile_loop` derives."""
+        return {
+            int(r["job_id"]) for r in pdr.list_sessions()
+            if r.get("job_id") is not None
+            and generation_jobs.job_status(int(r["job_id"]))
+            in ("queued", "running", "awaiting_input")
+        }
+
+    def test_job_status_reads_a_real_row_without_a_session_argument(self, tmp_path, monkeypatch):
+        """`job_status` owns its session — that is the whole reason it exists.
+        The call that used to stand here had no `db` and raised TypeError."""
+        from app.services.generation_jobs import generation_jobs
+        S = self._db(tmp_path, monkeypatch)
+        jid = self._job(S, "completed")
+        assert generation_jobs.job_status(jid) == "completed"
+
+    def test_a_stale_GENERATING_session_is_dropped(self, tmp_path, monkeypatch):
+        """`generating` with a finished job and no registry entry ⇒ nothing is
+        working on it. This is the rule the dead sweep silently never applied."""
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.services import pre_deploy_registry as pdr
+        from app.services.generation_jobs import generation_jobs
+        S = self._db(tmp_path, monkeypatch)
+        jid = self._job(S, "completed")
+        pdr.add_session(user="alice", service="probe", recipe_path="", label="0",
+                        state="generating", job_id=jid)
+
+        rep = pdr.reconcile(set(), self._live_set(pdr, generation_jobs))
+
+        assert rep["dropped_stale"], (
+            "a finished job must not keep its combination reserved")
+        assert pdr.list_sessions() == []
+
+    def test_a_LIVE_generating_session_is_KEPT(self, tmp_path, monkeypatch):
+        """The case the `get_job` TypeError actually broke: `live` was always
+        empty, so an in-flight generation's session was swept away mid-run —
+        the card vanished while the work was still going.
+
+        `awaiting_input` counts as live: it is NOT terminal."""
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.services import pre_deploy_registry as pdr
+        from app.services.generation_jobs import generation_jobs
+        S = self._db(tmp_path, monkeypatch)
+        jid = self._job(S, "awaiting_input")
+        pdr.add_session(user="alice", service="probe", recipe_path="", label="0",
+                        state="generating", job_id=jid)
+
+        rep = pdr.reconcile(set(), self._live_set(pdr, generation_jobs))
+
+        assert rep["dropped_stale"] == []
+        assert len(pdr.list_sessions()) == 1
+
+    def test_a_PAUSED_session_is_never_stale(self, tmp_path, monkeypatch):
+        """G26: the handoff writes the session and then deletes the -api entry,
+        so a `paused` session has NO registry entry by construction and its
+        analysis job has already COMPLETED — it matches the stale rule exactly.
+        Dropping it would take the fixing guide and the task id with it and make
+        `check` unreachable, so `paused` joins `refused` as operator-only."""
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.services import pre_deploy_registry as pdr
+        from app.services.generation_jobs import generation_jobs
+        S = self._db(tmp_path, monkeypatch)
+        jid = self._job(S, "completed")
+        pdr.add_session(user="alice", service="probe", recipe_path="", label="0",
+                        state="paused", reason="llm_fix", job_id=jid,
+                        guide="rename the port", task_id="abc123")
+
+        rep = pdr.reconcile(set(), self._live_set(pdr, generation_jobs))
+
+        assert rep["dropped_stale"] == [] and rep["dropped_registered"] == []
+        kept = pdr.list_sessions()
+        assert len(kept) == 1
+        assert kept[0]["guide"] == "rename the port"
+        assert kept[0]["task_id"] == "abc123"
+
+
+class TestEnvPhaseEmptySurface:
+    """§4 + the empty-`${VAR}`-surface path.
+
+    Regression found LIVE (job 117): making `_mechanical_env` return "" instead
+    of None let execution reach `if not content:` with `content` never bound —
+    both arms (`if kvs:` and the mechanical fallback) are skipped when the
+    compose has no ${VAR} surface and the LLM produced no kvs, so the phase died
+    with UnboundLocalError instead of writing the empty `.raw` §4 asks for.
+    """
+
+    def test_content_is_bound_before_the_kvs_branch(self):
+        import inspect
+        from app.services.generation_jobs import GenerationJobManager
+        src = inspect.getsource(GenerationJobManager._run_job)
+        i = src.index("content = \"\"")
+        j = src.index("if kvs:", i)
+        k = src.index("if not content:", j)
+        assert i < j < k, "`content` must be bound before both arms"
+
+    def test_mechanical_env_returns_empty_string_not_none(self):
+        import inspect
+        from app.services.generation_jobs import GenerationJobManager
+        src = inspect.getsource(GenerationJobManager._mechanical_env)
+        assert "return \"\"" in src
+        assert "return None" not in src
+
+
+class TestCapacityAlertOnTheGenerationPath:
+    """§4d's persistent alert must fire wherever a refusal can appear.
+
+    Round-2 fix: the new up-front 503 on `/api/llm/jobs` surfaces during the
+    deploy flow's GENERATION step, which only showed a toast — and would hand a
+    structured `detail` object straight to `message.error`.
+    """
+
+    def test_generation_refusal_raises_the_persistent_alert(self):
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert src.count("setAtCapacity(") >= 2, (
+            "both the deploy path and the generation path must raise the alert"
+        )
+        # ...and neither may pass a structured detail to message.error
+        assert "message.error(typeof d === 'string'" in src
+
+    def test_the_alert_renders_at_the_component_root(self):
+        """Inside a modal it was invisible whenever the OTHER surface was on
+        screen — measured: /api/llm/jobs returned 503 and no alert appeared."""
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert src.count("{renderAtCapacity()}") == 1, "rendered exactly once — no duplicates"
+        root = src.index("  return (")
+        first_modal = src.index("<Modal", root)
+        alert_site = src.index("{renderAtCapacity()}", root)
+        assert alert_site < first_modal, (
+            "the alert must sit at the component ROOT, before any modal"
+        )
+
+
+class TestEnvPrecedenceOverRealFiles:
+    """§2b's rule exercised over REAL files — both halves.
+
+    Audit flaw 5: the §2b e2e (`NEO4J_PORT=7687`) exercised only the "empty
+    in-file value → materialize the compose default" half, because that
+    fixture's in-file value WAS empty — yet the doc cited it as closing §2b.
+
+    SCOPE, stated honestly: this drives `_mechanical_env` — the function that
+    implements the rule — against real compose/env files on disk. It does NOT
+    drive `_run_job`'s env phase, and it is NOT a dashboard e2e, so it does not
+    cover the wiring above the helper. (This class was first named
+    "...EndToEnd"; that was an overclaim of exactly the kind under audit.)
+    """
+
+    def _run_env_phase(self, tmp_path, monkeypatch, base_env_text, compose_text):
+        import asyncio, json
+        from app.config import settings
+        from app.services.generation_jobs import GenerationJobManager
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", Path(tmp_path))
+        recipe = tmp_path / "myapp"
+        recipe.mkdir()
+        (recipe / "docker-compose.yml").write_text(compose_text)
+        (recipe / "base.env").write_text(base_env_text)
+
+        m = GenerationJobManager()
+        req = {
+            "selection": {"compose": ["docker-compose.yml"], "env": ["base.env"]},
+            "user_name": "alice", "label": "0",
+        }
+        # The env phase writes `.env.raw.{user}.{label}` into the recipe dir.
+        mech = m._mechanical_env("myapp", "", req)
+        return mech, recipe
+
+    def test_a_non_empty_in_file_value_is_never_overwritten(self, tmp_path, monkeypatch):
+        mech, recipe = self._run_env_phase(
+            tmp_path, monkeypatch,
+            base_env_text="KEEP_ME=hand-written\nEMPTY_ME=\n",
+            compose_text=(
+                "services:\n  app:\n    image: x\n    environment:\n"
+                "      - A=${KEEP_ME:-from-compose}\n"
+                "      - B=${EMPTY_ME:-from-compose}\n"
+            ),
+        )
+        lines = dict(
+            ln.split("=", 1) for ln in mech.splitlines() if "=" in ln
+        )
+        assert lines["KEEP_ME"] == "hand-written", (
+            "the compose default must NOT overwrite a non-empty in-file value"
+        )
+        assert lines["EMPTY_ME"] == "from-compose", (
+            "an EMPTY value counts as not set and receives the compose default"
+        )
+
+
+class TestConflictDetectionIsNotGraphitiSpecific:
+    """Audit flaw 8: "source-agnostic" rested on ONE fixture (graphiti).
+
+    These use conflicts that share no shape with it: two different names in two
+    different files, and a nested default.
+    """
+
+    def _write(self, tmp_path, name, text):
+        p = tmp_path / name
+        p.write_text(text)
+        return p
+
+    def test_two_different_names_in_two_different_files(self, tmp_path):
+        from app.utils.var_scan import conflicting_defaults
+        a = self._write(tmp_path, "a.yml",
+                        "services:\n  a:\n    environment:\n      - X=${ALPHA:-1}\n")
+        b = self._write(tmp_path, "b.yml",
+                        "services:\n  b:\n    environment:\n      - Y=${BETA:-2}\n"
+                        "      - Z=${ALPHA:-9}\n")
+        found = {c["name"] for c in conflicting_defaults([a, b])}
+        assert found == {"ALPHA"}, "only the genuinely conflicting name is flagged"
+        assert "BETA" not in found, "a single-default name is not a conflict"
+
+    def test_nested_default_conflict_is_detected(self, tmp_path):
+        from app.utils.var_scan import conflicting_defaults
+        p = self._write(tmp_path, "c.yml",
+                        "services:\n  a:\n    environment:\n"
+                        "      - A=${OUTER:-${INNER:-x}}\n"
+                        "      - B=${INNER:-y}\n")
+        names = {c["name"] for c in conflicting_defaults([p])}
+        assert "INNER" in names, "a nested default is scanned like any other site"
+
+
+class TestRefusedSessionsSurviveReconcile:
+    """A `refused` session must not be reconciled away.
+
+    Found live (Round 1): the deploy was refused BEFORE any task ran, so the
+    session has no `job_id` by construction, and it may share a key with an older
+    registration. Both reconcile rules therefore deleted it within one 90s pass —
+    destroying the operator's only record of the refusal and its Retry options.
+    """
+
+    def _store(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.services import pre_deploy_registry as pdr
+        return pdr
+
+    def test_refused_session_survives_the_stale_rule(self, tmp_path, monkeypatch):
+        pdr = self._store(tmp_path, monkeypatch)
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="refused", job_id=None)
+        rep = pdr.reconcile(set(), live_job_ids=set())
+        assert rep["dropped_stale"] == []
+        assert len(pdr.list_sessions()) == 1
+
+    def test_refused_session_survives_the_registered_rule(self, tmp_path, monkeypatch):
+        pdr = self._store(tmp_path, monkeypatch)
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="refused", job_id=None)
+        rep = pdr.reconcile({"alice|myapp||0"}, live_job_ids=set())
+        assert rep["dropped_registered"] == []
+        assert len(pdr.list_sessions()) == 1
+
+    def test_generating_sessions_are_still_reconciled(self, tmp_path, monkeypatch):
+        """The fix must not blunt reconcile for the states it exists for."""
+        pdr = self._store(tmp_path, monkeypatch)
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="generating", job_id=None)
+        rep = pdr.reconcile(set(), live_job_ids=set())
+        assert rep["dropped_stale"] == ["alice|myapp||0"]
+
+
+class TestStaleSelectionAcceptsTheJ2Sibling:
+    """A `.j2` sibling satisfies a stored selection — behaviourally, over real files.
+
+    The -api's register-time conversion renames a plain compose to `<name>.j2`.
+    Without this, the platform's OWN action marks a stored selection stale, and a
+    stale selection disables Deploy for that service — which silently blocked
+    trace T4 for two rounds (established live, Round 5).
+    """
+
+    def _setup(self, tmp_path, monkeypatch, files):
+        import json
+        from app.config import settings
+        from app.services import file_sets
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+        proj = tmp_path / "myapp"
+        proj.mkdir()
+        for f in files:
+            (proj / f).write_text("services: {}\n")
+        # a stored selection pointing at the PLAIN name
+        (proj / ".provision-state.json").write_text(json.dumps({
+            "schema_version": 2, "recipe_origin": "auto", "recipe_paths": ["."],
+            "files": sorted(files),
+            "file_sets": {".": {"compose": ["docker-compose.fix.yml"], "nginx": None,
+                                "env": [], "profiles": []}},
+        }))
+        return file_sets
+
+    def test_j2_sibling_is_not_stale(self, tmp_path, monkeypatch):
+        fs = self._setup(tmp_path, monkeypatch,
+                         ["docker-compose.fix.yml.j2"])
+        info = fs.list_file_sets("myapp")
+        assert (info.get("stale") or {}).get(".") in (None, {}), \
+            "a .j2 sibling must satisfy the selection, not mark it stale"
+
+    def test_a_genuinely_missing_file_is_still_stale(self, tmp_path, monkeypatch):
+        """The fix must not blunt staleness for files that really are gone."""
+        fs = self._setup(tmp_path, monkeypatch, ["docker-compose.yml"])
+        info = fs.list_file_sets("myapp")
+        stale = (info.get("stale") or {}).get(".") or {}
+        assert "docker-compose.fix.yml" in (stale.get("compose") or [])
+
+
+class TestACapacityRefusalRecordsTheRefusedSession:
+    """Does a REAL capacity refusal reach `mark_refused`? (Round 20.)
+
+    Trace T5 could not produce a live refusal after nine attempts, so the question
+    was narrowed to the wiring: when the -api answers 503 `at_capacity`, does the
+    gateway record the refusal — with the options Retry needs? This tests that
+    path directly instead of trying to saturate a live pool.
+
+    Why no live refusal was reachable, incidentally: a dashboard Deploy first runs
+    the generation phase (the per-user env), so the deploy POST lands ~a minute
+    after the click — by which time no occupier survives.
+    """
+
+    def _deploy(self, monkeypatch, tmp_path, status: int, body: dict):
+        import asyncio, httpx
+        from app.routers import users as users_router
+
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.services import pre_deploy_registry as pdr
+
+        req = {"user_name": "alice", "service_name": "myapp", "project_root": "myapp",
+               "label": "0", "domain": "localhost", "passwd": "x",
+               "compose_file_paths": ["docker-compose.yml"], "env_files": [".env.1.alice.0"]}
+
+        # a real httpx error carrying the -api's 503 body (what as_http_error reads)
+        hreq = httpx.Request("POST", "http://api/users")
+        hresp = httpx.Response(status, request=hreq, json=body)
+
+        async def fake_register(**kw):
+            raise httpx.HTTPStatusError("boom", request=hreq, response=hresp)
+
+        monkeypatch.setattr(users_router.provision_service, "register_user", fake_register)
+        # the pre-flight service lookup + selection persistence are not under test
+        from app.services.service_manager import service_manager
+        # SYNC: the router calls this via run_in_threadpool, so an async def here
+        # would hand back a coroutine instead of the dict.
+        def fake_get_service(name):
+            return {"files": ["docker-compose.yml"]}
+        monkeypatch.setattr(service_manager, "get_service", fake_get_service)
+        from app.services import file_sets as fs
+        monkeypatch.setattr(fs, "put_file_set", lambda *a, **k: {})
+
+        try:
+            asyncio.run(users_router.deploy_user(req, None, {"id": 1, "role": "admin"}))
+        except Exception as exc:
+            return exc, pdr
+        return None, pdr
+
+    def test_at_capacity_records_state_reason_and_options(self, monkeypatch, tmp_path):
+        # the FLAT shape the -api's TaskCapacityError handler actually emits
+        exc, pdr = self._deploy(monkeypatch, tmp_path, 503, {
+            "error": "at_capacity", "detail": "at capacity: 4 task(s) running",
+            "running": 4, "capacity": 4})
+        assert exc is not None, "the refusal must propagate to the caller"
+        assert getattr(exc, "status_code", None) == 503, f"got {exc}"
+        row = pdr.get_session("alice", "myapp", "myapp", "0") or pdr.get_session("alice", "myapp", "", "0")
+        assert row is not None, "a refusal must RECORD a pre-deploy session"
+        assert row["state"] == "refused"
+        assert row["reason"] == "at_capacity"
+        assert row.get("options"), "Retry needs the refused options to replay"
+        # …and it keeps the URL and the credential the request carried, because
+        # the retry replays THIS deployment (user ruling 2026-09-26). This is the
+        # WIRING check — the rule itself is pinned in
+        # `test_a_refusal_carries_the_url_and_the_credential_for_its_retry`.
+        opts = row["options"]
+        assert opts.get("passwd") == "x", "the retry needs the password it confirmed"
+        assert opts.get("domain") == "localhost", "…and the URL"
+        assert opts.get("compose_file_paths") == ["docker-compose.yml"], (
+            "the paths the refused deploy was SENT are what the retry replays")
+
+    def test_a_refused_record_always_carries_all_three_paths(self, monkeypatch, tmp_path):
+        """G20: the record must carry compose AND env AND nginx.
+
+        The reason is Retry's panel, not tidiness: its pickers have no `None`
+        option, so a record missing the nginx path seeds that picker at
+        `generate new` and the retry re-runs the nginx phase instead of reusing
+        the file the refused attempt already generated and sent. The request
+        carries the path under `selection.nginx`, the way the deploy payload
+        does, so the record must derive it rather than copy the request blindly.
+        """
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.services import pre_deploy_registry as pdr
+
+        row = pdr.mark_refused(
+            user="alice", service="myapp", recipe_path="myapp", label="0",
+            reason="at_capacity", detail="at capacity: 4 task(s) running",
+            options={"compose_file_paths": ["docker-compose.fix.yml"],
+                     "env_files": [".env.raw.alice.0"],
+                     "selection": {"compose": ["docker-compose.fix.yml"],
+                                   "nginx": "nginx.fix.conf", "env": []}})
+
+        assert row["options"]["nginx_conf_file_path"] == "nginx.fix.conf", (
+            "a refused record without the nginx path makes Retry re-run the "
+            "nginx phase — the exact thing G20 rules out")
+
+        # An explicit path is authoritative and is never overwritten by the
+        # selection (the two can differ when the selection was rewritten).
+        row2 = pdr.mark_refused(
+            user="bob", service="myapp", recipe_path="myapp", label="0",
+            reason="at_capacity", detail="at capacity: 4 task(s) running",
+            options={"compose_file_paths": ["docker-compose.yml"],
+                     "env_files": [".env.1.bob.0"],
+                     "nginx_conf_file_path": "nginx.conf",
+                     "selection": {"nginx": "nginx.base.conf"}})
+        assert row2["options"]["nginx_conf_file_path"] == "nginx.conf"
+
+    def test_the_nested_shape_is_also_recognised(self, monkeypatch, tmp_path):
+        """The -api can also emit `{"detail": {"error": ...}}` (HTTPException).
+        Only the flat form used to be detected, so that refusal became a 502."""
+        exc, pdr = self._deploy(monkeypatch, tmp_path, 503, {
+            "detail": {"error": "at_capacity", "detail": "at capacity", "running": 4, "capacity": 4}})
+        assert getattr(exc, "status_code", None) == 503, f"got {exc}"
+        row = pdr.get_session("alice", "myapp", "myapp", "0") or pdr.get_session("alice", "myapp", "", "0")
+        assert row is not None and row["state"] == "refused"
+
+    def test_a_non_capacity_error_does_not_record_a_refusal(self, monkeypatch, tmp_path):
+        """Only a capacity refusal creates the card — other errors must not."""
+        exc, pdr = self._deploy(monkeypatch, tmp_path, 409, {"detail": "already registered"})
+        assert getattr(exc, "status_code", None) == 502, "a 409 stays a generic 502"
+        assert pdr.list_sessions() == []
+
+
+class TestASelectedEnvIsTheHandoffNotGenerated:
+    """§2/§4: "when the operator *did* select an env, that selection is the handoff
+    instead" of the generated `.raw`.
+
+    The deploy path forced the per-user env generation EVEN THEN (needsGeneration
+    included `needsEnv && !perUserEnv` unconditionally), which contradicts the
+    documented design and makes every Deploy pay a ~30s generation window before
+    the deploy POST. Measured across Rounds 24-25 of trace T5, where that window
+    also made a live capacity refusal unreachable.
+    """
+
+    def test_a_selected_env_suppresses_env_generation(self):
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert "hasSelectedEnv" in src
+        assert "!hasSelectedEnv" in src, "a selected env must suppress the env generation"
+        # ...and the whole term is still gated off entirely for a refused retry,
+        # with ONE carve-out: a gateway refusal's own retry regenerates, because
+        # the generation is what was refused (GRILLING G29) — see
+        # `test_a_generation_refusals_retry_is_not_gated_on_its_options`.
+        assert "(!initialOptions || regenerate) && (" in src
+
+
+class TestPinnedLabelIsReassertedAtSubmit:
+    """G27 — a pinned panel must never submit an unpinned label.
+
+    The open-time pin sits at the END of the async `init()`, behind
+    `await loadSources()`, so for the first ~600 ms after the panel opens the
+    DISABLED Label field still shows the Form's `initialValues` `label: '0'`
+    (measured live: `0` at t=587 ms, correct and stable only from t=692 ms).
+    Confirming inside that window sent `request.label='0'` for a label-2
+    session, which generated `.env.raw.<user>.0` instead of `.env.raw.<user>.2`.
+
+    The fix re-asserts the pin at submit time, from the SAME source the
+    open-time pin reads (`preselectedLabel` = the session/entry's own label).
+    """
+
+    def test_the_pin_is_reasserted_inside_handle_deploy(self):
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        start = src.index("const handleDeploy")
+        end = src.index("const payload: any = {")
+        body = src[start:end]
+        assert "pinnedSessionLabel(preselectedLabel)" in body, (
+            "handleDeploy must re-read the pinned label from its source"
+        )
+        assert "snap.label = pinnedAtSubmit" in body, (
+            "the re-read pin must overwrite snap.label, which every request "
+            "consumer (generation job + deploy payload) reads"
+        )
+
+    def test_the_pin_has_one_definition_used_by_both_call_sites(self):
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert src.count("function pinnedSessionLabel(") == 1, (
+            "the open-time pin and the submit-time re-assert must agree, so "
+            "the condition lives in exactly one predicate"
+        )
+        assert src.count("pinnedSessionLabel(preselectedLabel)") >= 2, (
+            "both the open-time pin and the submit-time re-assert must use it"
+        )
+
+
+class TestCheckRestartCarriesTheGlobalProxy:
+    """G26 row 5 + G20: a `check` restart replays the PATH's proxy.
+
+    Found live on T13: cancelling a proxied `probe-slow` deploy, running `LLM
+    based fix` and then `check` opened the deploy panel with "Use global proxy"
+    UNCHECKED, so the restart registered with `build_args: {}` while the deploy
+    that created the session had recorded the proxy args. The refused path had
+    already learned this lesson (G20/T3: Retry replays the exact options), so a
+    `check` restart — which resumes a path the session store still holds — is
+    the same situation, not a preference.
+    """
+
+    def _registry_with(self, tmp_path, build_args_yaml: str) -> str:
+        reg = tmp_path / "user_registry.yml"
+        reg.write_text(
+            "- user_name: alice\n"
+            "  service_name: myapp\n"
+            "  label: '0'\n"
+            f"  build_args:\n{build_args_yaml}"
+        )
+        return str(reg)
+
+    def test_add_session_records_the_proxy_setting(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.services import pre_deploy_registry as pdr
+
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="paused", reason="llm_fix", job_id=5,
+                        guide="g", task_id="t", slot="compose",
+                        use_global_proxy=True)
+        assert pdr.get_session("alice", "myapp", "", "0")["use_global_proxy"] is True
+
+    def test_the_proxy_setting_defaults_to_off(self, tmp_path, monkeypatch):
+        """Every session carries the key (the panel reads it), default off."""
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.services import pre_deploy_registry as pdr
+
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state="generating", job_id=1)
+        assert pdr.get_session("alice", "myapp", "", "0")["use_global_proxy"] is False
+
+    def test_build_args_detection(self):
+        from app.services.proxy_service import build_args_carry_global_proxy
+
+        assert build_args_carry_global_proxy(
+            {"HTTP_PROXY": "http://p:1", "HTTPS_PROXY": "http://p:1",
+             "http_proxy": "http://p:1", "https_proxy": "http://p:1"})
+        # the live registry carries a subset (HTTP only) — any one key is enough
+        assert build_args_carry_global_proxy({"http_proxy": "http://p:1"})
+        assert not build_args_carry_global_proxy({})
+        assert not build_args_carry_global_proxy(None)
+        assert not build_args_carry_global_proxy({"SOME_USER_ARG": "x"})
+
+    def test_the_handoff_reads_the_failed_entrys_args(self, tmp_path, monkeypatch):
+        from app.config import settings
+        monkeypatch.setattr(
+            settings, "REGISTRY_FILE",
+            self._registry_with(tmp_path, "    HTTP_PROXY: http://172.18.0.1:7897\n"))
+        from app.services.generation_jobs import _instance_used_global_proxy
+
+        assert _instance_used_global_proxy("alice", "myapp", "0") is True
+        assert _instance_used_global_proxy("alice", "myapp", "9") is False
+
+    def test_the_handoff_stores_it_on_the_paused_session(self, tmp_path, monkeypatch):
+        """The wiring under test: `_llm_fix_handoff` must put the derived proxy
+        on the session BEFORE the -api delete removes the entry that carries it."""
+        import asyncio
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.config import settings
+        monkeypatch.setattr(
+            settings, "REGISTRY_FILE",
+            self._registry_with(tmp_path, "    http_proxy: http://172.18.0.1:7897\n"))
+        from app.services import provision_service as ps
+
+        async def fake_remove(user, service, label):
+            return {}
+        monkeypatch.setattr(ps.provision_service, "remove_user", fake_remove)
+
+        from app.services.generation_jobs import generation_jobs
+        asyncio.run(generation_jobs._llm_fix_handoff(
+            user="alice", service="myapp", recipe_path="", label="0",
+            guide="fix it", task_id="t", job_id=5, slot="compose"))
+
+        from app.services import pre_deploy_registry as pdr
+        row = pdr.get_session("alice", "myapp", "", "0")
+        assert row is not None and row["state"] == "paused"
+        assert row["use_global_proxy"] is True, (
+            "the check restart would open with the proxy unchecked and register "
+            "build_args: {} — the defect T13 found live")
+
+    def test_the_handoff_prefers_an_explicit_request_value(self, tmp_path, monkeypatch):
+        import asyncio
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        # No registry entry at all: the explicit value must still win.
+        from app.config import settings
+        monkeypatch.setattr(settings, "REGISTRY_FILE", str(tmp_path / "missing.yml"))
+        from app.services import provision_service as ps
+
+        async def fake_remove(user, service, label):
+            return {}
+        monkeypatch.setattr(ps.provision_service, "remove_user", fake_remove)
+
+        from app.services.generation_jobs import generation_jobs
+        asyncio.run(generation_jobs._llm_fix_handoff(
+            user="alice", service="myapp", recipe_path="", label="0",
+            guide="fix it", task_id="t", job_id=5, slot="compose",
+            use_global_proxy=True))
+        from app.services import pre_deploy_registry as pdr
+        assert pdr.get_session("alice", "myapp", "", "0")["use_global_proxy"] is True
+
+
+class TestThePanelSeedsTheProxyFromTheSession:
+    """The dashboard half of the same fix: the `check` restart must HAND the
+    session's proxy to the panel, and the panel must apply it from a source that
+    is authoritative at submit time (the same shape as the label pin)."""
+
+    def test_the_check_handler_passes_the_session_proxy(self):
+        src = (_DASH / "src" / "pages" / "UsersPage.tsx").read_text()
+        assert "setPreselectedUseGlobalProxy(!!sess.use_global_proxy)" in src
+        assert "preselectedUseGlobalProxy={preselectedUseGlobalProxy}" in src
+
+    def test_the_panel_uses_one_predicate_at_both_sites(self):
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert src.count("function seedUseGlobalProxy(") == 1, (
+            "the open-time seed and the submit-time re-assert must agree, so the "
+            "condition lives in exactly one predicate")
+        assert src.count("seedUseGlobalProxy(preselectedUseGlobalProxy)") >= 2
+
+    def test_the_seed_precedes_the_first_await(self):
+        """The label pin sat behind `await loadSources()`, which left a window
+        where the field was wrong. The proxy seed must not repeat that: it runs
+        synchronously, before the first await of `init()`."""
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        seed = src.index("seedUseGlobalProxy(preselectedUseGlobalProxy)")
+        first_await = src.index("const sourcesData = await loadSources()")
+        assert seed < first_await, "the seed must run before the first await"
+
+    def test_the_reassert_lands_before_the_payload_is_built(self):
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        start = src.index("const handleDeploy")
+        end = src.index("const payload: any = {")
+        body = src[start:end]
+        assert "effectiveUseGlobalProxy()" in body
+        assert "snap.use_global_proxy = effectiveUseGlobalProxy()" in body, (
+            "every request consumer reads snap, so the re-assert must set snap")
+
+    def test_an_operator_toggle_is_never_overridden(self):
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        start = src.index("const effectiveUseGlobalProxy = ")
+        end = src.index("const generateMissingFiles = async ()")
+        body = src[start:end]
+        assert "!proxyTouchedRef.current" in body, (
+            "the session value is a DEFAULT; an explicit toggle must win — the "
+            "predicate is shared, so the guard lives here, once")
+
+
+class TestTheGenerateEntryPointCarriesTheGlobalProxy:
+    """T12: the GENERATE entry point creates a pre-deploy session too.
+
+    `DeployForm.handleDeploy` (the deploy path) was fixed to re-assert the
+    session's proxy, but `generateMissingFiles` (the "Generate Missing Files via
+    LLM" button) built its `startJob` payload WITHOUT `use_global_proxy`. The
+    gateway defaults the key to `false`, so the session it created recorded
+    `use_global_proxy: false` even when the box was ticked — and the `check`
+    restart on that parked `compose_fix` session replayed `false`. Found live on
+    T12: `finalgrill|probe-conflict||1` was `false` while the box had been
+    ticked. G20: a resumed path replays the options it was created with, and the
+    generate entry point is the same class as the deploy one.
+    """
+
+    _SRC = (_DASH / "src" / "components" / "services" / "DeployForm.tsx")
+
+    def test_generate_missing_files_sends_the_proxy(self):
+        src = self._SRC.read_text()
+        start = src.index("const generateMissingFiles = async ()")
+        end = src.index("const generateMissingFilesForDeploy")
+        body = src[start:end]
+        assert "genJob.startJob({" in body, "the named site is the startJob call"
+        assert "use_global_proxy: effectiveUseGlobalProxy()" in body, (
+            "the generate payload must carry the proxy, or the session the job "
+            "opens records `false` and `check` replays it (T12)")
+
+    def test_the_deploy_auto_run_reads_the_snapshot(self):
+        """The deploy-scoped generation runs AFTER `onClose()` (destroyOnClose),
+        so it must read the already-computed snapshot, never the live form."""
+        src = self._SRC.read_text()
+        start = src.index("const generateMissingFilesForDeploy")
+        end = src.index("const generateMissingFilesForDeploy")
+        end = src.index("\n  // Generation job completed", end)
+        body = src[start:end]
+        assert "use_global_proxy: !!snap.use_global_proxy" in body, (
+            "the deploy-scoped generation must reuse the submit-time snapshot")
+        assert "form.getFieldValue('use_global_proxy')" not in body, (
+            "the form is destroyed by then — reading it would re-introduce the "
+            "empty-value window the label pin was moved out of")
+
+    def test_one_predicate_for_both_entry_points(self):
+        src = self._SRC.read_text()
+        assert src.count("const effectiveUseGlobalProxy = ") == 1, (
+            "deploy and generate must read the SAME predicate")
+        helper = src[src.index("const effectiveUseGlobalProxy = "):
+                     src.index("const generateMissingFiles = async ()")]
+        assert "seedUseGlobalProxy(preselectedUseGlobalProxy)" in helper, (
+            "the shared predicate is the session seed the deploy path already uses")
+        assert src.count("snap.use_global_proxy = effectiveUseGlobalProxy()") == 1, (
+            "the deploy path must go through the shared predicate too")
+
+
+class TestTheGenerationRouterRecordsTheRequestProxy:
+    """The gateway half: the session the generation router creates must record
+    the proxy the request carried. There is no instance to derive it from (the
+    session exists so that none does), so the request is the only source."""
+
+    def test_add_session_gets_the_request_proxy(self):
+        src = (Path(__file__).parent.parent / "app" / "routers" / "llm.py").read_text()
+        start = src.index("pdr.add_session(")
+        # The call carries a long explanatory comment, so take a wide window and
+        # stop at the statement's own closing line.
+        end = src.index("\n        )", start)
+        body = src[start:end]
+        assert 'use_global_proxy=bool(req.get("use_global_proxy"))' in body, (
+            "omitting it defaulted the session to `false` (T12)")
+
+    def test_the_sweep_preserves_the_proxy_on_pause(self):
+        """The periodic sweep must not drop the key the router wrote.
+
+        Asserted together with its own CONTRAST, because either half alone can
+        lie: a `paused` session is never pruned (G30), so the proxy it carries
+        survives — while a `generating` session with no registry entry and no
+        live job IS dropped. That contrast is what proves the sweep actually ran
+        instead of no-opping, which is the D3 failure mode (`_cleanup_stale` was
+        never called at all) and would make the first assertion pass for free.
+
+        The store is a table now (G31), so the sweep is `reconcile()` and the
+        pause is `set_state_for_job()` — the reach-through this test used to
+        perform (`list_sessions()` → mutate → `_save`) is the lost update G31
+        removed and no longer exists.
+        """
+        from app.services import pre_deploy_registry as pdr
+
+        pdr.add_session(user="u", service="probe-conflict", recipe_path="",
+                        label="1", state="generating", job_id=7,
+                        use_global_proxy=True)
+        # What `GenerationJobManager._set_status` does on a pause.
+        assert pdr.set_state_for_job(7, "paused", "compose_fix") is True
+
+        report = pdr.reconcile(registered_keys=set(), live_job_ids=set())
+
+        row = pdr.get_session("u", "probe-conflict", "", "1")
+        assert row is not None, "a paused session is never pruned (G30)"
+        assert row["use_global_proxy"] is True, "the sweep dropped the router's proxy"
+        assert row["reason"] == "compose_fix"
+        assert report["remaining"] == 1, report
+        assert report["dropped_stale"] == [], report
+
+        # ...and the same conditions on a `generating` row ARE stale.
+        pdr.add_session(user="v", service="probe-plain", recipe_path="",
+                        label="2", state="generating", job_id=8,
+                        use_global_proxy=True)
+        report = pdr.reconcile(registered_keys=set(), live_job_ids=set())
+        assert pdr.get_session("v", "probe-plain", "", "2") is None, (
+            "a generating session with no registry entry and no live job is stale")
+        assert len(report["dropped_stale"]) == 1, report
+        assert pdr.get_session("u", "probe-conflict", "", "1") is not None
+
+
+class TestTheGatewayRefusesAtItsOwnCapacity:
+    """GRILLING G29: the gateway runs its OWN generation pool, so it has its OWN
+    refusal — and it is NOT the -api's.
+
+    The -api's `at_capacity` guards the HOST against concurrent docker work; this
+    one guards the LLM endpoint and cost (`GATEWAY_MAX_GENERATIONS`, deliberately
+    a separate number). Both must reach the operator with their own remedy, which
+    is why they are told apart by a stable code rather than by the 503 alone.
+
+    The suite used to assert the OPPOSITE — `TestNoGatewaySideUpFrontRefusal`,
+    which encoded a 2026-09-20 ruling ("let the -api answer"). G29 superseded
+    that ruling on 2026-09-24, so the class was retired and these replace it.
+    """
+
+    @staticmethod
+    def _jobs(n: int, status: str) -> None:
+        """`n` rows in `status`. The gate counts ROWS (G31), so no runner is
+        needed — and counting the rows is exactly what makes the number true
+        across the four workers."""
+        from app.database import SessionLocal
+        from app.models.generation_job import GenerationJob
+        db = SessionLocal()
+        try:
+            for i in range(n):
+                db.add(GenerationJob(service_name=f"probe-occupier-{i}",
+                                     job_type="generate_missing",
+                                     status=status, request="{}", progress=status))
+            db.commit()
+        finally:
+            db.close()
+
+    def test_the_pool_refuses_at_its_own_limit(self, monkeypatch):
+        """The refusal carries its counts AND its remedy, not just a failure."""
+        from app.config import settings
+        from app.database import SessionLocal
+        from app.services.generation_jobs import (
+            GenerationJobManager, GenerationCapacityError,
+        )
+
+        monkeypatch.setattr(settings, "GATEWAY_MAX_GENERATIONS", 2)
+        self._jobs(2, "running")
+
+        db = SessionLocal()
+        try:
+            with pytest.raises(GenerationCapacityError) as exc:
+                GenerationJobManager().create_job(db, "probe-new", "", "generate_missing", {})
+        finally:
+            db.close()
+        assert exc.value.code == "generation_at_capacity", "its OWN code, not the -api's"
+        assert (exc.value.in_flight, exc.value.capacity) == (2, 2)
+        assert "cancel one" in str(exc.value), "the remedy travels with the refusal"
+
+    def test_the_router_records_the_refusal_on_the_session(self, monkeypatch):
+        """Recorded on the SESSION, with its own reason — that is the card the
+        operator sees (T19), not a toast that scrolls away."""
+        import asyncio
+        from fastapi import HTTPException
+        from app.config import settings
+        from app.database import SessionLocal
+        from app.routers import llm as llm_router
+        from app.services import pre_deploy_registry as pdr
+
+        monkeypatch.setattr(settings, "GATEWAY_MAX_GENERATIONS", 1)
+        self._jobs(1, "running")
+
+        req = {"service_name": "probe-cap", "recipe_path": "", "label": "3",
+               "user_name": "alice", "job_type": "generate_missing"}
+        db = SessionLocal()
+        try:
+            with pytest.raises(HTTPException) as exc:
+                asyncio.run(llm_router.create_generation_job(req, {"id": 1, "role": "admin"}, db))
+        finally:
+            db.close()
+        assert exc.value.status_code == 503, exc.value
+        assert exc.value.detail["error"] == "generation_at_capacity"
+        assert (exc.value.detail["running"], exc.value.detail["capacity"]) == (1, 1)
+
+        row = pdr.get_session("alice", "probe-cap", "", "3")
+        assert row is not None, "the refusal must land on the session the card reads"
+        assert row["state"] == "refused"
+        assert row["reason"] == "generation_at_capacity", (
+            "the card picks the remedy by the reason; `at_capacity` would send the "
+            "operator to cancel a docker task that does not exist")
+        assert "cancel one" in row["detail"]
+
+    def test_the_refusal_carries_the_options_its_retry_seeds_from(self, monkeypatch):
+        """G29: "A gateway-side refusal also produces a `refused` session with its
+        own Retry, exactly as the -api's does."
+
+        It did not. `mark_refused` was called WITHOUT `options`, the dashboard's
+        Retry is `disabled={!sess.options}` for anything that is not a generation
+        refusal, and the card therefore offered a Retry that could never fire —
+        found live 2026-09-25 on `browserverify|example-service|recipes/slowbuild|3`
+        (options NULL on the record, button greyed out). The -api's refusal has
+        always carried its options, which is what makes ITS Retry work.
+        """
+        import asyncio
+        from fastapi import HTTPException
+        from app.config import settings
+        from app.database import SessionLocal
+        from app.routers import llm as llm_router
+        from app.services import pre_deploy_registry as pdr
+
+        monkeypatch.setattr(settings, "GATEWAY_MAX_GENERATIONS", 1)
+        self._jobs(1, "running")
+
+        req = {"service_name": "probe-cap", "recipe_path": "recipes/cap",
+               "label": "3", "user_name": "alice",
+               "job_type": "generate_missing",
+               "selection": {"compose": [], "nginx": None, "env": [], "profiles": []},
+               "use_global_proxy": True,
+               "deploy_metadata": {"service_name": "probe-cap", "user_name": "alice",
+                                   "label": "3", "domain": "example.test", "https": True}}
+        db = SessionLocal()
+        try:
+            with pytest.raises(HTTPException):
+                asyncio.run(llm_router.create_generation_job(req, {"id": 1, "role": "admin"}, db))
+        finally:
+            db.close()
+
+        row = pdr.get_session("alice", "probe-cap", "recipes/cap", "3")
+        opts = row.get("options")
+        assert opts, "the refusal's Retry has nothing to seed the panel from"
+        assert opts["user_name"] == "alice" and opts["service_name"] == "probe-cap"
+        assert opts["project_root"] == "recipes/cap", (
+            "the panel re-derives the Service picker from `project_root`")
+        assert opts["https"] is True, (
+            "deploy_metadata is flattened in: the retry must deploy the same thing")
+        assert opts["use_global_proxy"] is True
+        assert "selection" in opts, "the file selection rides along"
+        assert opts["domain"] == "example.test", (
+            "the URL is KEPT: a retry missing it is a different deployment")
+
+    def test_a_refusal_carries_the_url_and_the_credential_for_its_retry(self, monkeypatch, tmp_path):
+        """User ruling, 2026-09-26 — the SECOND reading, which corrected the first:
+
+        *"for the generate path which is part of a deploy path, it indeed sees the
+        password, and for supporting retry, the password / url should indeed be
+        stored!"*
+
+        The first pass had blanked both, on a sentence that was a question rather
+        than an instruction. It was wrong for the reason the record exists at all:
+        its Retry must replay the deployment the operator confirmed, and a blanked
+        URL or password is not a safer record — it is a retry that silently
+        deploys something else. Both refusal entry points go through
+        `refusal_options`, so "what a refusal keeps" cannot mean two things.
+
+        The one path with nothing to store is the standalone Source Projects
+        Generate panel: it sends no `user_name`, so no session is recorded (G15) —
+        no card, no Retry, nothing to feed.
+        """
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.services import pre_deploy_registry as pdr
+
+        req = {"user_name": "alice", "service_name": "myapp", "label": "0",
+               "domain": "example.test", "https": True, "passwd": "hunter2",
+               "compose_file_paths": ["docker-compose.yml"],
+               "selection": {"compose": ["docker-compose.yml"], "nginx": None,
+                             "env": [], "profiles": []}}
+        opts = pdr.refusal_options(req, use_global_proxy=True)
+        assert opts["passwd"] == "hunter2", "the retry replays the deploy it confirmed"
+        assert opts["domain"] == "example.test"
+        assert opts["https"] is True
+        assert opts["compose_file_paths"] == ["docker-compose.yml"], (
+            "the SENT paths are what a refused retry replays")
+        assert opts["selection"]["compose"] == ["docker-compose.yml"]
+        assert opts["use_global_proxy"] is True
+        # The dashboard is what SUPPLIES it: it sends the password with the
+        # generation request, because a refusal of that generation is exactly
+        # where the record is written (pinned by the dashboard source guard
+        # `test_the_generation_payload_carries_the_url_and_the_password`).
+        assert req["passwd"] not in ("", None)
+
+    def test_a_refused_session_does_not_block_its_own_retry(self, monkeypatch):
+        """The reserve must let the operator's own retry through.
+
+        A gateway refusal reserves the (user, service, recipe, label) key — that
+        is what stops a live deploy being clobbered. But this refusal's retry
+        MUST run the generation (the pool was the only obstacle and nothing was
+        produced), and while the reserve was absolute that retry answered 409:
+        the card's Retry was a dead end. A `generating` session still reserves.
+        """
+        import asyncio
+        from fastapi import HTTPException
+        from app.database import SessionLocal
+        from app.routers import llm as llm_router
+        from app.services import pre_deploy_registry as pdr
+        from app.services.generation_jobs import generation_jobs
+
+        async def _noop(job_id):                     # never run a real generation
+            return None
+        monkeypatch.setattr(generation_jobs, "_run_job", _noop)
+
+        req = {"service_name": "probe-cap", "recipe_path": "", "label": "3",
+               "user_name": "alice", "job_type": "generate_missing"}
+
+        pdr.mark_refused(user="alice", service="probe-cap", recipe_path="",
+                         label="3", reason="generation_at_capacity",
+                         detail="generation at capacity: 1 job(s) running (limit 1)")
+        db = SessionLocal()
+        try:
+            job = asyncio.run(llm_router.create_generation_job(req, {"id": 1, "role": "admin"}, db))
+        finally:
+            db.close()
+        assert job is not None, "a refused session must not block its own retry"
+        assert pdr.get_session("alice", "probe-cap", "", "3")["state"] == "generating", (
+            "the retry replaces the refused record with the live session")
+
+        # …while a GENERATING session still reserves: the retry is an exception for
+        # the operator's own refused record, not a hole in the reservation.
+        db = SessionLocal()
+        try:
+            with pytest.raises(HTTPException) as exc:
+                asyncio.run(llm_router.create_generation_job(req, {"id": 1, "role": "admin"}, db))
+        finally:
+            db.close()
+        assert exc.value.status_code == 409, exc.value
+        assert exc.value.detail["error"] == "combination_reserved"
+
+    def test_a_terminal_pause_does_not_hold_a_slot(self, monkeypatch):
+        """G27 made a pause TERMINAL, so it stops counting as in-flight — the
+        gate's own comment says the two changes go together."""
+        import asyncio
+        from app.config import settings
+        from app.database import SessionLocal
+        from app.services.generation_jobs import generation_jobs
+
+        monkeypatch.setattr(settings, "GATEWAY_MAX_GENERATIONS", 1)
+        self._jobs(1, "paused")                      # terminal under G27
+
+        async def _noop(job_id):                     # never run a real generation
+            return None
+        monkeypatch.setattr(generation_jobs, "_run_job", _noop)
+
+        async def _create():
+            db = SessionLocal()
+            try:
+                return generation_jobs.create_job(db, "probe-after-pause", "",
+                                                  "generate_missing", {})
+            finally:
+                db.close()
+
+        job = asyncio.run(_create())
+        assert job.status == "queued", "a paused leg must not refuse the next one"
+
+
+class TestTheCleanupContract:
+    """GRILLING G30: ONE contract, two engine-adapted implementations, asserted
+    on BOTH sides so the two stores cannot drift.
+
+    The contract: only `completed | failed | cancelled` are eligible; a record
+    waiting for the operator (`paused`, and the legacy `awaiting_input`) is never
+    pruned; one TTL with one default; a count cap evicting oldest-first; when a
+    record goes, its LOG goes with it; cleanup and recovery are owner-side only.
+
+    The TRIGGER rule is part of it — D3's retraction: the TTL sweep runs on
+    READS, the count cap on SUBMIT, and the two engines have to agree on that
+    and not only on the terminal set. The gateway's half is asserted here; the
+    -api asserts its own half in `test_task_manager.py`.
+    """
+
+    @staticmethod
+    def _jobs(specs):
+        """Insert rows: (service, status) pairs, oldest first."""
+        from datetime import datetime, timedelta, timezone
+        from app.database import SessionLocal
+        from app.models.generation_job import GenerationJob
+
+        base = datetime.now(timezone.utc) - timedelta(days=30)
+        db = SessionLocal()
+        ids = []
+        try:
+            for i, (svc, status) in enumerate(specs):
+                j = GenerationJob(service_name=svc, job_type="generate_missing",
+                                  status=status, request="{}", progress=status)
+                j.created_at = base + timedelta(days=i)   # deterministic order
+                j.updated_at = base + timedelta(days=i)
+                db.add(j)
+            db.commit()
+            ids = [j.id for j in db.query(GenerationJob)
+                   .order_by(GenerationJob.created_at.asc()).all()]
+        finally:
+            db.close()
+        return ids
+
+    def test_the_ttl_sweep_leaves_the_operators_records_alone(self):
+        """Only finished records age out, and only past the TTL."""
+        from datetime import datetime, timedelta, timezone
+        from app.database import SessionLocal
+        from app.models.generation_job import GenerationJob
+        from app.services.generation_jobs import generation_jobs
+
+        old, paused, running = self._jobs([("a", "completed"),
+                                           ("b", "paused"),
+                                           ("c", "running")])
+        # `a` is already 30 days old; make `paused`/`running` older still, so age
+        # cannot be what saves them.
+        db = SessionLocal()
+        try:
+            for jid in (paused, running):
+                row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
+                row.updated_at = datetime.now(timezone.utc) - timedelta(days=90)
+            db.commit()
+            pruned = generation_jobs.prune_finished(db)
+            left = {j.id for j in db.query(GenerationJob).all()}
+        finally:
+            db.close()
+        assert pruned == 1, "exactly the finished job aged out"
+        assert old not in left
+        assert paused in left, "a record waiting for the operator is never pruned"
+        assert running in left
+
+    def test_the_ttl_sweep_runs_on_the_reads(self):
+        """The trigger rule: a READ sweeps. Asserted on both read entry points,
+        because `list_jobs` alone would not prove the single-record read does."""
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+        from app.database import SessionLocal
+        from app.models.generation_job import GenerationJob
+        from app.routers import llm as llm_router
+        from app.services.generation_jobs import generation_jobs
+
+        old, asked = self._jobs([("a", "completed"), ("b", "completed")])
+        db = SessionLocal()
+        try:
+            row = db.query(GenerationJob).filter(GenerationJob.id == old).first()
+            row.updated_at = datetime.now(timezone.utc) - timedelta(days=90)
+            # the job being ASKED for stays inside the TTL: the sweep must not
+            # refuse the read it is serving
+            row = db.query(GenerationJob).filter(GenerationJob.id == asked).first()
+            row.updated_at = datetime.now(timezone.utc)
+            db.commit()
+            asyncio.run(llm_router.get_generation_job(asked, {"id": 1, "role": "admin"}, db))
+        finally:
+            db.close()
+        db = SessionLocal()
+        try:
+            assert db.query(GenerationJob).filter(GenerationJob.id == old).first() is None, (
+                "GET /llm/jobs/{id} must sweep the TTL (the -api's `get()` does)")
+            generation_jobs.list_jobs(db)          # and the list read
+        finally:
+            db.close()
+
+    def test_the_log_goes_with_the_record(self):
+        from datetime import datetime, timedelta, timezone
+        from app.database import SessionLocal
+        from app.models.generation_job import GenerationJob
+        from app.services.generation_jobs import generation_jobs
+
+        doomed, kept = self._jobs([("a", "completed"), ("b", "completed")])
+        db = SessionLocal()
+        try:
+            for jid in (doomed, kept):
+                generation_jobs._log_path(jid).write_text("session log\n")
+            row = db.query(GenerationJob).filter(GenerationJob.id == doomed).first()
+            row.updated_at = datetime.now(timezone.utc) - timedelta(days=90)
+            row = db.query(GenerationJob).filter(GenerationJob.id == kept).first()
+            row.updated_at = datetime.now(timezone.utc)       # fresh — inside the TTL
+            db.commit()
+            generation_jobs.prune_finished(db)
+        finally:
+            db.close()
+        assert not generation_jobs._log_path(doomed).exists(), (
+            "a log whose record is gone is unreachable — and grows without bound")
+        assert generation_jobs._log_path(kept).exists(), "a live record keeps its log"
+
+    def test_the_ttl_and_cap_defaults_are_the_apis(self):
+        """G30: "one TTL number, one default, configured the same way".
+
+        The two stores are different engines, so the env NAMES differ on purpose
+        — but the DEFAULTS must not. They are pinned here and in the -api's suite
+        (`test_task_manager.py::test_the_cleanup_defaults_are_the_contract`), so
+        a change on one side that is not mirrored on the other fails a test
+        instead of silently aging records for different lengths of time.
+        """
+        from app.config import settings
+
+        assert settings.GATEWAY_JOB_TTL_SECONDS == 604800, (
+            "the -api's TASK_TTL_SECONDS default (1 week)")
+        assert settings.GATEWAY_MAX_JOBS == 1000, "the -api's TASK_MAX_COUNT default"
+
+    def test_a_paused_record_survives_recovery(self):
+        """G30's contract lists "a paused record survives recovery" — and a
+        `paused` leg is TERMINAL under G27, so nothing may rewrite it into a
+        failure just because the gateway restarted.
+
+        The same pass must still mark a genuinely interrupted job failed, or the
+        test would pass on a sweep that did nothing at all."""
+        from app.database import SessionLocal
+        from app.models.generation_job import (
+            GenerationJob, JOB_STATUS_FAILED, JOB_STATUS_PAUSED,
+        )
+        from app.services.generation_jobs import generation_jobs
+
+        paused, interrupted = self._jobs([("a", "paused"), ("b", "running")])
+        db = SessionLocal()
+        try:
+            assert generation_jobs.recover_stale_jobs(db) == 1, (
+                "exactly the interrupted job is recovered")
+            by_id = {j.id: j.status for j in db.query(GenerationJob).all()}
+        finally:
+            db.close()
+        assert by_id[paused] == JOB_STATUS_PAUSED, (
+            "a pause waiting for the operator must survive a restart")
+        assert by_id[interrupted] == JOB_STATUS_FAILED
+
+    def test_a_zero_ttl_is_honoured_not_swallowed(self, monkeypatch):
+        """0 is a MEANINGFUL setting for both knobs — a TTL of 0 prunes every
+        finished record at once, a cap of 0 keeps none — and the usual
+        `int(getattr(..., default) or default)` idiom silently discards it. The
+        gateway would then run with the default while the operator believed they
+        had asked for the strictest setting."""
+        from app.config import settings
+        from app.database import SessionLocal
+        from app.models.generation_job import GenerationJob
+        from app.services.generation_jobs import generation_jobs
+
+        monkeypatch.setattr(settings, "GATEWAY_JOB_TTL_SECONDS", 0)
+        done, paused = self._jobs([("a", "completed"), ("b", "paused")])
+        db = SessionLocal()
+        try:
+            generation_jobs.prune_finished(db)
+            left = {j.id for j in db.query(GenerationJob).all()}
+        finally:
+            db.close()
+        assert done not in left, "a TTL of 0 must prune the finished record"
+        assert paused in left, "…and still never the operator's record"
+
+    def test_a_zero_cap_is_honoured_not_swallowed(self, monkeypatch):
+        from app.config import settings
+        from app.database import SessionLocal
+        from app.models.generation_job import GenerationJob
+        from app.services.generation_jobs import generation_jobs
+
+        monkeypatch.setattr(settings, "GATEWAY_MAX_JOBS", 0)
+        done, paused = self._jobs([("c", "failed"), ("d", "paused")])
+        db = SessionLocal()
+        try:
+            generation_jobs.prune_excess(db)
+            left = {j.id for j in db.query(GenerationJob).all()}
+        finally:
+            db.close()
+        assert done not in left, "a cap of 0 must evict the finished record"
+        assert paused in left, "…and still never the operator's record"
+
+    def test_the_cap_evicts_the_oldest_finished_on_submit(self, monkeypatch):
+        """The cap is enforced on SUBMIT (the -api's `_cleanup_excess` trigger),
+        oldest-first, and it cannot touch an operator's record either."""
+        import asyncio
+        from app.config import settings
+        from app.database import SessionLocal
+        from app.services.generation_jobs import generation_jobs
+
+        monkeypatch.setattr(settings, "GATEWAY_MAX_JOBS", 2)
+        oldest, middle, newest, paused = self._jobs([("a", "completed"),
+                                                    ("b", "failed"),
+                                                    ("c", "completed"),
+                                                    ("d", "paused")])
+        # `paused` is the OLDEST row of all with a created_at in the past; give it
+        # the earliest stamp so oldest-first eviction would take it if status
+        # were not respected.
+        from app.models.generation_job import GenerationJob
+        db = SessionLocal()
+        try:
+            row = db.query(GenerationJob).filter(GenerationJob.id == paused).first()
+            from datetime import datetime, timedelta, timezone
+            row.created_at = datetime.now(timezone.utc) - timedelta(days=99)
+            db.commit()
+
+            async def _noop(job_id):
+                return None
+            monkeypatch.setattr(generation_jobs, "_run_job", _noop)
+
+            async def _submit():
+                return generation_jobs.create_job(db, "probe-new", "",
+                                                  "generate_missing", {})
+            asyncio.run(_submit())
+
+            left = {j.id for j in db.query(GenerationJob).all()}
+        finally:
+            db.close()
+        assert oldest not in left, "the oldest FINISHED record is evicted first"
+        assert {middle, newest}.issubset(left), "the cap was 2 finished records"
+        assert paused in left, "eviction respects the same eligibility rule"
+
+    def test_the_cap_cannot_evict_a_live_job(self, monkeypatch):
+        """A RUNNING record is never eligible. This is where the two engines
+        deliberately differ: the -api sorts every task by age and can evict a
+        live one, but a gateway job whose row is gone has nowhere to write its
+        terminal status, so the runner would finish silently."""
+        import asyncio
+        from app.config import settings
+        from app.database import SessionLocal
+        from app.models.generation_job import GenerationJob
+        from app.services.generation_jobs import generation_jobs
+
+        monkeypatch.setattr(settings, "GATEWAY_MAX_JOBS", 1)
+        running, done1, done2 = self._jobs([("a", "running"), ("b", "completed"),
+                                            ("c", "failed")])
+        db = SessionLocal()
+        try:
+            import datetime as _dt
+            row = db.query(GenerationJob).filter(GenerationJob.id == running).first()
+            row.created_at = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=99)
+            db.commit()
+
+            async def _noop(job_id):
+                return None
+            monkeypatch.setattr(generation_jobs, "_run_job", _noop)
+
+            async def _submit():
+                return generation_jobs.create_job(db, "probe-new", "",
+                                                  "generate_missing", {})
+            asyncio.run(_submit())
+
+            left = {j.id for j in db.query(GenerationJob).all()}
+        finally:
+            db.close()
+        # two finished records against a cap of one ⇒ exactly one eviction, and
+        # the OLDEST row overall is the running one — eviction by age alone would
+        # take it, so this asserts eligibility, not luck.
+        assert running in left, "a live job keeps its row"
+        assert done1 not in left, "the oldest FINISHED record goes instead"
+        assert done2 in left, "the cap is one finished record"
+
+
+# ---------------------------------------------------------------------------
+# Restored 2026-09-25 (G27 work): these four classes were added after the last
+# clean snapshot of this file and were recovered from the damaged working copy.
+# ---------------------------------------------------------------------------
+
+class TestAPauseIsALegAndTheAnswerIsANewJob:
+    """GRILLING G27: a pause ENDS a leg; answering it starts a NEW one.
+
+    These replace `test_submit_pending_input_writes_env_and_completes` and
+    `test_resume_requeues_the_SAME_job_with_the_compose_unselected`. Both drove
+    `submit_pending_input`, which rewrote the SAME row and re-ran it. That
+    machinery is gone — a pause is a terminal status carrying a payload, and the
+    answer is a new job — so what has to be true is different, and testable
+    without the removed method.
+    """
+
+    def test_a_conflict_pause_is_terminal_and_carries_the_next_leg(self, tmp_path, monkeypatch):
+        """The real validate phase pauses — and what it leaves behind is a
+        TERMINAL row plus everything the next leg needs.
+
+        No LLM is involved on this path: the compose is SELECTED and on disk, so
+        the phase plan is validate-first and the conflict is found by the scan.
+        """
+        import asyncio
+        import json
+        from pathlib import Path
+        from app.config import settings
+        from app.database import SessionLocal
+        from app.models.generation_job import GenerationJob, JOB_STATUS_PAUSED
+        from app.services.generation_jobs import GenerationJobManager
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", Path(tmp_path))
+        recipe = tmp_path / "myapp"
+        recipe.mkdir()
+        # ONE name, TWO sites, TWO defaults — the conflict §3b exists for.
+        (recipe / "docker-compose.yml").write_text(
+            "services:\n  a:\n    environment:\n      - P=${P:-1}\n"
+            "  b:\n    environment:\n      - Q=${P:-2}\n"
+        )
+
+        async def scenario():
+            # A FRESH manager per test: the module singleton caches an
+            # `asyncio.Lock` per (service, recipe), and a Lock is bound to the
+            # loop that created it — reusing the singleton across tests trips
+            # "bound to a different event loop".
+            m = GenerationJobManager()
+            db = SessionLocal()
+            job = m.create_job(db, "myapp", "", "generate_missing", {
+                "service_name": "myapp",
+                "selection": {"compose": ["docker-compose.yml"], "nginx": None, "env": []},
+                "user_name": "alice", "label": "0",
+            })
+            jid = job.id
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                if m.job_status(jid) == JOB_STATUS_PAUSED:
+                    break
+            db.expire_all()
+            row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
+            return jid, row.status, json.loads(row.result or "{}"), db.query(GenerationJob).count()
+
+        jid, status, result, count = asyncio.run(scenario())
+
+        assert status == JOB_STATUS_PAUSED, f"the leg must END, not park (got {status})"
+        pause = result.get("pause") or {}
+        assert pause.get("kind") == "compose_fix"
+        assert pause.get("ask", {}).get("conflicts"), "the operator must be told what conflicts"
+        carried = pause.get("request") or {}
+        assert carried.get("selection", {}).get("compose") == [], (
+            "the faulty compose must be UNSELECTED so the next leg regenerates it")
+        assert carried.get("fix") is True, "a guided restart emits .fix (G25)"
+        assert count == 1, "the pause must not spawn a job — the ANSWER will"
+        # ...and the carried request IS a plan that continues the path.
+        assert GenerationJobManager._compute_phases("generate_missing", carried)[:2] == [
+            "compose", "validate"]
+
+    def test_a_credential_pause_carries_the_env_so_the_answer_needs_no_llm(self, tmp_path, monkeypatch):
+        """The carry makes the answering leg a single env write.
+
+        `_compute_phases` yields exactly `["env"]`, and the env branch finishes
+        from the carried mechanical text + key map — which is why the answer
+        costs no LLM call.
+        """
+        import asyncio
+        from pathlib import Path
+        from app.config import settings
+        from app.database import SessionLocal
+        from app.services.generation_jobs import GenerationJobManager
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", Path(tmp_path))
+        (tmp_path / "myapp").mkdir()
+
+        carried = {
+            "service_name": "myapp",
+            "selection": {"compose": [], "nginx": None, "env": []},
+            "user_name": "alice", "label": "0",
+            "resume_env": {"env_name": ".env.raw.alice.0", "vars": ["OPENAI_API_KEY"],
+                           "mech": "OPENAI_API_KEY=\n",
+                           "kvs": {"OPENAI_API_KEY": {"env_type": "external"}},
+                           "compose_paths": []},
+            "resume_values": {"OPENAI_API_KEY": "sk-from-the-operator"},
+        }
+        assert GenerationJobManager._compute_phases("generate_missing", carried) == ["env"]
+
+        async def scenario():
+            m = GenerationJobManager()   # fresh: see the note in the test above
+            db = SessionLocal()
+            job = m.create_job(db, "myapp", "", "generate_missing", carried)
+            jid = job.id
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                if m.job_status(jid) in ("completed", "failed"):
+                    return m.job_status(jid)
+            return "timed out"
+
+        assert asyncio.run(scenario()) == "completed"
+        written = (tmp_path / "myapp" / ".env.raw.alice.0").read_text()
+        assert "OPENAI_API_KEY=sk-from-the-operator" in written
+
+
+class TestCancellationIsOnTheRow:
+    """D1 (GRILLING G31): a cancel is a STATUS ON THE ROW, not a pid-local set.
+
+    Found live: `self._cancelled` was an in-memory set and `_check_cancelled`
+    read only it, while the job runs in ANOTHER worker's event loop under
+    `uvicorn --workers 4`. A `DELETE` landing on a different worker therefore
+    flipped the row to `cancelled` and left the job running — and the runner's
+    own terminal write then overwrote the row back to `completed`.
+
+    These drive the real methods with the local set EMPTY, which is exactly the
+    state a worker that did not handle the DELETE is in.
+    """
+
+    def _job(self, status: str = "running") -> int:
+        from app.database import SessionLocal
+        from app.models.generation_job import GenerationJob
+        db = SessionLocal()
+        job = GenerationJob(service_name="probe", job_type="generate_missing",
+                            status=status, request="{}", progress="x")
+        db.add(job); db.commit()
+        jid = job.id
+        db.close()
+        return jid
+
+    def test_a_cancel_on_another_worker_is_seen(self):
+        """The row says cancelled ⇒ the runner must stop, with no local state."""
+        from app.services.generation_jobs import generation_jobs, JobCancelled
+        jid = self._job("cancelled")
+        assert jid not in generation_jobs._cancelled, "the local set must be empty (another worker)"
+        with pytest.raises(JobCancelled):
+            generation_jobs._check_cancelled(jid)
+
+    def test_a_running_job_is_not_cancelled(self):
+        from app.services.generation_jobs import generation_jobs
+        jid = self._job("running")
+        generation_jobs._check_cancelled(jid)  # must not raise
+
+    def test_a_terminal_write_cannot_resurrect_a_cancelled_row(self):
+        """The runner finishing must not overwrite the cancel."""
+        from app.database import SessionLocal
+        from app.models.generation_job import GenerationJob, JOB_STATUS_CANCELLED
+        from app.services.generation_jobs import generation_jobs
+        jid = self._job("cancelled")
+        generation_jobs._set_status(jid, "completed", progress="completed")
+        db = SessionLocal()
+        row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
+        status = row.status
+        db.close()
+        assert status == JOB_STATUS_CANCELLED, (
+            "a finished run must not resurrect a job the operator cancelled")
+
+
+class TestEnvPhasePrecedenceEndToEnd:
+    """§2b's rule driven through the ACTUAL env phase, not just the helper.
+
+    Audit flaw 5: the §2b e2e (`NEO4J_PORT=7687`) exercised only the
+    "empty in-file value → materialize the compose default" half, because that
+    fixture's in-file value WAS empty. The rule's other half — "a NON-EMPTY
+    in-file value wins and is never overwritten" — had only ever been tested
+    against `_mechanical_env` in isolation. This drives `_run_job`'s env phase
+    over real files so the phase's own wiring is covered too.
+    """
+
+    def _run_env_phase(self, tmp_path, monkeypatch, base_env_text, compose_text):
+        import asyncio, json
+        from app.config import settings
+        from app.services.generation_jobs import GenerationJobManager
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", Path(tmp_path))
+        recipe = tmp_path / "myapp"
+        recipe.mkdir()
+        (recipe / "docker-compose.yml").write_text(compose_text)
+        (recipe / "base.env").write_text(base_env_text)
+
+        m = GenerationJobManager()
+        req = {
+            "selection": {"compose": ["docker-compose.yml"], "env": ["base.env"]},
+            "user_name": "alice", "label": "0",
+        }
+        # The env phase writes `.env.raw.{user}.{label}` into the recipe dir.
+        mech = m._mechanical_env("myapp", "", req)
+        return mech, recipe
+
+    def test_a_non_empty_in_file_value_is_never_overwritten(self, tmp_path, monkeypatch):
+        mech, recipe = self._run_env_phase(
+            tmp_path, monkeypatch,
+            base_env_text="KEEP_ME=hand-written\nEMPTY_ME=\n",
+            compose_text=(
+                "services:\n  app:\n    image: x\n    environment:\n"
+                "      - A=${KEEP_ME:-from-compose}\n"
+                "      - B=${EMPTY_ME:-from-compose}\n"
+            ),
+        )
+        lines = dict(
+            ln.split("=", 1) for ln in mech.splitlines() if "=" in ln
+        )
+        assert lines["KEEP_ME"] == "hand-written", (
+            "the compose default must NOT overwrite a non-empty in-file value"
+        )
+        assert lines["EMPTY_ME"] == "from-compose", (
+            "an EMPTY value counts as not set and receives the compose default"
+        )
+
+
+class TestTheGenerationOwnsItsOwnRecordAndLog:
+    """GRILLING G28/G30: the `record` mirror is gone; the gateway keeps its OWN
+    per-task log, and the log is deleted WITH the record.
+
+    Four tests used to live here — `TestCancellingAPausedJobFreesTheSlot` and
+    `TestAPausedGenerationSessionReachesATerminalState`. Both asserted the fate
+    of the -api record task (that a cancel freed its pool slot, and that a
+    resumed park drove it terminal). That machinery is deliberately gone: a
+    generation no longer writes anything into the -api, which is exactly what
+    made it consume a capacity it never used. These are the contract that took
+    its place.
+    """
+
+    def test_the_mirror_is_gone(self):
+        """The mechanism is removed, not merely unused."""
+        from app.services.generation_jobs import generation_jobs
+        for name in ("_session_create", "_session_append", "_session_append_async",
+                     "_session_finish", "_session_finish_sync", "_session_endpoint",
+                     "_session_drain"):
+            assert not hasattr(generation_jobs, name), f"{name} is the removed mirror"
+
+    def test_a_generation_writes_its_own_log_file(self, tmp_path, monkeypatch):
+        """`gt-<id>.log` under the gateway's own task_logs dir — the same
+        convention the -api uses for its own tasks."""
+        from app.config import settings
+        from app.services.generation_jobs import generation_jobs
+        monkeypatch.setattr(settings, "GATEWAY_DATA_DIR", tmp_path)
+
+        generation_jobs._log_append(7, {"file": "compose", "status": "done"})
+
+        p = generation_jobs._log_path(7)
+        assert p.exists(), f"no log at {p}"
+        assert p.name == "gt-7.log"
+        assert "compose" in p.read_text()
+
+    def test_the_log_is_deleted_with_the_record(self, tmp_path, monkeypatch):
+        """G30's cleanup contract, on the gateway side: the log goes with the
+        record — a log whose record is gone is unreachable anyway, and leaving
+        it behind is how a log directory grows without bound."""
+        from app.config import settings
+        from app.services.generation_jobs import generation_jobs
+        monkeypatch.setattr(settings, "GATEWAY_DATA_DIR", tmp_path)
+
+        generation_jobs._log_append(9, {"x": 1})
+        assert generation_jobs._log_path(9).exists()
+        generation_jobs._log_delete(9)
+        assert not generation_jobs._log_path(9).exists()
