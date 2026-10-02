@@ -18,6 +18,7 @@ from .routers import (
     auth_router,
     audit_router,
     llm_router,
+    pre_deploy_router,
     services_router,
     system_router,
     tasks_router,
@@ -43,10 +44,90 @@ def _get_reconcile_interval_min() -> int:
         return 0
 
 
+async def _pre_deploy_reconcile_loop():
+    """§8b: periodically close the two-write gap for pre-deploy sessions.
+
+    `reconcile` used to run ONLY at startup, so a session whose job had since
+    finished — a completed generation the operator never deployed — kept its
+    combination RESERVED forever, and every later generation for the same
+    (user, service, label) was refused with 409 until the gateway restarted.
+    Found live: a stale session blocked a deploy verification three times.
+
+    A session is dropped when its key already exists in the -api registry (the
+    registration succeeded, so the session is done) or when nothing is working
+    on it any more (no live job). Both facts are needed, so this loop reads the
+    registry once per pass.
+    """
+    while True:
+        try:
+            # ONE HOME (GRILLING G31, D4). Each worker runs the lifespan, so
+            # without this every loop runs FOUR times — and THIS one was the
+            # damaging case: it does a read-modify-write on shared state.
+            from .services.loop_lease import acquire_lease
+            if not acquire_lease("pre_deploy_reconcile", 300):
+                await asyncio.sleep(90)
+                continue
+            from .services import pre_deploy_registry as _pdr
+            from .services.provision_service import provision_service
+
+            sessions = _pdr.list_sessions()
+            if sessions:
+                registered: set[str] = set()
+                try:
+                    payload = await provision_service.list_users()
+                    for u in payload.get("user_status", []):
+                        uname = u.get("user_name") or ""
+                        for bucket in ("healthy_services", "unhealthy_services",
+                                       "missing_services", "failed_services"):
+                            for svc in (u.get(bucket) or []):
+                                registered.add(
+                                    f"{uname}|{svc.get('service_name', '')}|"
+                                    f"{svc.get('recipe_path') or ''}|{svc.get('label', '0')}"
+                                )
+                except Exception:
+                    # Cannot read the registry this pass — only the live-job rule
+                    # can be applied, which is still enough to free a session
+                    # nothing is working on.
+                    registered = set()
+                live: set[int] = set()
+                try:
+                    from .services.generation_jobs import generation_jobs
+                    for row in sessions:
+                        jid = row.get("job_id")
+                        if jid is None:
+                            continue
+                        # `job_status` (not `get_job`) — it owns its session.
+                        # This called `get_job(int(jid))` with no `db`, and the
+                        # TypeError was swallowed below, so `live` was always
+                        # empty and every session without a registry entry was
+                        # dropped... except the exception fired BEFORE the drop,
+                        # leaving the sweep a complete no-op. See `job_status`.
+                        if generation_jobs.job_status(int(jid)) in (
+                            "queued", "running", "awaiting_input"
+                        ):
+                            live.add(int(jid))
+                except Exception:
+                    live = set()
+                rep = _pdr.reconcile(registered, live)
+                if rep["dropped_registered"] or rep["dropped_stale"]:
+                    print(f"[gateway] pre-deploy reconcile: dropped "
+                          f"{len(rep['dropped_stale'])} stale, "
+                          f"{len(rep['dropped_registered'])} already-registered session(s)")
+        except Exception:
+            pass
+        await asyncio.sleep(90)
+
+
 async def _reconcile_loop():
     """Background loop: periodically trigger reconciliation on provision-api."""
     while True:
         try:
+            # ONE HOME (GRILLING G31, D4): one worker triggers the -api's
+            # reconcile, not four.
+            from .services.loop_lease import acquire_lease
+            if not acquire_lease("provision_api_reconcile", 600):
+                await asyncio.sleep(90)
+                continue
             interval = _get_reconcile_interval_min()
         except Exception:
             interval = 0
@@ -69,6 +150,12 @@ async def _docker_events_monitor():
     The actual reconciliation is also covered by _reconcile_loop on schedule.
     """
     try:
+        # ONE HOME (GRILLING G31, D4): only the lease holder watches. This
+        # function is NOT inside an interval loop — it holds a long-lived docker
+        # events stream — so a non-holder RETURNS rather than skipping a turn.
+        from .services.loop_lease import acquire_lease
+        if not acquire_lease("docker_events_monitor", 3600):
+            return
         import docker
     except ImportError:
         return
@@ -116,6 +203,11 @@ async def _project_monitor_loop():
     from .services.service_manager import service_manager as _sm
     while True:
         try:
+            # ONE HOME (GRILLING G31, D4): one worker rescans source_projects.
+            from .services.loop_lease import acquire_lease
+            if not acquire_lease("project_monitor", 120):
+                await asyncio.sleep(10)
+                continue
             new = _sm.scan_for_new_projects()
             if new:
                 names = [p["name"] for p in new]
@@ -132,6 +224,16 @@ async def lifespan(app: FastAPI):
     # Startup
     init_db()
     print(f"[gateway] Database initialized at {settings.DATABASE_URL}")
+
+    # The pre-deploy store moved from `pre-deploy-registry.json` into the table
+    # `pre_deploy_sessions` (GRILLING G31). Import any sessions the file still
+    # holds before anything reads the table — otherwise a live refusal the
+    # operator has not acted on yet would vanish with the file. Idempotent, and
+    # the file is renamed once imported.
+    from .services.pre_deploy_registry import migrate_legacy_json
+    _imported = migrate_legacy_json()
+    if _imported:
+        print(f"[gateway] pre-deploy registry: imported {_imported} session(s) from the legacy JSON file")
 
     # Initialize Registry and HostnameIndex for ACL/service access
     from .services.registry import Registry
@@ -161,7 +263,19 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         print(f"[gateway] WARNING: generation-job recovery failed: {exc}")
 
+    # §8b: pre-deploy sessions are closed against what actually exists now — the
+    # stale ones were marked failed above, so nothing is live for them.
+    try:
+        from .services import pre_deploy_registry as _pdr
+        rep = _pdr.reconcile(set(), live_job_ids=set())
+        if rep["dropped_stale"] or rep["dropped_registered"]:
+            print(f"[gateway] pre-deploy reconcile: dropped {rep['dropped_stale']} stale, "
+                  f"{rep['dropped_registered']} already-registered session(s)")
+    except Exception as exc:
+        print(f"[gateway] WARNING: pre-deploy reconcile failed: {exc}")
+
     _reconcile_task = asyncio.create_task(_reconcile_loop())
+    _pre_deploy_task = asyncio.create_task(_pre_deploy_reconcile_loop())
     print("[gateway] Scheduled reconciliation background task started")
     _docker_events_task = asyncio.create_task(_docker_events_monitor())
     print("[gateway] Docker events monitor started (watching subnet-acl-nginx)")
@@ -218,6 +332,7 @@ app.include_router(services_router)
 app.include_router(users_router)
 app.include_router(tasks_router)
 app.include_router(llm_router)
+app.include_router(pre_deploy_router)
 app.include_router(audit_router)
 
 

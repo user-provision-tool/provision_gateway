@@ -1,0 +1,17 @@
+{
+  "verdict": "PASSED",
+  "summary": "Fixed the unpinned-label defect in DeployForm.tsx by re-asserting the session/entry label at submit time. Chosen shape A (re-assert at submit) over shape B (disable Confirm until pinned) because B only shifts the race and needs a pin-applied signal the panel does not have, while A makes an unpinned submission structurally impossible however fast Confirm is clicked. Added a single shared predicate pinnedSessionLabel() used by BOTH the open-time pin and the submit-time re-assert so the two can never drift; two source-scan guard tests were added in provision-gateway/tests/test_unit.py (451 passed). Rebuilt the dashboard image (sha256:e8e7d22e2596d0dd2e18cee8b62a3d3779d1b7cca2bf70d5c8d6e7eaacba342f, replacing sha256:aa3d1001d033b70009e02bf48960f7b03813983cf09ced6991de2c65121ca017) and recreated subnet-acl-dashboard on it; the served bundle index-kmSn9hRA.js matches the new image and differs from the pre-fix index-DrPbcoyE.js. Live behavioural verification: three separate `check` attack rounds on LLM-fix pauses for browserverify/probe-slow at labels 4, 4 and 5, each confirming at the earliest frame the Deploy button was enabled (in-page rAF loop, ~8 ms resolution). Every round's generation_jobs.request.label equalled the session's own label (4/4, 4/4, 5/5) and produced .env.raw.browserverify.<label> with the right label. No foreign rows appeared in audit_log or generation_jobs.",
+  "outputPath": "contracts/iter-1-20260922T202500Z-coder-output.json",
+  "filesChanged": [
+    "/home/wyan2026/Desktop/_workspace/_subnet_acl/_provision_gateway/provision-dashboard/src/components/services/DeployForm.tsx",
+    "/home/wyan2026/Desktop/_workspace/_subnet_acl/_provision_gateway/provision-gateway/tests/test_unit.py",
+    "/home/wyan2026/Desktop/_workspace/_subnet_acl/_provision_gateway/docs/features.md"
+  ],
+  "plan": [
+    {
+      "gap": "unpinned-label-on-check",
+      "steps": "Add one shared predicate pinnedSessionLabel(preselectedLabel) (DeployForm.tsx:51); use it for the open-time pin (DeployForm.tsx:314-317) and re-assert it into snap.label at the top of handleDeploy (DeployForm.tsx:724-725) before any request is built; add two guard tests; rebuild the dashboard image; run 3 live attack rounds via the browser.",
+      "acceptanceCriteria": "Every attack run's generation_jobs.request.label equals the session's own label, and the generated env artifact is .env.raw.<user>.<label> with the right label. Met: 4/4, 4/4, 5/5; artifacts .env.raw.browserverify.4 and .env.raw.browserverify.5."
+    }
+  ]
+}

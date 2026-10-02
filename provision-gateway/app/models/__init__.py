@@ -10,6 +10,8 @@ from .proxy_config import ProxyConfig
 from .end_user import EndUser
 from .api_key import ApiKey
 from .generation_job import GenerationJob
+from .pre_deploy_session import PreDeploySession
+from .loop_lease import LoopLease
 
 __all__ = [
     "AdminUser",
@@ -21,4 +23,6 @@ __all__ = [
     "EndUser",
     "ApiKey",
     "GenerationJob",
+    "PreDeploySession",
+    "LoopLease",
 ]

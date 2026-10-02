@@ -6,6 +6,7 @@ from .services import router as services_router
 from .users import router as users_router
 from .tasks import router as tasks_router
 from .llm import router as llm_router
+from .pre_deploy import router as pre_deploy_router
 from .audit import router as audit_router
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     "users_router",
     "tasks_router",
     "llm_router",
+    "pre_deploy_router",
     "audit_router",
 ]

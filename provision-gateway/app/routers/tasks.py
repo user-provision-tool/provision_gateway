@@ -18,11 +18,18 @@ router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 async def list_tasks(
     current_admin: dict = Depends(require_admin),
 ):
-    """List all tasks from provision-api."""
+    """List all tasks from provision-api.
+
+    Each task is annotated with ``is_record``: a *record* is bookkeeping for work
+    an external process performs (the gateway's generation session) and occupies
+    no pool worker — so the Tasks page must not present it as running work.
+    """
     try:
         result = await provision_service.list_tasks()
     except Exception as e:
         raise HTTPException(502, f"provision-api error: {e}")
+    for t in (result.get("tasks") or []):
+        t["is_record"] = (t.get("target") or {}).get("kind") == "record"
     return result
 
 

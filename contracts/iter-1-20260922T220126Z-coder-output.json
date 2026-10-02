@@ -1,0 +1,36 @@
+{
+  "verdict": "PASSED",
+  "summary": "Fixed the state carry-over defect where a `check` restart launched from a `paused` LLM-fix session opened the deploy panel with 'Use global proxy' UNCHECKED, so the restart registered with `build_args: {}` while the deploy that created the session had recorded the proxy args. Justification is G20's existing precedent (a resumed path replays the options it was created with; the gateway already re-adds `use_global_proxy` for a refused Retry) — a `check` restart is the same situation. Minimal change in three layers: (1) proxy_service gains PROXY_ENV_KEYS + build_args_carry_global_proxy(); (2) pre_deploy_registry.add_session stores `use_global_proxy`, and generation_jobs._llm_fix_handoff derives it from the FAILED instance's registry `build_args` (read BEFORE the add-then-delete removes the entry that carries it) and stores it on the paused session; (3) UsersPage's `check` handler passes the session's value to DeployForm via `preselectedUseGlobalProxy`, which seeds it synchronously on open (before the first await, avoiding the hydration window the label pin had) and re-asserts it at submit time from that same source unless the operator toggled the box — the same shape as the label fix. Rebuilt both images (gateway sha256:954b6acf..., dashboard sha256:637a26f9...) and proved it behaviourally on the dashboard: proxycarry/probe-slow/0 one-shot deploy with docker-compose.yml + proxy ticked, cancelled while building -> failed; LLM based fix -> check; the panel opened CHECKED (rAF trace: checked:true from the first frame, t=341 ms, never changed); confirm -> the restart's registry entry carries the four proxy build args identical to the original deploy's, and request.label = the session's own label. 462 passed in tests/test_unit.py (11 new). No contamination: every audit_log/generation_jobs row above the recorded baseline is attributable to this run.",
+  "outputPath": "contracts/iter-1-20260922T220126Z-coder-output.json",
+  "filesChanged": [
+    "/home/wyan2026/Desktop/_workspace/_subnet_acl/_provision_gateway/provision-gateway/app/services/proxy_service.py",
+    "/home/wyan2026/Desktop/_workspace/_subnet_acl/_provision_gateway/provision-gateway/app/services/pre_deploy_registry.py",
+    "/home/wyan2026/Desktop/_workspace/_subnet_acl/_provision_gateway/provision-gateway/app/services/generation_jobs.py",
+    "/home/wyan2026/Desktop/_workspace/_subnet_acl/_provision_gateway/provision-dashboard/src/pages/UsersPage.tsx",
+    "/home/wyan2026/Desktop/_workspace/_subnet_acl/_provision_gateway/provision-dashboard/src/components/services/DeployForm.tsx",
+    "/home/wyan2026/Desktop/_workspace/_subnet_acl/_provision_gateway/provision-gateway/tests/test_unit.py",
+    "/home/wyan2026/Desktop/_workspace/_subnet_acl/_provision_gateway/docs/features.md"
+  ],
+  "plan": [
+    {
+      "gap": "proxy-carry-over-on-check",
+      "steps": "Fix track. Reproduce: a `check` restart of a proxied paused session opened the panel unchecked -> restart registered build_args {} (pre-fix live entries browserverify/probe-slow/4 and /5 carry build_args: ''). Isolate: the paused session row had no proxy field (pre-deploy-registry.json), UsersPage's check handler carried only service/user/label/guide, and DeployForm submitted snap.use_global_proxy (undefined -> false). Classify: code. Fix the layer that loses the state: proxy_service.PROXY_ENV_KEYS + build_args_carry_global_proxy() recognise the proxy's four build args; pre_deploy_registry.add_session persists `use_global_proxy`; generation_jobs._instance_used_global_proxy reads the failed instance's registry build_args (before the handoff's delete) and _llm_fix_handoff stores it on the paused session; UsersPage.check sets preselectedUseGlobalProxy from the session; DeployForm seeds it synchronously at open and re-asserts at submit from one shared predicate, skipping the re-assert if the operator toggled the box. 11 unit tests added (backend detection + persistence + panel wiring guards).",
+      "acceptanceCriteria": "Panel's proxy checkbox is CHECKED as it opens and the restart's registry entry carries the four proxy build args equal to the original deploy's, with request.label still the session's label. Met live: rAF trace showed checked:true at the first frame (t=341 ms, never changed); restart entry build_args = HTTP_PROXY/HTTPS_PROXY/http_proxy/https_proxy = http://172.18.0.1:7897 (identical to the original deploy's), request.label = '0' = the session's label. 462 passed."
+    }
+  ],
+  "notes": {
+    "new_gateway_image_id": "sha256:954b6acf33d26f9024bf0c2e04715ca7a0eb02fbcfb85593974c8359791b04e3",
+    "previous_gateway_image_id": "sha256:9de0af3659d38b4d6c2481aa1f3f5de2d585578bd350c2274c2d2d5ecab52387",
+    "new_dashboard_image_id": "sha256:637a26f9c6fe7bd8714d7a2f8e22cddd4da354510f430d1d4eed8b032a4e088c",
+    "previous_dashboard_image_id": "sha256:e8e7d22e2596d0dd2e18cee8b62a3d3779d1b7cca2bf70d5c8d6e7eaacba342f",
+    "served_bundle": "index-CfTS7rL9.js (new image; pre-fix was index-kmSn9hRA.js)",
+    "panel_proxy_state_on_open": "checked (rAF trace [{t:341, checked:true, disabled:false}])",
+    "restart_build_args": "HTTP_PROXY: http://172.18.0.1:7897 / HTTPS_PROXY: http://172.18.0.1:7897 / http_proxy: http://172.18.0.1:7897 / https_proxy: http://172.18.0.1:7897",
+    "label_check": "generation_jobs.id=251 request.label = '0' = session label '0' = registry entry label '0'",
+    "test_count": "462 passed, 1 warning (tests/test_unit.py); tests/test_proxy.py 12 passed",
+    "baseline_ids_before": {"audit_log_max": 1853, "generation_jobs_max": 248},
+    "final_ids_after": {"audit_log_max": 1860, "generation_jobs_max": 251},
+    "contamination": "none — audit rows 1854-1860 and jobs 249-251 are all from this run (proxycarry/probe-slow/0 deploy, fix analysis, check restart)",
+    "registry_operation": "none — no dev-debug-flow-v3 cycle dir (no gap-registry.json / config.md / features-tracking.md) exists in this workspace, so no gap-registry resolve applied; the project's feature doc _provision_gateway/docs/features.md was updated with row L22"
+  }
+}

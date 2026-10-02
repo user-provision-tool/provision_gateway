@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 
 @dataclass
@@ -156,6 +156,54 @@ def scan_compose_file(path: str | Path) -> ScanResult:
         return scan_text(p.read_text(encoding="utf-8", errors="replace"))
     except OSError:
         return ScanResult()
+
+
+def conflicting_defaults(paths: Iterable[str | Path]) -> list[dict[str, Any]]:
+    """Names used at two sites with two DIFFERENT defaults (doc §3b).
+
+    That pattern is a compose bug: the name carries two meanings, so no single
+    value satisfies both and the compose is only correct while the variable is
+    *unset* — a state any operator destroys by following the repo's own
+    `.env.example`. graphiti's `NEO4J_PORT` is the worked example (`:-7687` at
+    the Bolt sites, `:-7474` in the HTTP health probe).
+
+    Source-agnostic by construction: it reads the same `${VAR}` scan the rest of
+    the pipeline uses — no name lists, no per-project rules.
+
+    Returns one entry per conflicting name::
+
+        {"name": "NEO4J_PORT", "defaults": ["7474", "7687"], "sites": [...]}
+
+    where each site is ``{"file": ..., "default": ...}`` in first-seen order.
+    """
+    sites: dict[str, list[dict[str, str]]] = {}
+    seen: dict[str, set[str]] = {}
+    for p in paths:
+        path = Path(p)
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for ref in scan_text(text).refs:
+            if not ref.has_default:
+                continue
+            d = ref.default_raw or ""
+            if d in seen.setdefault(ref.name, set()):
+                continue
+            seen[ref.name].add(d)
+            sites.setdefault(ref.name, []).append({"file": path.name, "default": d})
+
+    out: list[dict[str, Any]] = []
+    for name, defaults in seen.items():
+        if len(defaults) > 1:
+            out.append({
+                "name": name,
+                "defaults": sorted(defaults),
+                "sites": sites.get(name, []),
+            })
+    return sorted(out, key=lambda c: c["name"])
 
 
 def scan_compose_files(paths: Iterable[str | Path]) -> ScanResult:

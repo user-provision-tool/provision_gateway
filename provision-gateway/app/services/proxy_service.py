@@ -193,6 +193,13 @@ async def test_all_configs() -> list[dict]:
 # Proxy env vars for docker / git
 # ---------------------------------------------------------------------------
 
+# The four keys `inject_proxy_build_args` writes into a deployment's
+# `build_args`. Named once because the RECORD path also has to recognise them:
+# a resumed deployment's stored args are how the gateway tells that the global
+# proxy was ON for the path it is about to replay (G20).
+PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+
+
 def _get_active_url(db: Session) -> str:
     config = db.query(ProxyConfigModel).filter(ProxyConfigModel.is_active == True).first()
     if not config:
@@ -205,7 +212,21 @@ def get_proxy_env(db: Session) -> dict[str, str]:
     url = _get_active_url(db)
     if not url:
         return {}
-    return {"HTTP_PROXY": url, "HTTPS_PROXY": url, "http_proxy": url, "https_proxy": url}
+    return {k: url for k in PROXY_ENV_KEYS}
+
+
+def build_args_carry_global_proxy(build_args: dict | None) -> bool:
+    """Did this deployment's build args come from the global proxy?
+
+    G20's precedent applies to every resumed path, not just Retry: a resume
+    REPLAYS the options the path was created with. For the LLM-fix handoff the
+    only surviving record of "was the proxy on?" is the failed instance's own
+    registry `build_args` — the deploy that recorded `use_global_proxy: true`
+    wrote these four keys, and a deployment without the proxy has neither.
+    """
+    if not build_args:
+        return False
+    return any(k in build_args for k in PROXY_ENV_KEYS)
 
 
 def inject_proxy_build_args(db: Session, build_args: dict | None, use_global_proxy: bool) -> dict:

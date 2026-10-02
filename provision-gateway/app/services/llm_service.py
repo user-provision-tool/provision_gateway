@@ -692,6 +692,27 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             "filled from deployment_meta, overriding any existing value.\n"
             "2. It is REQUIRED by the compose (no default) AND currently EMPTY — "
             "the instance cannot boot without it.\n"
+            "\n"
+            "For every variable you identify, also decide WHICH OF THREE "
+            "CATEGORIES it falls into — where its value can legitimately come "
+            "from:\n"
+            "  · \"non-secret\" — a deployment-derived value: the platform knows "
+            "it (a URL/origin/host/base built from deployment_meta). The "
+            "deployment fills it in.\n"
+            "  · \"secret\" — a secret THIS INSTANCE generates for itself, so a "
+            "value invented here and now is still CORRECT: a signing key, an "
+            "encryption key, a database password for a database this compose "
+            "creates, a session salt. Nobody outside needs to know it, and the "
+            "same random value every deploy is not required.\n"
+            "  · \"external\" — a credential issued by a THIRD PARTY that this "
+            "instance merely consumes: an API key or account token for an "
+            "external service (a model provider, a mail relay, an analytics or "
+            "object-storage account). The test that separates it from "
+            "\"secret\": could a value invented here and now be correct? For a "
+            "self-generated key yes; for a credential someone else must issue "
+            "no — inventing one produces a plausible-looking string that fails "
+            "at first use. Those the OPERATOR supplies; say so with this "
+            "category and DO NOT invent a placeholder value.\n"
             "NOT necessary — and therefore EXCLUDED:\n"
             "- Anything the PLATFORM owns (see 'How THIS PLATFORM serves the "
             "instance' above), judged by MEANING — what the variable DOES — "
@@ -716,16 +737,25 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             ":port inside the compose network).\n"
             "- Anything with a safe compose default that is not deployment-"
             "affected.\n"
-            'Reply with ONLY a JSON array of variable names, e.g. '
-            '["CONSOLE_API_URL","SECRET_KEY"]. No markdown fences, no prose.'
+            'Reply with ONLY a JSON object mapping each necessary variable to '
+            'its category, e.g. '
+            '{"CONSOLE_API_URL":"non-secret","SECRET_KEY":"secret",'
+            '"OPENAI_API_KEY":"external"}. No markdown fences, no prose.'
         )
         return "\n".join(parts)
 
     def _env_turn2_prompt(
-        self, context: dict, var_list: list[str], operator_prompt: str = ""
+        self, context: dict, var_list: list[str], operator_prompt: str = "",
+        categories: dict | None = None,
     ) -> str:
         """Turn-2 prompt (appended to the same conversation): map the
-        identified variables to concrete values from deployment_meta."""
+        identified variables to concrete values from deployment_meta.
+
+        ``categories`` carries turn 1's name → category verdict, so each variable
+        is shown with the category it was classified into. The model does not
+        re-litigate the categories here; it echoes ``external`` ones with a null
+        value for the operator to fill, and never invents a placeholder.
+        """
         dm = context.get("deploy_metadata") or {}
         handoff = (
             "  serving_url: " + str(dm.get("serving_url") or "") + "\n"
@@ -737,7 +767,10 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             "  user_name: " + str(dm.get("user_name") or "") + "\n"
             "  label: " + str(dm.get("label") or "0")
         )
-        names = "\n".join(f"- {n}" for n in var_list)
+        names = "\n".join(
+            f"- {n}" + (f"   [{categories[n]}]" if categories and categories.get(n) else "")
+            for n in var_list
+        )
         operator_block = ""
         if operator_prompt and operator_prompt.strip():
             operator_block = (
@@ -796,15 +829,24 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             "that slipped through identification. Drop each from your JSON "
             "ENTIRELY: do not give it a value, do not set it to empty, do not "
             "carry it over.\n"
+            "- For a variable you listed as a THIRD-PARTY CREDENTIAL this "
+            "instance merely consumes (marked [external] above): env_type is "
+            "'external' and value is null. The operator supplies it — the "
+            "gateway pauses and asks. NEVER invent a placeholder for it, do not "
+            "guess a plausible format (no 'sk-...', no 'your-key-here'), and do "
+            "not carry an example value over: a made-up credential looks "
+            "configured and fails at first use, which is worse than an empty "
+            "one.\n"
             "- For every OTHER variable: env_type is 'non-secret' and value is "
             "the final value (from deployment_meta / derivation as above).\n"
             "- Keep values consistent with the compose network for internal "
             "addresses if any are in the list.\n"
             "Reply with ONLY a JSON object mapping each variable to "
-            '{"env_type":"secret"|"non-secret","value":<string|null>}, e.g. '
+            '{"env_type":"secret"|"non-secret"|"external","value":<string|null>}, e.g. '
             '{"SECRET_KEY":{"env_type":"secret","value":null},'
             '"CONSOLE_API_URL":{"env_type":"non-secret",'
-            '"value":"http://dify-x.localhost:8767"}}. '
+            '"value":"http://dify-x.localhost:8767"},'
+            '"OPENAI_API_KEY":{"env_type":"external","value":null}}. '
             'Plus exactly one extra key, "_removed": an object mapping each '
             "variable you removed above to a one-line reason naming the "
             'platform decision it would have restated, e.g. {"_removed":'
@@ -814,6 +856,142 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             "enough that a reviewer can disagree with your judgement. "
             "No markdown fences, no comments, no other extra keys."
         )
+
+    def _fix_analysis_prompt(self, context: dict) -> str:
+        """The ANALYSIS prompt for `LLM based fix` (GRILLING G26).
+
+        Asks for a FIXING GUIDE — the guidance an operator would type into the
+        pause popup — never for corrected files. The guide is what the restarted
+        path consumes; the `.fix` files come from that restart (G25), so this
+        step writing files would be writing them twice and outside the gate.
+        """
+        failure = context.get("failure") or {}
+        log = context.get("task_log") or ""
+        files = context.get("base_files") or {}
+        meta = context.get("deploy_metadata") or {}
+
+        parts: list[str] = []
+        parts.append(
+            "A deployment failed. Analyse WHY it failed and write a FIXING GUIDE "
+            "for the generation step that will rebuild this deployment's files.\n"
+        )
+        parts.append(
+            "The guide is a DIRECTIVE addressed to that generation step: state "
+            "what must be changed in the deployment files and why, in enough "
+            "detail that the correction is unambiguous. Do NOT write the files "
+            "themselves, and do not answer with a diff — answer with the "
+            "instruction.\n"
+        )
+        parts.append(
+            "Also name which of the three slots is at fault, as a single word "
+            "on a line of its own, exactly one of:\n"
+            "SLOT: compose\nSLOT: nginx\nSLOT: env\nSLOT: unknown\n"
+        )
+        parts.append(
+            "Deployment: service=%s user=%s label=%s domain=%s"
+            % (
+                context.get("service_name") or "",
+                meta.get("user_name") or context.get("user_name") or "",
+                meta.get("label") or context.get("label") or "0",
+                meta.get("domain") or "localhost",
+            )
+        )
+        if failure:
+            parts.append(
+                "Failure stage: %s\nFailure message:\n%s"
+                % (failure.get("stage") or "(unknown)", failure.get("message") or "(none)")
+            )
+        if files:
+            listing = []
+            for name, body in files.items():
+                listing.append(
+                    "--- %s ---\n%s" % (name, (body or "")[:6000])
+                )
+            parts.append(
+                "The deployment files currently in the recipe:\n\n" + "\n\n".join(listing)
+            )
+        # The log is fed WHOLE (llm-based-fix-todo.md §4): a truncated tail is
+        # what hides the first error, and the first error is usually the cause.
+        parts.append("The failed task's log, in full:\n\n" + (log or "(empty log)"))
+        parts.append(
+            "\nAnswer with the guide, then the SLOT line. No preamble, no "
+            "markdown fences around the whole answer."
+        )
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _split_fix_guide(content: str) -> tuple[str, str]:
+        """Split the analysis answer into ``(guide, slot)``.
+
+        `slot` is a best-effort hint used to default WHICH slot the restart sets
+        to `generate new` — the operator sees and can change it, so an unusable
+        answer falls back to `compose` rather than failing the step.
+        """
+        import re as _re
+
+        text = content or ""
+        slot = ""
+        m = _re.search(r"^\s*SLOT\s*:\s*(compose|nginx|env|unknown)\s*$",
+                       text, _re.IGNORECASE | _re.MULTILINE)
+        if m:
+            slot = m.group(1).strip().lower()
+            text = text[:m.start()] + text[m.end():]
+        return text.strip(), (slot or "compose")
+
+    async def generate_fix_guide(
+        self,
+        db: Session,
+        context: dict,
+        progress=None,
+        session_log=None,
+        usage_cb=None,
+        on_delta=None,
+    ) -> dict:
+        """Analyse a failed deployment → ``{"guide", "slot", "usage", "warnings"}``.
+
+        No files are written: the only output is the guide (GRILLING G26).
+        """
+        base_url, model, headers = self._resolve_endpoint(db)
+        cfg = db.query(LLMConfig).filter(LLMConfig.is_active == True).first()
+        sysp = (cfg.system_prompt if cfg and cfg.system_prompt else "") or ""
+        usage_total: dict[str, int] = {"prompt": 0, "completion": 0, "reasoning": 0}
+
+        messages: list[dict] = []
+        if sysp:
+            messages.append({"role": "system", "content": sysp})
+        prompt = self._fix_analysis_prompt(context)
+        messages.append({"role": "user", "content": prompt})
+
+        if progress:
+            await progress("analyzing the failure to write a fixing guide")
+        resp = await self._chat(base_url, model, headers, messages, on_delta=on_delta)
+        u = (resp or {}).get("usage") or {}
+        usage_total["prompt"] += int(u.get("prompt_tokens") or 0)
+        usage_total["completion"] += int(u.get("completion_tokens") or 0)
+        usage_total["reasoning"] += int(
+            (u.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+        )
+        if usage_cb:
+            try:
+                usage_cb(dict(usage_total))
+            except Exception:
+                pass
+        choice = ((resp.get("choices") or [{}])[0].get("message") or {})
+        content = choice.get("content") or ""
+        if session_log:
+            session_log({
+                "stage": "fix.analyze",
+                "finish_reason": (resp.get("choices") or [{}])[0].get("finish_reason"),
+                "prompt_head": prompt[:1500],
+                "content_head": content[:3000],
+                "reasoning": (choice.get("reasoning_content") or "")[:3000],
+                "usage": dict(usage_total),
+            })
+        guide, slot = self._split_fix_guide(content)
+        warnings: list[str] = []
+        if not guide:
+            warnings.append("the analysis returned no guide text")
+        return {"guide": guide, "slot": slot, "usage": usage_total, "warnings": warnings}
 
     async def generate_env_two_turn(
         self,
@@ -878,16 +1056,37 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             "content_head": _cap(c1, 3000),
             "reasoning": _cap(_m1.get("reasoning_content") or ""),
         })
-        var_list = self._json_first(c1, want_object=False)
-        if var_list is None:
+        # Turn 1 answers with {name: category}. A bare array (the pre-category
+        # contract) is still accepted and treated as category-less, so a model
+        # that regresses to the old shape does not fail the phase.
+        turn1 = self._json_first(c1, want_object=True)
+        if turn1 is None:
+            turn1 = self._json_first(c1, want_object=False)
+        if turn1 is None:
             # one strict-JSON nudge for turn 1
             messages.append({"role": "assistant", "content": c1[:2000]})
-            messages.append({"role": "user", "content": "Your reply was not a JSON array. Reply with ONLY the JSON array of variable names."})
+            messages.append({"role": "user", "content":
+                "Your reply was not a JSON object. Reply with ONLY the JSON object mapping each "
+                "variable name to its category: \"non-secret\", \"secret\" or \"external\"."})
             resp1b = await self._chat(base_url, model, headers, messages, on_delta=on_delta)
             _add(resp1b)
             c1 = ((resp1b.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-            var_list = self._json_first(c1, want_object=False)
-        var_list = [str(x) for x in (var_list or []) if isinstance(x, str) and x.strip()]
+            turn1 = self._json_first(c1, want_object=True)
+        categories: dict[str, str] = {}
+        if isinstance(turn1, dict):
+            for k, v in turn1.items():
+                name = str(k).strip()
+                if not name:
+                    continue
+                cat = str(v).strip().lower() if not isinstance(v, dict) else ""
+                categories[name] = cat if cat in ("non-secret", "secret", "external") else ""
+        else:  # bare array — pre-category contract
+            for x in (turn1 or []):
+                if isinstance(x, str) and x.strip():
+                    categories[str(x).strip()] = ""
+        var_list = list(categories)
+        if categories:
+            _log({"stage": "env.turn1.categories", "categories": categories})
         # Surface turn 1's tokens the moment the call returns (the popup's step
         # row shows the counters live instead of waiting for turn 2 to start).
         if progress:
@@ -900,7 +1099,8 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
         if not var_list:
             warnings.append("env turn 1 returned no variables — falling back to mechanical env")
             _log({"stage": "env.turn1", "ok": False, "vars": []})
-            return {"vars": [], "kvs": {}, "warnings": warnings, "usage": dict(usage_total)}
+            return {"vars": [], "kvs": {}, "categories": {}, "external": [],
+                    "warnings": warnings, "usage": dict(usage_total)}
 
         # assistant continuity into turn 2
         messages.append({"role": "assistant", "content": c1[:4000]})
@@ -908,7 +1108,8 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
         # ---- Turn 2: map variables → values with deployment_meta ----
         op_prompt = (context.get("prompt") or "").strip()
         op_prefetched = await self._prefetch_prompt_urls(op_prompt) if op_prompt else ""
-        user2 = self._env_turn2_prompt(context, var_list, operator_prompt=op_prefetched or op_prompt)
+        user2 = self._env_turn2_prompt(context, var_list, operator_prompt=op_prefetched or op_prompt,
+                                       categories=categories)
         messages.append({"role": "user", "content": user2})
         if progress:
             await progress(f"env: mapping {len(var_list)} values from deployment_meta (turn 2/2)")
@@ -936,13 +1137,23 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
         # it anyway — it carries no env_type) so the reasons are recorded
         # instead of silently discarded.
         kvs, _removed_report = _split_removed_report(kvs)
-        # Values are {env_type: secret|non-secret, value: str|null} objects
-        # (decision-4 schema). Keep entries that carry the env_type marker.
+        # Values are {env_type: secret|non-secret|external, value: str|null}
+        # objects (decision-4 schema + the `external` category). Keep entries
+        # that carry the env_type marker — `external` MUST be among the accepted
+        # values: the filter used to admit only secret/non-secret, which would
+        # silently drop every operator-supplied credential and fall back to the
+        # mechanical env with no trace of why.
         kvs = {
             str(k): v
             for k, v in (kvs or {}).items()
-            if isinstance(v, dict) and v.get("env_type") in ("secret", "non-secret")
+            if isinstance(v, dict) and v.get("env_type") in ("secret", "non-secret", "external")
         }
+        # Which of them the operator must supply. Only names that turn 1
+        # classified `external` AND that survived into the final map — a
+        # variable the adversarial pass dropped is not asked for.
+        external_vars = sorted(
+            name for name, v in kvs.items() if v.get("env_type") == "external"
+        )
         if not kvs:
             warnings.append("env turn 2 returned no JSON map — falling back to mechanical env")
         if progress:
@@ -952,7 +1163,12 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             )
         _log({
             "stage": "env.turn2", "ok": bool(kvs), "vars": var_list,
-            "kvs_head": dict(list(kvs.items())[:5]),
+            # Never log an `external` value: at this point it is always null
+            # (the operator supplies it later), but masking the key keeps that
+            # invariant visible if the contract ever changes.
+            "kvs_head": {k: ("<external>" if v.get("env_type") == "external" else v)
+                         for k, v in list(kvs.items())[:5]},
+            "external": external_vars,
             # Audit trail for the adversarial removal pass — what the model
             # judged platform-owned and why. Absent if it reported nothing.
             "removed": _removed_report,
@@ -964,6 +1180,7 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             )
         return {
             "vars": var_list, "kvs": kvs, "removed": _removed_report,
+            "categories": categories, "external": external_vars,
             "warnings": warnings, "usage": dict(usage_total),
         }
 

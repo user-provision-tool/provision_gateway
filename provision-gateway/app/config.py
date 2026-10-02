@@ -57,6 +57,31 @@ class Settings:
             f"sqlite:///{self.GATEWAY_DATA_DIR / 'gateway.db'}",
         )
 
+        # ---- Generation capacity (GRILLING G29) ----
+        # The GATEWAY's own pool limit, a sibling of the -api's
+        # TASK_MAX_CONCURRENCY. Same mechanism, different reason: the -api's
+        # guards the host against concurrent docker work; this one guards the
+        # LLM endpoint and cost. Kept as a separate number on purpose — do not
+        # "unify" them.
+        self.GATEWAY_MAX_GENERATIONS: int = int(
+            os.environ.get("GATEWAY_MAX_GENERATIONS", "4")
+        )
+
+        # ---- Cleanup contract (GRILLING G30) ----
+        # ONE contract, two engine-adapted implementations: the terminal set,
+        # the log disposal and the trigger rule are shared, but one engine scans
+        # an in-memory dict and rewrites a JSON file while this one issues a SQL
+        # `DELETE`. These two numbers therefore carry the SAME DEFAULTS as the
+        # -api's `TASK_TTL_SECONDS` / `TASK_MAX_COUNT` so the two stores cannot
+        # drift apart, while the env names stay the gateway's own: they configure
+        # a different engine, and a shared variable would silently retune both.
+        self.GATEWAY_JOB_TTL_SECONDS: int = int(
+            os.environ.get("GATEWAY_JOB_TTL_SECONDS", "604800")     # = the -api's 1 week
+        )
+        self.GATEWAY_MAX_JOBS: int = int(
+            os.environ.get("GATEWAY_MAX_JOBS", "1000")              # = the -api's cap
+        )
+
         # ---- JWT ----
         self.JWT_EXPIRE_SEC: int = int(os.environ.get("JWT_EXPIRE_SEC", "3600"))
         self.JWT_REFRESH_EXPIRE_SEC: int = int(

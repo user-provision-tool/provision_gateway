@@ -235,16 +235,28 @@ def list_file_sets(service_name: str) -> dict[str, Any]:
         }
 
         # Stale detection: stored entry whose file vanished / profile gone.
+        #
+        # A file is NOT gone if only its `.j2` template remains: the -api's
+        # register-time conversion renames a plain compose to `<name>.j2`, so a
+        # selection pointing at the plain name would otherwise be marked stale by
+        # the platform's OWN action — which then disables Deploy for that
+        # service. Established live (Round 5) after it silently blocked trace T4
+        # for two rounds. The `.j2` is the same file in the platform's template
+        # form, so it satisfies the selection.
+        def _exists_or_template(name: str) -> bool:
+            base = _recipe_dir(project_dir, rp)
+            return (base / name).is_file() or (base / f"{name}.j2").is_file()
+
         entry_stale: dict[str, list[str]] = {}
         if selected:
             gone = [
                 p for p in selected.get("compose", [])
-                if not (_recipe_dir(project_dir, rp) / p).is_file()
+                if not _exists_or_template(p)
             ]
             if gone:
                 entry_stale["compose"] = gone
             sel_nginx = selected.get("nginx")
-            if sel_nginx and not (_recipe_dir(project_dir, rp) / sel_nginx).is_file():
+            if sel_nginx and not _exists_or_template(sel_nginx):
                 entry_stale["nginx"] = [sel_nginx]
             gone_env = [
                 p for p in selected.get("env", [])

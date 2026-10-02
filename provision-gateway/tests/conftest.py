@@ -75,3 +75,60 @@ def token(tmp_path_factory):
 
     pytest.skip("Could not obtain auth cookie — gateway may not be set up yet")
     return ""  # unreachable but satisfies type checker
+
+
+@pytest.fixture(autouse=True)
+def _isolated_gateway_db(tmp_path_factory, monkeypatch):
+    """Point every test at its OWN throwaway SQLite database (GRILLING G31).
+
+    Two reasons this is autouse rather than opt-in:
+
+    1. **Safety.** The gateway's real store is `gateway_data/gateway.db`, shared
+       with the live container. Any test that reaches `SessionLocal` without an
+       override writes into the running system's data.
+    2. **The store is a table now.** `pre_deploy_registry` used to be a JSON file
+       under `GATEWAY_DATA_DIR`, so setting that env var to `tmp_path` was enough
+       isolation. The sessions moved into SQLite, so a temp *directory* no longer
+       isolates anything — a temp *engine* does.
+
+    `database.SessionLocal` is resolved at call time by every service (the
+    codebase's convention), so patching it here reaches all of them.
+    """
+    import app.database as database
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import app.models  # noqa: F401 — registers every model on Base.metadata
+    from app.database import Base
+
+    # A SEPARATE directory, not the test's own `tmp_path`: a test that
+    # fingerprints `tmp_path` would otherwise see this file (`gateway-test.db`)
+    # as one of its own entries.
+    data_dir = tmp_path_factory.mktemp("gateway-data")
+    engine = create_engine(f"sqlite:///{data_dir}/gateway.db")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(
+        database, "SessionLocal",
+        sessionmaker(bind=engine, expire_on_commit=False),
+    )
+    monkeypatch.setenv("GATEWAY_DATA_DIR", str(data_dir))
+    # ...and the RESOLVED setting, not only the environment variable. `settings`
+    # is built at import time, so a later `setenv` cannot reach it — which left
+    # every per-task LOG path pointing at the live `/srv/provision/gateway_data`
+    # for the whole suite. Anything that unlinks a log (`prune_finished` does)
+    # would then have deleted a real deployment's log file.
+    from app.config import settings
+    monkeypatch.setattr(settings, "GATEWAY_DATA_DIR", data_dir, raising=False)
+
+    # The manager is a module-level SINGLETON and every test gets a FRESH
+    # database whose job ids restart at 1. Its id-keyed bookkeeping would
+    # therefore outlive the rows it describes: a cancel booked in one test
+    # (or a `_cancel_polled` throttle timestamp) would silently apply to a
+    # later test's job that reused the id. Same stale-id hazard `_set_status`
+    # guards against with its `discard`. Reset it with the database.
+    from app.services.generation_jobs import generation_jobs
+    generation_jobs._tasks.clear()
+    generation_jobs._cancelled.clear()
+    generation_jobs._cancel_polled.clear()
+
+    return engine
