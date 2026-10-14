@@ -15,6 +15,11 @@
 # (auth_request /_auth_jwt → gateway verify, credential injection), and proxy
 # to the internal -nginx mirroring the client scheme.
 
+# The stream gate's own module (task-doc R4.2). It ships in the nginx image
+# (`/usr/lib/nginx/modules/ngx_stream_js_module.so`) but is NOT loaded by
+# default: without this line `js_import` is an unknown directive.
+load_module /usr/lib/nginx/modules/ngx_stream_js_module.so;
+
 user nginx;
 worker_processes auto;
 
@@ -37,24 +42,70 @@ http {
     resolver 127.0.0.11 valid=30s ipv6=off;
 
     # ------------------------------------------------------------------
-    # SNI → per-domain cert — DYNAMIC catch-all (decision 9, v5 §4.3/§7).
-    # Any SNI resolves to `SSL_DIR/{domain}/fullchain.pem`; the variable
-    # `ssl_certificate` re-reads the file per handshake, so a newly-added cert
-    # is served immediately and rotation is live. The `default` placeholder
-    # exists ONLY to satisfy nginx's startup requirement (it must load a valid
-    # cert); at request time every SNI matches the regex, so a domain WITHOUT a
-    # cert file fails the TLS handshake (connection dropped — the certless-https
-    # behavior, decision 9). The placeholder lives in the edge IMAGE at
+    # SNI → per-domain cert — DYNAMIC catch-all, keyed on the DOMAIN
+    # (decision 9, v5 §4.3/§7; re-keyed 2026-10-10 — task-doc R4.3 / T4).
+    #
+    # `SSL_DIR/{domain}/fullchain.pem`, where the DOMAIN IS DERIVED FROM THE SNI
+    # by dropping the first label: `<label>.<domain>` → `<domain>`. That is what
+    # makes the ONE wildcard certificate per domain (`*.example.com`) serve every
+    # name under it — instance hosts, dash hosts, and the opaque exposure handles
+    # the stream path mints on demand. Deliberately DOMAIN-AGNOSTIC: matching a
+    # configured domain instead would mean editing this file and restarting the
+    # edge for every new domain, which is the very property the catch-all exists
+    # to avoid (a cert added to the store is live on the next handshake).
+    #
+    # Fail-closed BY SHAPE: a name that is not one label under a domain matches
+    # nothing here and takes the `default` branch (the placeholder) — so a deeper
+    # name (`a.b.example.com` → `/certs/b.example.com/`, a directory that does
+    # not exist) and a dotless name both FAIL THE HANDSHAKE (connection dropped —
+    # the certless-https behaviour, decision 9) and neither ever presents a
+    # WRONG certificate for a name.
+    #
+    # The variable `ssl_certificate` re-reads the file per handshake, so a
+    # newly-added cert is served immediately and rotation is live. The `default`
+    # placeholder exists ONLY to satisfy nginx's startup requirement (it must load
+    # a valid cert); the placeholder lives in the edge IMAGE at
     # /etc/nginx/acl/placeholder/ (generated at build, decision 11) — NOT under
     # the read-only SSL_DIR /certs mount.
+    #
+    # The stream listener needs ITS OWN copy of this key rule (a `map` cannot
+    # cross configuration contexts) — see the `stream` block below.
     # ------------------------------------------------------------------
     map $ssl_server_name $cert_pem {
-        default     /etc/nginx/acl/placeholder/fullchain.pem;
-        ~^(?<d>.+)$ /certs/$d/fullchain.pem;
+        default                     /etc/nginx/acl/placeholder/fullchain.pem;
+        ~^(?<rest>[^.]+)\.(?<d>.+)$ /certs/$d/fullchain.pem;
     }
     map $ssl_server_name $cert_key {
-        default     /etc/nginx/acl/placeholder/privkey.pem;
-        ~^(?<d>.+)$ /certs/$d/privkey.pem;
+        default                     /etc/nginx/acl/placeholder/privkey.pem;
+        ~^(?<rest>[^.]+)\.(?<d>.+)$ /certs/$d/privkey.pem;
+    }
+
+    # ------------------------------------------------------------------
+    # R4-F63 — the Host forwarded DOWNSTREAM to a service, port included.
+    #
+    # `$host` strips the port, and an application that builds an absolute URL
+    # from the host it was given then names the scheme's default port — on a
+    # deployment whose edge is remapped off 443, a dead end (measured through
+    # the card's own `/go/` hand-off: `Location: https://<host>/browser/` and
+    # an empty response, where the same redirect at the published port loaded).
+    # `$http_host` is the Host the client actually sent, port and all, and no
+    # port when the client used the default one — the truthful answer, and it
+    # needs no knowledge of this deployment's ports.
+    #
+    # The `""` arm is why this is a map rather than a bare `$http_host`: a
+    # client that sends NO Host header at all (HTTP/1.0, a bare probe) would
+    # forward an empty header downstream. Falling back to `$host` keeps today's
+    # behaviour for those clients — and it is what makes `$http_host` safe to
+    # use unguarded at the next hop, in the generated per-instance conf, which
+    # only ever sees a request that has already passed through here.
+    #
+    # NOT used by the auth subrequest below: that one keeps `$host`, because
+    # the gateway resolves the service from it and mints the access token's
+    # `svc_host` claim against the registry's portless `hostname`.
+    # ------------------------------------------------------------------
+    map $http_host $forwarded_host {
+        ""      $host;
+        default $http_host;
     }
 
     # ------- Portal (portal host) -------
@@ -115,7 +166,8 @@ http {
             error_page 401 = @auth_401;
             error_page 403 = @auth_403;
             proxy_set_header Authorization "Basic $service_basic";
-            proxy_set_header Host $host;
+            # R4-F63 — the client's Host, port included (see the map above).
+            proxy_set_header Host $forwarded_host;
             proxy_set_header X-Forwarded-Proto http;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_pass http://subnet-acl-nginx;
@@ -139,7 +191,8 @@ http {
             error_page 401 = @auth_401;
             error_page 403 = @auth_403;
             proxy_set_header Authorization "Basic $service_basic";
-            proxy_set_header Host $host;
+            # R4-F63 — the client's Host, port included (see the map above).
+            proxy_set_header Host $forwarded_host;
             proxy_set_header X-Forwarded-Proto https;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_ssl_server_name on;
@@ -157,7 +210,8 @@ http {
         server_name _;
         if (-f /certs/$host/fullchain.pem) { return 301 https://$host${HTTPS_REDIRECT_PORT}$request_uri; }
         location / {
-            proxy_set_header Host $host;
+            # R4-F63 — the client's Host, port included (see the map above).
+            proxy_set_header Host $forwarded_host;
             proxy_set_header X-Forwarded-Proto http;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_pass http://subnet-acl-nginx;
@@ -170,7 +224,8 @@ http {
         ssl_certificate $cert_pem;
         ssl_certificate_key $cert_key;
         location / {
-            proxy_set_header Host $host;
+            # R4-F63 — the client's Host, port included (see the map above).
+            proxy_set_header Host $forwarded_host;
             proxy_set_header X-Forwarded-Proto https;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_ssl_server_name on;
@@ -180,4 +235,75 @@ http {
         include /etc/nginx/acl/acl-helpers.conf;
     }
     # [endif]
+}
+
+# ======================================================================
+# STREAM — the non-HTTP exposure path (task-doc area D, GRILLING G39/G40/G42)
+# ======================================================================
+# ONE shared TLS-terminating listener, and NO plain listener on this port:
+# every connection is a TLS ClientHello whose SNI is the operator's exposure
+# handle, and the routing decision is made per connection by the gateway
+# (`/api/stream/verify`), never cached.
+#
+# The listener terminates the CLIENT's TLS with the SAME catch-all map rule the
+# http vhosts use — which is why it needs its OWN copy: a `map` lives in one
+# configuration context, so the `http` map above cannot serve this block
+# (task-doc R4.3). The names here (handles) are minted on demand, so a
+# per-block certificate is impossible by design and the map is the only shape
+# that fits.
+#
+# What happens to a connection, in order (all of it measured on this stack):
+#   1. TLS handshake with the certificate the *stream* map resolves. A handle is
+#      one label under the domain, so the domain wildcard serves it; a name the
+#      map cannot resolve (dotless, deeper) falls to the placeholder and the
+#      client's verification fails.
+#   2. `js_preread` runs — and this needs `ssl_preread on;`, without which the
+#      preread phase never fires for a terminating listener and the handshake
+#      never completes at all. It reads $ssl_server_name (the handle), POSTs it
+#      to the gateway, and either `s.deny()`s the session or `s.allow()`s it
+#      after setting $stream_upstream / $stream_sni.
+#   3. The content phase opens the platform-internal TLS hop to the internal
+#      nginx under the CANONICAL NAME as its SNI (verification off — internal),
+#      which is the only thing that hop carries. The last hop, internal nginx →
+#      container, is PLAIN, so the application needs no TLS of its own (R5.5).
+stream {
+    map $ssl_server_name $stream_cert_pem {
+        default                     /etc/nginx/acl/placeholder/fullchain.pem;
+        ~^(?<rest>[^.]+)\.(?<d>.+)$ /certs/$d/fullchain.pem;
+    }
+    map $ssl_server_name $stream_cert_key {
+        default                     /etc/nginx/acl/placeholder/privkey.pem;
+        ~^(?<rest>[^.]+)\.(?<d>.+)$ /certs/$d/privkey.pem;
+    }
+
+    js_import stream_acl from /etc/nginx/acl/stream-acl.js;
+
+    server {
+        listen      ${STREAM_PORT} ssl;
+        ssl_certificate     $stream_cert_pem;
+        ssl_certificate_key $stream_cert_key;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+
+        # Required: the preread phase (and therefore the hook's SNI) does not
+        # exist without it on a listener that terminates TLS.
+        ssl_preread on;
+        js_preread  stream_acl.preread;
+
+        # The hook calls the gateway by name, and njs's `ngx.fetch` resolves
+        # names through nginx's OWN resolver — not the system one. Without this
+        # the fetch fails with "no resolver defined" and every connection stalls
+        # in the preread phase (measured 2026-10-10).
+        resolver 127.0.0.11 valid=30s ipv6=off;
+
+        # Set by the hook on an allow; empty on a deny, which is exactly what
+        # makes a refusal unroutable rather than merely unlogged.
+        set $stream_upstream "";
+        set $stream_sni      "";
+        proxy_pass          $stream_upstream;
+        # The inner hop is TLS whose only job is carrying the name.
+        proxy_ssl           on;
+        proxy_ssl_server_name on;
+        proxy_ssl_name      $stream_sni;
+        proxy_ssl_verify    off;
+    }
 }

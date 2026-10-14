@@ -20,6 +20,7 @@ from .routers import (
     llm_router,
     pre_deploy_router,
     services_router,
+    stream_router,
     system_router,
     tasks_router,
     users_router,
@@ -334,6 +335,7 @@ app.include_router(tasks_router)
 app.include_router(llm_router)
 app.include_router(pre_deploy_router)
 app.include_router(audit_router)
+app.include_router(stream_router)
 
 
 # ---------------------------------------------------------------------------

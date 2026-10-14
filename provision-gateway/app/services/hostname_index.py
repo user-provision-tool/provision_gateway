@@ -48,6 +48,20 @@ class HostnameIndex:
                 hostname = entry.get("hostname", "")
                 if hostname:
                     new_index[hostname.lower()] = entry
+                # R1.5 — an instance's EXTRA HTTP endpoints resolve to the SAME
+                # entry, so `/go/<instance host>--<sub_service>.<domain>` reaches
+                # the sub-service with the instance's own cookie exactly as its
+                # primary URL does (the reason the platform relays through /go/ at
+                # all: the login cookie is host-scoped). Without these aliases the
+                # card offered a link that answered `Service not found` — measured
+                # 2026-10-10 on a live deployment whose entry recorded both extra
+                # endpoints.
+                #
+                # `setdefault`, never assignment: a name that is also some other
+                # instance's primary hostname must keep resolving to that instance.
+                for _extra in (entry.get("http_endpoints") or []):
+                    if isinstance(_extra, str) and _extra:
+                        new_index.setdefault(_extra.lower(), entry)
             self._index = new_index
             self._mtime = current_mtime
             return True

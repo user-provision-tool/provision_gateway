@@ -37,7 +37,14 @@ _PER_USER_ENV_RE = re.compile(r"^\.env\.[^./]+\.[0-9]+$")
 # docker-compose.user-specialsync.0.yml) — never recipe candidates.
 _PER_USER_COMPOSE_RE = re.compile(r"^docker-compose\.user-[^/]+\.yml$")
 
-_FILE_SET_CATEGORIES = ("compose", "nginx", "env", "profiles")
+_FILE_SET_CATEGORIES = ("compose", "nginx", "serving_ports", "stream_conf", "env", "profiles")
+
+# The serving-ports artifact's stem (task-doc R1.1). The platform's other
+# artifacts carry theirs in the file name (`docker-compose…`, `nginx…`), and this
+# one is no different: the stem is what identifies the artifact, and the
+# `.base`/`.fix` + job-id token that the generation pipeline appends goes BEFORE
+# the extension (so the platform's existing pattern predicates keep matching).
+_SERVING_PORTS_STEMS = ("serving_ports", "serving-ports")
 
 
 class FileSetError(ValueError):
@@ -100,6 +107,36 @@ def _is_nginx_candidate(name: str) -> bool:
     if name.endswith(".generated") or name.endswith(".j2"):
         return False
     return name.endswith(".conf") and not name.endswith(".j2")
+
+
+def _is_serving_ports_candidate(name: str) -> bool:
+    """True when ``name`` is a serving-ports artifact by naming convention.
+
+    The convention — not "any YAML" — identifies it, exactly as `_is_compose_name`
+    argues for composts. `.generated` and `.j2` forms are the platform's own
+    by-products, never candidates; the `.base.<job>` / `.fix.<job>` forms ARE
+    candidates (task-doc R1.1: identified by PATTERN, never by exact name — the
+    job-id token is a collision guard, not an identity).
+    """
+    if name.endswith(".generated") or name.endswith(".j2"):
+        return False
+    if not (name.endswith(".yml") or name.endswith(".yaml")):
+        return False
+    return name.startswith(_SERVING_PORTS_STEMS)
+
+
+def _is_stream_conf_candidate(name: str) -> bool:
+    """True when ``name`` is a generated STREAM conf, by naming convention.
+
+    The generated file is `<svc>.user-<user>.<label>.stream.conf` (T9's output),
+    and the name is load-bearing twice over: the -api's conversion dispatches on
+    it (`convert_stream_conf`, R9.2) and its rendered copy must match the pattern
+    the internal nginx includes (`*.stream.conf`). `.generated` and `.j2` forms
+    are the platform's by-products, never candidates.
+    """
+    if name.endswith(".generated") or name.endswith(".j2"):
+        return False
+    return name.endswith(".stream.conf")
 
 
 def _is_env_candidate(name: str) -> bool:
@@ -218,6 +255,8 @@ def list_file_sets(service_name: str) -> dict[str, Any]:
         compose_cands = sorted(n for n in names if _is_compose_candidate(n))
         nginx_cands = sorted(n for n in names if _is_nginx_candidate(n))
         env_cands = sorted(n for n in names if _is_env_candidate(n))
+        sp_cands = sorted(n for n in names if _is_serving_ports_candidate(n))
+        sc_cands = sorted(n for n in names if _is_stream_conf_candidate(n))
 
         # Profile candidates derive from the SELECTED compose (the merged set);
         # when nothing is selected the section stays disabled (dependency on
@@ -230,6 +269,8 @@ def list_file_sets(service_name: str) -> dict[str, Any]:
         candidates[rp] = {
             "compose": compose_cands,
             "nginx": nginx_cands,
+            "serving_ports": sp_cands,
+            "stream_conf": sc_cands,
             "env": env_cands,
             "profiles": prof_cands,
         }
@@ -244,8 +285,9 @@ def list_file_sets(service_name: str) -> dict[str, Any]:
         # for two rounds. The `.j2` is the same file in the platform's template
         # form, so it satisfies the selection.
         def _exists_or_template(name: str) -> bool:
-            base = _recipe_dir(project_dir, rp)
-            return (base / name).is_file() or (base / f"{name}.j2").is_file()
+            return (base_dir / name).is_file() or (base_dir / f"{name}.j2").is_file()
+
+        base_dir = _recipe_dir(project_dir, rp)
 
         entry_stale: dict[str, list[str]] = {}
         if selected:
@@ -258,6 +300,12 @@ def list_file_sets(service_name: str) -> dict[str, Any]:
             sel_nginx = selected.get("nginx")
             if sel_nginx and not _exists_or_template(sel_nginx):
                 entry_stale["nginx"] = [sel_nginx]
+            sel_sp = selected.get("serving_ports")
+            if sel_sp and not (base_dir / sel_sp).is_file():
+                entry_stale["serving_ports"] = [sel_sp]
+            sel_sc = selected.get("stream_conf")
+            if sel_sc and not (base_dir / sel_sc).is_file():
+                entry_stale["stream_conf"] = [sel_sc]
             gone_env = [
                 p for p in selected.get("env", [])
                 if not (_recipe_dir(project_dir, rp) / p).is_file()
@@ -333,17 +381,36 @@ def put_file_set(service_name: str, recipe_path: str, file_set: dict[str, Any]) 
         if not isinstance(nginx, str) or not nginx.strip():
             raise FileSetError("nginx must be a path string or null")
         nginx = _validate_paths(project_dir, recipe_key, [nginx])[0]
+    serving_ports = file_set.get("serving_ports")
+    if serving_ports is not None:
+        if not isinstance(serving_ports, str) or not serving_ports.strip():
+            raise FileSetError("serving_ports must be a path string or null")
+        serving_ports = _validate_paths(project_dir, recipe_key, [serving_ports])[0]
+    stream_conf = file_set.get("stream_conf")
+    if stream_conf is not None:
+        if not isinstance(stream_conf, str) or not stream_conf.strip():
+            raise FileSetError("stream_conf must be a path string or null")
+        stream_conf = _validate_paths(project_dir, recipe_key, [stream_conf])[0]
     profiles = [p for p in (file_set.get("profiles") or []) if isinstance(p, str)]
+    # R2-F10 / R1.3 — `None` is a first-class RECORDED state, not the absence of a
+    # selection: "deliberately no serving-ports file" has to survive the save, or
+    # a redeploy replays it as "generate new" and the two states collapse into one.
+    # (The same rule the stream_conf slot needed; the flag was simply missed in
+    # both places that carry the category.)
+    serving_ports_none = bool(file_set.get("serving_ports_none"))
 
     entry = {
         "compose": compose,
         "nginx": nginx,
+        "serving_ports": serving_ports,
+        "serving_ports_none": serving_ports_none,
+        "stream_conf": stream_conf,
         "env": env,
         "profiles": profiles,
     }
     for key in _FILE_SET_CATEGORIES:
         if key not in entry:
-            entry[key] = [] if key != "nginx" else None
+            entry[key] = [] if key not in ("nginx", "serving_ports", "stream_conf") else None
 
     from ..services.service_manager import service_manager
 

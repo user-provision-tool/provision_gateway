@@ -384,6 +384,41 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# The ACL matrix — ONE definition, two callers
+# ---------------------------------------------------------------------------
+
+
+def parse_allowed_special_users(raw: str | None) -> list[str]:
+    """Parse the comma-separated ``allowed_special_users`` list, trimming (N1)."""
+    if not raw:
+        return []
+    return [u.strip() for u in raw.split(",") if u.strip()]
+
+
+def acl_allows(end_user, target_user_name: str) -> bool:
+    """Does ``end_user`` reach an instance owned by ``target_user_name``?
+
+    This IS the ACL matrix: the rule the HTTP gate applies at
+    ``routers/auth.py::verify_auth`` to an (end user, target instance) pair, and
+    the rule the stream verdict re-applies per connection at
+    ``services/stream_service.py::verify``. One function on purpose — GRILLING
+    **G39** §3 requires the stream path to evaluate "the same ACL matrix the HTTP
+    path uses" (task-doc R3.3), and two copies of a security rule drift.
+
+    The matrix proper is only *own instance, or a recorded special-user grant*.
+    The checks around it stay with each caller, because they answer with
+    different things: the HTTP gate must return ``login_required`` (401) for an
+    inactive or unapproved user *before* ``acl_denied`` (403) can be the answer,
+    while the stream verdict turns any of them into a deny.
+    """
+    if target_user_name == getattr(end_user, "username", None):
+        return True
+    return target_user_name in parse_allowed_special_users(
+        getattr(end_user, "allowed_special_users", None)
+    )
+
+
 TARGET_TYPES = ("end_user", "admin")
 
 

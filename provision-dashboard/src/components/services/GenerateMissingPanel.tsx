@@ -4,8 +4,7 @@ import Editor from '@monaco-editor/react'
 import client from '../../api/client'
 import { deriveProfiles } from '../../api/services'
 import { useGenerationJob, isPaused } from '../../hooks/useGenerationJob'
-import ExternalCredentialPrompt from './ExternalCredentialPrompt'
-import ComposeFixPrompt from './ComposeFixPrompt'
+import PausePrompt from './PausePrompt'
 import FileSetSelection, {
   phaseOfFile,
   EMPTY_CANDIDATES,
@@ -146,6 +145,26 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
     nginx: selection.nginx && !(stale.nginx || []).includes(selection.nginx) ? selection.nginx : null,
     env: selection.env.filter(p => !(stale.env || []).includes(p)),
     profiles: selection.profiles.filter(p => !(stale.profiles || []).includes(p)),
+    // R4-F62 — the serving-ports slot must travel here too, and it did NOT.
+    //
+    // This panel renders the serving-ports picker (it uses the same
+    // `FileSetSelection` as the deploy panel), so the operator could select an
+    // artifact, watch it appear in the panel, and have it silently dropped from
+    // the request: the job's `selection` arrived without a `serving_ports` key,
+    // so `validate_ports` was never in its phase plan (its "in play" test reads
+    // that key) and the artifact was neither checked nor used. Measured
+    // 2026-10-11 on `probe-validate-standalone`: the job completed WITHOUT the
+    // check ever running.
+    //
+    // The same hand-rebuilt key list as the deploy panel's R2-F39 and the save
+    // path's R2-F33 — this is the third instance of the shape, which is why the
+    // comment is repeated rather than referenced.
+    serving_ports: selection.serving_ports
+      && !(stale.serving_ports || []).includes(selection.serving_ports)
+      ? selection.serving_ports
+      : null,
+    // R1.3 — and the deliberate-None state goes with it, never both.
+    serving_ports_none: !selection.serving_ports && !!selection.serving_ports_none,
   })
 
   const startGeneration = async () => {
@@ -212,7 +231,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
             type="info"
             showIcon
             message="Env files are NOT generated here"
-            description="Per-user env files are generated automatically at deploy time (last step of the deploy pipeline). This panel generates compose and nginx only."
+            description="Per-user env files are generated automatically at deploy time (last step of the deploy pipeline). This panel generates the recipe-level artifacts: compose, serving_ports and nginx."
           />
           {!llmActive && (
             <Alert
@@ -277,19 +296,11 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
                 // G27 made a pause TERMINAL, so it arrives as `paused` and the
                 // legacy status check matched nothing — the panel then rendered
                 // the progress branch for a stopped leg, with no way to answer it.
-                ((jobState.pending_input) || {}).kind === 'compose_fix' ? (
-                  <ComposeFixPrompt
-                    jobState={jobState}
-                    onSubmit={submitInput}
-                    onCancel={cancelJob}
-                  />
-                ) : (
-                  <ExternalCredentialPrompt
-                    jobState={jobState}
-                    onSubmit={submitInput}
-                    onCancel={cancelJob}
-                  />
-                )
+                <PausePrompt
+                  jobState={jobState}
+                  onSubmit={submitInput}
+                  onCancel={cancelJob}
+                />
               ) : (
                 <Space direction="vertical" style={{ width: '100%' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>

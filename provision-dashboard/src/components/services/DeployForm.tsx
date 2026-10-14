@@ -5,11 +5,13 @@ import Editor from '@monaco-editor/react'
 import client from '../../api/client'
 import { deriveProfiles, getComposePreview } from '../../api/services'
 import { useGenerationJob, isPaused } from '../../hooks/useGenerationJob'
-import ExternalCredentialPrompt from './ExternalCredentialPrompt'
-import ComposeFixPrompt from './ComposeFixPrompt'
+import PausePrompt from './PausePrompt'
 import FileSetSelection, {
   fixVariantFor,
   phaseOfFile,
+  servingPortsRows,
+  setPrimary,
+  ServingPortsRow,
   EMPTY_CANDIDATES,
   EMPTY_SELECTION,
   FileSetCandidates,
@@ -332,8 +334,17 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         // guide belongs to the pause, not to the picker.
         if (fixingGuide) setPrompt(fixingGuide.guide || '')
         // Re-attach to the parked generation job, which is what surfaces its
-        // pause popup (compose conflict / external credential) in this panel.
-        if (resumeJobId != null) genJob.resumeJob(resumeJobId)
+        // pause popup (compose conflict / external credential) in this panel —
+        // AND OPEN that popup. Attaching without opening it left the panel
+        // showing an ordinary deploy form while the pause it had just attached
+        // to was nowhere on screen, so the operator's only route to the answer
+        // was the Tasks page. Measured 2026-10-11 on the `check` path with a
+        // credential pause. `renderExternalPrompt` lives inside the popup, so
+        // attaching and opening it are one action, not two.
+        if (resumeJobId != null) {
+          genJob.resumeJob(resumeJobId)
+          setGenPopupOpen(true)
+        }
         try {
           const { data: cfg } = await client.get('/llm/config')
           setLlmActive(!!(cfg && (cfg.is_active || cfg.byok_configured)))
@@ -422,6 +433,11 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       setSelection({
         compose: entry.compose || [],
         nginx: entry.nginx || null,
+        // R1.1/R1.3: the serving-ports artifact and its deliberate-None state,
+        // read from the SAME stored file set the other categories come from — so
+        // the deploy forwards what the operator (or the generation) selected.
+        serving_ports: entry.serving_ports || null,
+        serving_ports_none: entry.serving_ports_none || false,
         env: entry.env || [],
         profiles: entry.profiles || [],
       })
@@ -513,6 +529,47 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
   // Selection used for generation/deploy requests — stale stored entries are
   // excluded (kept + flagged in the UI, never sent, design §Selection & UI).
+  // R1.3 — the `primary` picker's rows, read from the artifact the picker names.
+  // The picker is a field OF that file, so it appears only when one is selected
+  // (never for `None`), and changing it EDITS the file rather than a panel
+  // field: the edit forks `.fix` and the selection flips to the fork, exactly
+  // as editing the file itself does.
+  const [spRows, setSpRows] = useState<ServingPortsRow[]>([])
+  const spFile = selection.serving_ports
+  useEffect(() => {
+    let cancelled = false
+    if (!spFile) { setSpRows([]); return }
+    const svcVal = form.getFieldValue('service_name') || ''
+    const { baseName, recipePath } = parseServiceValue(svcVal)
+    if (!baseName) { setSpRows([]); return }
+    const path = recipePath ? `${recipePath}/${spFile}` : spFile
+    client.get(`/projects/${baseName}/files/${path}`)
+      .then(({ data }) => { if (!cancelled) setSpRows(servingPortsRows(typeof data?.content === 'string' ? data.content : '')) })
+      .catch(() => { if (!cancelled) setSpRows([]) })
+    return () => { cancelled = true }
+  }, [spFile])
+
+  const changePrimary = async (subService: string) => {
+    if (!spFile) return
+    const svcVal = form.getFieldValue('service_name') || ''
+    const { baseName, recipePath } = parseServiceValue(svcVal)
+    const path = recipePath ? `${recipePath}/${spFile}` : spFile
+    try {
+      const { data } = await client.get(`/projects/${baseName}/files/${path}`)
+      const content = typeof data?.content === 'string' ? data.content : ''
+      const next = setPrimary(content, subService)
+      const targetName = fixVariantFor(spFile)
+      await client.post('/projects/save-generated', {
+        service_name: baseName, recipe_path: recipePath, files: { [targetName]: next },
+      })
+      setSpRows(servingPortsRows(next))
+      setSelection(prev => ({ ...prev, serving_ports: targetName }))
+      message.success(`${subService} is now the primary — saved as ${targetName}, and the picker uses it`)
+    } catch (err: any) {
+      message.error(err?.response?.data?.detail || 'Could not set the primary')
+    }
+  }
+
   const effectiveSelection = (): FileSetSelectionData => {
     const st = fileSetStale || {}
     return {
@@ -520,6 +577,20 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       nginx: selection.nginx && !(st.nginx || []).includes(selection.nginx) ? selection.nginx : null,
       env: selection.env.filter(p => !(st.env || []).includes(p)),
       profiles: selection.profiles.filter(p => !(st.profiles || []).includes(p)),
+      // R2-F39 — the serving-ports slot MUST travel with the payload. It was
+      // rebuilt here by hand and this function forgot it, so the deploy carried
+      // no artifact: `produce_for_deploy(serving_ports_path=None)` produced no
+      // stream conf, the entry recorded `stream_sub_services: []`, and the card
+      // offered no action — with a picker, a stored selection and a working
+      // gateway, and NOTHING visible saying why. (The same omission as the save
+      // path's, R2-F33: a hand-rebuilt key list is the recurring shape of this
+      // bug.)
+      serving_ports: selection.serving_ports
+        && !(st.serving_ports || []).includes(selection.serving_ports)
+        ? selection.serving_ports
+        : null,
+      // R1.3 — and the deliberate-None state goes with it, never both.
+      serving_ports_none: !selection.serving_ports && !!selection.serving_ports_none,
     }
   }
 
@@ -665,6 +736,33 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       },
     })
     if (!jobId) throw new Error('Failed to start generation job')
+    // R4-F50 — THE SESSION is the durable handle, not this hook's ref.
+    //
+    // `genJob.jobIdRef` advances only when THIS hook instance answers the pause
+    // (`submitInput` → `setJob(next)`). An answer that creates the next leg from
+    // anywhere else — the card's `Check`, which re-opens this panel attached to
+    // the parked job — left this loop polling the paused row, which is terminal
+    // forever: it neither deployed nor failed until the 900 s timeout, and the
+    // operator saw "deploying the instance…" with nothing happening (F50,
+    // measured 2026-10-10). The pre-deploy SESSION is keyed by the
+    // (user, service, label) and its `job_id` moves to every new leg the server
+    // creates, so reading it is what makes the auto-run survive an answer from
+    // anywhere. A missing session (404 — cancelled, or already handed off) is
+    // simply "no better information": keep polling what we have.
+    const sessionJobId = async (): Promise<number | null> => {
+      const _u = snap.user_name || ''
+      if (!_u) return null
+      try {
+        const { data } = await client.get(
+          `/pre-deploy/${encodeURIComponent(_u)}/${encodeURIComponent(baseName)}`
+          + `/${encodeURIComponent(snap.label || '0')}`,
+          { params: { recipe_path: recipePath || '' } })
+        return data?.job_id == null ? null : Number(data.job_id)
+      } catch {
+        return null
+      }
+    }
+
     for (let i = 0; i < 900; i++) {
       await new Promise(r => setTimeout(r, 1000))
       // G27: read the CURRENT id on every pass, never the one captured here.
@@ -673,7 +771,12 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       // driven by the hook, already shows the resumed leg complete. The deploy
       // was then never issued and the operator stared at "deploying the
       // instance…" with nothing happening. Found live in T13.
-      const pollId = genJob.jobIdRef.current ?? jobId
+      let pollId = genJob.jobIdRef.current ?? jobId
+      // ...and the SESSION outranks the ref: it is the server's own record of
+      // which leg this deployment is on, so a leg it has moved past is a leg
+      // that was answered somewhere this panel cannot see (F50).
+      const liveId = await sessionJobId()
+      if (liveId !== null && liveId !== pollId) pollId = liveId
       const { data } = await client.get(`/llm/jobs/${pollId}`)
       if (data.status === 'completed') {
         const result = data.result || {}
@@ -797,6 +900,15 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           compose: prev.compose.map(p => (p === editorFileName ? targetName : p)),
           nginx: prev.nginx === editorFileName ? targetName : prev.nginx,
           env: prev.env.map(p => (p === editorFileName ? targetName : p)),
+          // R4-F64 — and the serving-ports slot, which this list forgot. Every
+          // other category is flipped here; `serving_ports` was added to the
+          // selection later and this hand-rebuilt list was not carried with it,
+          // so an edit to the ports artifact forked to `.fix` and left the
+          // picker on the ORIGINAL — the next deploy then used the file the
+          // operator had just edited away from. The fourth instance of the same
+          // shape (F39, F33, F62), which is why the comment is repeated rather
+          // than referenced: a hand-rebuilt key list is how this keeps happening.
+          serving_ports: prev.serving_ports === editorFileName ? targetName : prev.serving_ports,
         }))
         message.success(`Saved as ${targetName} — the selection now uses it`)
       } else {
@@ -1139,17 +1251,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     const _terminal = genJob.jobState.status === 'paused'
     const _onCancel = _terminal ? () => genJob.reset() : genJob.cancelJob
     const _label = _terminal ? 'Close' : 'Cancel'
-    // The pause has two kinds (§3b): awaiting the operator's credential
-    // VALUES, or awaiting an editable FIX GUIDANCE for a compose conflict.
-    return (genJob.jobState.pending_input || {}).kind === 'compose_fix' ? (
-      <ComposeFixPrompt
-        jobState={genJob.jobState}
-        onSubmit={genJob.submitInput}
-        onCancel={_onCancel}
-        cancelLabel={_label}
-      />
-    ) : (
-      <ExternalCredentialPrompt
+    // The pause's kinds are dispatched in ONE place (`PausePrompt`): the
+    // credential VALUES, the compose conflict's editable GUIDANCE, and R1.3's
+    // two validation checks — each of which names the file it wants fixed.
+    // Spelled out here it was a two-way branch, so a third kind fell through to
+    // the credential prompt and offered a form that could not answer it.
+    return (
+      <PausePrompt
         jobState={genJob.jobState}
         onSubmit={genJob.submitInput}
         onCancel={_onCancel}
@@ -1356,6 +1464,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
             needsEnv={needsEnv}
             onChange={setSelection}
             onOpenFile={(name) => openSelectedFile(name)}
+            spRows={spRows}
+            onPrimaryChange={changePrimary}
           />
 
           {/* ---- Deploy-time per-user env (pipeline env phase, design §2) ---- */}
@@ -1448,7 +1558,16 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         {renderExternalPrompt()}
                         {genJob.jobState && (genJob.jobState.status === 'failed' || genJob.jobState.status === 'cancelled') && (
                           <div style={{marginTop:8}}>
-                            <Text type="danger" style={{fontSize:12}}>{genJob.jobState.error || `Job ${genJob.jobState.status}`}</Text>
+                            {/* R3-F48 — coerced, not trusted: an API error body
+                                is an OBJECT, and React refuses to render one
+                                (#31), which blanks this whole panel — the pause
+                                dialog included. */}
+                            <Text type="danger" style={{fontSize:12}}>
+                              {typeof genJob.jobState.error === 'string'
+                                ? genJob.jobState.error
+                                : (genJob.jobState.error?.detail || genJob.jobState.error?.error
+                                   || `Job ${genJob.jobState.status}`)}
+                            </Text>
                             <Button size="small" style={{marginLeft:8}} onClick={genJob.reset}>Dismiss</Button>
                           </div>
                         )}

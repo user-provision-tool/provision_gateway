@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..models.generation_job import (
+    JOB_ORIGIN_DEPLOY,
     JOB_STATUS_CANCELLED,
     JOB_STATUS_AWAITING_INPUT,
     JOB_STATUS_PAUSED,
@@ -37,6 +38,7 @@ from ..models.generation_job import (
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
     GenerationJob,
+    job_origin,
 )
 from .llm_service import llm_service
 
@@ -45,11 +47,16 @@ ProgressFn = Callable[[str], Awaitable[None]]
 # Multi-phase order: compose is the root; nginx is blocked until compose
 # exists; env comes from the var-scan of the resolved compose (design
 # §Dependency graph).
-PHASE_ORDER = ("compose", "nginx", "env")
+# The standalone/generate order. `serving_ports` sits BETWEEN compose and nginx
+# because it is derived FROM the compose (the ports it mentions) and the nginx
+# conf is derived from it in turn (GRILLING G37's "generated after compose and
+# before nginx").
+PHASE_ORDER = ("compose", "serving_ports", "validate_ports", "stream_conf", "nginx", "validate_conf", "env")
 
 # Phase → config_type used by the LLM.
 PHASE_CONFIG_TYPE = {
     "compose": "docker_compose",
+    "serving_ports": "serving_ports",
     "nginx": "nginx_conf",
     "env": "env_file",
 }
@@ -87,6 +94,10 @@ PHASE_CONFIG_TYPE = {
 # carries agreed meaning (`.raw` vs `.fix`) — see §3's table.
 PHASE_FILENAME = {
     "compose": "docker-compose.base.{token}.yml",
+    # The serving-ports artifact follows the same convention the other two base
+    # files do: stem, `.base`, the job-id token, then the EXTENSION (task-doc
+    # R1.1) — so the platform's existing pattern predicates keep matching it.
+    "serving_ports": "serving_ports.base.{token}.yml",
     "nginx": "nginx.base.{token}.conf",
     "env": ".env",
 }
@@ -106,6 +117,7 @@ PHASE_FILENAME = {
 # that `check` triggers afterwards, which is the only thing that writes `.fix`.
 FIX_FILENAME = {
     "compose": "docker-compose.fix.{token}.yml",
+    "serving_ports": "serving_ports.fix.{token}.yml",
     "nginx": "nginx.fix.{token}.conf",
     "env": ".env.fix",
 }
@@ -465,6 +477,21 @@ class GenerationJobManager:
             _gen_nginx = "nginx.conf" in missing or (
                 _deploy_scoped and not sel.get("nginx")
             )
+            # The serving-ports artifact (task-doc R1.1/T12), by the SAME rule as
+            # its siblings: deploy-scoped runs demand every slot be NAMED (G20),
+            # so an unselected one is generated even if a file of that kind
+            # already sits in the recipe. Positioned after the compose's
+            # validation — it is derived from that compose — and before nginx.
+            # R1.3's `None` is a first-class RECORDED state: "deliberately no file".
+            # It suppresses the generation exactly as it suppresses both
+            # validations — and the recording is what tells this apart from "no
+            # file exists", both here and on the card.
+            _sp_none = bool(sel.get("serving_ports_none"))
+            _gen_serving_ports = (not _sp_none) and (
+                "serving_ports" in missing or (
+                    _deploy_scoped and not sel.get("serving_ports")
+                )
+            )
             phases: list[str] = []
             if _gen_compose:
                 phases.append("compose")
@@ -477,8 +504,43 @@ class GenerationJobManager:
                 # one. So validate whenever a compose is in play, not only when
                 # this run generated it.
                 phases.append("validate")
+            if _gen_serving_ports:
+                phases.append("serving_ports")
+            # T9 — the internal stream conf, produced from the serving-ports rows
+            # whose kind is a STREAM protocol, and **conditional on the TLS toggle**
+            # (R8.4): with TLS off the slot is not generated, not demanded by "every
+            # slot must come out named", and not carried in the refusal record — so
+            # a replay reproduces the same shape. A `serving_ports` row may still be
+            # declared with TLS off; that row simply has no conf, no route and no
+            # exposure.
+            # T14 / R1.3: the two validations are STEPS, and the skip rule is
+            # stated over ARTIFACTS, not phases — a step runs when its input
+            # artifact is IN PLAY (selected, or produced by this run), and is
+            # skipped when the artifact is deliberately absent. That is what makes
+            # "a selected compose is still validated" and "a deliberately absent
+            # ports file skips both checks" the same rule rather than two.
+            _sp_in_play = "serving_ports" in phases or bool(sel.get("serving_ports"))
+            if _sp_in_play and not sel.get("serving_ports_none"):
+                phases.append("validate_ports")
+
+            _tls_on = bool((request.get("deploy_metadata") or {}).get("https")
+                           or request.get("https") or request.get("tls"))
+            if _tls_on and (
+                "serving_ports" in phases
+                or sel.get("serving_ports")
+                or "stream_conf" in missing
+            ):
+                phases.append("stream_conf")
             if _gen_nginx:
                 phases.append("nginx")
+            # The conf's agreement with the ports file is checkable whenever BOTH
+            # are in play — and "in play" includes a conf the operator SELECTED,
+            # not only one this run generated. Nesting this under the generation
+            # was a real gap, caught by the test for exactly this rule (R1.3 states
+            # it for the compose: "a selected artifact is still validated").
+            if (_sp_in_play and not sel.get("serving_ports_none")
+                    and (_gen_nginx or sel.get("nginx"))):
+                phases.append("validate_conf")
             # The Source Projects panel passes skip_env (env is deploy-time
             # only — design §8.7).
             if not request.get("skip_env"):
@@ -496,33 +558,43 @@ class GenerationJobManager:
     @classmethod
     def _recipe_missing(cls, request: dict[str, Any]) -> list[str]:
         """Mirror the provision-api ``check_missing_files`` presence scan on the
-        recipe dir (compose/nginx only). Returns which of ``docker-compose`` /
-        ``nginx.conf`` are ABSENT from the recipe, i.e. which LLM phases a
-        generate-missing run must include.
+        recipe dir (compose / serving_ports / nginx). Returns which of them are
+        ABSENT from the recipe, i.e. which LLM phases a generate-missing run must
+        include.
+
+        The THREE parts must agree or the deploy has a phase that never runs and
+        no file to deploy — the failure mode `_is_compose_name`'s comment warns
+        about, now for the serving-ports artifact too (task-doc R1.1/G20: a
+        recipe without one cannot deploy).
         """
-        from ..services.file_sets import _is_compose_name, _recipe_dir
+        from ..services.file_sets import (
+            _is_compose_name, _is_serving_ports_candidate, _recipe_dir,
+        )
 
         service_name = request.get("service_name") or ""
         recipe_path = request.get("recipe_path") or ""
         try:
             recipe_dir = _recipe_dir(Path(settings.SOURCE_PROJECTS_DIR) / service_name, recipe_path)
         except Exception:
-            return ["docker-compose", "nginx.conf"]  # unknown recipe — assume missing
+            return ["docker-compose", "serving_ports", "nginx.conf"]  # unknown recipe — assume missing
         missing: list[str] = []
         try:
             files = [f.name for f in recipe_dir.iterdir() if f.is_file()]
         except OSError:
-            return ["docker-compose", "nginx.conf"]
+            return ["docker-compose", "serving_ports", "nginx.conf"]
         # Same definition the candidate scan uses (a template still counts as
         # present) — if these two disagree, the compose phase is skipped while
         # the panel offers nothing to select and the deploy has no compose.
         has_compose = any(_is_compose_name(f, allow_template=True) for f in files)
+        has_serving_ports = any(_is_serving_ports_candidate(f) for f in files)
         has_nginx = any(
             f.endswith(".conf.j2") or (f.endswith(".conf") and not f.endswith(".j2"))
             for f in files
         )
         if not has_compose:
             missing.append("docker-compose")
+        if not has_serving_ports:
+            missing.append("serving_ports")
         if not has_nginx:
             missing.append("nginx.conf")
         return missing
@@ -1486,6 +1558,310 @@ class GenerationJobManager:
                                 )
                             continue
 
+                        # ---- T14: the two validations (MECHANICAL) ----
+                        # No LLM: they CHECK artifacts, they do not produce any.
+                        # What a FAILURE does is two different things, and R1.3
+                        # states why that is not decoration: a pause KEEPS the
+                        # run and the artifacts it has already produced, while a
+                        # raised failure discards both and re-pays for them on
+                        # the retry. So the deploy-scoped path pauses — a pause
+                        # IS a session, and one exists there — with this check's
+                        # OWN kind, so the guided fix names the right file; the
+                        # standalone Generate panel (no user, no label, no
+                        # session — which is why that path is Tasks-page-only by
+                        # design) raises, with the same precise errors and the
+                        # same named file.
+                        if phase in ("validate_ports", "validate_conf"):
+                            # `validate_serving_ports` lives with the other
+                            # mechanical validators; `validate_conf_agreement` with
+                            # the artifact's own semantics. Both are imported here
+                            # because this branch is where they are used.
+                            from ..services.config_validation import validate_serving_ports
+                            from ..services.serving_ports import validate_conf_agreement
+
+                            # R2-F40/F41 — this branch needs its OWN `recipe_dir`
+                            # and `context`. Both are locals of `_run_job` assigned
+                            # in OTHER branches, so reading them here raised
+                            # `UnboundLocalError` — the second and third unbound
+                            # name this phase body has now failed on (after
+                            # `eff_compose`, R2-F38), because no test executes a
+                            # phase body. `_build_context` is the same call the
+                            # other phases make, so the compose paths it resolves
+                            # are the ones this check is about.
+                            recipe_dir = self._recipe_dir_for(service_name, recipe_path)
+                            context = self._build_context(service_name, recipe_path, phase, request)
+
+                            _sel = dict(request.get("selection") or {})
+                            _sp_name = _names.get("serving_ports")
+                            _sp_path = None
+                            # WHICH file is being checked — recorded, not
+                            # re-derived: a pause must name the file that FAILED,
+                            # and `_names.get("serving_ports")` is the phase's
+                            # prospective name for this job, not the artifact in
+                            # play whenever the row came from the selection.
+                            # Measured: naming it from `_names` first reported
+                            # `serving_ports.base.<job>.yml` as the culprit while
+                            # the operator's own `serving_ports.yml` was the file
+                            # the check had actually rejected.
+                            _sp_source = ""
+                            # Initialised HERE, not inside the `validate_conf`
+                            # branch that fills it: the pause below reads it from
+                            # another branch, and a name bound only in a sibling
+                            # branch is NOT bound for that load. Bound at this
+                            # level it is bound on every path, which is what the
+                            # static net (TestPhaseBodiesBindTheirOwnNames) and
+                            # the runtime both want.
+                            _conf_source = ""
+                            if _sp_name and _sp_name in result_files:
+                                # produced by THIS run (not yet on disk)
+                                _sp_text = result_files[_sp_name]
+                                _sp_source = _sp_name
+                            elif _sel.get("serving_ports"):
+                                _p = recipe_dir / _sel["serving_ports"]
+                                _sp_text = _p.read_text(encoding="utf-8", errors="replace") if _p.is_file() else ""
+                                _sp_source = str(_sel["serving_ports"])
+                            else:
+                                _sp_text = ""
+                            _ports = None
+                            try:
+                                import yaml as _yaml
+                                _ports = _yaml.safe_load(_sp_text) if _sp_text else None
+                            except Exception as _e:  # noqa: BLE001
+                                _ports = None
+                                warnings.append(f"serving_ports could not be parsed: {_e}")
+
+                            _domain = (request.get("deploy_metadata") or {}).get("domain") or "localhost"
+                            if phase == "validate_ports":
+                                # R2-F38 — `eff_compose` belonged to a LATER
+                                # function and was never a name in this scope, so
+                                # the first real run of this phase died with
+                                # `NameError` and the whole generation job failed
+                                # (measured 2026-10-10, job 362, phase 3/6). The
+                                # compose in play is the one the run resolved:
+                                # `context["compose_paths"]` when the compose phase
+                                # ran, else the selected list. The unit suite
+                                # covers the phase LISTS, not the phase bodies, so
+                                # nothing caught it — the same hole the round
+                                # already recorded for a wrong module path.
+                                _vp_compose = [
+                                    str(p) for p in (context.get("compose_paths") or [])
+                                ] or [
+                                    str(recipe_dir / p) for p in (_sel.get("compose") or [])
+                                ]
+                                _res = validate_serving_ports(_sp_text, _vp_compose)
+                            else:
+                                # The conf in play: this run's produced one, else the
+                                # selection's. It is a TEMPLATE at this point, so the
+                                # two known substitutions are applied before the
+                                # comparison — the served names are what the check is
+                                # about, and `{{ hostname }}` is the instance host.
+                                _conf_name = _names.get("nginx")
+                                # Same recording as the ports artifact above: the
+                                # pause names the conf that FAILED, not this job's
+                                # prospective name for it. (`_conf_source` is
+                                # already "" from the branch's own initialiser.)
+                                if _conf_name and _conf_name in result_files:
+                                    _conf_text = result_files[_conf_name]
+                                    _conf_source = _conf_name
+                                elif _sel.get("nginx"):
+                                    _p = recipe_dir / _sel["nginx"]
+                                    _conf_text = _p.read_text(encoding="utf-8", errors="replace") if _p.is_file() else ""
+                                    _conf_source = str(_sel["nginx"])
+                                else:
+                                    _conf_text = ""
+                                # R2-F46 — the template→rendered normalisation is
+                                # owned by the checker itself
+                                # (`serving_ports.validate_conf_agreement`), so the
+                                # caller passes the conf as it stands and cannot
+                                # forget the step.
+                                _res = validate_conf_agreement(
+                                    _ports, _conf_text,
+                                    service_name=service_name,
+                                    user_name=str(request.get("user_name") or "x"),
+                                    label=str(request.get("label") or "0"),
+                                    domain=_domain,
+                                )
+
+                            warnings.extend(_res.get("warnings") or [])
+                            if not _res.get("valid"):
+                                _errs = _res.get("errors") or []
+                                await _event(fname, "failed", {
+                                    "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
+                                    "step": f"{phase}#final", "errors": _errs,
+                                })
+                                # R1.3 — the deploy-scoped path PAUSES; the
+                                # standalone panel RAISES. `job_origin` is the
+                                # one home for "which path created this job"
+                                # (the deploy's own generation, a resumed leg, a
+                                # fix, or the Source Projects panel), read off
+                                # what the job RECORDS rather than inferred.
+                                if job_origin(request, job.job_type) == JOB_ORIGIN_DEPLOY:
+                                    # The file the operator must fix, and the
+                                    # slot that produces it. The restart has to
+                                    # REGENERATE the artifact the check rejected,
+                                    # so that slot travels UNSELECTED — the same
+                                    # rule the compose-conflict pause uses (G21),
+                                    # for the same reason: re-running the path
+                                    # with the bad file still selected would
+                                    # judge it again and pause forever on its own
+                                    # output. `user_name` is already in the
+                                    # carried request, which is what keeps the
+                                    # resumed leg deploy-scoped.
+                                    if phase == "validate_ports":
+                                        _fix_file = _sp_source or "serving_ports"
+                                        _fix_unsel = {"serving_ports": None}
+                                    else:
+                                        _fix_file = _conf_source or "nginx.conf"
+                                        _fix_unsel = {"nginx": None}
+                                    _guidance = (
+                                        f"{_fix_file} failed the {phase} check: "
+                                        + "; ".join(_errs)
+                                        + f". Confirm to regenerate {_fix_file} and resume."
+                                    )
+                                    await _event(fname, "paused", {
+                                        "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
+                                        "step": f"{phase}#input", "errors": _errs,
+                                    })
+                                    self._set_status(
+                                        job_id, JOB_STATUS_PAUSED,
+                                        progress=f"{phase}: {_fix_file}",
+                                        result={
+                                            "pause": {
+                                                # Its OWN kind per check, so the
+                                                # prompt the operator answers is
+                                                # the one that names the right
+                                                # file (T14's rule, restated).
+                                                "kind": f"{phase}_fix",
+                                                "ask": {
+                                                    "file": _fix_file,
+                                                    "check": phase,
+                                                    "errors": _errs,
+                                                    "guidance": _guidance,
+                                                },
+                                                "request": {
+                                                    **request,
+                                                    "selection": {**_sel, **_fix_unsel},
+                                                    "prompt": _guidance,
+                                                    "fix": True,
+                                                },
+                                                "warnings": warnings,
+                                            }
+                                        },
+                                    )
+                                    return
+                                raise GenerationJobError(
+                                    f"{phase} failed: " + "; ".join(_errs)
+                                )
+                            await _event(fname, "done", {
+                                "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
+                                "step": f"{phase}#final", "errors": [], "warnings": _res.get("warnings") or [],
+                            })
+                            continue
+
+                        # ---- T9: the internal stream conf (MECHANICAL) ----
+                        # No LLM: the judgment already happened in the
+                        # serving_ports phase (which ports exist, what each
+                        # speaks). What remains is arithmetic — pick the stream
+                        # rows, name each, write a block the internal nginx
+                        # selects by `server_name`.
+                        if phase == "stream_conf":
+                            from ..services.stream_conf import (
+                                render_stream_conf, stream_rows,
+                            )
+                            from ..services.serving_ports import load_kind_categories  # noqa: F401
+
+                            # R2-F42 — its own `recipe_dir`, for the reason the
+                            # validate branch needed one (F40): the name is bound
+                            # in the `env` branch only, so reading it here would
+                            # have been the FOURTH `UnboundLocalError` in these
+                            # phase bodies. Found by the static net, not by a run.
+                            recipe_dir = self._recipe_dir_for(service_name, recipe_path)
+
+                            _sel = dict(request.get("selection") or {})
+                            _sp_name = _names.get("serving_ports")
+                            _sp_path = None
+                            if _sp_name and _sp_name in result_files:
+                                _sp_path = recipe_dir / _sp_name
+                            elif _sel.get("serving_ports"):
+                                _sp_path = recipe_dir / _sel["serving_ports"]
+
+                            _rows: list[dict[str, Any]] = []
+                            if _sp_path and _sp_path.is_file():
+                                try:
+                                    import yaml as _yaml
+                                    _rows = stream_rows(
+                                        _yaml.safe_load(_sp_path.read_text(encoding="utf-8", errors="replace"))
+                                    )
+                                except Exception as _e:  # noqa: BLE001
+                                    warnings.append(f"could not read serving_ports: {_e}")
+
+                            if not _rows:
+                                # R1.4 by construction: nothing to expose, so no
+                                # file is written at all.
+                                await _event(fname, "done", {
+                                    "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
+                                    "step": f"{phase}#final", "stream_rows": 0,
+                                })
+                                continue
+
+                            _domain = (request.get("deploy_metadata") or {}).get("domain") or "localhost"
+                            _ssl_dir = Path(getattr(settings, "SSL_DIR", ""))
+                            content = render_stream_conf(
+                                _rows,
+                                service_name=service_name,
+                                user_name=str(request.get("user_name") or ""),
+                                label=str(request.get("label") or "0"),
+                                domain=_domain,
+                                cert_pem=str(_ssl_dir / _domain / "fullchain.pem"),
+                                cert_key=str(_ssl_dir / _domain / "privkey.pem"),
+                            )
+                            # The name is PER-USER (it carries user and label), so
+                            # it cannot come from the token map the recipe-level
+                            # artifacts use.
+                            sc_name = (
+                                f"{service_name}.user-{request.get('user_name') or 'unknown'}"
+                                f".{request.get('label') or '0'}.stream.conf"
+                            )
+                            result_files[sc_name] = content
+                            _swapped = dict(request.get("selection") or {})
+                            _swapped["stream_conf"] = sc_name
+                            request["selection"] = _swapped
+
+                            # Persist the swap (the same inline pattern the LLM
+                            # phases use): the in-memory dict dies with this run,
+                            # and the request is what a later resume — and the
+                            # deploy payload — reads. Without it the conf is
+                            # generated and then not sent.
+                            try:
+                                _db = SessionLocal()
+                                try:
+                                    _row = _db.query(GenerationJob).filter(
+                                        GenerationJob.id == job_id
+                                    ).first()
+                                    if _row:
+                                        _row.request = json.dumps(request, ensure_ascii=False)
+                                        _db.commit()
+                                finally:
+                                    _db.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            # Write it to the recipe dir immediately, like the other
+                            # phases: the payload references a PATH, so the file has
+                            # to exist before this run finishes.
+                            try:
+                                _rd = self._recipe_dir_for(service_name, recipe_path)
+                                _rd.mkdir(parents=True, exist_ok=True)
+                                _fp = _rd / sc_name
+                                _fp.write_text(content, encoding="utf-8")
+                                (_rd / f"{_fp.name}.generated").write_text("")
+                            except OSError:
+                                pass
+                            await _event(sc_name, "done", {
+                                "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
+                                "step": f"{phase}#final", "stream_rows": len(_rows),
+                            })
+                            continue
+
                         # ---- compose / nginx phases (LLM) ----
                         context = self._build_context(service_name, recipe_path, phase, request)
                         gen = None
@@ -1521,13 +1897,15 @@ class GenerationJobManager:
                             # corrected compose, and the final result carries the
                             # swapped selection so the client's deploy payload
                             # names it — no second deploy.
-                            if phase in ("compose", "nginx"):
+                            if phase in ("compose", "nginx", "serving_ports"):
                                 _swapped = dict(request.get("selection") or {})
                                 # compose is a LIST slot, nginx a SINGLE-value
                                 # one — the shape mirrors the panel's own
                                 # selection model.
                                 if phase == "compose":
                                     _swapped["compose"] = [fname]
+                                elif phase == "serving_ports":
+                                    _swapped["serving_ports"] = fname
                                 else:
                                     _swapped["nginx"] = fname
                                 request["selection"] = _swapped
@@ -1744,6 +2122,23 @@ class GenerationJobManager:
         sel_env = [p for p in selection.get("env", []) if isinstance(p, str)]
         profiles = [p for p in selection.get("profiles", []) if isinstance(p, str)]
 
+        # R1.5 / T16 — the serving-ports artifact in play. The nginx phase needs
+        # its `kind: http` rows to know which EXTRA endpoints the conf must serve
+        # (R1.3 makes a missing block for one an error). The SELECTION comes
+        # first — the artifact the deploy actually used — then the newest
+        # candidate, the same precedence the mint settled on (round 2's F35);
+        # without it the model sees only the compose and writes one block.
+        from .file_sets import _is_serving_ports_candidate
+
+        _sel_sp = selection.get("serving_ports")
+        if not _sel_sp:
+            _sp_candidates = sorted(
+                (f.name for f in recipe_dir.iterdir()
+                 if f.is_file() and _is_serving_ports_candidate(f.name)),
+            )
+            _sel_sp = _sp_candidates[-1] if _sp_candidates else None
+        serving_ports_path = str(recipe_dir / _sel_sp) if _sel_sp else None
+
         base_files: dict[str, str] = {}
         # Compose files are the base for the nginx phase; the compose phase
         # itself only gets the manifests (or a selected compose being replaced).
@@ -1751,7 +2146,10 @@ class GenerationJobManager:
         # the raw compose: huge inputs make reasoning models spend the whole
         # token budget on chain-of-thought and return EMPTY content
         # (finish_reason=length) — the var list is all the phase needs.
-        if phase == "nginx":
+        if phase in ("nginx", "serving_ports"):
+            # Both are DERIVED from the compose: nginx proxies what it declares,
+            # serving_ports classifies the ports it mentions (which is why the
+            # artifact lists every `ports:` AND every `expose:` entry — R1.1).
             for p in eff_compose:
                 fp = recipe_dir / p
                 if fp.is_file():
@@ -1847,6 +2245,7 @@ class GenerationJobManager:
             "base_files": base_files,
             "profiles": profiles,
             "compose_paths": [str(recipe_dir / p) for p in eff_compose],
+            "serving_ports_path": serving_ports_path,
             "project_dir": str(project_dir),
             "recipe_path": recipe_path,
             "empty_recipe": not has_compose and not sel_nginx and not sel_env,

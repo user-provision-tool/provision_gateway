@@ -85,8 +85,12 @@ def _normalize_file_sets(raw: Any) -> dict[str, dict]:
     """Validate + normalize a loaded ``file_sets`` payload.
 
     Accepts v2 payloads only; anything malformed is dropped per-key so a
-    corrupt entry can never crash listing. Each recipe entry keeps the four
-    known categories and discards unknown keys.
+    corrupt entry can never crash listing. Each recipe entry keeps the known
+    categories and discards unknown keys — which is why a NEW category has to be
+    added HERE as well as in the file-set service: this normalizer is the schema,
+    and a category it does not know is silently dropped on the next load
+    (measured 2026-10-10, when `serving_ports` survived the save and vanished on
+    the read).
     """
     if not isinstance(raw, dict):
         return {}
@@ -98,11 +102,29 @@ def _normalize_file_sets(raw: Any) -> dict[str, dict]:
         nginx = entry.get("nginx")
         if nginx is not None and not isinstance(nginx, str):
             nginx = None
+        # The serving-ports artifact (task-doc R1.1): single-valued like nginx,
+        # same normalization contract.
+        serving_ports = entry.get("serving_ports")
+        if serving_ports is not None and not isinstance(serving_ports, str):
+            serving_ports = None
+        # The deliberate-NO-FILE state (R1.3). It must be normalized here as well
+        # as in the file-set service: this function rebuilds the entry from a
+        # whitelist, so a key it does not name is dropped on the next load —
+        # measured for `stream_conf`, and the flag was missed the same way.
+        serving_ports_none = bool(entry.get("serving_ports_none"))
+        # The generated stream conf (T9): single-valued like nginx, and it MUST be
+        # in this normalizer too or it is dropped on the next load.
+        stream_conf = entry.get("stream_conf")
+        if stream_conf is not None and not isinstance(stream_conf, str):
+            stream_conf = None
         env = [p for p in (entry.get("env") or []) if isinstance(p, str)]
         profiles = [p for p in (entry.get("profiles") or []) if isinstance(p, str)]
         result[recipe_key] = {
             "compose": compose,
             "nginx": nginx,
+            "serving_ports": serving_ports,
+            "serving_ports_none": serving_ports_none,
+            "stream_conf": stream_conf,
             "env": env,
             "profiles": profiles,
         }

@@ -157,3 +157,120 @@ def validate_env(
             errors.append(f"missing env var(s) without defaults: {', '.join(missing)}")
 
     return {"valid": not errors, "errors": errors, "missing": missing, "skipped": False}
+
+
+def _compose_profiles(compose_paths: list[str | Path]) -> set[str]:
+    """Every profile ANY service in the given compose files declares."""
+    import yaml
+
+    out: set[str] = set()
+    for p in compose_paths:
+        try:
+            data = yaml.safe_load(Path(p).read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        services = (data or {}).get("services") if isinstance(data, dict) else None
+        if isinstance(services, dict):
+            for svc in services.values():
+                if isinstance(svc, dict):
+                    for prof in svc.get("profiles") or []:
+                        if isinstance(prof, str) and prof:
+                            out.add(prof)
+    return out
+
+
+def validate_serving_ports(
+    content: str, compose_paths: list[str | Path]
+) -> dict[str, Any]:
+    """Mechanical validation of a generated `serving_ports` artifact (T13/R1.2).
+
+    The errors are the ones that make the artifact WRONG for the platform:
+
+    * it does not parse, or has no `ports:` list;
+    * a row is not a mapping, or misses `sub_service` / `port`;
+    * a row names a service the compose does not have (the platform routes by
+      that name);
+    * `--` appears anywhere in a name — it is the platform's reserved separator
+      and an ambiguous name cannot be split again (R1.5);
+    * a `profiles` entry the compose never declares (the deploy panel can only
+      select what exists);
+    * more than one `primary: true` — the instance hostname points at exactly
+      one service.
+
+    Two things are deliberately WARNINGS, not errors, because the doc leaves them
+    to the operator's judgment (T14's `validate_ports` phase is where a guided fix
+    can pause): a port the compose mentions with no row (an omission worth
+    surfacing, but a row list may be deliberately partial), and a row with no
+    `kind` (legal, and NOT exposed — R1.2's fail-closed rule — so it is worth
+    saying out loud without blocking).
+    """
+    import yaml
+
+    from .file_sets import compose_service_names
+    from .serving_ports import compose_port_surface
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    try:
+        data = yaml.safe_load(content or "")
+    except Exception as exc:  # noqa: BLE001 — any parse failure is the same answer
+        return {"valid": False, "errors": [f"not valid YAML: {exc}"], "warnings": [], "repairable": True}
+
+    if not isinstance(data, dict) or not isinstance(data.get("ports"), list):
+        return {
+            "valid": False,
+            "errors": ["output must be a mapping with a `ports:` list"],
+            "warnings": [],
+            "repairable": True,
+        }
+
+    # `compose_service_names` is path-based (it reads the files); the context
+    # hands us strings, so they are wrapped here — measured live 2026-10-10:
+    # passing strings raised `'str' object has no attribute 'is_file'` and the
+    # generation job failed outright.
+    services = set(compose_service_names([Path(p) for p in compose_paths]))
+    declared_profiles = set(_compose_profiles(compose_paths))
+    seen_ports = {(r.get("sub_service"), r.get("port")) for r in compose_port_surface([Path(p) for p in compose_paths])}
+    primary_count = 0
+
+    for i, row in enumerate(data["ports"]):
+        where = f"ports[{i}]"
+        if not isinstance(row, dict):
+            errors.append(f"{where}: must be a mapping")
+            continue
+        sub = row.get("sub_service")
+        port = row.get("port")
+        if not isinstance(sub, str) or not sub.strip():
+            errors.append(f"{where}: `sub_service` must be a non-empty string")
+        elif "--" in sub:
+            errors.append(f"{where}: `sub_service` must not contain '--' (reserved separator)")
+        elif services and sub not in services:
+            errors.append(f"{where}: `sub_service` {sub!r} is not a service in the compose")
+        if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
+            errors.append(f"{where}: `port` must be an integer in 1..65535")
+        kind = row.get("kind")
+        if kind is not None and (not isinstance(kind, str) or not kind.strip()):
+            errors.append(f"{where}: `kind`, when present, must be a non-empty string")
+        elif kind is None:
+            warnings.append(f"{where}: no `kind` — this row is NOT exposed (fail-closed)")
+        if row.get("primary") is True:
+            primary_count += 1
+        profiles = row.get("profiles") or []
+        if not isinstance(profiles, list):
+            errors.append(f"{where}: `profiles` must be a list")
+        else:
+            for p in profiles:
+                if not isinstance(p, str):
+                    errors.append(f"{where}: `profiles` entries must be strings")
+                elif declared_profiles and p not in declared_profiles:
+                    errors.append(f"{where}: profile {p!r} is not declared by the compose")
+
+    if primary_count > 1:
+        errors.append(f"{primary_count} rows are marked `primary` — the instance host points at exactly one service")
+
+    for sub, port in sorted(seen_ports, key=lambda x: (str(x[0]), str(x[1]))):
+        if (sub, port) not in {(r.get("sub_service"), r.get("port")) for r in data["ports"]}:
+            warnings.append(f"the compose mentions {sub}:{port} and no row declares it")
+
+    return {"valid": not errors, "errors": errors, "warnings": warnings, "repairable": True}

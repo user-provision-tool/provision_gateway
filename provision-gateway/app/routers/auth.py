@@ -20,6 +20,7 @@ from ..schemas.auth import (
     SetupRequest,
 )
 from ..services import auth_service
+from ..services.registry_entry import entry_tls
 from ..config import settings
 import bcrypt as _bcrypt
 
@@ -250,18 +251,12 @@ def verify_auth(
     host = request.headers.get("Host", "")
     registry_entry = _lookup_by_hostname(host, request)
 
-    if registry_entry:
-        target_user = registry_entry.get("user_name", "")
-        # Check if viewer is accessing their own service
-        if target_user == end_user.username:
-            svc_basic = _get_service_basic_credential(request, db)
-            return _respond(200, {"X-Service-Basic": svc_basic}, None)
-
-        # Check allowed_special_users (trimmed on parse — N1)
-        allowed = _parse_allowed_special_users(end_user.allowed_special_users)
-        if target_user in allowed:
-            svc_basic = _get_service_basic_credential(request, db)
-            return _respond(200, {"X-Service-Basic": svc_basic}, None)
+    if registry_entry and auth_service.acl_allows(end_user, registry_entry.get("user_name", "")):
+        # The ONE matrix (auth_service.acl_allows): own instance, or a recorded
+        # special-user grant (trimmed on parse — N1). The stream verdict applies
+        # this same function per connection (GRILLING G39 §3 / task-doc R3.3).
+        svc_basic = _get_service_basic_credential(request, db)
+        return _respond(200, {"X-Service-Basic": svc_basic}, None)
 
     # ACL denied
     return _deny("acl_denied", 403, "ACL denied")
@@ -284,10 +279,12 @@ def _resolve_client_type(request: Request) -> str:
 
 
 def _parse_allowed_special_users(raw: str | None) -> list[str]:
-    """Parse a comma-separated allowed_special_users list, trimming each entry (N1)."""
-    if not raw:
-        return []
-    return [u.strip() for u in raw.split(",") if u.strip()]
+    """Parse a comma-separated allowed_special_users list, trimming each entry (N1).
+
+    Kept as this module's name (the guard test imports it) but delegated: the
+    ONE parser lives beside the ONE matrix in ``services/auth_service.py``.
+    """
+    return auth_service.parse_allowed_special_users(raw)
 
 
 def _lookup_by_hostname(host: str, request: Request) -> dict | None:
@@ -523,8 +520,15 @@ def go_to_service(
 
     # Scheme/port from the service's https flag (GAP-19): https services get
     # https + NGINX_HTTPS_PORT; http services get http + NGINX_HTTP_PORT.
-    domain = entry.get("hostname", hostname)
-    https = bool(entry.get("https", False))
+    #
+    # R1.5 — the redirect targets the host the operator DIALED, not the entry's
+    # primary hostname. They are the same string for the instance's own URL, and
+    # they must DIFFER for an extra endpoint: `/go/<host>--neo4j.<domain>` has to
+    # land on `<host>--neo4j.<domain>`, or the relay would send the browser to the
+    # instance's primary endpoint and the sub-service would be unreachable — the
+    # link would resolve and then silently open the wrong service.
+    domain = hostname or entry.get("hostname", hostname)
+    https = entry_tls(entry)
     port = settings.NGINX_HTTPS_PORT if https else settings.NGINX_HTTP_PORT
     scheme = "https" if https else "http"
 
@@ -575,7 +579,7 @@ def exchange(request: Request, db: Session = Depends(get_db)):
         try:
             hostname_index = request.app.state.hostname_index
             entry = hostname_index.get_by_hostname(svc_host)
-            https = bool(entry and entry.get("https", False))
+            https = entry_tls(entry)
         except Exception:
             https = False
 

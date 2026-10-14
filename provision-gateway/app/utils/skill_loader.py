@@ -15,6 +15,7 @@ _SKILL_PATH = Path(__file__).parent.parent / "skills" / "provision-api" / "SKILL
 # Cached extracted sections
 _compose_rules: str | None = None
 _nginx_rules: str | None = None
+_serving_ports_rules: str | None = None
 
 
 def _load_skill() -> str:
@@ -54,6 +55,31 @@ def get_compose_rules() -> str:
         if not _compose_rules:
             _compose_rules = _fallback_compose_rules()
     return _compose_rules
+
+
+def get_serving_ports_rules() -> str:
+    """Get the serving_ports rules from SKILL.md (its own `## Creating …` section).
+
+    Extracted like the nginx rules: from its `##` heading through to the next
+    `##` one, since the section is several subsections long.
+    """
+    global _serving_ports_rules
+    if _serving_ports_rules is not None:
+        return _serving_ports_rules
+    content = _load_skill()
+    _serving_ports_rules = ""
+    if content:
+        lines = content.splitlines()
+        start = None
+        for i, line in enumerate(lines):
+            if line.startswith("## Creating serving_ports"):
+                start = i
+            elif start is not None and line.startswith("## "):
+                _serving_ports_rules = "\n".join(lines[start:i]).strip()
+                break
+        if start is not None and not _serving_ports_rules:
+            _serving_ports_rules = "\n".join(lines[start:]).strip()
+    return _serving_ports_rules
 
 
 def get_nginx_rules() -> str:

@@ -117,7 +117,26 @@ export function useGenerationJob() {
       return data.job_id as number
     } catch (err: any) {
       stopPolling()
-      throw err
+      // R3-F48 — never let an API ERROR BODY reach a render.
+      //
+      // A 409 from a paused job carries `{error, detail}`. A caller that stored
+      // that object and rendered it killed React (#31, "objects are not valid as
+      // a React child"), which blanked the deploy panel — INCLUDING the pause
+      // dialog that lived in the same tree, so the paused job became impossible
+      // to answer and every later deploy for that service was refused with the
+      // same 409. Measured 2026-10-10. The message is flattened here, at the one
+      // boundary every caller passes through, so no caller can undo it.
+      const d = err?.response?.data
+      const msg =
+        (typeof d?.detail === 'string' && d.detail) ||
+        (typeof d?.error === 'string' && d.error) ||
+        (typeof d === 'string' && d) ||
+        err?.message ||
+        'Generation failed'
+      const normalised: any = new Error(msg)
+      // The status stays reachable for callers that branch on it.
+      normalised.response = err?.response
+      throw normalised
     }
   }
 

@@ -39,7 +39,10 @@ NGINX_CONF_OUT="${NGINX_CONF_OUT:-/etc/nginx/nginx.conf}"
 START_NGINX="${START_NGINX:-1}"
 
 # ---- envsubst allow-list: ONLY these constants are substituted ----
-ENVSUBST_VARS='$PORTAL_SCHEME $PORTAL_HOSTNAME $PORTAL_REDIRECT_PORT $HTTPS_REDIRECT_PORT'
+# STREAM_PORT is the stream listener's port — the ONE shared published door a
+# client dials for an exposure URL (task-doc R8.1). It is substituted into the
+# template's `listen` so the conf and the compose publish can never disagree.
+ENVSUBST_VARS='$PORTAL_SCHEME $PORTAL_HOSTNAME $PORTAL_REDIRECT_PORT $HTTPS_REDIRECT_PORT $STREAM_PORT'
 
 # ---- condvar evaluation ----
 # PORTAL_MODE is an enum (`http` | `https`), not a boolean; ENABLE_ACL is a
@@ -69,7 +72,10 @@ HTTPS_REDIRECT_PORT="${HTTPS_REDIRECT_PORT:-}"
 case "$HTTPS_REDIRECT_PORT" in ""|:*) ;; *) HTTPS_REDIRECT_PORT=":$HTTPS_REDIRECT_PORT" ;; esac
 PORTAL_REDIRECT_PORT="${PORTAL_REDIRECT_PORT:-}"
 case "$PORTAL_REDIRECT_PORT" in ""|:*) ;; *) PORTAL_REDIRECT_PORT=":$PORTAL_REDIRECT_PORT" ;; esac
-export PORTAL_SCHEME PORTAL_HOSTNAME PORTAL_REDIRECT_PORT HTTPS_REDIRECT_PORT
+# The stream door. 17687 is the value the feature ruled and measured free on
+# this host (R8.1); the compose publishes the same number from the same var.
+STREAM_PORT="${STREAM_PORT:-17687}"
+export PORTAL_SCHEME PORTAL_HOSTNAME PORTAL_REDIRECT_PORT HTTPS_REDIRECT_PORT STREAM_PORT
 
 # ---- frame stack (2-char frames, ${_stack%??} pop) ----
 _push() { _stack="${_stack}$1"; }

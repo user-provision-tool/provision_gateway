@@ -6,11 +6,17 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 
-from ..database import SessionLocal
+from .. import database
 from ..models.admin import AdminUser
 from ..models.end_user import EndUser
 from ..services.auth_service import decode_access_token, decode_gateway_token, get_admin_by_id, get_end_user_by_id
 
+
+# `SessionLocal` is resolved through the MODULE (``database.SessionLocal()``) and
+# never bound here: this module is imported once, so a binding made at import
+# time pins whichever engine existed then. Every service resolves it per call
+# (the codebase's convention, stated in tests/conftest.py's isolation fixture) —
+# and this is the AUTH path, where a stale engine means "user not found".
 security_scheme = HTTPBearer(auto_error=False)
 
 
@@ -72,7 +78,7 @@ def require_gateway_token(
     if role == "special":
         raise HTTPException(status_code=403, detail="Special users are not permitted to access the dashboard")
 
-    db = SessionLocal()
+    db = database.SessionLocal()
     try:
         if user_type == "admin":
             admin = get_admin_by_id(db, user_id)
@@ -134,7 +140,7 @@ def get_current_admin(
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid token subject")
 
-    db = SessionLocal()
+    db = database.SessionLocal()
     try:
         admin = get_admin_by_id(db, admin_id)
         if admin is None or not admin.is_active:
@@ -177,7 +183,7 @@ def get_current_user(
     role = payload.get("role", "viewer")
     email = payload.get("email", "")
 
-    db = SessionLocal()
+    db = database.SessionLocal()
     try:
         if user_type == "admin":
             admin = get_admin_by_id(db, user_id)
@@ -202,7 +208,7 @@ def get_current_admin_optional(
     """Like get_current_admin but returns None instead of raising 401."""
     if credentials is None:
         return None
-    db = SessionLocal()
+    db = database.SessionLocal()
     try:
         try:
             payload = decode_access_token(credentials.credentials)

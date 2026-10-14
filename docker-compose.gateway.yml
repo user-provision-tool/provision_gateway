@@ -17,6 +17,9 @@ services:
       - GATEWAY_SECRET_KEY=${GATEWAY_SECRET_KEY:-dev-secret-change-me-in-production-32chars!}
       - NGINX_HTTP_PORT=${NGINX_HTTP_PORT:-8080}
       - NGINX_HTTPS_PORT=${NGINX_HTTPS_PORT:-8443}
+      # The ONE shared stream door an exposure URL is dialled on (task-doc R8.1):
+      # the edge's published port in fullset. The minimal shape has no gateway.
+      - STREAM_PORT=${STREAM_PORT:-17687}
       - DOCKER_OPS_LOG=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/docker_ops.log
       - ENABLE_ACL=${ENABLE_ACL:-false}
       - REGISTRY_FILE=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/user_registry.yml
@@ -74,10 +77,19 @@ services:
       # the same values the gateway reads for /go/, service-URL display, system-info.
       - "${NGINX_HTTP_PORT:-80}:80"
       - "${NGINX_HTTPS_PORT:-443}:443"
+      # The ONE shared stream door (task-doc R8.1): every exposure URL is dialled
+      # here, and this is the ONLY host door to the stream path in fullset — the
+      # internal nginx's own stream publish is suppressed by the base compose
+      # (see _users_provision/docker-compose.provision.yml).
+      - "${STREAM_PORT:-17687}:${STREAM_PORT:-17687}"
     volumes:
       - ./nginx.acl/edge.conf.template:/etc/nginx/acl/edge.conf.template:ro
       - ./nginx.acl/acl-helpers.conf.template:/etc/nginx/acl/acl-helpers.conf.template:ro
       - ./nginx.acl/entrypoint.sh:/etc/nginx/acl/entrypoint.sh:ro
+      # The stream gate's njs hook (T7). Mounted like the templates so a change
+      # arrives by RESTART (the entrypoint re-renders nothing — the hook is read
+      # by nginx itself at `js_import` time, i.e. on (re)load).
+      - ./nginx.acl/stream-acl.js:/etc/nginx/acl/stream-acl.js:ro
       # SSL_DIR → /certs (per-domain certs + portal cert). Read-only: the edge is
       # the key-holder (decision 17, GAP-15) — certs are the user's concern.
       - ${PROVISION_DIR:-/srv/provision_subnet_acl}/ssl:/certs:ro

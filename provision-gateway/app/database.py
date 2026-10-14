@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import time
+
 from sqlalchemy import create_engine, event
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from .config import settings
@@ -154,6 +157,25 @@ def _ensure_schema(engine_=engine):
 
 
 def init_db():
-    """Create all tables if they don't exist, then migrate existing tables."""
-    Base.metadata.create_all(bind=engine)
-    _ensure_schema(engine)
+    """Create all tables if they don't exist, then migrate existing tables.
+
+    Retried, because this runs in EVERY worker (GRILLING G31: ``uvicorn
+    --workers 4`` shares one SQLite file) and ``create_all`` is
+    check-then-create: two processes can both see a missing table and both issue
+    the DDL, so the loser raises ``table ... already exists`` and — before this —
+    killed its own worker's lifespan ("Application startup failed. Exiting.").
+    Observed 2026-10-10, on the first boot after ``stream_exposures`` was added:
+    it bites only when a NEW table (or index) appears, which is exactly when
+    nobody is looking for it. The retry is safe by construction: the winner's
+    table is the one the loser was about to create, and ``_ensure_schema`` is
+    idempotent (it inspects before it alters).
+    """
+    for attempt in range(5):
+        try:
+            Base.metadata.create_all(bind=engine)
+            _ensure_schema(engine)
+            return
+        except OperationalError as exc:
+            if "already exists" not in str(exc) or attempt == 4:
+                raise
+            time.sleep(0.25 * (attempt + 1))

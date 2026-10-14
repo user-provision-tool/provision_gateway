@@ -1,0 +1,58 @@
+# kind → category — the ONLY load-bearing table in the serving-ports artifact
+# (GRILLING G37, task-doc R1.2).
+#
+# The LLM answers, per port, a `kind` inferred from the compose's context (the
+# port number is not authoritative: applications remap ports, so Bolt on 17373 is
+# as real as Bolt on 7687). This file is what turns that answer into a CATEGORY,
+# and the category decides everything downstream: which conf is generated
+# (`*.stream.conf` / `*.mail.conf` / `*.http.conf`) and therefore which listener
+# serves it.
+#
+# Editing it is PLATFORM-LEVEL POLICY, not a recipe's business — hence a config
+# file beside the generation skill rather than something a recipe declares.
+#
+# The rules, in order:
+#   * an explicit entry wins;
+#   * `else` is the default — every kind not listed here is a STREAM protocol
+#     (a named-but-unlisted kind routes to stream by the default rule);
+#   * a row with NO kind at all is NOT exposed (fail-closed, R1.2). That is a
+#     property of the artifact's own validation, not of this table.
+#
+# Categories in use: `http`, `mail`, `stream`. Only `stream` is served by this
+# feature today; the other two are where their confs would go.
+
+kinds:
+  # Web protocols — served by the platform's http path (its own conf category).
+  http: http
+  https: http
+  ws: http
+  wss: http
+  grpc: http
+  http2: http
+  h2c: http
+
+  # Mail protocols — their own conf category; nobody has claimed them yet, so the
+  # table names them rather than letting them fall through to stream.
+  smtp: mail
+  smtps: mail
+  submission: mail
+  imap: mail
+  imaps: mail
+  pop3: mail
+  pop3s: mail
+
+  # Everything else — bolt, redis, postgres, mysql, mongodb, mqtt, amqp, kafka,
+  # whatever is named next — is a STREAM protocol. Listed here for documentation
+  # only: `else` already covers them.
+  bolt: stream
+  redis: stream
+  postgres: stream
+  postgresql: stream
+  mysql: stream
+  mariadb: stream
+  mongodb: stream
+  mqtt: stream
+  amqp: stream
+  kafka: stream
+
+else: stream

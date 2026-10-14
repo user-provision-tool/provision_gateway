@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import logging
+
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -13,6 +17,9 @@ from ..models.end_user import EndUser
 from ..config import settings
 from ..services import audit_service, curl_service
 from ..services.provision_service import provision_service
+from ..services import stream_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/services", tags=["services"])
 
@@ -241,6 +248,44 @@ async def deploy_user(
         req.get("user_name") or "", req.get("service_name") or "",
         _pdr_recipe_path(req), str(req.get("label", "0")),
     )
+    # ------------------------------------------------------------------
+    # T9 / R8.4 — the stream conf is produced HERE, on the deploy path.
+    #
+    # NOT (only) in the generation pipeline: a deploy whose files are all
+    # selected runs no generation at all, so a generation-only phase leaves the
+    # exposure path unreachable for the normal, fully-configured recipe —
+    # measured 2026-10-10 during the end-to-end plan. It is the same shape as the
+    # per-user env, which is generated as the deploy's last step for the same
+    # reason. Conditional on the TLS toggle (R8.4) and on a stream row existing
+    # (R1.4); with TLS off nothing is produced, so nothing is carried.
+    # ------------------------------------------------------------------
+    _tls = bool(req.get("tls") or req.get("https"))
+    if _tls:
+        from ..services.stream_conf import produce_for_deploy
+        _sel = req.get("selection") if isinstance(req.get("selection"), dict) else {}
+        _sp = (_sel or {}).get("serving_ports")
+        _conf = produce_for_deploy(
+            service_name=service_name,
+            user_name=req.get("user_name", ""),
+            label=str(req.get("label") or "0"),
+            domain=req.get("domain") or "localhost",
+            serving_ports_path=_sp,
+            ssl_dir=str(settings.SSL_DIR),
+            recipe_dir=str(Path(settings.SOURCE_PROJECTS_DIR) / service_name),
+        )
+        if _conf:
+            # R9.2's LIST: the instance's confs travel together. The singular
+            # field stays for the readers that predate the list.
+            _confs = list(req.get("nginx_conf_file_paths") or [])
+            _single = req.get("nginx_conf_file_path") or req.get("nginx_conf_template_path")
+            if _single and _single not in _confs:
+                _confs.append(_single)
+            if _conf not in _confs:
+                _confs.append(_conf)
+            req["nginx_conf_file_paths"] = _confs
+            req.pop("nginx_conf_file_path", None)
+            req.pop("nginx_conf_template_path", None)
+
     try:
         result = await provision_service.register_user(**req)
     except Exception as e:
@@ -376,6 +421,27 @@ async def remove_user_service(
             target_label=label, status="failure", error_message=str(e),
         )
         raise HTTPException(502, f"provision-api error: {e}")
+
+    # R7.1's GATEWAY half, and the only place it can happen: the instance's
+    # exposure handles die with the instance. Nothing else knows a delete
+    # occurred — `stream_service.verify` merely *denies* such a handle as
+    # "instance gone" once the registry no longer lists it — and leaving the rows
+    # live would keep an unrouteable credential alive instead of a dead one.
+    #
+    # The other half is the -api's: it removes the instance's rendered
+    # `*.stream.conf` — the path it recorded when it rendered the conf (R9.2) —
+    # exactly as it removes the http conf today. Called only AFTER a successful
+    # removal, so a failed delete never revokes a live instance's URLs.
+    try:
+        revoked = stream_service.revoke_instance(db, service_name, user_name, label)
+        if revoked:
+            logger.info(
+                "revoked %d stream exposure handle(s) with %s/%s/%s",
+                revoked, service_name, user_name, label,
+            )
+    except Exception as e:  # noqa: BLE001 — a revoke failure must not undo a delete
+        logger.warning("could not revoke stream exposures for %s/%s/%s: %s",
+                       service_name, user_name, label, e)
 
     audit_service.log_action(
         db, action="remove", admin_id=current_admin["id"],

@@ -28,6 +28,10 @@ RUN apk add --no-cache openssl \
 COPY edge.conf.template     /etc/nginx/acl/edge.conf.template
 COPY acl-helpers.conf.template /etc/nginx/acl/acl-helpers.conf.template
 COPY entrypoint.sh          /etc/nginx/acl/entrypoint.sh
+# The stream gate's njs hook (task-doc R4.2). Baked like the templates AND
+# mounted over (docker-compose.gateway.yml) so a change needs a restart, not a
+# rebuild.
+COPY stream-acl.js          /etc/nginx/acl/stream-acl.js
 RUN chmod +x /etc/nginx/acl/entrypoint.sh
 
 # Non-root (decision 17): nginx needs to write nginx.conf (assembled by the

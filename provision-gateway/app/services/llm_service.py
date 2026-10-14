@@ -408,7 +408,7 @@ class LLMService:
         deploy metadata + activated profiles; the app-manifest carve-out when
         compose itself is missing.
         """
-        from ..utils.skill_loader import get_compose_rules, get_nginx_rules, get_compose_template, get_nginx_template
+        from ..utils.skill_loader import get_compose_rules, get_nginx_rules, get_serving_ports_rules, get_compose_template, get_nginx_template
 
         desc = context.get("repo_description", "an application")
         user_prompt = (context.get("prompt") or "").strip()
@@ -488,14 +488,90 @@ Output ONLY the raw YAML, no markdown fences, no explanations.""")
                     + ".\nYour proxy_pass MUST use one of these exact service names as the host "
                     "(e.g. proxy_pass http://<service>:PORT;)."
                 )
+            # R1.5 / T16 — the EXTRA http endpoints this deployment declares.
+            #
+            # R1.3 makes it an ERROR for a surviving `kind: http` row to have no
+            # `server{}` block serving `<instance host>--<sub_service>.<domain>`,
+            # and the serving_ports artifact is where those rows live. Without
+            # this the model saw only the compose, wrote ONE block, and every
+            # generation failed its own validation (measured 2026-10-10, jobs
+            # 366/367). The artifact is authoritative here for the same reason it
+            # is in the serving_ports phase: it is the deployment's own
+            # declaration of what exists.
+            extras_block = ""
+            _sp_path = context.get("serving_ports_path")
+            if _sp_path:
+                try:
+                    import yaml as _yaml
+
+                    from .serving_ports import http_rows as _http_rows
+
+                    _rows = _http_rows(
+                        _yaml.safe_load(Path(_sp_path).read_text(encoding="utf-8", errors="replace"))
+                    )
+                    _extra = [
+                        r for r in _rows
+                        if r.get("primary") is not True and r.get("sub_service")
+                    ]
+                    if _extra:
+                        _lines = "\n".join(
+                            "  - server_name {service_name}_hostname--%s;  with proxy_pass "
+                            "http://%s:%s;" % (r["sub_service"], r["sub_service"], r["port"])
+                            for r in _extra
+                        )
+                        extras_block = (
+                            "\nThis deployment declares these ADDITIONAL http endpoints "
+                            "(from its serving_ports artifact — one `server { listen 80; … }` "
+                            "block EACH, server_name and proxy_pass exactly as shown, and no "
+                            "other extra blocks):\n" + _lines
+                        )
+                except Exception:  # noqa: BLE001 — a missing artifact must not fail the prompt
+                    extras_block = ""
             parts.append(f"""
 Generate an nginx reverse proxy configuration. It sits behind provision-nginx,
-serving hostname {deploy_meta.get('domain','localhost')} with basic auth support.{hint}
+serving hostname {deploy_meta.get('domain','localhost')} with basic auth support.{hint}{extras_block}
 Follow these rules from the provision-api skill:
 
 {rules}
 {template_block}
 Output ONLY the raw nginx config, no markdown fences.""")
+
+        elif config_type == "serving_ports":
+            # T13 / R1.2. Two blocks, and the difference between them matters:
+            # the RULES come from the platform's skill file (where the compose and
+            # nginx rules live), and the PORT SURFACE comes from the compose
+            # actually in play — the prompt's own ground truth of what must have
+            # a row. The application/port table inside the rules is explicitly
+            # reference-only, because a port number is not authority for what
+            # speaks on it.
+            from ..services.serving_ports import load_kind_categories, compose_port_surface
+
+            rules = get_serving_ports_rules()
+            table = load_kind_categories()
+            kinds_block = "\n".join(
+                f"  {k} -> {v}" for k, v in sorted((table.get("kinds") or {}).items())
+            )
+            surface = compose_port_surface([Path(p) for p in (context.get("compose_paths") or [])])
+            surface_block = ""
+            if surface:
+                rows = "\n".join(
+                    f"  - {r['sub_service']} (from `{r['source']}:`): container port {r['port']}"
+                    for r in surface
+                )
+                surface_block = (
+                    "\nEvery port the compose in play mentions, mechanically scanned. Each one MUST\n"
+                    "appear as a row: this list is what exists, and a missing row leaves the operator\n"
+                    "unable to tell whether the analysis missed the port or the platform refuses it:\n"
+                    + rows + "\n"
+                )
+            parts.append(f"""
+The platform's kind -> category table, the ONLY load-bearing mapping. A kind not
+listed here takes the `else` category (`{table.get("else")}`):
+{kinds_block}
+{surface_block}
+{rules}
+
+Output ONLY the raw YAML, no markdown fences, no commentary.""")
 
         elif config_type == "env_file":
             meta_bits = f" for user '{deploy_meta.get('user_name','?')}' label {deploy_meta.get('label','0')} on {deploy_meta.get('domain','localhost')}"
@@ -1842,6 +1918,14 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
                     pass
             result["repairable"] = True
             return result
+        if config_type == "serving_ports":
+            # No draft file: this validator reads the CONTENT and the compose in
+            # play, so there is nothing to place on disk (unlike the compose and
+            # nginx checks, whose tooling is path-based).
+            from .config_validation import validate_serving_ports
+            if not content.strip():
+                return {"valid": False, "errors": ["empty serving_ports output"], "repairable": True}
+            return validate_serving_ports(content, compose_paths)
         if config_type == "nginx_conf":
             from .config_validation import validate_nginx
             if not content.strip():

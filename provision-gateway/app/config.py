@@ -33,6 +33,14 @@ class Settings:
         self.NGINX_HTTP_PORT: int = int(os.environ.get("NGINX_HTTP_PORT", "80"))
         self.NGINX_HTTPS_PORT: int = int(os.environ.get("NGINX_HTTPS_PORT", "443"))
 
+        # ---- The stream door (GRILLING G39 §2 / G40, task-doc R8.1) ----
+        # The ONE shared published port a client dials for an exposure URL: the
+        # EDGE's door in fullset (17687, measured free on this host 2026-10-05).
+        # The minimal shape publishes the internal nginx's own listener instead
+        # (host 8769) and has no gateway at all, so this setting only ever names
+        # the fullset door — it is what the card shows beside the URL.
+        self.STREAM_PORT: int = int(os.environ.get("STREAM_PORT", "17687"))
+
         # ---- Docker log path ----
         # Log streaming is now proxied to provision-api's per-task SSE endpoint.
         # DOCKER_OPS_LOG is kept for backward-compatible reference only.

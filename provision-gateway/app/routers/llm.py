@@ -184,7 +184,13 @@ async def create_generation_job(
     if isinstance(_resume, dict) and _resume.get("request"):
         carried = dict(_resume["request"])
         _values = {str(k): str(v) for k, v in (req.get("values") or {}).items()}
-        if _resume.get("kind") == "compose_fix" and _values.get("guidance"):
+        # The GUIDED-FIX kinds (the compose conflict, and R1.3's two validation
+        # checks) each carry an EDITABLE guidance that becomes the next leg's
+        # prompt; `input` is the credential pause and carries values instead.
+        # The set is named once, here, because the three kinds differ only in
+        # which file they name — the answer's shape is the same.
+        if _resume.get("kind") in ("compose_fix", "validate_ports_fix", "validate_conf_fix") \
+                and _values.get("guidance"):
             carried["prompt"] = _values["guidance"]
         if _resume.get("kind") == "input" and _values:
             carried["resume_values"] = _values
@@ -239,7 +245,21 @@ async def create_generation_job(
         _resuming_own_pause = (
             _existing is not None
             and _existing.get("state") == "paused"
-            and bool(req.get("fix"))
+            # R3-F49 — and ANSWERING the pause counts as resuming it. The panel
+            # answers a pause by starting a NEW job that consumes the paused leg:
+            # the body carries `resume` (the pause being answered) and
+            # `parent_job_id` (the leg it ends). Only `fix` — the `check` button's
+            # guided restart — was recognised here, so a plain answer was refused
+            # by the very reservation its own pause had created: the operator saw
+            # a 409 they could not clear, the paused job could never be consumed,
+            # and every later deploy of that service hit the same 409. Measured
+            # 2026-10-10; the deadlock was total, with no way forward in the UI.
+            #
+            # Read `_resume` / `_answered_job_id`, NOT `req`: by this point the
+            # handler has replaced `req` with the CARRIED request (line ~196), so
+            # a lookup on `req` finds neither key — measured, and it is why the
+            # first version of this fix still answered 409.
+            and bool(req.get("fix") or _resume or _answered_job_id)
         )
         # G29: the SAME escape for the operator's own RETRY of a refused
         # deployment. A gateway refusal is recorded on the session (below), and

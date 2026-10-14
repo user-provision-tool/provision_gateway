@@ -16,6 +16,18 @@ const baseName = (p?: string) => (p ? p.split('/').pop() || '' : '')
 
 interface ServiceInstance {
   user_name: string; service_name: string; label: string;
+  // R6.1: the sub-services this instance exposes a STREAM endpoint for, as the
+  // canonical names the -api recorded when it rendered the stream conf. Empty or
+  // absent means nothing is exposed — which is also the TLS-off case by
+  // construction, so the panel needs NO logic of its own for it.
+  stream_sub_services?: string[]
+  // R1.5/R6.2: the instance's EXTRA http endpoints, as the whole served names
+  // (`<instance host>--<sub_service>.<domain>`) the -api read out of the rendered
+  // conf. The URL section lists one `/go/` row per entry, keyed by the
+  // sub-service, beside the primary's own row keyed `primary` — and offers
+  // nothing that the deployment did not create.
+  http_endpoints?: string[]
+  nginx_conf_paths?: string[]
   healthy_containers?: Record<string,string>
   unhealthy_containers?: Record<string,string>
   missing_containers?: Record<string,string>
@@ -27,6 +39,9 @@ interface ServiceInstance {
   recipe_path?: string
   env_file_path?: string
   has_auth?: boolean; url?: string
+  // R1.5 — the instance's own host, recorded in the registry entry and reported
+  // by the -api. Every `/go/` link on the card is built from it.
+  hostname?: string
   status?: string  // "building" | "running" | "failed" | "unknown"
   // Bounded failure reason, present only on a `failed` entry (GRILLING G10):
   // {stage, message, at}. Instance-scoped state from the registry — the card
@@ -207,6 +222,30 @@ export default function UsersPage() {
   // A REFUSED deployment's stored options, handed to the deploy panel so the
   // operator confirms exactly what will be replayed (GRILLING G20).
   const [retryOptions, setRetryOptions] = useState<Record<string, any> | null>(null)
+  // The minted exposure URL, held ONLY here and only for this page's lifetime:
+  // the API returns it once and can never return it again (R2.2), so this is the
+  // single place it survives — and it dies with the tab, which is the point.
+  const [exposureUrls, setExposureUrls] = useState<Record<string,string>>({})
+  const [exposureModal, setExposureModal] = useState<{url:string; port:number; row:string} | null>(null)
+
+  // R6.1/R6.2: mint from the SUB-SERVICE alone. The port is not sent — the
+  // registry records names, never ports, so the gateway resolves the row from the
+  // instance's own serving_ports artifact. The URL comes back ONCE.
+  const mintExposure = async (svc: ServiceInstance, canonical: string) => {
+    const sub = canonical.includes('--')
+      ? canonical.split('--').slice(1).join('--').split('.')[0]
+      : canonical.split('.')[0]
+    try {
+      const { data } = await client.post('/stream/exposures', {
+        service_name: svc.service_name, user_name: svc.user_name,
+        label: String(svc.label), sub_service: sub,
+      })
+      setExposureUrls(prev => ({...prev, [canonical]: data.host}))
+      setExposureModal({url: data.host, port: data.stream_port, row: sub})
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || 'Could not generate an exposure URL')
+    }
+  }
   // G29: for a GATEWAY-side refusal the retry is NOT a replay. The generation
   // pool refused before anything was produced, so the retry has to run the
   // generation again — the panel seeds itself from the record, and the pipeline
@@ -318,9 +357,32 @@ export default function UsersPage() {
   // 302 → `{hostname}/_set_token?token=…` (setting the provision_token cookie for
   // the service domain) → service loads silently. This is required because the
   // login cookie is host-scoped and is NOT sent to the service hostname directly.
+  // The instance's OWN host, taken from the URL the -api reports — its domain is
+  // whatever the deployment used, and the `/go/` relay is on the dashboard's
+  // domain, so only the host part is needed. The previous form hard-coded
+  // `.localhost`, so on any other domain every `/go/` link pointed at a host that
+  // does not exist.
+  const instanceHost = useCallback((svc: ServiceInstance): string => {
+    // The RECORDED host first — the registry entry carries it, and it is the
+    // single source of truth the deploy itself used.
+    if (svc.hostname) return svc.hostname
+    try {
+      const h = new URL(svc.url || '').hostname
+      if (h) return h
+    } catch { /* no url yet — fall through to the composed name */ }
+    return `${svc.service_name}-${svc.user_name}-${svc.label}.localhost`
+  }, [])
+
   const buildServiceUrl = useCallback((svc: ServiceInstance): string => {
-    const host = `${svc.service_name}-${svc.user_name}-${svc.label}.localhost`
-    return `/go/${host}`
+    return `/go/${instanceHost(svc)}`
+  }, [instanceHost])
+
+  // R1.5/R6.2 — one `/go/` row per EXTRA http endpoint. The recorded name IS the
+  // host to dial (`<instance host>--<sub_service>.<domain>`), and the key shown
+  // is the sub-service: the same shape the stream rows use, so one convention
+  // covers both.
+  const goUrlFor = useCallback((svc: ServiceInstance, servedName: string): string => {
+    return `/go/${servedName}`
   }, [])
 
   // Parse "user-service-label" key (service may contain hyphens like "example-mcp")
@@ -1307,6 +1369,76 @@ export default function UsersPage() {
                         </a>
                         {svc.has_auth && <Tag color="blue" style={{marginLeft:4}}>Auth</Tag>}
                       </div>
+                      {/* R6.2 — the URL section: one `/go/` row per exposed HTTP
+                          endpoint, keyed by the sub-service name, the primary
+                          keyed `primary`. Every row is read from the artifacts
+                          (the entry's recorded endpoints), never typed, and the
+                          section appears only when the deployment HAS an extra
+                          endpoint — an instance with just its primary shows the
+                          single URL above, unchanged. */}
+                      {(svc.http_endpoints || []).length > 0 && (
+                        <div>
+                          <Text strong>Endpoints: </Text>
+                          <Space direction="vertical" size={2}>
+                            <Space size={6} wrap>
+                              <Text code>primary</Text>
+                              <a href={buildServiceUrl(svc)} target="_blank" rel="noopener noreferrer">
+                                <Text code style={{color:'#1677ff'}}>{instanceHost(svc)}</Text>
+                              </a>
+                            </Space>
+                            {(svc.http_endpoints || []).map((served: string) => {
+                              const sub = served.includes('--')
+                                ? served.split('--').slice(1).join('--').split('.')[0]
+                                : served
+                              return (
+                                <Space key={served} size={6} wrap>
+                                  <Text code>{sub}</Text>
+                                  <a href={goUrlFor(svc, served)} target="_blank" rel="noopener noreferrer">
+                                    <Text code style={{color:'#1677ff'}}>{served}</Text>
+                                  </a>
+                                </Space>
+                              )
+                            })}
+                          </Space>
+                        </div>
+                      )}
+                      {/* R6.2 — the exposure endpoints, read from the RECORDED
+                          state (the entry's stream sub-services). Nothing here
+                          re-derives "TLS is on and a row exists": with TLS off
+                          nothing was recorded, so nothing is offered. The URL
+                          itself is a credential — shown once, kept only in this
+                          page's memory, never fetched back. */}
+                      {(svc.stream_sub_services || []).length > 0 && (
+                        <div>
+                          <Text strong>Stream endpoints: </Text>
+                          <Space direction="vertical" size={2}>
+                            {(svc.stream_sub_services || []).map((canonical: string) => {
+                              const sub = canonical.includes('--')
+                                ? canonical.split('--').slice(1).join('--').split('.')[0]
+                                : canonical
+                              const url = exposureUrls[canonical]
+                              return (
+                                <Space key={canonical} size={6} wrap>
+                                  <Text code>{sub}</Text>
+                                  <Button size="small" type="primary" ghost
+                                    onClick={() => mintExposure(svc, canonical)}>
+                                    Generate exposure URL
+                                  </Button>
+                                  {url && (
+                                    <Text code copyable={{text: url}} style={{fontSize:12}}>{url}</Text>
+                                  )}
+                                </Space>
+                              )
+                            })}
+                          </Space>
+                          <div>
+                            <Text type="secondary" style={{fontSize:12}}>
+                              The client must speak TLS — dial the name with the shared stream port
+                              (shown when you generate the URL). The application itself needs none.
+                            </Text>
+                          </div>
+                        </div>
+                      )}
                       {(svc as any).subnet && (
                         <div><Text strong>Subnet: </Text><Tag color="purple">{(svc as any).subnet}</Tag></div>
                       )}
@@ -1603,6 +1735,28 @@ export default function UsersPage() {
           </div>
         )}
       </Drawer>
+      <Modal
+        open={!!exposureModal}
+        title="Exposure URL — shown once"
+        onCancel={() => setExposureModal(null)}
+        onOk={() => setExposureModal(null)}
+        okText="I have it"
+        cancelButtonProps={{style:{display:'none'}}}
+      >
+        {exposureModal && (
+          <Space direction="vertical" size={8} style={{width:'100%'}}>
+            <Text>
+              The client dials this name on port <Text code>{exposureModal.port}</Text> with TLS
+              (SNI = the name). It is a credential carried in the clear: this is the ONLY time it is
+              shown, and regenerating it invalidates this one at its next connection.
+            </Text>
+            <Text code copyable style={{wordBreak:'break-all'}}>{exposureModal.url}</Text>
+            <Text type="secondary" style={{fontSize:12}}>
+              Row: {exposureModal.row} · the application behind it needs no TLS of its own.
+            </Text>
+          </Space>
+        )}
+      </Modal>
     </div>
   )
 }

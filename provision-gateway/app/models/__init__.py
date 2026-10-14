@@ -12,6 +12,7 @@ from .api_key import ApiKey
 from .generation_job import GenerationJob
 from .pre_deploy_session import PreDeploySession
 from .loop_lease import LoopLease
+from .stream_exposure import StreamExposure
 
 __all__ = [
     "AdminUser",

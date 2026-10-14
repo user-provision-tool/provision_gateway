@@ -465,6 +465,17 @@ def save_generated_files(
         nginx = selection.get("nginx")
         mapped["nginx"] = rename_map.get(nginx, nginx) if nginx else None
         mapped["env"] = [rename_map.get(p, p) for p in (selection.get("env") or [])]
+        # R2-F9 — the serving-ports slot must survive this rebuild too. It is
+        # rebuilt here by hand (not passed through), so a category this function
+        # does not know about is silently DROPPED: saving a generation that
+        # produced a `serving_ports.base.<token>.yml` — which the pipeline had
+        # already swapped into the selection — reset the slot to "generate new",
+        # and the very next deploy then carried no artifact for the stream conf
+        # to be built from (the same broken chain as T15's missing picker).
+        sp = selection.get("serving_ports")
+        mapped["serving_ports"] = rename_map.get(sp, sp) if sp else None
+        if selection.get("serving_ports_none"):
+            mapped["serving_ports_none"] = True
         try:
             put_file_set(service_name, recipe_path, mapped)
         except FileSetError:

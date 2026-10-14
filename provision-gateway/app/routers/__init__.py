@@ -8,6 +8,7 @@ from .tasks import router as tasks_router
 from .llm import router as llm_router
 from .pre_deploy import router as pre_deploy_router
 from .audit import router as audit_router
+from .stream import router as stream_router
 
 __all__ = [
     "auth_router",
@@ -18,4 +19,5 @@ __all__ = [
     "llm_router",
     "pre_deploy_router",
     "audit_router",
+    "stream_router",
 ]
