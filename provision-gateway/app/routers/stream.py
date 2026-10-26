@@ -120,17 +120,15 @@ def _selected_serving_ports(service_name: str) -> list[Path]:
     return out
 
 
-def _resolve_stream_row_port(service_name: str, sub_service: str) -> int | None:
-    """The port of a sub-service's STREAM row, from the deploy's own artifact.
+def _artifact_kind(service_name: str, sub_service: str) -> str | None:
+    """Informational only: the row's KIND from the recipe's artifacts.
 
-    Reads the **selected** artifact first, then the recipe's `serving_ports*`
-    files **newest-first**, returning the first port declared for a row whose
-    `sub_service` matches and whose kind resolves to the stream category. None
-    means "no row in any candidate", which the caller turns into a refusal.
+    The rendered conf is the authority for membership and port; it does not
+    carry a protocol name. The kind is looked up only AFTER membership passes,
+    so a filtered-out row is never resurrected by this scan.
     """
     import yaml
 
-    from ..services.serving_ports import is_exposed, load_kind_categories  # noqa: F401
     from ..services.stream_conf import row_for_sub_service, stream_rows
 
     recipe = Path(settings.SOURCE_PROJECTS_DIR) / service_name
@@ -139,23 +137,97 @@ def _resolve_stream_row_port(service_name: str, sub_service: str) -> int | None:
     candidates = _selected_serving_ports(service_name)
     seen = {p.resolve() for p in candidates}
     candidates += [
-        p
-        for p in sorted(
-            (p for p in recipe.iterdir() if p.is_file() and p.name.startswith(("serving_ports", "serving-ports"))),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
+        p for p in sorted(
+            (p for p in recipe.iterdir()
+             if p.is_file() and p.name.startswith(("serving_ports", "serving-ports"))),
+            key=lambda p: p.stat().st_mtime, reverse=True,
         )
         if p.resolve() not in seen
     ]
     for path in candidates:
         try:
             rows = stream_rows(yaml.safe_load(path.read_text(encoding="utf-8", errors="replace")))
-        except Exception:
+        except Exception:  # noqa: BLE001
             continue
         row = row_for_sub_service(rows, sub_service)
         if row is not None:
-            return int(row["port"])
+            return row.get("kind")
     return None
+
+
+def _resolve_stream_row(entry: dict, service_name: str, sub_service: str) -> dict[str, Any] | None:
+    """A sub-service's STREAM row, from the instance's RENDERED stream conf.
+
+    G61 (D6): the exposed set is the rendered confs. The registry's
+    ``stream_sub_services`` (parsed from the rendered file at deploy time) is
+    the membership check — a sub-service filtered out by the active profiles is
+    NOT in it, and minting it is refused. The port is read from the same
+    rendered block; the registry stays ports-free.
+
+    The old artifact scan (selected serving_ports, then newest-first) is gone as
+    the authority: it still contains rows the conf does not serve.
+    """
+    import re
+
+    recorded = entry.get("stream_sub_services") or []
+    canonical = None
+    for name in recorded:
+        if "--" in name and name.split("--", 1)[1].split(".")[0] == sub_service:
+            canonical = name
+            break
+    if canonical is None:
+        return None
+
+    paths: list[str] = []
+    by_cat = entry.get("nginx_conf_paths_by_category") or {}
+    if by_cat.get("stream"):
+        paths.append(by_cat["stream"])
+    for p in entry.get("nginx_conf_paths") or []:
+        if p not in paths and (str(p).endswith(".stream.conf") or ".stream." in str(p)):
+            paths.append(p)
+
+    for path in paths:
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # One block per sub-service: find the block naming this canonical name,
+        # then read its upstream port.
+        depth = 0
+        block: list[str] = []
+        in_target = False
+        for line in text.splitlines():
+            if depth == 0 and re.match(r"^[ \t]*server[ \t]*\{", line):
+                block = [line]
+                in_target = False
+                depth = line.count("{") - line.count("}")
+                continue
+            if depth > 0:
+                block.append(line)
+                depth += line.count("{") - line.count("}")
+                if f"server_name" in line and canonical in line:
+                    in_target = True
+                if depth <= 0:
+                    if in_target:
+                        body = "\n".join(block)
+                        m = re.search(
+                            r"proxy_pass[ \t]+(?:https?://)?(?:\{\{\s*container_prefix\s*\}\})?"
+                            r"[A-Za-z0-9_.-]+:(\d+)",
+                            body,
+                        ) or re.search(
+                            r"set[ \t]+\$[A-Za-z0-9_]+[ \t]+(?:\{\{\s*container_prefix\s*\}\})?"
+                            r"[A-Za-z0-9_.-]+:(\d+)",
+                            body,
+                        )
+                        if m:
+                            return {
+                                "sub_service": sub_service,
+                                "port": int(m.group(1)),
+                                "kind": _artifact_kind(service_name, sub_service),
+                            }
+                    block = []
+    return None
+
 
 
 def _owner_for_mint(db: Session, entry: dict, requester: dict) -> EndUser:
@@ -215,17 +287,18 @@ async def mint_exposure(
     entry = _instance_entry(request, payload.service_name, payload.user_name, payload.label)
     owner = _owner_for_mint(db, entry, current_user)
 
-    # The row — and so the port — comes from the artifact the deploy used. This is
-    # what lets the card mint from a SUB-SERVICE name alone, which is all the
-    # registry records.
-    resolved_port = _resolve_stream_row_port(payload.service_name, payload.sub_service)
-    if resolved_port is None:
+    # The row — and so the port AND the kind — comes from the artifact the deploy
+    # used. This is what lets the card mint from a SUB-SERVICE name alone, which
+    # is all the registry records.
+    artifact_row = _resolve_stream_row(entry, payload.service_name, payload.sub_service)
+    if artifact_row is None:
         raise HTTPException(
             status_code=409,
-            detail=(f"no stream row for sub-service {payload.sub_service!r} in "
-                    f"{payload.service_name}'s serving_ports — nothing to expose"),
+            detail=(f"sub-service {payload.sub_service!r} is not in "
+                    f"{payload.service_name}'s rendered stream conf — nothing to expose"),
         )
-    if payload.port is not None and int(payload.port) != int(resolved_port):
+    resolved_port = int(artifact_row["port"])
+    if payload.port is not None and int(payload.port) != resolved_port:
         raise HTTPException(
             status_code=409,
             detail=(f"port {payload.port} disagrees with the serving_ports row "
@@ -237,16 +310,33 @@ async def mint_exposure(
         owner_user_id=owner.id,
         entry=entry,
         sub_service=payload.sub_service,
-        port=int(resolved_port),
+        port=resolved_port,
     )
+    address = f"{host}:{settings.STREAM_PORT}"
     return {
         "host": host,
         "stream_port": settings.STREAM_PORT,
-        "address": f"{host}:{settings.STREAM_PORT}",
+        # THE COPYABLE VALUE: the name and the port, and nothing else.
+        #
+        # The PORT is the half that must not be lost — handed only the name, a
+        # client dials its protocol default (7687 for Bolt), which is the
+        # instance's INTERNAL port and answers nothing, and the operator concludes
+        # the feature is broken (measured 2026-10-16, alongside a UI that copied
+        # the bare host).
+        #
+        # The SCHEME is not the platform's to add. Nothing above the door is
+        # protocol-aware (see `stream_conf`'s note): the bytes are opaque, `bolt`
+        # and `redis` are not special to any code path, and a scheme this layer
+        # invented for a kind it does not know would be a guess dressed as a fact.
+        # The operator knows which protocol their row speaks, because it is the
+        # protocol their client speaks.
+        "address": address,
+        "kind": artifact_row.get("kind"),
         "canonical_name": row.canonical_name,
         "row": {"sub_service": row.sub_service, "port": row.port},
-        # Said out loud because it is the contract, not a UI detail: the handle
-        # is not retrievable afterwards, by any endpoint.
+        # What this says is a promise about the SERVER, not about the screen: the
+        # store keeps only the hash, so no endpoint can hand the handle back
+        # again. The dashboard is free to keep showing what it holds, and does.
         "shown_once": True,
     }
 

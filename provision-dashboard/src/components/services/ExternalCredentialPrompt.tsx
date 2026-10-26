@@ -63,6 +63,9 @@ export default function ExternalCredentialPrompt({
           <Input.Password
             size="small"
             style={{ marginTop: 2 }}
+            name={`credential_${v.toLowerCase()}`}
+            autoComplete="new-password"
+            data-lpignore="true" data-1p-ignore="true" data-bwignore="true"
             placeholder="value issued by the third party"
             value={values[v] || ''}
             onChange={e => setValues(prev => ({ ...prev, [v]: e.target.value }))}

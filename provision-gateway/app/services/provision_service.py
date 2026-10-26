@@ -300,7 +300,15 @@ class ProvisionService:
             params["recipe_path"] = recipe_path
         return await self._request("GET", f"/services/{service_name}/check-missing-files", params=params)
 
-    async def compose_preview(self, service_name: str, compose_files: list[str], recipe_path: str = "") -> dict[str, Any]:
+    async def compose_preview(
+        self,
+        service_name: str,
+        compose_files: list[str],
+        recipe_path: str = "",
+        user_name: str = "",
+        label: str = "",
+        profiles: list[str] | None = None,
+    ) -> dict[str, Any]:
         """Lightweight convert/preview: converter in-call src→key mapping.
 
         Proxies to provision-api's ``/services/{name}/compose/preview`` so the
@@ -313,6 +321,16 @@ class ProvisionService:
         params: dict[str, Any] = {"compose_files": compose_files}
         if recipe_path:
             params["recipe_path"] = recipe_path
+        # G60 — the identity travels with the preview so the -api can return the
+        # golden `volume_paths`; without one it returns keys only.
+        if user_name:
+            params["user_name"] = user_name
+        if label:
+            params["label"] = label
+        # The active profiles travel with the preview: the -api filters the
+        # mount table to the services those profiles actually start.
+        if profiles:
+            params["profiles"] = list(profiles)
         return await self._request("GET", f"/services/{service_name}/compose/preview", params=params)
 
     # ---- SSL certificates ----

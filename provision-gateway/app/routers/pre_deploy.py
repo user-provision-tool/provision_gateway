@@ -69,10 +69,24 @@ async def get_pre_deploy(
     user: str, service: str, label: str, recipe_path: str = "",
     current_admin: dict = Depends(require_admin),
 ):
-    row = pdr.get_session(user, service, recipe_path, label)
-    if row is None:
-        raise HTTPException(404, "no pre-deploy session for that combination")
-    return row
+    """The session for this combination, or `{}` — an absence is NOT an error.
+
+    This answered `404 no pre-deploy session for that combination`, and its only
+    caller is the deploy panel's auto-run, which asks it once a SECOND to keep
+    track of which leg the deployment is on. So an ordinary state — no record for
+    this combination — printed ~60 red "Failed to load resource: 404" lines in
+    the browser console on every deploy, measured 2026-10-14.
+
+    Nothing broke on it: the caller reads `data?.job_id == null` and treats that
+    as "no better information", by design. But an error status for an expected
+    answer is a lie, and a console full of false alarms is how a REAL failure
+    hides — which is exactly what it did, to the person writing this.
+
+    `{}` is what the caller already means by this, so it is what the endpoint
+    answers. Note the reader must test a FIELD on it (`data?.job_id`), never the
+    mere presence of a body.
+    """
+    return pdr.get_session(user, service, recipe_path, label) or {}
 
 
 # A `POST /{user}/{service}/{label}/retry` endpoint lived here until 2026-09-26: it

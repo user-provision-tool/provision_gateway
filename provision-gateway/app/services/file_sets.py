@@ -31,13 +31,34 @@ from .project_state import (
     ProjectState,
 )
 
-# Per-user deployment files (.env.{user}.{label}) are NOT candidates.
-_PER_USER_ENV_RE = re.compile(r"^\.env\.[^./]+\.[0-9]+$")
+# Per-user deployment files are NOT candidates — they are the DEPLOY's handoff,
+# never a recipe source. Four names exist in the tree:
+#   legacy        .env.{user}.{label}
+#   canonical     .env.{index}.{user}.{label}   (render_compose's per-user copy)
+#   generated     .env.raw.{user}.{label}       (the env phase's handoff)
+#   fix           .env.fix.{user}.{label}
+# The first pattern only matched the legacy form, so the other three were
+# offered as ENV candidates. Measured 2026-10-24: a stale, all-empty
+# `.env.1.bob.3` from 2026-09-29 was selectable; a deploy picked it, skipped
+# env generation (the slot looked satisfied) and started the graph with an
+# empty OPENAI_API_KEY — it crash-looped.
+_PER_USER_ENV_RES = (
+    re.compile(r"^\.env\.[^./]+\.[0-9]+$"),
+    re.compile(r"^\.env\.\d+\.[^./]+\.[0-9]+$"),
+    re.compile(r"^\.env\.raw\.[^./]+\.[0-9]+$"),
+    re.compile(r"^\.env\.fix\.[^./]+\.[0-9]+$"),
+)
+
+
+def _is_per_user_env(name: str) -> bool:
+    return any(rx.match(name) for rx in _PER_USER_ENV_RES)
 # Per-user rendered compose artifacts (deploy pipeline output, e.g.
 # docker-compose.user-specialsync.0.yml) — never recipe candidates.
 _PER_USER_COMPOSE_RE = re.compile(r"^docker-compose\.user-[^/]+\.yml$")
 
-_FILE_SET_CATEGORIES = ("compose", "nginx", "serving_ports", "stream_conf", "env", "profiles")
+_FILE_SET_CATEGORIES = (
+    "compose", "nginx", "serving_ports", "stream_conf", "mail_conf", "env", "profiles",
+)
 
 # The serving-ports artifact's stem (task-doc R1.1). The platform's other
 # artifacts carry theirs in the file name (`docker-compose…`, `nginx…`), and this
@@ -104,9 +125,20 @@ def _is_compose_candidate(name: str) -> bool:
 
 
 def _is_nginx_candidate(name: str) -> bool:
+    """The HTTP category's candidates. The other categories are NOT offered here:
+    the category is explicit now (G55), so a stream/mail conf cannot silently
+    occupy the http slot by sharing the `.conf` extension."""
     if name.endswith(".generated") or name.endswith(".j2"):
         return False
-    return name.endswith(".conf") and not name.endswith(".j2")
+    if not name.endswith(".conf"):
+        return False
+    return not _is_stream_conf_candidate(name) and not _is_mail_conf_candidate(name)
+
+
+def _is_mail_conf_candidate(name: str) -> bool:
+    if name.endswith(".generated") or name.endswith(".j2"):
+        return False
+    return name.endswith(".mail.conf")
 
 
 def _is_serving_ports_candidate(name: str) -> bool:
@@ -136,13 +168,19 @@ def _is_stream_conf_candidate(name: str) -> bool:
     """
     if name.endswith(".generated") or name.endswith(".j2"):
         return False
-    return name.endswith(".stream.conf")
+    if name.endswith(".stream.conf"):
+        return True
+    # G56 — the generated source is RECIPE-LEVEL (`nginx.stream.base.<job>.conf`),
+    # so the category is carried in the `.stream.` segment rather than as the
+    # final two extensions. The historical per-instance name above stays a
+    # candidate: it is a valid, now-portable source (D7 templates its names).
+    return ".stream." in name and name.endswith(".conf")
 
 
 def _is_env_candidate(name: str) -> bool:
     if name.startswith(".provision-state") or name.endswith(".generated"):
         return False
-    if _PER_USER_ENV_RE.match(name):
+    if _is_per_user_env(name):
         return False
     return name.startswith(".env")
 
@@ -247,6 +285,17 @@ def list_file_sets(service_name: str) -> dict[str, Any]:
 
     recipe_paths = _recipe_paths(state)
     file_sets = dict(state.file_sets)
+    # G41-adjacent hygiene (2026-10-24): per-user env files are the DEPLOY's
+    # handoff, never a selectable source. Older stored sets may still carry
+    # one (the candidate filter missed three of the four name forms) — drop it
+    # from the READ so the panel cannot pre-select a stale empty file and skip
+    # env generation. The stored state is not rewritten.
+    for _rp, _entry in list(file_sets.items()):
+        if isinstance(_entry, dict) and _entry.get("env"):
+            _entry["env"] = [
+                p for p in _entry["env"]
+                if isinstance(p, str) and not _is_per_user_env(p.split("/")[-1])
+            ]
     candidates: dict[str, dict[str, Any]] = {}
     stale: dict[str, dict[str, list[str]]] = {}
 
@@ -257,6 +306,7 @@ def list_file_sets(service_name: str) -> dict[str, Any]:
         env_cands = sorted(n for n in names if _is_env_candidate(n))
         sp_cands = sorted(n for n in names if _is_serving_ports_candidate(n))
         sc_cands = sorted(n for n in names if _is_stream_conf_candidate(n))
+        mc_cands = sorted(n for n in names if _is_mail_conf_candidate(n))
 
         # Profile candidates derive from the SELECTED compose (the merged set);
         # when nothing is selected the section stays disabled (dependency on
@@ -271,6 +321,7 @@ def list_file_sets(service_name: str) -> dict[str, Any]:
             "nginx": nginx_cands,
             "serving_ports": sp_cands,
             "stream_conf": sc_cands,
+            "mail_conf": mc_cands,
             "env": env_cands,
             "profiles": prof_cands,
         }
@@ -306,6 +357,9 @@ def list_file_sets(service_name: str) -> dict[str, Any]:
             sel_sc = selected.get("stream_conf")
             if sel_sc and not (base_dir / sel_sc).is_file():
                 entry_stale["stream_conf"] = [sel_sc]
+            sel_mc = selected.get("mail_conf")
+            if sel_mc and not (base_dir / sel_mc).is_file():
+                entry_stale["mail_conf"] = [sel_mc]
             gone_env = [
                 p for p in selected.get("env", [])
                 if not (_recipe_dir(project_dir, rp) / p).is_file()
@@ -376,6 +430,11 @@ def put_file_set(service_name: str, recipe_path: str, file_set: dict[str, Any]) 
 
     compose = _validate_paths(project_dir, recipe_key, [p for p in (file_set.get("compose") or []) if isinstance(p, str)])
     env = _validate_paths(project_dir, recipe_key, [p for p in (file_set.get("env") or []) if isinstance(p, str)])
+    _per_user = [p for p in env if _is_per_user_env(p.split("/")[-1])]
+    if _per_user:
+        raise FileSetError(
+            f"per-user env files are not selectable — they are the deploy's handoff: {_per_user}"
+        )
     nginx = file_set.get("nginx")
     if nginx is not None:
         if not isinstance(nginx, str) or not nginx.strip():
@@ -391,6 +450,11 @@ def put_file_set(service_name: str, recipe_path: str, file_set: dict[str, Any]) 
         if not isinstance(stream_conf, str) or not stream_conf.strip():
             raise FileSetError("stream_conf must be a path string or null")
         stream_conf = _validate_paths(project_dir, recipe_key, [stream_conf])[0]
+    mail_conf = file_set.get("mail_conf")
+    if mail_conf is not None:
+        if not isinstance(mail_conf, str) or not mail_conf.strip():
+            raise FileSetError("mail_conf must be a path string or null")
+        mail_conf = _validate_paths(project_dir, recipe_key, [mail_conf])[0]
     profiles = [p for p in (file_set.get("profiles") or []) if isinstance(p, str)]
     # R2-F10 / R1.3 — `None` is a first-class RECORDED state, not the absence of a
     # selection: "deliberately no serving-ports file" has to survive the save, or
@@ -405,12 +469,15 @@ def put_file_set(service_name: str, recipe_path: str, file_set: dict[str, Any]) 
         "serving_ports": serving_ports,
         "serving_ports_none": serving_ports_none,
         "stream_conf": stream_conf,
+        "mail_conf": mail_conf,
         "env": env,
         "profiles": profiles,
     }
     for key in _FILE_SET_CATEGORIES:
         if key not in entry:
-            entry[key] = [] if key not in ("nginx", "serving_ports", "stream_conf") else None
+            entry[key] = [] if key not in (
+                "nginx", "serving_ports", "stream_conf", "mail_conf",
+            ) else None
 
     from ..services.service_manager import service_manager
 

@@ -292,111 +292,119 @@ def validate_conf_agreement(
     user_name: str,
     label: str,
     domain: str,
+    category: str = "http",
 ) -> dict[str, Any]:
-    """Does the nginx conf agree with the ports file? (R1.3's `validate_conf`.)
+    """Does an nginx conf agree with the ports file? (R1.3's `validate_conf`.)
 
-    ERRORS, because each means the deployment does not match its own declaration:
+    G56 — NAME-AGNOSTIC, for BOTH categories. The -api renders the names
+    (``{{ hostname_stem }}--<sub>.{{ domain_name }}``), so comparing names here
+    would be redundant at best and would refuse a perfectly reusable conf at
+    worst. What the gateway still checks is what the -api cannot infer from the
+    conf alone:
 
-    * a surviving `kind: http` row with no `server{}` block serving its name — the
-      row says the endpoint exists and the conf serves nothing;
-    * the primary's block does not serve the instance host — the instance's own
-      URL would point somewhere else.
-
-    WARNINGS, because the doc calls the last one "at least a warning": a block
-    whose upstream names no row at all (the conf proxies something the artifact
-    does not declare — worth saying, not worth blocking).
-
-    The names follow R1.5: the primary is served at the instance host, every other
-    http row at `<instance host>--<sub_service>.<domain>` — one name per
-    sub-service, the same form the stream path uses.
+    * **coverage** — every row of this category has a ``server{}`` block. A block
+      is identified by its ``--<sub_service>`` suffix; the primary http block is
+      the one with no ``--``. A block for an undeclared sub-service is a warning.
+    * **upstream/port agreement** — a block's upstream port equals the row's
+      port. A host that does not look like ``<prefix><sub_service>`` is a
+      warning (the conf may legitimately target something the artifact does not
+      declare, and a templated upstream cannot always be read pre-render).
     """
     import re
 
     errors: list[str] = []
     warnings: list[str] = []
 
-    # R2-F46 — read the conf AS THE PLATFORM WILL RENDER IT.
-    #
-    # The conf in play is a TEMPLATE, and the -api's converter owns what it
-    # becomes (`lib/nginx_converter.py`): a `server_name` token with no `--`
-    # becomes the instance host, and one carrying R1.5's separator becomes
-    # `<instance host>--<sub_service>.<domain>` — the extra endpoint, kept as one
-    # label under the domain. The SKILL tells the generator to write
-    # `<service>_hostname` / `<service>_hostname--<sub>` rather than the final
-    # names, so judging the PRE-conversion text compares names the platform never
-    # serves: it refused a generated conf for not serving a name it was about to
-    # be given (measured 2026-10-10, jobs 366/367) — and, before the converter
-    # learned the rule, it made every extra http row unservable (round 2's F47).
-    #
-    # The rewrite lives HERE, not at the caller, so no caller can forget it.
-    instance_stem = f"{service_name}-{user_name}-{label}"
-    instance_host = f"{instance_stem}.{domain}"
-
-    def _normalise_server_names(match: "re.Match[str]") -> str:
-        head, token, tail = match.group(1), match.group(2), match.group(3)
-        served: list[str] = []
-        for name in token.split():
-            if "--" in name:
-                # `<instance host>--<sub>.<domain>` (R1.5) — the STEM carries the
-                # separator, so the result is still ONE label under the domain.
-                sub = name.split("--", 1)[1].split(".")[0].strip()
-                served.append(f"{instance_stem}--{sub}.{domain}" if sub else instance_host)
-            else:
-                served.append(instance_host)
-        return head + " ".join(served) + tail
-
-    conf_text = re.sub(
-        r"([ \t]*server_name[ \t]+)([^\n;]+)(;)",
-        _normalise_server_names,
-        conf_text or "",
-    )
-
+    rows = http_rows(serving_ports) if category == "http" else _stream_rows(serving_ports)
     blocks = _server_blocks(conf_text or "")
 
-    def _served_names(block: str) -> set[str]:
-        names: set[str] = set()
-        for m in re.finditer(r"^[ \t]*server_name[ \t]+([^;\n]+);", block, re.MULTILINE):
-            names |= {t.strip() for t in m.group(1).split() if t.strip()}
-        return names
+    _prefix = r"(?:\{\{\s*container_prefix\s*\}\})?"
+    _UP = re.compile(
+        r"proxy_pass[ \t]+(?:https?://)?" + _prefix + r"([A-Za-z0-9_.-]+)(?::(\d+))?"
+    )
+    _SET = re.compile(
+        r"set[ \t]+\$[A-Za-z0-9_]+[ \t]+" + _prefix + r"([A-Za-z0-9_.-]+)(?::(\d+))?"
+    )
 
-    served: set[str] = set()
-    upstreams: set[str] = set()
-    for b in blocks:
-        served |= _served_names(b)
-        for m in re.finditer(r"^[ \t]*set[ \t]+\$[A-Za-z0-9_]+[ \t]+([A-Za-z0-9_.-]+):", b, re.MULTILINE):
-            upstreams.add(m.group(1))
-        for m in re.finditer(r"proxy_pass[ \t]+https?://([A-Za-z0-9_.-]+)", b):
-            upstreams.add(m.group(1))
+    def _block_info(block: str) -> tuple[list[str | None], list[tuple[str, int | None]]]:
+        """``(sub-service markers, upstreams)`` of one block.
 
-    # (`instance_host` was computed above, with the rendering normalisation.)
-    rows = http_rows(serving_ports)
-    primary = next((r for r in rows if r.get("primary") is True), None)
-    declared_upstreams: set[str] = set()
+        A marker is the sub-service a token names, or ``None`` for a primary
+        (no ``--``). A templated ``server_name`` is read by its literal
+        ``--<sub>.`` fragment, which survives until the -api renders it.
+        """
+        subs: list[str | None] = []
+        m = re.search(r"server_name[ \t]+([^;\n]+);", block)
+        raw = m.group(1).strip() if m else ""
+        if "{{" in raw:
+            subs = re.findall(r"--([A-Za-z0-9_-]+)\.", raw) or [None]
+        else:
+            for token in raw.split():
+                if "--" in token:
+                    subs.append(token.split("--", 1)[1].split(".")[0])
+                else:
+                    subs.append(None)
+        upstreams: list[tuple[str, int | None]] = []
+        for rx in (_UP, _SET):
+            for mm in rx.finditer(block):
+                upstreams.append((mm.group(1), int(mm.group(2)) if mm.group(2) else None))
+        return subs, upstreams
+
+    infos = [_block_info(b) for b in blocks]
+    declared = {str(r.get("sub_service")) for r in rows if r.get("sub_service")}
 
     for row in rows:
         sub = str(row.get("sub_service") or "")
         if not sub:
             continue
-        declared_upstreams.add(sub)
-        want = (instance_host if row.get("primary") is True
-                else extra_http_host(service_name=service_name, user_name=user_name,
-                                     label=label, domain=domain, sub_service=sub))
-        if want not in served:
+        is_primary = category == "http" and row.get("primary") is True
+        # The block that serves this row: the primary (no `--`) for the primary
+        # row, otherwise the block whose marker names this sub-service.
+        match = next(
+            (
+                (subs, ups)
+                for subs, ups in infos
+                if (None in subs if is_primary else sub in subs)
+            ),
+            None,
+        )
+        if match is None:
+            where = "the instance host (primary)" if is_primary else repr(sub)
             errors.append(
-                f"row {sub}: no `server{{}}` block serves {want!r} — the row declares an "
+                f"row {sub}: no `server{{}}` block serves {where} — the row declares an "
                 f"endpoint the conf does not serve"
             )
-
-    if primary is not None and instance_host not in served:
-        errors.append(
-            f"the primary row's block does not serve the instance host {instance_host!r}"
-        )
-
-    for up in sorted(upstreams):
-        if up not in declared_upstreams and up not in (instance_host,):
+            continue
+        _subs, upstreams = match
+        ports = [p for _h, p in upstreams if p is not None]
+        want_port = row.get("port")
+        if ports and isinstance(want_port, int) and want_port not in ports:
+            errors.append(
+                f"row {sub}: the block's upstream port(s) {ports} do not match the "
+                f"row's port {want_port}"
+            )
+        hosts = [h for h, _p in upstreams]
+        if hosts and not any(h == sub or h.endswith(sub) for h in hosts):
             warnings.append(
-                f"a block proxies to {up!r}, which no row declares — declared: "
-                f"{sorted(declared_upstreams) or 'nothing'}"
+                f"row {sub}: the block proxies to {hosts!r}, which does not look like "
+                f"this row's service — check the upstream"
             )
 
+    # Undeclared blocks: a block serving a sub-service the artifact does not
+    # declare exposes something unaccounted for. Warn, never block.
+    for subs, _ups in infos:
+        for marker in subs:
+            if marker is not None and marker not in declared:
+                warnings.append(
+                    f"a block serves {marker!r}, which no row of this category declares — "
+                    f"declared: {sorted(declared) or 'nothing'}"
+                )
+
     return {"valid": not errors, "errors": errors, "warnings": warnings}
+
+
+def _stream_rows(serving_ports: Any) -> list[dict[str, Any]]:
+    """The stream rows, imported lazily to keep the module graph one-way."""
+    from .stream_conf import stream_rows
+
+    return stream_rows(serving_ports)

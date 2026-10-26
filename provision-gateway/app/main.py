@@ -45,78 +45,28 @@ def _get_reconcile_interval_min() -> int:
         return 0
 
 
-async def _pre_deploy_reconcile_loop():
-    """§8b: periodically close the two-write gap for pre-deploy sessions.
-
-    `reconcile` used to run ONLY at startup, so a session whose job had since
-    finished — a completed generation the operator never deployed — kept its
-    combination RESERVED forever, and every later generation for the same
-    (user, service, label) was refused with 409 until the gateway restarted.
-    Found live: a stale session blocked a deploy verification three times.
-
-    A session is dropped when its key already exists in the -api registry (the
-    registration succeeded, so the session is done) or when nothing is working
-    on it any more (no live job). Both facts are needed, so this loop reads the
-    registry once per pass.
-    """
-    while True:
-        try:
-            # ONE HOME (GRILLING G31, D4). Each worker runs the lifespan, so
-            # without this every loop runs FOUR times — and THIS one was the
-            # damaging case: it does a read-modify-write on shared state.
-            from .services.loop_lease import acquire_lease
-            if not acquire_lease("pre_deploy_reconcile", 300):
-                await asyncio.sleep(90)
-                continue
-            from .services import pre_deploy_registry as _pdr
-            from .services.provision_service import provision_service
-
-            sessions = _pdr.list_sessions()
-            if sessions:
-                registered: set[str] = set()
-                try:
-                    payload = await provision_service.list_users()
-                    for u in payload.get("user_status", []):
-                        uname = u.get("user_name") or ""
-                        for bucket in ("healthy_services", "unhealthy_services",
-                                       "missing_services", "failed_services"):
-                            for svc in (u.get(bucket) or []):
-                                registered.add(
-                                    f"{uname}|{svc.get('service_name', '')}|"
-                                    f"{svc.get('recipe_path') or ''}|{svc.get('label', '0')}"
-                                )
-                except Exception:
-                    # Cannot read the registry this pass — only the live-job rule
-                    # can be applied, which is still enough to free a session
-                    # nothing is working on.
-                    registered = set()
-                live: set[int] = set()
-                try:
-                    from .services.generation_jobs import generation_jobs
-                    for row in sessions:
-                        jid = row.get("job_id")
-                        if jid is None:
-                            continue
-                        # `job_status` (not `get_job`) — it owns its session.
-                        # This called `get_job(int(jid))` with no `db`, and the
-                        # TypeError was swallowed below, so `live` was always
-                        # empty and every session without a registry entry was
-                        # dropped... except the exception fired BEFORE the drop,
-                        # leaving the sweep a complete no-op. See `job_status`.
-                        if generation_jobs.job_status(int(jid)) in (
-                            "queued", "running", "awaiting_input"
-                        ):
-                            live.add(int(jid))
-                except Exception:
-                    live = set()
-                rep = _pdr.reconcile(registered, live)
-                if rep["dropped_registered"] or rep["dropped_stale"]:
-                    print(f"[gateway] pre-deploy reconcile: dropped "
-                          f"{len(rep['dropped_stale'])} stale, "
-                          f"{len(rep['dropped_registered'])} already-registered session(s)")
-        except Exception:
-            pass
-        await asyncio.sleep(90)
+# `_pre_deploy_reconcile_loop` stood here until 2026-10-16: a 90-second patrol
+# that dropped pre-deploy sessions whose key appeared in the -api registry, or
+# which had no live job. BOTH halves are gone, and the reasons matter:
+#
+#   * "no live job => stale" existed only because a finished leg's record kept
+#     its combination RESERVED forever, refusing every later generation with 409
+#     (its docstring recorded that found live, blocking a deploy verification
+#     three times). That was a MISSING STATE, not a cleanup problem: the record
+#     had nowhere to step down to. `STATE_GENERATED` is that state now — a record
+#     that holds nothing needs nobody to patrol for it.
+#   * "key in the registry => registered => drop" compared a DB row against a
+#     membership list harvested from the -api's registry, and that list was built
+#     from four buckets INCLUDING `failed_services` — so retrying a failed
+#     instance had its live record deleted mid-generation. Measured 2026-10-14:
+#     60 consecutive probe misses, and the operator's card gone while its
+#     generation was still running. The deploy's handoff already removes the
+#     record on its way into the -api (remove-then-register), so this rule had
+#     nothing to catch even when it fired correctly.
+#
+# What is left is `pre_deploy_registry.reconcile`, called ONCE in `lifespan`
+# below for the one case nothing else covers: a record whose runner died with the
+# gateway, which nothing will ever write a state for.
 
 
 async def _reconcile_loop():
@@ -265,18 +215,20 @@ async def lifespan(app: FastAPI):
         print(f"[gateway] WARNING: generation-job recovery failed: {exc}")
 
     # §8b: pre-deploy sessions are closed against what actually exists now — the
-    # stale ones were marked failed above, so nothing is live for them.
+    # stale ones were marked failed above, so nothing is live for them. This is
+    # the ONLY time `reconcile` runs (see the note where the loop used to be): it
+    # tidies records whose runner died with the gateway, and it spares the ones in
+    # the operator's hands — `paused`, `refused`, and `generated`.
     try:
         from .services import pre_deploy_registry as _pdr
-        rep = _pdr.reconcile(set(), live_job_ids=set())
-        if rep["dropped_stale"] or rep["dropped_registered"]:
-            print(f"[gateway] pre-deploy reconcile: dropped {rep['dropped_stale']} stale, "
-                  f"{rep['dropped_registered']} already-registered session(s)")
+        rep = _pdr.reconcile(live_job_ids=set())
+        if rep["dropped_stale"]:
+            print(f"[gateway] pre-deploy reconcile: dropped "
+                  f"{len(rep['dropped_stale'])} stale session(s)")
     except Exception as exc:
         print(f"[gateway] WARNING: pre-deploy reconcile failed: {exc}")
 
     _reconcile_task = asyncio.create_task(_reconcile_loop())
-    _pre_deploy_task = asyncio.create_task(_pre_deploy_reconcile_loop())
     print("[gateway] Scheduled reconciliation background task started")
     _docker_events_task = asyncio.create_task(_docker_events_monitor())
     print("[gateway] Docker events monitor started (watching subnet-acl-nginx)")

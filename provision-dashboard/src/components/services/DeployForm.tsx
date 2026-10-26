@@ -7,6 +7,7 @@ import { deriveProfiles, getComposePreview } from '../../api/services'
 import { useGenerationJob, isPaused } from '../../hooks/useGenerationJob'
 import PausePrompt from './PausePrompt'
 import FileSetSelection, {
+  confCategory,
   fixVariantFor,
   phaseOfFile,
   servingPortsRows,
@@ -201,9 +202,22 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
   // Auto-detected volume keys from compose template
   const [expectedVolumeKeys, setExpectedVolumeKeys] = useState<string[]>([])
-  // Canonical per-user volume root (from compose-preview; never hardcoded —
-  // the provision-api bootstraps bind targets under ITS user_data root).
-  const [userDataDir, setUserDataDir] = useState<string>('/srv/provision/user_data')
+  // G60 (D8) — the golden per-key paths, computed by the -api. The dashboard
+  // never assembles `{root}/{user}/{service}/{label}/{key}` itself.
+  const [volumePaths, setVolumePaths] = useState<Record<string, string>>({})
+  // The compose's container target per volume key — the second column of the
+  // MOUNT TABLE the panel shows (`host path : container path`). Also the
+  // -api's fact; the dashboard never parses the compose.
+  const [volumeTargets, setVolumeTargets] = useState<Record<string, string>>({})
+  // The sub-service that mounts each volume key (the row label; the key itself
+  // is an implementation detail the operator does not need to see), and the
+  // rows in service order.
+  const [volumeServices, setVolumeServices] = useState<Record<string, string>>({})
+  const [volumeRows, setVolumeRows] = useState<{ key: string; service: string; target: string }[]>([])
+
+  // True once a compose has been selected AND previewed — the mount table is
+  // only meaningful from then on.
+  const [volumePreviewed, setVolumePreviewed] = useState(false)
 
   // Helper: parse service value which may include recipe path (format: "name@@recipe_path")
   const parseServiceValue = (val: string): { baseName: string; recipePath: string } => {
@@ -214,13 +228,23 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   // Fetch expected volumes from the converter's in-call src→key mapping via
   // the lightweight compose-preview response (design §Implementation notes
   // L284-286) — keys are NEVER parsed from .j2 templates in the frontend.
-  const fetchExpectedVolumes = async (serviceName: string, sourcesList?: { name: string; files: string[] }[]) => {
+  const fetchExpectedVolumes = async (
+    serviceName: string,
+    sourcesList?: { name: string; files: string[] }[],
+    userName?: string,
+    label?: string,
+  ) => {
     try {
       const svcVal = serviceName || ''
       // Reset stale volume rows whenever the service changes — the mapping
       // is user+service+label-dependent and must never survive a selection
       // change (design §8.2).
       setExpectedVolumeKeys([])
+      setVolumePaths({})
+      setVolumeTargets({})
+      setVolumeServices({})
+      setVolumeRows([])
+      setVolumePreviewed(false)
       form.setFieldsValue({ volumes: [] })
       const { baseName, recipePath } = parseServiceValue(svcVal)
       const list = sourcesList || sources
@@ -247,9 +271,15 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       } else {
         // Convention, not extension: `ellipsis.yaml` and the per-user compose are not composes,
         // and merging them makes the preview fail (see isComposeName).
+        //
+        // ONE file, not every plain candidate: this branch runs before the
+        // stored file set loads. Merging overlays (fix/test/compose) produced a
+        // service set with NO volumes, so the next preview returned zero keys
+        // and cleared the rows (measured 2026-10-24). The first plain compose
+        // is the base; the stored selection replaces it a moment later.
         const plain = candidates.filter((f: string) => isComposeName(f) && !f.endsWith('.j2'))
         if (plain.length > 0) {
-          composeFiles = plain.map(pathFor)
+          composeFiles = [pathFor(plain[0])]
         } else {
           const composeJ2 = candidates.find((f: string) => f.endsWith('.yml.j2'))
           if (composeJ2) composeFiles = [pathFor(composeJ2)]
@@ -257,10 +287,21 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       }
       if (composeFiles.length === 0) { setExpectedVolumeKeys([]); return }
 
-      const { data } = await getComposePreview(baseName, composeFiles, recipePath)
+      const u = userName !== undefined ? userName : (form.getFieldValue('user_name') || '')
+      const l = label !== undefined ? label : (form.getFieldValue('label') || '0')
+      const { data } = await getComposePreview(
+        baseName, composeFiles, recipePath, u, String(l), selection.profiles,
+      )
       setExpectedVolumeKeys(data.volume_keys || [])
-      if (data.user_data_dir) setUserDataDir(data.user_data_dir)
-    } catch { setExpectedVolumeKeys([]) }
+      setVolumePaths(data.volume_paths || {})
+      setVolumeTargets(data.volume_targets || {})
+      setVolumeServices(data.volume_services || {})
+      setVolumeRows(data.volume_rows || [])
+      setVolumePreviewed(true)
+    } catch {
+      setExpectedVolumeKeys([]); setVolumePaths({}); setVolumeTargets({})
+      setVolumeServices({}); setVolumeRows([]); setVolumePreviewed(false)
+    }
   }
 
   // GAP-003: Compute next label when user+service selections change
@@ -308,6 +349,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         proxyTouchedRef.current = false
         const seedProxy = seedUseGlobalProxy(preselectedUseGlobalProxy)
         if (seedProxy !== null) form.setFieldsValue({ use_global_proxy: seedProxy })
+        // B2: a free-standing open starts from a clean generation view. A
+        // resumed one (`check`) re-attaches below and legitimately shows its
+        // pause prompt.
+        if (resumeJobId == null) {
+          genJob.reset()
+          setGenPopupOpen(false)
+        }
         const sourcesData = await loadSources()
         loadProxyStatus()
         loadDeployableUsers()
@@ -433,6 +481,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       setSelection({
         compose: entry.compose || [],
         nginx: entry.nginx || null,
+        stream_conf: entry.stream_conf || null,
+        mail_conf: entry.mail_conf || null,
         // R1.1/R1.3: the serving-ports artifact and its deliberate-None state,
         // read from the SAME stored file set the other categories come from — so
         // the deploy forwards what the operator (or the generation) selected.
@@ -452,9 +502,14 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           || (initialOptions.compose_file_path ? [initialOptions.compose_file_path] : null)
         const sentEnv = initialOptions.env_files
           || (initialOptions.env_file_path ? [initialOptions.env_file_path] : null)
+        // G55 — the per-category map is the record's shape; the legacy singular
+        // is still understood for an older refusal.
+        const sentConfs = initialOptions.nginx_confs || {}
         setSelection(prev => ({
           compose: Array.isArray(sentCompose) && sentCompose.length ? sentCompose : prev.compose,
-          nginx: initialOptions.nginx_conf_file_path || prev.nginx,
+          nginx: sentConfs.http || initialOptions.nginx_conf_file_path || prev.nginx,
+          stream_conf: sentConfs.stream || prev.stream_conf,
+          mail_conf: sentConfs.mail || prev.mail_conf,
           env: Array.isArray(sentEnv) && sentEnv.length ? sentEnv : prev.env,
           profiles: initialOptions.profiles || prev.profiles,
         }))
@@ -469,6 +524,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           ...prev,
           compose: slot === 'compose' ? [] : prev.compose,
           nginx: slot === 'nginx' ? null : prev.nginx,
+          stream_conf: slot === 'stream_conf' ? null : prev.stream_conf,
           env: slot === 'env' ? [] : prev.env,
         }))
       }
@@ -575,6 +631,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     return {
       compose: selection.compose.filter(p => !(st.compose || []).includes(p)),
       nginx: selection.nginx && !(st.nginx || []).includes(selection.nginx) ? selection.nginx : null,
+      // G55 — one file per category; stale entries are kept + flagged, never sent.
+      stream_conf: selection.stream_conf
+        && !(st.stream_conf || []).includes(selection.stream_conf)
+        ? selection.stream_conf : null,
+      mail_conf: selection.mail_conf
+        && !(st.mail_conf || []).includes(selection.mail_conf)
+        ? selection.mail_conf : null,
       env: selection.env.filter(p => !(st.env || []).includes(p)),
       profiles: selection.profiles.filter(p => !(st.profiles || []).includes(p)),
       // R2-F39 — the serving-ports slot MUST travel with the payload. It was
@@ -598,14 +661,56 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   // selections — never about what the recipe happens to contain. `generate new`
   // is the absence of a selection, so "ready to deploy" means all three slots
   // name a specific file.
+  //
+  // ...except the ENV slot, which has a THIRD way to be ready. The per-user
+  // `.raw` is the deploy's HANDOFF, not a selection (design §2), so a slot with
+  // no file picked is satisfied by a handoff this path already produced. This
+  // predicate is the single home for that rule because BOTH of its readers need
+  // it — the readiness alert and the deploy's own generation test. Written as
+  // `eff.env.length > 0` it made every recipe with no base env file look
+  // incomplete: the panel printed "Per-user env ready: …" and "Missing essential
+  // files" at the same time, and — measured 2026-10-14 on `bob|graphiti-local||0`
+  // — every Deploy re-ran the whole generation, so it asked again for the
+  // credentials the operator had just supplied at the pause.
   const eff = effectiveSelection()
-  const slotsSpecified = eff.compose.length > 0 && !!eff.nginx && eff.env.length > 0
+  // The env slot is satisfied ONLY by the per-user HANDOFF (the generated
+  // `.env.raw.<user>.<label>`). A selected recipe env file is generation
+  // CONTEXT, never the deploy's env — treating it as satisfied skipped the env
+  // phase entirely and shipped whatever the file held. Measured 2026-10-24: the
+  // stored `.env` selection (empty OPENAI_API_KEY) made a no-TLS deploy skip
+  // generation, and the graph crash-looped on an empty key.
+  const envSatisfied = !!perUserEnv
+  // G56 — with TLS on (and a serving-ports artifact in play), the stream conf is
+  // a SLOT like the http one: a fully-configured deploy names both. `None` is
+  // the deliberate no-stream state and demands nothing.
+  const httpsOn = !!Form.useWatch('https', form)
+  const streamSlotNeeded = httpsOn && !eff.serving_ports_none
+  const slotsSpecified = eff.compose.length > 0 && !!eff.nginx && envSatisfied
+    && (!streamSlotNeeded || !!eff.stream_conf)
 
   // Async generation job (ordered phases compose → nginx → env, one job).
   const genJob = useGenerationJob()
   const [genValidations, setGenValidations] = useState<Record<string, any>>({})
   // Deploy progress popup (design §8.3) — shows generation steps + deploy step.
   const [genPopupOpen, setGenPopupOpen] = useState(false)
+
+  // B2 / G58 — closing the panel ENDS its attachment to the generation leg.
+  // `genJob` and `genPopupOpen` survived the close (only `handleDeploy`'s
+  // finally or the prompt's own Close cleared them), so the next, unrelated
+  // Deploy panel rendered the previous leg's "waiting for external
+  // credentials" prompt inline and kept its hidden pause modal mounted.
+  // The server-side pause is untouched: re-opening `check` still attaches to
+  // it, because that path calls `resumeJob` again.
+  useEffect(() => {
+    // `handleDeploy` closes the panel ITSELF right after snapshotting the form,
+    // then runs the generation + deploy from the popup. That close is not a
+    // detach: resetting here killed the auto-run (the job went on server-side
+    // and the dashboard stopped polling it).
+    if (!open && !deployAutoRunRef.current) {
+      genJob.reset()
+      setGenPopupOpen(false)
+    }
+  }, [open])
   // True while handleDeploy's one-shot auto-gen runs — the popup FREEZES on the
   // completed frame (no reset, no "review, then deploy" toast) until /users/deploy
   // returns; the manual Generate button keeps the review-gate behavior (feature 4).
@@ -839,6 +944,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         // of its own, so reading `[]` as "clear" would wipe the operator's picks.
         if (Array.isArray(resultSel.compose) && resultSel.compose.length) next.compose = resultSel.compose
         if (typeof resultSel.nginx === 'string' && resultSel.nginx) next.nginx = resultSel.nginx
+        if (typeof resultSel.stream_conf === 'string' && resultSel.stream_conf) next.stream_conf = resultSel.stream_conf
+        if (typeof resultSel.mail_conf === 'string' && resultSel.mail_conf) next.mail_conf = resultSel.mail_conf
         if (Array.isArray(resultSel.env) && resultSel.env.length) next.env = resultSel.env
         return next
       })
@@ -853,8 +960,12 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       if (producedCompose) setSelection(prev => ({ ...prev, compose: [producedCompose] }))
       // nginx: `*.conf` and NOT a template — the -api's own predicate, which the
       // gateway's candidate scan mirrors (both engines MUST agree).
-      const producedNginx = Object.keys(files).find(n => n.endsWith('.conf') && !n.endsWith('.j2'))
+      const producedNginx = Object.keys(files).find(n => n.endsWith('.conf') && !n.endsWith('.j2')
+        && confCategory(n) === 'http')
       if (producedNginx) setSelection(prev => ({ ...prev, nginx: producedNginx }))
+      const producedStream = Object.keys(files).find(n => n.endsWith('.conf') && !n.endsWith('.j2')
+        && confCategory(n) === 'stream')
+      if (producedStream) setSelection(prev => ({ ...prev, stream_conf: producedStream }))
     }
     if (!isDeployAuto) genJob.reset()
   }, [genJob.jobState])
@@ -899,6 +1010,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           ...prev,
           compose: prev.compose.map(p => (p === editorFileName ? targetName : p)),
           nginx: prev.nginx === editorFileName ? targetName : prev.nginx,
+          stream_conf: prev.stream_conf === editorFileName ? targetName : prev.stream_conf,
+          mail_conf: prev.mail_conf === editorFileName ? targetName : prev.mail_conf,
           env: prev.env.map(p => (p === editorFileName ? targetName : p)),
           // R4-F64 — and the serving-ports slot, which this list forgot. Every
           // other category is flipped here; `serving_ports` was added to the
@@ -996,21 +1109,27 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       // contradicts the design AND made every Deploy pay a ~30s generation window
       // before the deploy POST — measured across Rounds 24-25 of trace T5, where
       // it also made a live capacity refusal unreachable.
-      const hasSelectedEnv = effectiveSelection().env.length > 0
+      //
+      // The SAME rule now covers the other handoff, the `.raw` this path has just
+      // generated: `slotsSpecified` counts a ready handoff as a satisfied env
+      // slot, so a Deploy after a completed Generate no longer re-runs the
+      // pipeline and re-asks for the credentials just supplied. This condition
+      // used to spell that out in a third clause of its own
+      // (`needsEnv && !perUserEnv && !hasSelectedEnv`) — the same test written
+      // twice, which is how this panel keeps drifting, so it is written once.
       // G13/G20: `generate new` means NOT SELECTED, and a deploy must send the
       // -api ALL THREE paths — a refused deployment carries all three, because
       // any slot left at `generate new` had a file generated and sent for it.
       // So an unselected slot is a reason to generate, independently of what the
-      // recipe happens to contain on disk. Without `!slotsSpecified` a deploy
-      // whose nginx slot sat at `generate new` while an `nginx.conf` existed
-      // skipped generation entirely, and the payload carried NO nginx path at
-      // all — found live on `bob|probe-interp||3`.
+      // recipe happens to contain on disk. Without the compose/nginx half a
+      // deploy whose nginx slot sat at `generate new` while an `nginx.conf`
+      // existed skipped generation entirely, and the payload carried NO nginx
+      // path at all — found live on `bob|probe-interp||3`.
       // …except a GATEWAY refusal's retry (`regenerate`), whose record carries
       // options only as a SEED: nothing was generated, so the pipeline must run.
       const needsGeneration = (!initialOptions || regenerate) && (
         !slotsSpecified ||
-        missingFiles.length > 0 ||
-        (needsEnv && !perUserEnv && !hasSelectedEnv)
+        missingFiles.length > 0
       )
       if (needsGeneration && !hasSelectedCompose && missingFiles.length > 0 && !genJob.jobState) {
         message.error('Cannot deploy: missing essential files and no compose selected.')
@@ -1037,6 +1156,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         if (resSel) {
           if (Array.isArray(resSel.compose) && resSel.compose.length) sel.compose = resSel.compose
           if (typeof resSel.nginx === 'string' && resSel.nginx) sel.nginx = resSel.nginx
+          if (typeof resSel.stream_conf === 'string' && resSel.stream_conf) sel.stream_conf = resSel.stream_conf
+          if (typeof resSel.mail_conf === 'string' && resSel.mail_conf) sel.mail_conf = resSel.mail_conf
           if (Array.isArray(resSel.env) && resSel.env.length) sel.env = resSel.env
         } else {
           // No reported selection — name what THIS run produced instead, by
@@ -1045,8 +1166,12 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           // matching and the payload would keep the file the run just replaced).
           const producedCompose = Object.keys(genNow).find(isComposeName)
           if (producedCompose) sel.compose = [producedCompose]
-          const producedNginx = Object.keys(genNow).find(n => n.endsWith('.conf') && !n.endsWith('.j2'))
+          const producedNginx = Object.keys(genNow).find(n => n.endsWith('.conf') && !n.endsWith('.j2')
+            && confCategory(n) === 'http')
           if (producedNginx) sel.nginx = producedNginx
+          const producedStream = Object.keys(genNow).find(n => n.endsWith('.conf') && !n.endsWith('.j2')
+            && confCategory(n) === 'stream')
+          if (producedStream) sel.stream_conf = producedStream
         }
       }
       // Merge previously generated (reviewed) files with the just-generated
@@ -1088,8 +1213,18 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       // deployment with no nginx at all — that instance would deploy unroutable
       // and the edge would 502 its /go/ relay.
       if (!sel.nginx) {
-        const produced = Object.keys(gen).find(n => n.endsWith('.conf') || n.endsWith('.conf.j2'))
+        const produced = Object.keys(gen).find(
+          n => (n.endsWith('.conf') || n.endsWith('.conf.j2')) && confCategory(n) === 'http'
+        )
         if (produced) sel.nginx = produced
+      }
+      // G56 — the stream slot, by the same rule. Only when TLS is on and the
+      // deployment is not in the deliberate no-streams state.
+      if (!sel.stream_conf && httpsOn && !sel.serving_ports_none) {
+        const produced = Object.keys(gen).find(
+          n => (n.endsWith('.conf') || n.endsWith('.conf.j2')) && confCategory(n) === 'stream'
+        )
+        if (produced) sel.stream_conf = produced
       }
 
       // What was SELECTED is what is sent — no fallback chain
@@ -1101,11 +1236,20 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       if (sel.compose.length > 0) {
         payload.compose_file_paths = sel.compose
       }
-      // nginx is no longer "optional": it is governed by the same rule, and its
-      // absence is as fatal as a missing compose (the instance would deploy
-      // unroutable and the edge would 502 the /go/ relay).
-      if (sel.nginx) {
-        payload.nginx_conf_file_path = sel.nginx
+      // G55 — ONE per-category map, never a list and never the singular field.
+      // nginx is no longer "optional": its absence is as fatal as a missing
+      // compose (the instance would deploy unroutable and the edge would 502
+      // the /go/ relay), and the stream slot follows the same rule under TLS.
+      const nginxConfs: Record<string, string> = {}
+      if (sel.nginx) nginxConfs.http = sel.nginx
+      // G41 — the stream category is applicable only when TLS is on. The
+      // selection may still carry one (persisted for a later TLS deploy);
+      // sending it with the toggle off produced a stream conf with no
+      // certificates, which broke `nginx -t` and with it the reload.
+      if (snap.https && sel.stream_conf) nginxConfs.stream = sel.stream_conf
+      if (sel.mail_conf) nginxConfs.mail = sel.mail_conf
+      if (Object.keys(nginxConfs).length > 0) {
+        payload.nginx_confs = nginxConfs
       }
       // A selected env is passed even when EMPTY: the only guard is presence,
       // never size or content. An empty `--env-file` is exactly what the
@@ -1131,12 +1275,15 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         payload.privkey = snap.privkey || ''
       }
 
-      // Volume mapping
+      // Volume mapping — G60 (D8): send ONLY the operator's OVERRIDES. A row
+      // equal to the -api's golden path is not sent, so a formula change between
+      // preview and deploy is never pinned by a stale value.
       if (snap.volumes && snap.volumes.length > 0) {
-        payload.volumes = {}
+        const overrides: Record<string, string> = {}
         for (const v of snap.volumes) {
-          if (v.key && v.value) payload.volumes[v.key] = v.value
+          if (v.key && v.value && v.value !== volumePaths[v.key]) overrides[v.key] = v.value
         }
+        if (Object.keys(overrides).length > 0) payload.volumes = overrides
       }
 
       // Build args
@@ -1162,7 +1309,31 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       if (refusal) {
         setAtCapacity(refusal)
       } else {
-        message.error(typeof d === 'string' ? d : 'Deploy failed')
+        // Read the WHOLE ladder, not just `detail`-as-a-string.
+        //
+        // A FastAPI `HTTPException(409, {...})` serialises as
+        // `{"detail": {"error": …, "detail": …}}`, so `d` here is an OBJECT for
+        // every structured refusal this path can meet — and the old
+        // `typeof d === 'string' ? d : 'Deploy failed'` threw the whole body
+        // away and printed the literal `Deploy failed`. That is exactly what the
+        // operator reported on 2026-10-14 ("deployed is failed is shown
+        // immediately"), and it named nothing: the gateway's 409
+        // `combination_reserved` exists to SAY the instruction ("a pre-deploy
+        // session already exists for this (user, service, label) — check, cancel
+        // or delete it first"). The `generate` entry point has always unpacked
+        // this body; the deploy path was never given the same treatment.
+        //
+        // The sentence is preferred over the code, and `err.message` is the last
+        // resort: the deploy's first act is a generation leg, which goes through
+        // `useGenerationJob.startJob` — that FLATTENS the same body into
+        // `message` and rethrows with `response` re-attached.
+        message.error(
+          (typeof d === 'string' && d)
+          || (typeof d?.detail === 'string' && d.detail)
+          || (typeof d?.error === 'string' && d.error)
+          || (typeof err?.message === 'string' && err.message)
+          || 'Deploy failed'
+        )
       }
     } finally {
       setLoading(false)
@@ -1178,22 +1349,49 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   const selectedUserName = Form.useWatch('user_name', form)
   const selectedLabel = Form.useWatch('label', form)
 
+  // The generated per-user handoff is NAMED for the (user, label) it was made
+  // for (`.env.raw.<user>.<label>` — see the env phase's `_pu_env`), so it
+  // stops being THIS deployment's handoff the moment either changes. The service
+  // picker already clears it (`loadFileSets`), but a user or label change went
+  // unnoticed — harmless while an empty env slot always forced a regeneration,
+  // and no longer harmless now that `envSatisfied` trusts the handoff: a Deploy
+  // for user B would otherwise have carried user A's env file.
+  useEffect(() => {
+    setPerUserEnv(null)
+  }, [selectedUserName, selectedLabel])
+
   // Ref to access Form.List's add() function from outside the render
   const volumeAddRef = useRef<((defaultValue?: any) => void) | null>(null)
 
-  // Auto-fill volume mapping when service+user+label selected
+  // G60 (D8) — refetch the preview whenever the TARGET IDENTITY changes: the
+  // volume paths are the -api's golden information and depend on
+  // (user, service, label), so the panel never derives them itself.
   useEffect(() => {
-    if (!selectedServiceName || !selectedUserName) return
-    // Parse recipe path from service value (format: "name@@recipe_path")
-    const serviceBaseName = selectedServiceName.includes('@@') ? selectedServiceName.split('@@')[0] : selectedServiceName
-    const label = selectedLabel || '0'
+    if (!open || !selectedServiceName || !selectedUserName) return
+    fetchExpectedVolumes(selectedServiceName, undefined, selectedUserName, selectedLabel || '0')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, selectedServiceName, selectedUserName, selectedLabel, selection.compose, selection.profiles])
+
+  // Display the returned rows: editable, prefilled with EXACTLY the -api paths.
+  // Re-applied when the Volume Mapping section OPENS, because antd does not
+  // mount the Collapse content (and so the Form.List) until then — the fill
+  // used to run against a list that did not exist and the section opened empty
+  // (measured 2026-10-24, twice).
+  const applyVolumeRows = () => {
+    if (!selectedUserName) return
     const keys = expectedVolumeKeys
     if (keys.length === 0) return
-    const volumes = keys.map(key => ({
-      key,
-      value: `${userDataDir}/${selectedUserName}/${serviceBaseName}/${label}/${key}`
+    // The row carries its target too (the compose fact the -api returned), so
+    // the mount table never depends on a separate lookup racing the fill.
+    const rows = volumeRows.length > 0
+      ? volumeRows
+      : keys.map(key => ({ key, service: volumeServices[key] || '', target: volumeTargets[key] || '' }))
+    const volumes = rows.map(r => ({
+      key: r.key,
+      value: volumePaths[r.key] || '',
+      target: r.target,
+      service: r.service,
     }))
-    // First set the values on the form
     form.setFieldsValue({ volumes })
     // Also ensure Form.List has the right number of items
     if (volumeAddRef.current) {
@@ -1202,10 +1400,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         volumeAddRef.current()
         currentVolumes.push({})
       }
-      // After adding, set values again
       setTimeout(() => form.setFieldsValue({ volumes }), 0)
     }
-  }, [selectedServiceName, selectedUserName, selectedLabel, expectedVolumeKeys, userDataDir])
+  }
+  useEffect(() => {
+    applyVolumeRows()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedUserName, expectedVolumeKeys, volumePaths, volumeTargets, volumeServices, volumeRows])
 
   // External-credential pause (task doc §2): the shared prompt is rendered in BOTH surfaces that
   // can be on screen while a job runs — this panel's inline progress area, and the separate
@@ -1282,7 +1483,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       width={640}
       destroyOnClose
     >
+      {/* G58 — the panel is not a login form. It happens to contain password
+          inputs (the service password and the external credential), and without
+          an explicit opt-out the browser's credential heuristic treats the form
+          as one: saved password into the password field, saved username into the
+          first unannotated text input (the services-page Filter). */}
       <Form form={form} layout="vertical" onFinish={handleDeploy} preserve={false}
+        autoComplete="off"
         initialValues={{ label: '0', domain: 'localhost', https: false }}>
         
         {/* Hidden certificate fields live OUTSIDE the Space: as direct Space
@@ -1294,7 +1501,9 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           {/* ---- User & Service ---- */}
           <Space.Compact block>
             <Form.Item name="user_name" label="User Name" rules={[{ required: true, message: 'Required' }]} style={{ flex: 1 }}>
-              <Select showSearch placeholder="Select registered user" filterOption={(input, option) => (option?.label as string||'').toLowerCase().includes(input.toLowerCase())} options={deployableUsers.map(u=>({value:u.username,label:u.username}))}
+              <Select showSearch placeholder="Select registered user" id="deploy-target-user"
+                {...({ autoComplete: 'off' } as any)}
+                filterOption={(input, option) => (option?.label as string||'').toLowerCase().includes(input.toLowerCase())} options={deployableUsers.map(u=>({value:u.username,label:u.username}))}
                 onChange={(val) => {
                   const svc = form.getFieldValue('service_name') || ''
                   const { baseName: svcBase } = parseServiceValue(svc)
@@ -1305,6 +1514,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
             <Form.Item name="service_name" label="Service" rules={[{ required: true, message: 'Required' }]} style={{ flex: 1 }}>
               <Select
                 showSearch
+                id="deploy-target-service"
+                {...({ autoComplete: 'off' } as any)}
                 placeholder="Select source project"
                 disabled={!!preselectedService}
                 options={(() => {
@@ -1346,10 +1557,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
               <Input disabled addonAfter={computingLabel ? <Spin size="small" /> : null} />
             </Form.Item>
             <Form.Item name="domain" label="Domain" style={{ flex: 2 }}>
-              <Input placeholder="example.com" disabled={!!selectedSslDomain} />
+              <Input placeholder="example.com" name="deploy_domain" autoComplete="off"
+                disabled={!!selectedSslDomain} />
             </Form.Item>
             <Form.Item name="passwd" label="Password" style={{ flex: 1 }}>
-              <Input.Password placeholder="secret" />
+              <Input.Password placeholder="secret" name="service_password"
+                autoComplete="new-password"
+                data-lpignore="true" data-1p-ignore="true" data-bwignore="true" />
             </Form.Item>
           </Space.Compact>
 
@@ -1358,7 +1572,10 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
               label row + switch row + 24px gap). */}
           <Form.Item style={{ marginBottom: 0 }}>
             <Space size={8} align="center">
-              <Text>Enable HTTPS</Text>
+              {/* G41/G47 — the switch gates the instance's TLS vhost AND its
+                  stream confs (which are not https at all), so it is named for
+                  TLS, the same word the request, CLI and template use. */}
+              <Text>Enable TLS</Text>
               <Form.Item name="https" valuePropName="checked" noStyle>
                 <Switch onChange={(v) => {
                   setHttpsEnabled(v)
@@ -1392,69 +1609,6 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
               />
             </Form.Item>
           )}
-          {/* Exactly ONE blank line above Volume Mapping: the hidden cert fields
-              now live outside this Space (they used to add zero-height Space
-              rows), so the Space's own 16px gap is the single separator. */}
-          <Collapse
-            size="small"
-            ghost
-            items={[
-              {
-                key: 'volumes',
-                label: 'Volume Mapping (optional)',
-                children: (
-                  <Form.List name="volumes">
-                    {(fields, { add, remove }) => {
-                      volumeAddRef.current = add
-                      return (
-                        <>
-                          {fields.map(({ key, name, ...rest }) => (
-                            <Space key={key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
-                              <Form.Item {...rest} name={[name, 'key']} rules={[{ required: true, message: 'Volume name' }]}>
-                                <Input placeholder="app_data" style={{ width: 180 }} />
-                              </Form.Item>
-                              <span>→</span>
-                              <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Host path' }]}>
-                                <Input placeholder="/srv/provision/user-data/alice/app" style={{ width: 320 }} />
-                              </Form.Item>
-                              <Button type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(name)} />
-                            </Space>
-                          ))}
-                          <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>Add Volume</Button>
-                        </>
-                      )
-                    }}
-                  </Form.List>
-                ),
-              },
-              {
-                key: 'build_args',
-                label: 'Build Args (optional)',
-                children: (
-                  <Form.List name="build_args">
-                    {(fields, { add, remove }) => (
-                      <>
-                        {fields.map(({ key, name, ...rest }) => (
-                          <Space key={key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
-                            <Form.Item {...rest} name={[name, 'key']} rules={[{ required: true, message: 'Arg name' }]}>
-                              <Input placeholder="HTTP_PROXY" style={{ width: 180 }} />
-                            </Form.Item>
-                            <span>→</span>
-                            <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Arg value' }]}>
-                              <Input placeholder="http://proxy:8080" style={{ width: 320 }} />
-                            </Form.Item>
-                            <Button type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(name)} />
-                          </Space>
-                        ))}
-                        <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>Add Build Arg</Button>
-                      </>
-                    )}
-                  </Form.List>
-                ),
-              },
-            ]}
-          />
-
           {/* ---- Base file selection (design §Selection & UI) ---- */}
           <Divider plain>Base file selection <span style={{fontSize:12,color:'#999'}}>— stored default pre-selected; save happens on deploy</span></Divider>
           <FileSetSelection
@@ -1658,6 +1812,111 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
             </Checkbox>
           </Form.Item>
 
+          {/* Exactly ONE blank line above Volume Mapping: the hidden cert fields
+              now live outside this Space (they used to add zero-height Space
+              rows), so the Space's own 16px gap is the single separator. */}
+          <Collapse
+            size="small"
+            ghost
+            // Opening the section mounts its Form.List — fill the rows now,
+            // not only when the preview response arrived.
+            onChange={(keys) => {
+              if ((keys as string[]).includes('volumes')) setTimeout(applyVolumeRows, 0)
+            }}
+            items={[
+              {
+                key: 'volumes',
+                label: 'Volume Mapping (optional)',
+                // The Form.List must exist BEFORE the auto-fill runs: a
+                // collapsed Collapse does not mount its children, and the fill
+                // effect then set values on a list that had no fields — the
+                // section opened empty (measured 2026-10-24).
+                forceRender: true,
+                children: (
+                  !volumePreviewed ? (
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      Select a compose file to preview the mount table.
+                    </Text>
+                  ) : (
+                  <Form.List name="volumes">
+                    {(fields, { add }) => {
+                      volumeAddRef.current = add
+                      // A real mount TABLE: sub-service | host path : container
+                      // path. The key is the deploy's override-map entry and is
+                      // kept hidden; the operator edits only the host path.
+                      const COLS = '120px 1fr 16px 140px'
+                      return (
+                        <>
+                          <div style={{ display: 'grid', gridTemplateColumns: COLS, gap: 8, marginBottom: 4 }}>
+                            <Text type="secondary" style={{ fontSize: 12 }}>sub-service</Text>
+                            <Text type="secondary" style={{ fontSize: 12 }}>host path</Text>
+                            <span />
+                            <Text type="secondary" style={{ fontSize: 12 }}>container path</Text>
+                          </div>
+                          {fields.map(({ key, name, ...rest }) => (
+                            <div key={key} style={{ display: 'grid', gridTemplateColumns: COLS, gap: 8, alignItems: 'center', marginBottom: 8 }}>
+                              <Form.Item {...rest} name={[name, 'key']} hidden><Input /></Form.Item>
+                              <Form.Item noStyle shouldUpdate>
+                                {() => {
+                                  const rows = form.getFieldValue('volumes') || []
+                                  return (
+                                    <Text code style={{ fontFamily: 'monospace' }}>
+                                      {(rows[name] || {}).service || '—'}
+                                    </Text>
+                                  )
+                                }}
+                              </Form.Item>
+                              <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Host path' }]} style={{ marginBottom: 0 }}>
+                                <Input placeholder="/srv/provision/user-data/alice/app" />
+                              </Form.Item>
+                              <span style={{ textAlign: 'center' }}>:</span>
+                              <Form.Item noStyle shouldUpdate>
+                                {() => {
+                                  const rows = form.getFieldValue('volumes') || []
+                                  return (
+                                    <Text code style={{ fontFamily: 'monospace' }}>
+                                      {(rows[name] || {}).target || '—'}
+                                    </Text>
+                                  )
+                                }}
+                              </Form.Item>
+                            </div>
+                          ))}
+                        </>
+                      )
+                    }}
+                  </Form.List>
+                  )
+                ),
+              },
+              {
+                key: 'build_args',
+                label: 'Build Args (optional)',
+                children: (
+                  <Form.List name="build_args">
+                    {(fields, { add, remove }) => (
+                      <>
+                        {fields.map(({ key, name, ...rest }) => (
+                          <Space key={key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
+                            <Form.Item {...rest} name={[name, 'key']} rules={[{ required: true, message: 'Arg name' }]}>
+                              <Input placeholder="HTTP_PROXY" style={{ width: 180 }} />
+                            </Form.Item>
+                            <span>→</span>
+                            <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Arg value' }]}>
+                              <Input placeholder="http://proxy:8080" style={{ width: 320 }} />
+                            </Form.Item>
+                            <Button type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(name)} />
+                          </Space>
+                        ))}
+                        <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>Add Build Arg</Button>
+                      </>
+                    )}
+                  </Form.List>
+                ),
+              },
+            ]}
+          />
+
           <Space style={{ justifyContent: 'flex-end', width: '100%' }}>
             <Button onClick={onClose}>Cancel</Button>
             {fileSetLoading && (
@@ -1668,17 +1927,15 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
                 Select at least one compose file — deploying with an empty selection skips env generation.
               </Text>
             )}
-            {/* A compose may declare profile-gated services (e.g. the database or
-                vector store). With none activated, `docker compose` starts only the
-                unprofiled ones — the stack comes up missing those services and
-                nothing errors, so say so before the operator deploys. Warning, not
-                a block: an empty selection is legitimate for recipes whose optional
-                services are genuinely not wanted. */}
+            {/* G57 — profiles are OPTIONAL: no `--profile` is the compose CLI
+                default and a complete, legitimate deployment. Say which
+                services stay off, as a neutral note; never imply a profile is
+                required. */}
             {!fileSetLoading && (fileSetCandidates.profiles || []).length > 0 && effectiveSelection().profiles.length === 0 && (
-              <Text type="warning" style={{ fontSize: 12 }}>
-                This compose gates {(fileSetCandidates.profiles || []).length} optional service profile(s) and none is
-                selected — those services will not start. Select the ones this deployment needs
-                (a database or vector store is usually required).
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                No optional profile selected — services gated behind{' '}
+                {(fileSetCandidates.profiles || []).join(', ')} will not start
+                (the compose CLI default).
               </Text>
             )}
             <Button type="primary" htmlType="submit" loading={loading} icon={<span>🚀</span>}
@@ -1752,6 +2009,11 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       onCancel={() => setGenPopupOpen(false)}
       footer={null}
       width={560}
+      // B2 — a closed popup leaves NO DOM behind. Without this the previous
+      // leg's "Paused — waiting for you" title and credential form stayed
+      // mounted (display:none) after the panel closed, and a fresh panel had a
+      // hidden pause modal in the document.
+      destroyOnClose
     >
       <Space direction="vertical" style={{ width: '100%' }} size={6}>
         {/* The pause is rendered here too: during the auto-run deploy this popup

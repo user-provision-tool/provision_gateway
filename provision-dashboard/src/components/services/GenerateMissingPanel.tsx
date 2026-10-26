@@ -94,6 +94,8 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
       setSelection({
         compose: entry.compose || [],
         nginx: entry.nginx || null,
+        stream_conf: entry.stream_conf || null,
+        mail_conf: entry.mail_conf || null,
         env: entry.env || [],
         profiles: entry.profiles || [],
       })
@@ -143,6 +145,13 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
   const effectiveSelection = (): FileSetSelectionData => ({
     compose: selection.compose.filter(p => !(stale.compose || []).includes(p)),
     nginx: selection.nginx && !(stale.nginx || []).includes(selection.nginx) ? selection.nginx : null,
+    // G55 — the stream/mail categories travel with the selection, same rule.
+    stream_conf: selection.stream_conf
+      && !(stale.stream_conf || []).includes(selection.stream_conf)
+      ? selection.stream_conf : null,
+    mail_conf: selection.mail_conf
+      && !(stale.mail_conf || []).includes(selection.mail_conf)
+      ? selection.mail_conf : null,
     env: selection.env.filter(p => !(stale.env || []).includes(p)),
     profiles: selection.profiles.filter(p => !(stale.profiles || []).includes(p)),
     // R4-F62 — the serving-ports slot must travel here too, and it did NOT.

@@ -42,8 +42,25 @@ INTERNAL_STREAM_PORT = 7687
 # this range, so the guard is tenant isolation and nothing more.
 SHARED_SUBNET = "172.17.0.0/16"
 
-# The docker embedded DNS, for the deferred resolution below.
-DOCKER_DNS = "127.0.0.11"
+# The docker embedded DNS is deliberately NOT used here any more: the blocks
+# upstream STATICALLY (see `render_stream_conf`), because the variable form that
+# needed a resolver is what stopped the SNI selecting the block.
+
+# NOTE — the platform does NOT name the stream protocol, and there is deliberately
+# no `kind -> URL scheme` table here.
+#
+# One existed briefly (2026-10-16, added by the assistant) and was removed on the
+# operator's ruling: *"stop showing the protocol on the dashboard; it will be the
+# user's responsibility to know which protocol to call the stream API."* The
+# platform's own rule says the same thing in another form — "the kind is not the
+# port", and the only load-bearing table is `kind -> CATEGORY`. Everything at or
+# above the door is protocol-blind: the bytes are opaque, so `bolt` and `redis`
+# are not special to any code path, and a scheme invented for a kind nobody has
+# heard of (`postgres+s://`?) would be a guess dressed as a fact.
+#
+# What travels to the operator is the NAME AND THE PORT. The client supplies its
+# own protocol's spelling, which is exactly the knowledge the operator has and the
+# platform does not.
 
 
 def stream_rows(serving_ports: Any) -> list[dict[str, Any]]:
@@ -102,14 +119,20 @@ def render_stream_conf(
     for row in rows:
         sub = str(row["sub_service"])
         port = int(row["port"])
-        name = canonical_name(
-            service_name=service_name, user_name=user_name, label=label,
-            domain=domain, sub_service=sub,
-        )
         blocks.append(
             f"server {{\n"
             f"    listen              {INTERNAL_STREAM_PORT} ssl;\n"
-            f"    server_name         {name};\n"
+            # NO `ssl_preread` here, deliberately: the static upstream below is
+            # enough for nginx to choose the block by the SNI (measured on a
+            # minimal reproduction — two blocks, one certificate, two upstreams,
+            # and the SNI selected correctly with and without the line). The
+            # defect this block had was the upstream FORM, not a missing preread.
+            #
+            # G56 (D7) — TEMPLATED, like the http category's `server_name`. The
+            # -api renders `hostname_stem` and `domain_name` for the target
+            # instance, so a conf selected from another deployment is portable and
+            # the gateway never bakes an instance identity into a recipe artifact.
+            f"    server_name         {{{{ hostname_stem }}}}--{sub}.{{{{ domain_name }}}};\n"
             f"\n"
             f"    # The domain wildcard, named per block: these names are known when\n"
             f"    # this conf is generated, so no map is needed (R4.3/R5.4).\n"
@@ -120,19 +143,36 @@ def render_stream_conf(
             f"    allow               {SHARED_SUBNET};\n"
             f"    deny                all;\n"
             f"\n"
-            f"    # Deferred resolution so a reload survives a missing container (R5.3).\n"
-            f"    resolver            {DOCKER_DNS} valid=30s ipv6=off;\n"
-            # The variable is named `$stream_upstream`, NOT `$upstream`: the
-            # -api's renderer runs every conf through `strip_v4_scaffold`, whose
-            # v4-migration rule deletes a bare `set $upstream <target>;` line —
-            # and it cannot tell the ACL scaffold's line from a legitimate one.
-            # R4-F60, measured live 2026-10-11: the definition was stripped,
-            # `proxy_pass $stream_upstream;` was left dangling, and the internal
-            # nginx refused its WHOLE configuration with
-            # `unknown "upstream" variable` — every service down on the next
-            # reload, not just the stream route.
-            f"    set $stream_upstream {sub}:{port};\n"
-            f"    proxy_pass          $stream_upstream;\n"
+            # The last hop names the instance's OWN container, and it is STATIC —
+            # deliberately NOT `set $stream_upstream <name>; proxy_pass
+            # $stream_upstream;` with a `resolver`.
+            #
+            # The variable form DEFEATS the SNI-based choice of virtual server: every
+            # connection lands on the FIRST block, so every row but the first is
+            # unreachable. Measured 2026-10-16 on a minimal reproduction — one nginx,
+            # one certificate, two blocks, two distinguishable upstreams:
+            #
+            #   static proxy_pass          -> SNI a.test hit block 1, b.test hit block 2
+            #   set + variable + resolver  -> BOTH hit block 1
+            #
+            # …and on the live door, one handle per row: under the variable form the
+            # falkordb name answered NOTHING — the bytes reached neo4j's Bolt listener,
+            # which dropped them (`TCP 200, read 0`), and FalkorDB's MONITOR showed the
+            # command never arrived — while under this one it answered `+PONG` from
+            # FalkorDB itself. `ssl_preread` is NOT the missing piece: the static form
+            # selects correctly without it (measured).
+            #
+            # The price is R5.3's: nginx resolves a static upstream at LOAD time, so a
+            # conf left behind by a deleted instance makes the next reload fail. That
+            # is the cost of the routing working at all — the alternative is rows that
+            # cannot be reached.
+            #
+            # `{{ container_prefix }}` is substituted by the -api at register time
+            # (its own naming, one home in `template_engine.container_prefix`), which
+            # is what keeps this the instance's own container rather than a name every
+            # instance shares. Its converter leaves this line alone: it rewrites
+            # `<name>` in a `set $stream_upstream` line, and this is not one.
+            f"    proxy_pass          {{{{ container_prefix }}}}{sub}:{port};\n"
             f"}}\n"
         )
     if not blocks:

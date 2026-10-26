@@ -19,7 +19,12 @@ import { ArrowDownOutlined, ArrowUpOutlined, CloseOutlined } from '@ant-design/i
 
 export interface FileSetSelectionData {
   compose: string[]
+  // G55 — ONE file per category. `nginx` is the HTTP category (the stored key
+  // keeps its old name for compatibility); stream and mail have their own
+  // slots. The PICKER is one multi-select over all three.
   nginx: string | null
+  stream_conf?: string | null
+  mail_conf?: string | null
   // R1.1: the serving-ports artifact, single-valued like nginx. `null` means "no
   // file selected" (the pipeline generates one); the deliberate NO-FILE state is
   // recorded separately as `serving_ports_none`, so "deliberately none" and "no
@@ -33,6 +38,8 @@ export interface FileSetSelectionData {
 export interface FileSetCandidates {
   compose: string[]
   nginx: string[]
+  stream_conf?: string[]
+  mail_conf?: string[]
   serving_ports?: string[]
   env: string[]
   profiles: string[]
@@ -41,13 +48,24 @@ export interface FileSetCandidates {
 export interface FileSetStale {
   compose?: string[]
   nginx?: string[]
+  stream_conf?: string[]
+  mail_conf?: string[]
   serving_ports?: string[]
   env?: string[]
   profiles?: string[]
 }
 
-export const EMPTY_SELECTION: FileSetSelectionData = { compose: [], nginx: null, serving_ports: null, env: [], profiles: [] }
-export const EMPTY_CANDIDATES: FileSetCandidates = { compose: [], nginx: [], serving_ports: [], env: [], profiles: [] }
+export const EMPTY_SELECTION: FileSetSelectionData = { compose: [], nginx: null, stream_conf: null, mail_conf: null, serving_ports: null, env: [], profiles: [] }
+export const EMPTY_CANDIDATES: FileSetCandidates = { compose: [], nginx: [], stream_conf: [], mail_conf: [], serving_ports: [], env: [], profiles: [] }
+
+/** The nginx category of a conf file name (G55). The category, not the picker
+ * position, decides the slot — and the dashboard's grey-out. */
+export function confCategory(name: string): 'http' | 'stream' | 'mail' {
+  const base = name.split('/').pop() || name
+  if (base.endsWith('.mail.conf')) return 'mail'
+  if (base.endsWith('.stream.conf') || (base.includes('.stream.') && base.endsWith('.conf'))) return 'stream'
+  return 'http'
+}
 
 export function fixVariantFor(name: string): string {
   // Mirrors the gateway's FIX_FILENAME: the tag goes before the extension and
@@ -213,13 +231,17 @@ function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled, 
         <Space key={v} style={{ display: 'flex' }} size={4}>
           <Button size="small" icon={<ArrowUpOutlined />} disabled={disabled || i === 0} onClick={() => onOrderChange(moveItem(values, i, -1))} />
           <Button size="small" icon={<ArrowDownOutlined />} disabled={disabled || i === values.length - 1} onClick={() => onOrderChange(moveItem(values, i, 1))} />
+          {/* A missing selection stays SELECTED but is shown red + struck
+              through — no separate alert block. */}
           {onOpenFile ? (
-            <Button type="link" size="small" style={{ padding: 0, fontFamily: 'monospace', fontSize: 13 }}
+            <Button type="link" size="small"
+              style={{ padding: 0, fontFamily: 'monospace', fontSize: 13,
+                ...(staleMark(v) ? { color: '#cf1322', textDecoration: 'line-through' } : {}) }}
               onClick={() => onOpenFile(v)}>{v}</Button>
           ) : (
-            <span style={{ fontFamily: 'monospace', fontSize: 13 }}>{v}</span>
+            <span style={{ fontFamily: 'monospace', fontSize: 13,
+              ...(staleMark(v) ? { color: '#cf1322', textDecoration: 'line-through' } : {}) }}>{v}</span>
           )}
-          {staleMark(v) && <Tag color="red">stale</Tag>}
           <Button size="small" type="text" danger icon={<CloseOutlined />} disabled={disabled} onClick={() => onOrderChange(values.filter(x => x !== v))} />
         </Space>
       ))}
@@ -246,33 +268,42 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
   const st = stale || {}
   const isStale = (cat: keyof FileSetStale, name: string) => (st[cat] || []).includes(name)
   const set = (patch: Partial<FileSetSelectionData>) => onChange({ ...sel, ...patch })
-  const hasAnyStale =
-    (st.compose || []).length > 0 || (st.nginx || []).length > 0 ||
-    (st.serving_ports || []).length > 0 ||
-    (st.env || []).length > 0 || (st.profiles || []).length > 0
 
-  const nginxOptions = [...new Set([...candidates.nginx, ...(sel.nginx ? [sel.nginx] : [])])].map(c => ({ value: c, label: c }))
+  // G55 — ONE multi-select over every conf category. Selecting one file of a
+  // category disables the OTHER candidates of that same category; files of the
+  // other categories stay selectable. At most one per category.
+  const selectedConfs = [sel.nginx, sel.stream_conf, sel.mail_conf].filter(Boolean) as string[]
+  const selectedCats = new Set(selectedConfs.map(confCategory))
+  const staleConf = (name: string) =>
+    (st.nginx || []).includes(name) || (st.stream_conf || []).includes(name) ||
+    (st.mail_conf || []).includes(name)
+  // A stale name stays readable as SELECTED, in red with a line through it.
+  // The label is a node so both the dropdown AND the selected tag render it.
+  const strike = { color: '#cf1322', textDecoration: 'line-through' as const }
+  const nginxOptions = [...new Set([
+    ...candidates.nginx,
+    ...(candidates.stream_conf || []),
+    ...(candidates.mail_conf || []),
+    ...selectedConfs,
+  ])].map(c => ({
+    value: c,
+    label: staleConf(c) ? <span style={strike}>{c}</span> : c,
+    disabled: selectedCats.has(confCategory(c)) && !selectedConfs.includes(c),
+  }))
   const spOptions = [
     // R1.3 — `None` sits in the picker itself, as the user ruled it: an operator
     // choosing it means "proceed with no serving-ports file", which suppresses
     // generation and both validations and exposes nothing extra.
     { value: SERVING_PORTS_NONE, label: 'None — proceed without a serving-ports file' },
     ...[...new Set([...(candidates.serving_ports || []), ...(sel.serving_ports ? [sel.serving_ports] : [])])]
-      .map(c => ({ value: c, label: c })),
+      .map(c => ({
+        value: c,
+        label: isStale('serving_ports', c) ? <span style={strike}>{c}</span> : c,
+      })),
   ]
 
   return (
     <Space direction="vertical" style={{ width: '100%' }} size="small">
-      {hasAnyStale && (
-        <Alert
-          type="warning"
-          showIcon
-          style={{ marginBottom: 4 }}
-          message="Stale stored selections"
-          description="Entries that no longer exist at scan time are kept but flagged missing — they are excluded from generation/deploy requests until re-selected."
-        />
-      )}
-
       <div>
         <Typography.Text strong>Compose files</Typography.Text>
         <Typography.Text type="secondary" style={{ fontSize: 12 }}> — merge order (first wins, later overrides)</Typography.Text>
@@ -301,12 +332,6 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
             else set({ serving_ports: (v as string) || null, serving_ports_none: false })
           }}
           options={spOptions}
-          optionRender={(o) => (
-            <span>
-              {o.label}
-              {isStale('serving_ports', o.value as string) && <Tag color="red" style={{ marginLeft: 8 }}>stale</Tag>}
-            </span>
-          )}
         />
         {/* R1.4/R1.3 — the rule, said where the choice is made. With no file and
             no `None`, the pipeline generates one; with `None` nothing is
@@ -318,7 +343,9 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
             category that could not be edited from here at all. */}
         {sel.serving_ports && onOpenFile && (
           <div style={{ marginTop: 4 }}>
-            <Button type="link" size="small" style={{ padding: 0, fontFamily: 'monospace', fontSize: 13 }}
+            <Button type="link" size="small"
+              style={{ padding: 0, fontFamily: 'monospace', fontSize: 13,
+                ...(isStale('serving_ports', sel.serving_ports) ? strike : {}) }}
               onClick={() => onOpenFile(sel.serving_ports as string)}>{sel.serving_ports}</Button>
           </div>
         )}
@@ -347,9 +374,8 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
             description="The generation is suppressed and both validations are skipped; a stream row therefore has no conf, no route and no exposure URL on the card."
           />
         )}
-        {!sel.serving_ports_none && sel.serving_ports && isStale('serving_ports', sel.serving_ports) && (
-          <Tag color="red" style={{ marginTop: 6 }}>{sel.serving_ports} — stale</Tag>
-        )}
+        {/* A stale selection reads red + struck through in place — no alert,
+            no extra tag row. */}
       </div>
 
       <div>
@@ -360,19 +386,37 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
             `generate new` means the pipeline generates one. */}
         <Typography.Text type="secondary" style={{ fontSize: 12 }}> — or generate new</Typography.Text>
         <Select
+          mode="multiple"
           style={{ width: '100%', marginTop: 4 }}
-          placeholder="generate new (none selected)"
+          placeholder="select one per category, or generate new"
           allowClear
-          value={sel.nginx}
-          onChange={(v) => set({ nginx: v || null })}
+          value={selectedConfs}
+          onChange={(vals: string[]) => {
+            // One file per category; a category can never hold two entries.
+            const next: Partial<FileSetSelectionData> = {
+              nginx: null, stream_conf: null, mail_conf: null,
+            }
+            for (const v of vals) {
+              const cat = confCategory(v)
+              if (cat === 'stream') next.stream_conf = v
+              else if (cat === 'mail') next.mail_conf = v
+              else next.nginx = v
+            }
+            set(next)
+          }}
           options={nginxOptions}
           optionRender={(o) => (
             <span>
               {o.label}
-              {isStale('nginx', o.value as string) && <Tag color="red" style={{ marginLeft: 8 }}>stale</Tag>}
+              <Tag color="blue" style={{ marginLeft: 8 }}>{confCategory(o.value as string)}</Tag>
             </span>
           )}
         />
+        {selectedConfs.length === 0 && (
+          <Tag color="blue" style={{ width: 'fit-content', marginTop: 4 }}>
+            generate new — the pipeline will create what is missing
+          </Tag>
+        )}
       </div>
 
       <div>
@@ -415,7 +459,7 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
           />
         )}
         {(st.profiles || []).map(p => (
-          <Tag key={p} color="red" style={{ marginTop: 4 }}>{p} — stale</Tag>
+          <span key={p} style={{ marginTop: 4, display: 'inline-block', ...strike }}>{p}</span>
         ))}
       </div>
     </Space>

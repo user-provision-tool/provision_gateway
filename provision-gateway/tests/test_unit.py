@@ -4927,9 +4927,12 @@ class TestFileSetSelection:
         assert "Select profiles…" in src
 
     def test_stale_keep_and_mark(self):
+        """A stale stored selection is kept and shown IN PLACE, red + struck —
+        the operator asked for the inline marker instead of the old alert."""
         src = self._src()
         assert "stale" in src.lower()
-        assert "excluded from generation/deploy requests" in src
+        assert "textDecoration: 'line-through'" in src
+        assert "Stale stored selections" not in src
 
 
 class TestServicesPagePanelOpen:
@@ -5738,18 +5741,24 @@ class TestDeployPanelSemantics:
         assert PHASE_FILENAME["compose"] == "docker-compose.base.{token}.yml"
         assert PHASE_FILENAME["serving_ports"] == "serving_ports.base.{token}.yml"
         assert PHASE_FILENAME["nginx"] == "nginx.base.{token}.conf"
+        # G56 — the stream conf is recipe-level too.
+        assert PHASE_FILENAME["stream_conf"] == "nginx.stream.base.{token}.conf"
         assert PHASE_FILENAME["env"] == ".env"
         assert _phase_names(337, fix=False) == {
             "compose": "docker-compose.base.337.yml",
             "serving_ports": "serving_ports.base.337.yml",
             "nginx": "nginx.base.337.conf",
+            "stream_conf": "nginx.stream.base.337.conf",
             "env": ".env",
         }
         # The token goes BEFORE the extension, so the candidate predicates still
         # match and the file stays selectable everywhere it was.
-        from app.services.file_sets import _is_compose_candidate, _is_nginx_candidate
+        from app.services.file_sets import (
+            _is_compose_candidate, _is_nginx_candidate, _is_stream_conf_candidate,
+        )
         assert _is_compose_candidate(_phase_names(337, fix=False)["compose"])
         assert _is_nginx_candidate(_phase_names(337, fix=False)["nginx"])
+        assert _is_stream_conf_candidate(_phase_names(337, fix=False)["stream_conf"])
 
     def test_each_job_gets_its_own_names(self):
         """Two jobs never address the same path (GRILLING G33).
@@ -5895,19 +5904,20 @@ class TestPreDeployRegistry:
                         state="paused", job_id=None, reason="review")
         assert pdr.get_session("alice", "myapp", "", "0")["reason"] == "review"
 
-    def test_reconcile_drops_a_session_that_registered(self, tmp_path, monkeypatch):
-        pdr = self._store(tmp_path, monkeypatch)
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="generating", job_id=1)
-        rep = pdr.reconcile({"alice|myapp||0"}, live_job_ids={1})
-        assert rep["dropped_registered"] == ["alice|myapp||0"]
-        assert pdr.list_sessions() == []
+    # `test_reconcile_drops_a_session_that_registered` stood here until
+    # 2026-10-16, asserting that a session whose key appeared in the -api
+    # registry was dropped. That rule is GONE, and the test with it: the key list
+    # was built from four buckets including `failed_services`, so retrying a
+    # failed instance had its LIVE record deleted mid-generation (measured
+    # 2026-10-14: 60 consecutive probe misses). The deploy's handoff already
+    # removes the record on its way into the -api, so there was nothing for the
+    # rule to catch.
 
     def test_reconcile_keeps_a_live_session(self, tmp_path, monkeypatch):
         pdr = self._store(tmp_path, monkeypatch)
         pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
                         state="generating", job_id=42)
-        rep = pdr.reconcile(set(), live_job_ids={42})
+        rep = pdr.reconcile(live_job_ids={42})
         assert rep["remaining"] == 1
         assert pdr.list_sessions()[0]["job_id"] == 42
 
@@ -5922,7 +5932,7 @@ class TestPreDeployRegistry:
         pdr = self._store(tmp_path, monkeypatch)
         pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
                         state="generating", job_id=99)
-        rep = pdr.reconcile(set(), live_job_ids={1, 2})
+        rep = pdr.reconcile(live_job_ids={1, 2})
         assert rep["dropped_stale"] == ["alice|myapp||0"]
         assert pdr.list_sessions() == []
 
@@ -5941,7 +5951,7 @@ class TestPreDeployRegistry:
                         state="paused", reason="llm_fix", job_id=99,
                         guide="NEO4J_PORT is taken; move it", task_id="task-7",
                         slot="compose")
-        rep = pdr.reconcile(set(), live_job_ids={1, 2})
+        rep = pdr.reconcile(live_job_ids={1, 2})
         assert rep["dropped_stale"] == [], "a pause is waiting, not stale"
         assert rep["remaining"] == 1
         row = pdr.get_session("alice", "myapp", "", "0")
@@ -6051,6 +6061,186 @@ class TestPreDeployWiring:
         with pytest.raises(HTTPException) as ei2:
             asyncio.run(llm_router.create_generation_job({**base, "fix": True}, admin, None))
         assert ei2.value.status_code == 409
+
+    def test_a_finished_leg_releases_the_combination_it_reserved(self, tmp_path, monkeypatch):
+        """The reservation lasts as long as the JOB that made it — not longer.
+
+        A `generating` session exists to stop a competing generation clobbering
+        a LIVE job (see `test_a_guided_restart_resumes_its_own_pause`). Nothing
+        advanced it when the job ENDED: the only writer on a status change
+        mirrors the PAUSE (`GenerationJobManager._set_status` →
+        `set_state_for_job(job_id, "paused")`), and `reconcile` spares exactly
+        `paused`/`refused`, so a session left reading `generating` is dropped —
+        but only by the 90 s loop.
+
+        So the path deadlocked for up to 90 s after EVERY answered pause. The
+        answer is itself a `POST /llm/jobs`, which resets the session to
+        `generating`; that leg then completes in milliseconds; and the step that
+        must follow — the deploy's own generation, which is what produced the
+        files the deploy is about to send — was refused with 409
+        `combination_reserved`, because R3-F49's exemption recognises only a
+        `paused` session.
+
+        Measured 2026-10-14 on `bob|graphiti-local||0`: the answer (job 394)
+        completed 13:40:48.083, the deploy's generation was refused
+        13:41:00.397, and the stale session was not swept until 13:43:24 — the
+        operator saw `Deploy failed`, no task was created, and the card sat on
+        `Generating…` for the whole window.
+
+        The first fix for this DELETED the record, which cured the 409 and broke
+        something quieter: the deploy panel's auto-run asks for that record once
+        a second, so it logged ~60 red 404s per deploy, and the operator's card
+        vanished between "the files are ready" and "the deploy lands". The record
+        now steps DOWN — `generated` — instead of disappearing: it stops
+        reserving (below) and it survives (below).
+        """
+        import asyncio
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        import app.database as _dbmod
+        from app.routers import llm as llm_router
+        from app.services import pre_deploy_registry as pdr
+        from app.services.generation_jobs import generation_jobs
+        from app.models.generation_job import GenerationJob
+        from app.models.pre_deploy_session import PreDeploySession  # noqa: F401 — for create_all
+
+        # BOTH readers must see this DB: the registry resolves `SessionLocal` at
+        # call time and so does `GenerationJobManager._set_status`, which is the
+        # point of the indirection. Swapping it is what keeps this test off the
+        # live gateway DB whatever order the suite imported `app.config` in.
+        _eng = create_engine(f"sqlite:///{tmp_path}/probe-leg.db")
+        _dbmod.Base.metadata.create_all(_eng)
+        monkeypatch.setattr(_dbmod, "SessionLocal", sessionmaker(bind=_eng))
+        SessionLocal = _dbmod.SessionLocal
+        monkeypatch.setattr(llm_router, "log_action", lambda *a, **k: None)
+        # A key no real deployment uses: a `paused` session is never swept, so
+        # this one must be removed by the test, not by the reconcile loop.
+        user, service, label = "probe-leg", "probe-leg", "0"
+        admin = {"id": 1, "role": "admin"}
+        base = {"service_name": service, "recipe_path": "",
+                "job_type": "generate_missing", "user_name": user, "label": label}
+
+        def _leg(status: str = "running") -> int:
+            """A real row, so `_set_status` has something to write."""
+            db = SessionLocal()
+            try:
+                row = GenerationJob(service_name=service, job_type="generate_missing",
+                                    status=status, request="{}", progress="x")
+                db.add(row)
+                db.commit()
+                return row.id
+            finally:
+                db.close()
+
+        class _Row:
+            def __init__(self, jid):
+                self.id, self.status = jid, "queued"
+
+        def _route_next_leg_to(jid: int) -> None:
+            monkeypatch.setattr(llm_router.generation_jobs, "create_job",
+                                lambda *a, **k: _Row(jid))
+
+        def _status_of(jid: int) -> str:
+            db = SessionLocal()
+            try:
+                return db.query(GenerationJob).filter(GenerationJob.id == jid).first().status
+            finally:
+                db.close()
+
+        try:
+            # (1) A leg pauses for a credential and reserves the combination.
+            paused_leg = _leg("paused")
+            pdr.add_session(user=user, service=service, recipe_path="", label=label,
+                            state="paused", reason="input", job_id=paused_leg)
+            assert pdr.is_reserved(user, service, "", label) is True
+
+            # (2) The operator ANSWERS it, through the real entry point. The
+            #     answer is itself a `POST /llm/jobs`, and the handler mirrors the
+            #     session onto the leg it just created.
+            answer_leg = _leg()
+            _route_next_leg_to(answer_leg)
+            out = asyncio.run(llm_router.create_generation_job(
+                {**base,
+                 "resume": {"kind": "input",
+                            "ask": {"vars": ["OPENAI_API_KEY"]},
+                            "request": {**base, "resume_env": {"vars": ["OPENAI_API_KEY"]}}},
+                 "values": {"OPENAI_API_KEY": "x"},
+                 "parent_job_id": paused_leg}, admin, None))
+            assert out["job_id"] == answer_leg
+            sess = pdr.get_session(user, service, "", label)
+            assert sess["job_id"] == answer_leg and sess["state"] == "generating", (
+                "the new leg owns the session — and it must NOT also have been "
+                "released by the parent leg's own cancel (G34)")
+            assert _status_of(paused_leg) == "cancelled", "G34: the answered leg is consumed"
+
+            # (3) The answer leg ENDS — instantly, in the measured case: it only
+            #     had to write the file from the carry. THIS is the transition the
+            #     record was missing: the leg is over, its files are ready, and the
+            #     deploy has not been sent yet.
+            generation_jobs._set_status(answer_leg, "completed", progress="completed")
+            row = pdr.get_session(user, service, "", label)
+            assert row is not None, (
+                "a finished leg must KEEP its record — the deploy panel's auto-run "
+                "asks for it once a second, and it is the operator's card")
+            assert row["state"] == "generated", row["state"]
+            assert pdr.is_reserved(user, service, "", label) is False, (
+                "the finished record must stop reserving, or the step below is "
+                "refused 409 — the bug reported on 2026-10-14")
+
+            # (4) The path's next step — a PLAIN generation, no `resume` and no
+            #     `fix`, exactly what the deploy's auto-run sends — is let through
+            #     instead of answered 409, with the record still in place.
+            next_leg = _leg()
+            _route_next_leg_to(next_leg)
+            out = asyncio.run(llm_router.create_generation_job(base, admin, None))
+            assert out["job_id"] == next_leg
+
+            # (5) The operator's OWN record is not the runner's to discard:
+            #     `paused` signals a person, and the reconcile spares it for the
+            #     same reason.
+            pdr.add_session(user=user, service=service, recipe_path="", label=label,
+                            state="paused", reason="input", job_id=next_leg)
+            generation_jobs._set_status(next_leg, "cancelled", progress="cancelled")
+            row = pdr.get_session(user, service, "", label)
+            assert row is not None and row["state"] == "paused", (
+                "a terminal write must not destroy a session waiting on the operator")
+        finally:
+            pdr.remove_session(user, service, "", label)
+
+    def test_an_absent_session_is_an_empty_object_not_a_404(self, tmp_path, monkeypatch):
+        """No record for a combination is an ordinary answer, not an error.
+
+        The endpoint answered `404 no pre-deploy session for that combination`,
+        and its only caller — the deploy panel's auto-run — asks it once a
+        SECOND to keep track of which leg the deployment is on. So an ordinary
+        state printed ~60 red "Failed to load resource: 404" lines per deploy
+        (measured 2026-10-14) on a path where nothing was wrong. False alarms in
+        the console are how a real failure hides — that is not a theory here, it
+        is what happened while this was being diagnosed.
+
+        `{}` is what the caller already means by it (`data?.job_id == null`), so
+        the reader must test a FIELD, never the presence of a body.
+        """
+        import asyncio
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        import app.database as _dbmod
+        from app.models.pre_deploy_session import PreDeploySession  # noqa: F401 — for create_all
+        from app.services import pre_deploy_registry as pdr
+        from app.routers import pre_deploy as pd
+
+        _eng = create_engine(f"sqlite:///{tmp_path}/pre-deploy-get.db")
+        _dbmod.Base.metadata.create_all(_eng)
+        monkeypatch.setattr(_dbmod, "SessionLocal", sessionmaker(bind=_eng))
+
+        # Nothing recorded: an answer, and specifically not an HTTPException.
+        assert asyncio.run(pd.get_pre_deploy("nobody", "nosvc", "0", "")) == {}
+
+        # The row is still returned as itself when there IS one.
+        pdr.add_session(user="probepd", service="probepd", recipe_path="", label="0",
+                        state="generating", job_id=1)
+        row = asyncio.run(pd.get_pre_deploy("probepd", "probepd", "0", ""))
+        assert row["state"] == "generating" and row["job_id"] == 1
 
     def test_handoff_is_remove_then_add(self):
         """The other order leaves two cards for the window between the writes."""
@@ -6556,21 +6746,29 @@ class TestFixValidatesItsOwnOutput:
         assert '_fix_compose = _names["compose"]' in src
 
 
-class TestPreDeployReconcileIsPeriodic:
-    """A stale session must not reserve its combination forever.
+class TestPreDeployReconcile:
+    """`reconcile` runs ONCE, at startup, and must not touch a live path.
 
-    Found live: `reconcile` ran ONLY at startup, so a completed generation the
-    operator never deployed kept its key reserved and every later generation for
-    it was refused with 409 until the gateway restarted — which blocked a deploy
-    verification three times.
+    It exists for one case: a record whose runner died with the gateway, which
+    nothing will ever write a state for. It used to run on a 90-second loop as
+    well, and both of that loop's reasons are gone (2026-10-16):
+
+      * "no live job ⇒ stale" existed because a finished leg's record kept its
+        key reserved FOREVER, refusing every later generation with 409 until the
+        gateway restarted — found live, blocking a deploy verification three
+        times. That was a missing state, not a cleanup problem, and
+        `STATE_GENERATED` is that state.
+      * "key in the registry ⇒ registered ⇒ drop" read a key list built from
+        four buckets including `failed_services`, so retrying a failed instance
+        had its LIVE record deleted mid-generation (2026-10-14: 60 consecutive
+        probe misses).
 
     **The three source guards that used to live here all passed while the sweep
     was in fact a complete no-op.** The loop called `get_job(int(jid))` without
     its `db` argument, the `TypeError` was swallowed by the surrounding
     `except Exception`, and nothing was ever dropped — for every pass, forever.
     A test that greps for `reconcile`/`asyncio.sleep` cannot see that. These
-    drive the real functions against a real job row. (Found live in T13,
-    chasing a `paused` session the sweep should have dropped minutes earlier.)
+    drive the real function against a real job row.
     """
 
     def _db(self, tmp_path, monkeypatch):
@@ -6624,7 +6822,7 @@ class TestPreDeployReconcileIsPeriodic:
         pdr.add_session(user="alice", service="probe", recipe_path="", label="0",
                         state="generating", job_id=jid)
 
-        rep = pdr.reconcile(set(), self._live_set(pdr, generation_jobs))
+        rep = pdr.reconcile(self._live_set(pdr, generation_jobs))
 
         assert rep["dropped_stale"], (
             "a finished job must not keep its combination reserved")
@@ -6644,7 +6842,7 @@ class TestPreDeployReconcileIsPeriodic:
         pdr.add_session(user="alice", service="probe", recipe_path="", label="0",
                         state="generating", job_id=jid)
 
-        rep = pdr.reconcile(set(), self._live_set(pdr, generation_jobs))
+        rep = pdr.reconcile(self._live_set(pdr, generation_jobs))
 
         assert rep["dropped_stale"] == []
         assert len(pdr.list_sessions()) == 1
@@ -6664,13 +6862,57 @@ class TestPreDeployReconcileIsPeriodic:
                         state="paused", reason="llm_fix", job_id=jid,
                         guide="rename the port", task_id="abc123")
 
-        rep = pdr.reconcile(set(), self._live_set(pdr, generation_jobs))
+        rep = pdr.reconcile(self._live_set(pdr, generation_jobs))
 
-        assert rep["dropped_stale"] == [] and rep["dropped_registered"] == []
+        assert rep["dropped_stale"] == []
         kept = pdr.list_sessions()
         assert len(kept) == 1
         assert kept[0]["guide"] == "rename the port"
         assert kept[0]["task_id"] == "abc123"
+
+    def test_a_GENERATED_session_is_never_stale(self, tmp_path, monkeypatch):
+        """The window between "files ready" and "deploy sent" is a live path.
+
+        Its leg has finished, so "no live job" is true of it — which is exactly
+        the rule that used to delete it, taking the operator's card with it and
+        making the deploy panel's once-a-second probe answer 404 (`reconcile`
+        spares `paused`/`refused` for the same reason: those are waiting on a
+        person, and this one is waiting on the operator's Deploy press).
+        """
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.services import pre_deploy_registry as pdr
+        from app.services.generation_jobs import generation_jobs
+        S = self._db(tmp_path, monkeypatch)
+        jid = self._job(S, "completed")
+        pdr.add_session(user="alice", service="probe", recipe_path="", label="0",
+                        state=pdr.STATE_GENERATED, job_id=jid)
+
+        rep = pdr.reconcile(self._live_set(pdr, generation_jobs))
+
+        assert rep["dropped_stale"] == []
+        row = pdr.get_session("alice", "probe", "", "0")
+        assert row is not None and row["state"] == pdr.STATE_GENERATED
+
+    def test_a_GENERATED_session_holds_nothing(self, tmp_path, monkeypatch):
+        """...but it must not RESERVE the combination either — that is the bug
+        the state exists to fix. A plain generation for the same key is let
+        through, exactly as `test_a_finished_leg_releases_the_combination_it_
+        reserved` drives through the real router."""
+        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.services import pre_deploy_registry as pdr
+        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
+                        state=pdr.STATE_GENERATED, job_id=1)
+        assert pdr.is_reserved("alice", "myapp", "", "0") is False
+        # The states that DO reserve are untouched by the exemption.
+        pdr.add_session(user="bob", service="myapp", recipe_path="", label="0",
+                        state=pdr.STATE_GENERATING, job_id=2)
+        assert pdr.is_reserved("bob", "myapp", "", "0") is True
+        pdr.add_session(user="carol", service="myapp", recipe_path="", label="0",
+                        state=pdr.STATE_PAUSED, reason="input", job_id=3)
+        assert pdr.is_reserved("carol", "myapp", "", "0") is True
+        pdr.add_session(user="dave", service="myapp", recipe_path="", label="0",
+                        state=pdr.STATE_REFUSED, reason="at_capacity")
+        assert pdr.is_reserved("dave", "myapp", "", "0") is True
 
 
 class TestEnvPhaseEmptySurface:
@@ -6713,8 +6955,17 @@ class TestCapacityAlertOnTheGenerationPath:
         assert src.count("setAtCapacity(") >= 2, (
             "both the deploy path and the generation path must raise the alert"
         )
-        # ...and neither may pass a structured detail to message.error
-        assert "message.error(typeof d === 'string'" in src
+        # ...and neither may pass a structured detail to message.error. Asserted
+        # as the FAMILY of `typeof … === 'string'` guards rather than one exact
+        # spelling: the deploy path's ladder gained the nested `d?.detail` /
+        # `d?.error` / `err.message` rungs on 2026-10-16 — a FastAPI 409
+        # serialises as `{"detail": {"error": …, "detail": …}}`, so guarding on a
+        # string `detail` alone printed the literal `Deploy failed` and named
+        # nothing. The rule this asserts is "a raw object never reaches
+        # message.error", and every rung of both ladders tests the type first.
+        assert src.count("typeof d === 'string'") >= 2, (
+            "both the generate path and the deploy path must guard what they print"
+        )
 
     def test_the_alert_renders_at_the_component_root(self):
         """Inside a modal it was invisible whenever the OTHER surface was on
@@ -6835,24 +7086,22 @@ class TestRefusedSessionsSurviveReconcile:
         pdr = self._store(tmp_path, monkeypatch)
         pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
                         state="refused", job_id=None)
-        rep = pdr.reconcile(set(), live_job_ids=set())
+        rep = pdr.reconcile(live_job_ids=set())
         assert rep["dropped_stale"] == []
         assert len(pdr.list_sessions()) == 1
 
-    def test_refused_session_survives_the_registered_rule(self, tmp_path, monkeypatch):
-        pdr = self._store(tmp_path, monkeypatch)
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="refused", job_id=None)
-        rep = pdr.reconcile({"alice|myapp||0"}, live_job_ids=set())
-        assert rep["dropped_registered"] == []
-        assert len(pdr.list_sessions()) == 1
+    # `test_refused_session_survives_the_registered_rule` stood here until
+    # 2026-10-16 — it guarded a rule that no longer exists (see the note above
+    # `test_reconcile_keeps_a_live_session`). What it protected — a `refused`
+    # record never being dropped — is covered by
+    # `test_refused_session_survives_the_stale_rule` immediately above.
 
     def test_generating_sessions_are_still_reconciled(self, tmp_path, monkeypatch):
         """The fix must not blunt reconcile for the states it exists for."""
         pdr = self._store(tmp_path, monkeypatch)
         pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
                         state="generating", job_id=None)
-        rep = pdr.reconcile(set(), live_job_ids=set())
+        rep = pdr.reconcile(live_job_ids=set())
         assert rep["dropped_stale"] == ["alice|myapp||0"]
 
 
@@ -7326,7 +7575,7 @@ class TestTheGenerationRouterRecordsTheRequestProxy:
         # What `GenerationJobManager._set_status` does on a pause.
         assert pdr.set_state_for_job(7, "paused", "compose_fix") is True
 
-        report = pdr.reconcile(registered_keys=set(), live_job_ids=set())
+        report = pdr.reconcile(live_job_ids=set())
 
         row = pdr.get_session("u", "probe-conflict", "", "1")
         assert row is not None, "a paused session is never pruned (G30)"
@@ -7339,7 +7588,7 @@ class TestTheGenerationRouterRecordsTheRequestProxy:
         pdr.add_session(user="v", service="probe-plain", recipe_path="",
                         label="2", state="generating", job_id=8,
                         use_global_proxy=True)
-        report = pdr.reconcile(registered_keys=set(), live_job_ids=set())
+        report = pdr.reconcile(live_job_ids=set())
         assert pdr.get_session("v", "probe-plain", "", "2") is None, (
             "a generating session with no registry entry and no live job is stale")
         assert len(report["dropped_stale"]) == 1, report
@@ -8805,66 +9054,57 @@ class TestInitDbSurvivesTheMultiWorkerRace:
         assert raised, "a non-race DDL failure must not be swallowed"
 
 
-class TestTheMintReadsTheDeployedArtifact:
-    """R2-F12 — the mint resolves the row from the artifact the DEPLOY used.
+class TestTheMintReadsTheRenderedConf:
+    """G61 (D6) — membership comes from the instance, the port from its conf.
 
-    With more than one `serving_ports*` file in the recipe dir, "the newest wins"
-    is not the same question as "which one did this instance deploy". Measured
-    2026-10-10 on graphiti-local: the deploy carried `serving_ports.base.359.yml`
-    (five rows, neo4j's Bolt 7687 among them) and a later LLM generation had left
-    `serving_ports.base.360.yml` beside it with no neo4j rows — so the mint
-    refused a sub-service the deployed artifact declares, and the card's action
-    could not work at all.
+    The old scan of `serving_ports*` artifacts is gone as the AUTHORITY: an
+    artifact still lists rows the rendered conf filtered out (inactive profiles),
+    so minting from it would offer an endpoint whose route does not exist.
     """
 
-    def _recipe(self, tmp_path, monkeypatch, *, older_port: int = 7687, newer_port: int = 9999):
+    def _conf(self, tmp_path, port: int = 7687) -> str:
+        conf = tmp_path / "example-thing.user-u.0.stream.conf"
+        conf.write_text(
+            "server {\n"
+            "    listen              7687 ssl;\n"
+            "    server_name         example-thing-user_u-0--neo4j.example.com;\n"
+            "    proxy_pass          example-thing-user_u-0-neo4j:%d;\n"
+            "}\n" % port
+        )
+        return str(conf)
+
+    def _entry(self, conf: str) -> dict:
+        return {
+            "stream_sub_services": ["example-thing-user_u-0--neo4j.example.com"],
+            "nginx_conf_paths_by_category": {"stream": conf},
+        }
+
+    def test_the_port_comes_from_the_rendered_conf(self, tmp_path):
+        from app.routers.stream import _resolve_stream_row
+
+        row = _resolve_stream_row(self._entry(self._conf(tmp_path, 7687)), "example-thing", "neo4j")
+        assert row is not None and row["port"] == 7687
+
+    def test_a_sub_service_not_recorded_is_refused(self, tmp_path, monkeypatch):
+        """A row the conf filtered out is not in `stream_sub_services` — even when
+        a serving_ports artifact in the recipe still declares it."""
         from app.config import settings
 
         recipe = tmp_path / "example-thing"
-        recipe.mkdir(parents=True)
-        older = recipe / "serving_ports.base.001.yml"
-        newer = recipe / "serving_ports.base.002.yml"
-        older.write_text(f"ports:\n  - sub_service: neo4j\n    port: {older_port}\n    kind: bolt\n")
-        newer.write_text(f"ports:\n  - sub_service: neo4j\n    port: {newer_port}\n    kind: bolt\n")
-        # The mtimes are set EXPLICITLY: pytest's `tmp_path` (under /root/tmp on
-        # this host) gives two files written microseconds apart the SAME mtime_ns,
-        # so "written second" is not "newer" here — measured, and it silently made
-        # this test order-dependent on `iterdir()`.
-        import os as _os
-        _os.utime(older, (1_700_000_000, 1_700_000_000))
-        _os.utime(newer, (1_700_000_500, 1_700_000_500))
-        (recipe / "docker-compose.yml").write_text("services: {}\n")
+        recipe.mkdir()
+        (recipe / "serving_ports.yml").write_text(
+            "ports:\n  - sub_service: falkordb\n    port: 6379\n    kind: redis\n"
+        )
         monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path, raising=False)
-        return older, newer
+        from app.routers.stream import _resolve_stream_row
 
-    def test_without_a_selection_the_newest_candidate_is_read_first(self, tmp_path, monkeypatch):
-        """The fallback, unchanged: an unselected recipe orders candidates by mtime.
+        entry = self._entry(self._conf(tmp_path))
+        assert _resolve_stream_row(entry, "example-thing", "falkordb") is None
 
-        The two files declare the SAME row with DIFFERENT ports, so which one was
-        read is visible in the answer rather than inferred.
-        """
-        from app.routers.stream import _resolve_stream_row_port
+    def test_an_unknown_sub_service_resolves_to_nothing(self, tmp_path):
+        from app.routers.stream import _resolve_stream_row
 
-        self._recipe(tmp_path, monkeypatch, older_port=7687, newer_port=9999)
-        assert _resolve_stream_row_port("example-thing", "neo4j") == 9999
-
-    def test_the_selected_artifact_wins_over_a_newer_file(self, tmp_path, monkeypatch):
-        from app.routers.stream import _resolve_stream_row_port
-        from app.services import file_sets
-
-        older, _newer = self._recipe(tmp_path, monkeypatch, older_port=7687, newer_port=9999)
-        file_sets.put_file_set("example-thing", file_sets.ROOT_RECIPE_KEY, {
-            "compose": ["docker-compose.yml"],
-            "nginx": None,
-            "serving_ports": older.name,
-            "env": [],
-            "profiles": [],
-        })
-        assert _resolve_stream_row_port("example-thing", "neo4j") == 7687, (
-            "the deploy's own artifact is the authority, even though a newer file "
-            "in the recipe dir declares the row differently")
-        # a row no candidate declares is still a refusal, never a guess
-        assert _resolve_stream_row_port("example-thing", "postgres") is None
+        assert _resolve_stream_row(self._entry(self._conf(tmp_path)), "example-thing", "nope") is None
 
 
 class TestStreamEndpointsAreWired:
@@ -8893,16 +9133,27 @@ class TestStreamEndpointsAreWired:
         from pathlib import Path as _P
         from app.config import settings
 
-        # The mint resolves the row's PORT from the instance's own serving_ports
-        # artifact (the registry records names, never ports — §9's ruling), so the
-        # test needs a recipe with one.
+        # G61 — membership is the entry's recorded `stream_sub_services`, and the
+        # port comes from the instance's RENDERED stream conf. The test therefore
+        # needs both; the serving_ports artifact supplies the informational kind.
         root = _P(tempfile.mkdtemp())
+        entry = dict(self._ENTRY)
         if with_artifact:
             recipe = root / "graphiti-local"
             recipe.mkdir()
             (recipe / "serving_ports.yml").write_text(
                 "ports:\n  - sub_service: neo4j\n    port: 7687\n    kind: bolt\n"
             )
+            conf = recipe / "graphiti-local.user-shared2.0.stream.conf"
+            conf.write_text(
+                "server {\n"
+                "    listen              7687 ssl;\n"
+                "    server_name         graphiti-local-shared2-0--neo4j.localhost;\n"
+                "    proxy_pass          graphiti-local-user_shared2-0-neo4j:7687;\n"
+                "}\n"
+            )
+            entry["stream_sub_services"] = ["graphiti-local-shared2-0--neo4j.localhost"]
+            entry["nginx_conf_paths_by_category"] = {"stream": str(conf)}
         monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", root, raising=False)
 
         db = SessionLocal()
@@ -8915,7 +9166,7 @@ class TestStreamEndpointsAreWired:
         # No lifespan: `TestClient(app)` outside a `with` block does not run it,
         # so nothing touches the real data dir or the background tasks. The
         # registry the handlers read is therefore injected here.
-        monkeypatch.setattr(app.state, "registry", _FakeRegistry([self._ENTRY]), raising=False)
+        monkeypatch.setattr(app.state, "registry", _FakeRegistry([entry]), raising=False)
         return TestClient(app), token
 
     def test_mint_list_verify_revoke_round_trip(self, monkeypatch):
@@ -8932,6 +9183,18 @@ class TestStreamEndpointsAreWired:
         from app.config import settings
         assert body["stream_port"] == settings.STREAM_PORT > 0
         assert body["canonical_name"] == "graphiti-local-shared2-0--neo4j.localhost"
+        # The COPYABLE value is the NAME and the PORT — and the port is the half
+        # that must not be lost: handed only the name, a client dials its protocol
+        # default (7687 for Bolt), which is the instance's INTERNAL port and
+        # answers nothing, and the operator concludes the feature is broken
+        # (measured 2026-10-16, alongside a UI that copied the bare host).
+        assert body["address"] == f"{body['host']}:{settings.STREAM_PORT}"
+        assert body["kind"] == "bolt"
+        # …and NO scheme. The platform is protocol-blind above the door and must
+        # not guess one: a `url` field briefly prefixed `bolt+s://` (and would
+        # have prefixed `<kind>+s://` for any kind it did not know), which is the
+        # operator's knowledge, not the platform's (user ruling 2026-10-16).
+        assert "url" not in body, "the platform does not name the stream protocol"
         # The store's key is the client-facing name the edge will send as SNI —
         # the whole `<handle>.<domain>`, not its first label.
         host = body["host"]
@@ -9379,8 +9642,10 @@ class TestProduceForDeploy:
         text = Path(out).read_text()
         # Whitespace-insensitive on purpose: the conf's columns are padding, and a
         # spacing change is not a behavioural change.
+        # G56 — the produced file is a TEMPLATE: the -api renders the target
+        # instance's names, so a conf from another deployment is reusable.
         assert re.search(
-            r"server_name\s+graphiti-local-shared2-0--neo4j\.snaprovision\.com;", text
+            r"server_name\s+\{\{ hostname_stem \}\}--neo4j\.\{\{ domain_name \}\};", text
         ), text
         assert "ssl_certificate" in text, "the per-block certificate (R5.4)"
         # the last hop is plain (R5.5) and there is no http-only scaffolding
@@ -9611,10 +9876,11 @@ class TestStreamConfGenerator:
             cert_pem="/srv/provision_subnet_acl/ssl/snaprovision.com/fullchain.pem",
             cert_key="/srv/provision_subnet_acl/ssl/snaprovision.com/privkey.pem",
         )
-        # one block per stream row, selected by the CANONICAL name
+        # one block per stream row, selected by the -api-RENDERED canonical name
+        # (G56: the generated artifact is a TEMPLATE — no instance identity baked in)
         assert text.count("server {") == 2
-        assert "server_name         example-mcp-alice-3--neo4j.snaprovision.com;" in text
-        assert "server_name         example-mcp-alice-3--falkordb.snaprovision.com;" in text
+        assert "server_name         {{ hostname_stem }}--neo4j.{{ domain_name }};" in text
+        assert "server_name         {{ hostname_stem }}--falkordb.{{ domain_name }};" in text
         # the per-block certificate, and NO `map` DIRECTIVE — these names are known
         # when the conf is generated, so each block carries its own certificate
         # (R4.3's per-listener rule). Checked against the CODE, not the prose: the
@@ -9622,11 +9888,31 @@ class TestStreamConfGenerator:
         assert "ssl_certificate     /srv/provision_subnet_acl/ssl/snaprovision.com/fullchain.pem;" in text
         code = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("#"))
         assert "map " not in code
-        # the guard, the resolver and the PLAIN last hop
+        # the guard and the PLAIN last hop
         assert "allow               172.17.0.0/16;" in text and "deny                all;" in text
-        assert "resolver            127.0.0.11 valid=30s ipv6=off;" in text
-        assert "set $stream_upstream neo4j:7687;" in text
-        assert "proxy_pass          $stream_upstream;" in text
+        # The last hop is STATIC, and carries the -api's `{{ container_prefix }}`.
+        #
+        # Both halves are load-bearing, and both were measured on 2026-10-16:
+        #   * STATIC, because the variable form (`set $stream_upstream …` +
+        #     `resolver` + `proxy_pass $stream_upstream`) DEFEATS the SNI-based
+        #     choice of virtual server — in a minimal two-block reproduction both
+        #     SNIs hit the FIRST block, and on the live door the falkordb row
+        #     answered nothing (the bytes reached neo4j's Bolt listener) instead of
+        #     `+PONG`. Every row but the first was unreachable.
+        #   * the PLACEHOLDER, because this file is the handoff: the -api renders it
+        #     (`{{ container_prefix }}` = `<prefix><service>-user_<user>-<label>-`,
+        #     one home in `template_engine.container_prefix`), so the name is the
+        #     instance's OWN container and not one every instance shares.
+        assert "proxy_pass          {{ container_prefix }}neo4j:7687;" in text
+        assert "proxy_pass          {{ container_prefix }}falkordb:6379;" in text
+        # …and the variable form, which is the defect, must never come back.
+        # Checked against the CODE: the comments above name it on purpose.
+        assert "$stream_upstream" not in code, (
+            "a variable upstream makes nginx serve every SNI from the FIRST block")
+        assert "resolver" not in code, "a resolver is only needed for a variable upstream"
+        # `ssl_preread` is NOT required for this: the static form selects the block
+        # by SNI on its own (measured), so the conf stays free of it.
+        assert "ssl_preread" not in code
         # and the three things it must NEVER write
         assert "auth_basic" not in text, "the stream module has no such directive"
         assert "{% if" not in text, "a stream block's TLS listener is structural — no guard"
@@ -9698,42 +9984,64 @@ class TestTheStreamConfSlotIsConditionalOnTls:
 
 
 class TestTheMintResolvesTheRowItself:
-    """R6.1/R6.2 — the card knows a SUB-SERVICE, never a port.
+    """The card knows a SUB-SERVICE, never a port.
 
-    The registry records canonical NAMES, not ports (§9's ruling), so the mint
-    resolves the port from the instance's own serving_ports artifact. A caller
-    that does send a port must agree with it; a disagreement is refused rather
-    than silently preferred.
+    The port is read from the rendered stream block (the conf that routes), and
+    the KIND — informational only — from the recipe's artifact, AFTER membership
+    has passed. A rendered file that cannot be read resolves to nothing.
     """
 
-    def _artifact(self, tmp_path, monkeypatch, rows: str = "ports:\n  - sub_service: neo4j\n    port: 7687\n    kind: bolt\n"):
+    def _recipe(self, tmp_path, monkeypatch, rows: str = "ports:\n  - sub_service: neo4j\n    port: 7687\n    kind: bolt\n"):
         from app.config import settings
         recipe = tmp_path / "graphiti-local"
         recipe.mkdir()
         (recipe / "serving_ports.yml").write_text(rows)
         monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path, raising=False)
 
-    def test_the_port_comes_from_the_artifact(self, tmp_path, monkeypatch):
-        from app.routers.stream import _resolve_stream_row_port
-        self._artifact(tmp_path, monkeypatch)
-        assert _resolve_stream_row_port("graphiti-local", "neo4j") == 7687
+    def _entry(self, tmp_path, *, sub: str = "neo4j", port: int = 7687, conf: bool = True) -> dict:
+        entry = {
+            "stream_sub_services": [f"graphiti-local-user_u-0--{sub}.localhost"],
+            "nginx_conf_paths_by_category": {},
+        }
+        if conf:
+            path = tmp_path / "graphiti-local.user-u.0.stream.conf"
+            path.write_text(
+                "server {\n"
+                "    listen              7687 ssl;\n"
+                f"    server_name         graphiti-local-user_u-0--{sub}.localhost;\n"
+                f"    proxy_pass          graphiti-local-user_u-0-{sub}:{port};\n"
+                "}\n"
+            )
+            entry["nginx_conf_paths_by_category"]["stream"] = str(path)
+        return entry
+
+    def test_the_port_comes_from_the_rendered_conf(self, tmp_path, monkeypatch):
+        from app.routers.stream import _resolve_stream_row
+        self._recipe(tmp_path, monkeypatch)
+        row = _resolve_stream_row(self._entry(tmp_path), "graphiti-local", "neo4j")
+        assert row["port"] == 7687
+        assert row["kind"] == "bolt", "kind is informational, looked up after membership"
 
     def test_an_http_sub_service_has_no_stream_row(self, tmp_path, monkeypatch):
-        from app.routers.stream import _resolve_stream_row_port
-        self._artifact(tmp_path, monkeypatch,
-                       "ports:\n  - sub_service: graph\n    port: 8000\n    kind: http\n")
-        assert _resolve_stream_row_port("graphiti-local", "graph") is None
+        from app.routers.stream import _resolve_stream_row
+        self._recipe(tmp_path, monkeypatch,
+                     "ports:\n  - sub_service: graph\n    port: 8000\n    kind: http\n")
+        # not recorded as a stream sub-service, so the conf cannot be found either
+        entry = self._entry(tmp_path, sub="graph", port=8000, conf=False)
+        assert _resolve_stream_row(entry, "graphiti-local", "graph") is None
 
     def test_an_unknown_sub_service_resolves_to_nothing(self, tmp_path, monkeypatch):
-        from app.routers.stream import _resolve_stream_row_port
-        self._artifact(tmp_path, monkeypatch)
-        assert _resolve_stream_row_port("graphiti-local", "nope") is None
+        from app.routers.stream import _resolve_stream_row
+        self._recipe(tmp_path, monkeypatch)
+        assert _resolve_stream_row(self._entry(tmp_path), "graphiti-local", "nope") is None
 
-    def test_a_kindless_row_is_not_a_stream_row(self, tmp_path, monkeypatch):
-        from app.routers.stream import _resolve_stream_row_port
-        self._artifact(tmp_path, monkeypatch,
-                       "ports:\n  - sub_service: mystery\n    port: 9999\n")
-        assert _resolve_stream_row_port("graphiti-local", "mystery") is None
+    def test_a_missing_rendered_conf_resolves_to_nothing(self, tmp_path, monkeypatch):
+        """Recorded but unreadable is a refusal, never a guessed port."""
+        from app.routers.stream import _resolve_stream_row
+        self._recipe(tmp_path, monkeypatch)
+        assert _resolve_stream_row(
+            self._entry(tmp_path, conf=False), "graphiti-local", "neo4j"
+        ) is None
 
 
 class TestTheExtraHttpServedName:
@@ -9833,10 +10141,29 @@ class TestConfAgreement:
         r = self._v("", self._PORTS)
         assert any("primary" in e for e in r["errors"]), r["errors"]
 
-    def test_an_undeclared_upstream_is_a_warning_not_an_error(self):
+    def test_a_block_that_disagrees_with_its_row_fails_the_upstream_port_check(self):
+        """G56 — the upstream/port IS checked (the -api cannot invent the port);
+        the NAME is not. So the primary block targeting `mystery:9999` while the
+        row declares 8000 is an error, and the odd host is reported as a warning
+        alongside it."""
         r = self._v(self._CONF.replace("graph:8000", "mystery:9999"))
-        assert r["valid"], r["errors"]
+        assert not r["valid"]
+        assert any("do not match the row's port 8000" in e for e in r["errors"]), r["errors"]
         assert any("mystery" in w for w in r["warnings"]), r["warnings"]
+
+    def test_a_block_for_an_undeclared_sub_service_is_a_warning(self):
+        """A block serving something no row declares is worth saying, not worth
+        blocking — it exposes an endpoint the artifact does not account for."""
+        conf = self._CONF + """server {
+    listen 80;
+    server_name example-mcp_hostname--extra;
+    set $upstream extra:9000;
+    proxy_pass $upstream;
+}
+"""
+        r = self._v(conf)
+        assert r["valid"], r["errors"]
+        assert any("'extra'" in w for w in r["warnings"]), r["warnings"]
 
     def test_an_extra_http_row_can_be_served(self):
         """R1.5 / T16 — this was the strict `xfail` that named F47.
@@ -9990,3 +10317,190 @@ class TestTheRecordsTlsSwitch:
         assert offenders == [], (
             "these lines read the record's pre-rename key directly instead of "
             f"through registry_entry.entry_tls: {offenders}")
+
+
+class TestNameAgnosticConfAgreement:
+    """G56 — the gateway checks coverage and upstream/port, never NAMES.
+
+    The -api renders `{{ hostname_stem }}--<sub>.{{ domain_name }}` for the target
+    instance, so a conf selected from another deployment (another user/label
+    stem) is reusable. Comparing names here would refuse exactly that.
+    """
+
+    _PORTS = {"ports": [
+        {"sub_service": "neo4j", "port": 7687, "kind": "bolt"},
+        {"sub_service": "falkordb", "port": 6379, "kind": "redis"},
+    ]}
+
+    def _v(self, conf, ports=None, category="stream"):
+        from app.services.serving_ports import validate_conf_agreement
+        return validate_conf_agreement(
+            ports or self._PORTS, conf,
+            service_name="s", user_name="u", label="0", domain="example.com",
+            category=category,
+        )
+
+    def test_a_conf_from_another_deployment_is_accepted(self):
+        conf = """server {
+    listen 7687 ssl;
+    server_name someone-else-9--neo4j.example.com;
+    set $stream_upstream s-u-0-neo4j:7687;
+    proxy_pass $stream_upstream;
+}
+"""
+        r = self._v(conf, {"ports": [{"sub_service": "neo4j", "port": 7687, "kind": "bolt"}]})
+        assert r["valid"], r["errors"]
+
+    def test_a_missing_stream_row_block_is_an_error(self):
+        conf = """server {
+    listen 7687 ssl;
+    server_name s-u-0--neo4j.example.com;
+    proxy_pass s-u-0-neo4j:7687;
+}
+"""
+        r = self._v(conf)
+        assert not r["valid"]
+        assert any("falkordb" in e for e in r["errors"]), r["errors"]
+
+    def test_a_wrong_port_is_an_error(self):
+        conf = """server {
+    listen 7687 ssl;
+    server_name s-u-0--neo4j.example.com;
+    proxy_pass s-u-0-neo4j:9999;
+}
+"""
+        r = self._v(conf, {"ports": [{"sub_service": "neo4j", "port": 7687, "kind": "bolt"}]})
+        assert not r["valid"]
+        assert any("do not match the row's port" in e for e in r["errors"]), r["errors"]
+
+    def test_a_templated_server_name_is_read_by_its_sub_suffix(self):
+        """The generated stream artifact is a TEMPLATE — one `server_name` per
+        block, still parseable by its `--<sub>.` fragment."""
+        conf = """server {
+    listen 7687 ssl;
+    server_name {{ hostname_stem }}--neo4j.{{ domain_name }};
+    proxy_pass {{ container_prefix }}neo4j:7687;
+}
+"""
+        r = self._v(conf, {"ports": [{"sub_service": "neo4j", "port": 7687, "kind": "bolt"}]})
+        assert r["valid"], r["errors"]
+
+
+class TestStreamConfSelectionBypassesGeneration:
+    """G56 — selected stream conf ⇒ no generation, exactly like the http slot."""
+
+    _BASE = {
+        "service_name": "example-mcp", "recipe_path": "", "user_name": "alice",
+        "label": "3", "deploy_metadata": {"https": True},
+    }
+
+    def _phases(self, selection):
+        from app.services.generation_jobs import GenerationJobManager
+        return GenerationJobManager._compute_phases(
+            "generate_missing", {**self._BASE, "selection": selection})
+
+    def test_a_selected_stream_conf_is_not_generated(self):
+        phases = self._phases({
+            "compose": ["docker-compose.yml"], "nginx": "nginx.base.1.conf",
+            "serving_ports": "serving_ports.yml", "stream_conf": "x.stream.conf",
+        })
+        assert "stream_conf" not in phases
+
+    def test_an_absent_stream_conf_is_generated(self):
+        phases = self._phases({
+            "compose": ["docker-compose.yml"], "nginx": "nginx.base.1.conf",
+            "serving_ports": "serving_ports.yml",
+        })
+        assert "stream_conf" in phases
+
+    def test_a_selected_stream_conf_is_validated(self):
+        phases = self._phases({
+            "compose": ["docker-compose.yml"], "nginx": "nginx.base.1.conf",
+            "serving_ports": "serving_ports.yml", "stream_conf": "x.stream.conf",
+        })
+        assert "validate_conf" in phases
+
+
+class TestStreamTemplateIsACandidate:
+    """G56 — the generated source is `nginx.stream.base.<token>.conf`, and the
+    category is explicit: it must not also appear in the http candidates."""
+
+    def test_the_recipe_level_stream_template_is_a_stream_candidate(self):
+        from app.services.file_sets import _is_nginx_candidate, _is_stream_conf_candidate
+        assert _is_stream_conf_candidate("nginx.stream.base.337.conf")
+        assert not _is_nginx_candidate("nginx.stream.base.337.conf")
+
+    def test_historical_per_instance_stream_confs_still_work(self):
+        from app.services.file_sets import _is_nginx_candidate, _is_stream_conf_candidate
+        assert _is_stream_conf_candidate("graphiti-local.user-bob.1.stream.conf")
+        assert not _is_nginx_candidate("graphiti-local.user-bob.1.stream.conf")
+
+    def test_a_mail_conf_is_neither(self):
+        from app.services.file_sets import _is_nginx_candidate, _is_mail_conf_candidate
+        assert _is_mail_conf_candidate("x.mail.conf")
+        assert not _is_nginx_candidate("x.mail.conf")
+
+
+class TestPerUserEnvFilesAreNotSelectable:
+    """Found 2026-10-24 — the candidate filter only matched the LEGACY
+    `.env.<user>.<label>` form, so the canonical `.env.<index>.<user>.<label>`,
+    the `.env.raw.*` handoff and the `.env.fix.*` handoff were offered as env
+    candidates. A stale all-empty `.env.1.bob.3` was selectable, skipped env
+    generation and crash-looped the graph (empty OPENAI_API_KEY)."""
+
+    def _svc(self, tmp_path):
+        svc = tmp_path / "example-thing"
+        svc.mkdir(parents=True)
+        for n in (
+            ".env", ".env.example", ".env.1.bob.3", ".env.bob.3",
+            ".env.raw.bob.3", ".env.fix.bob.3",
+        ):
+            (svc / n).write_text("X=1\n")
+        (svc / "docker-compose.yml").write_text("services: {}\n")
+        return svc
+
+    def test_candidates_keep_only_recipe_env_files(self, tmp_path, monkeypatch):
+        from app.config import settings
+        from app.services import file_sets
+        self._svc(tmp_path)
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path, raising=False)
+        cands = file_sets.list_file_sets("example-thing")["candidates"][file_sets.ROOT_RECIPE_KEY]["env"]
+        assert cands == [".env", ".env.example"], cands
+
+    def test_a_stored_per_user_env_is_dropped_on_read(self, tmp_path, monkeypatch):
+        from app.config import settings
+        from app.services import file_sets
+        from app.services.project_state import ProjectState
+        svc = self._svc(tmp_path)
+        state = ProjectState(svc)
+        state.file_sets[file_sets.ROOT_RECIPE_KEY] = {
+            "compose": ["docker-compose.yml"], "nginx": None,
+            "serving_ports": None, "stream_conf": None, "mail_conf": None,
+            "env": [".env.1.bob.3", ".env"], "profiles": [],
+        }
+        state.save()
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path, raising=False)
+        listed = file_sets.list_file_sets("example-thing")
+        assert listed["file_sets"][file_sets.ROOT_RECIPE_KEY]["env"] == [".env"]
+
+    def test_saving_one_is_refused(self, tmp_path, monkeypatch):
+        import pytest
+        from app.config import settings
+        from app.services import file_sets
+        self._svc(tmp_path)
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path, raising=False)
+        with pytest.raises(file_sets.FileSetError):
+            file_sets.put_file_set("example-thing", file_sets.ROOT_RECIPE_KEY, {
+                "compose": ["docker-compose.yml"], "env": [".env.1.bob.3"],
+            })
+
+
+class TestComposePromptPreservesProfiles:
+    """G62 — the compose prompt must forbid dropping `profiles: [""]`; the LLM
+    fix of 2026-10-24 silently did, merging the default and profiled stacks."""
+
+    def test_the_prompt_requires_profiles_verbatim(self):
+        from pathlib import Path
+        src = (Path(__file__).resolve().parents[1] / "app/services/llm_service.py").read_text()
+        assert "PRESERVE `profiles:` EXACTLY" in src
+        assert 'profiles: [""]' in src

@@ -295,6 +295,9 @@ async def compose_preview(
     name: str,
     compose_files: list[str] = Query(default=[], description="Recipe-relative compose file paths (ordered)"),
     recipe_path: str = Query("", description="Recipe subdirectory path"),
+    user_name: str = Query("", description="Target user, for the golden volume paths"),
+    label: str = Query("", description="Target label, for the golden volume paths"),
+    profiles: list[str] = Query(default=[], description="Active compose profiles"),
     current_admin: dict = Depends(require_admin),
 ):
     """Lightweight convert/preview — converter in-call src→key mapping.
@@ -307,16 +310,14 @@ async def compose_preview(
     preview — no templates or markers are written.
     """
     try:
-        result = await provision_service.compose_preview(name, compose_files, recipe_path)
+        result = await provision_service.compose_preview(
+            name, compose_files, recipe_path, user_name, label, profiles
+        )
     except Exception as e:
         raise HTTPException(502, f"provision-api error: {e}")
-    # The panel's volume-override rows default to
-    # {user_data_dir}/{user}/{service}/{label}/{key} — inject the canonical
-    # root so the frontend never hardcodes a stale path (the provision-api
-    # bootstraps bind targets under ITS user_data root; a mismatched prefix
-    # makes copy-if-empty write to container-local paths the compose mounts
-    # never see).
-    result["user_data_dir"] = str(settings.USER_DATA_DIR)
+    # G60 (D8) — the gateway adds NOTHING. The -api is the only source of the
+    # volume paths (`volume_paths`), computed from the identity this call
+    # forwards; the gateway must not know or reproduce its formula.
     return result
 
 

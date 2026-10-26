@@ -99,6 +99,12 @@ PHASE_FILENAME = {
     # R1.1) — so the platform's existing pattern predicates keep matching it.
     "serving_ports": "serving_ports.base.{token}.yml",
     "nginx": "nginx.base.{token}.conf",
+    # G56 — the stream conf is RECIPE-LEVEL exactly like the http conf: the
+    # generated artifact is a stream TEMPLATE (`server_name` carries
+    # `{{ hostname_stem }}--<sub>.{{ domain_name }}`), and the -api renders it
+    # into the per-instance `*.stream.conf`. No user/label in the name, because
+    # the file is the recipe's, not the deployment's.
+    "stream_conf": "nginx.stream.base.{token}.conf",
     "env": ".env",
 }
 
@@ -119,6 +125,7 @@ FIX_FILENAME = {
     "compose": "docker-compose.fix.{token}.yml",
     "serving_ports": "serving_ports.fix.{token}.yml",
     "nginx": "nginx.fix.{token}.conf",
+    "stream_conf": "nginx.stream.fix.{token}.conf",
     "env": ".env.fix",
 }
 
@@ -525,11 +532,16 @@ class GenerationJobManager:
 
             _tls_on = bool((request.get("deploy_metadata") or {}).get("https")
                            or request.get("https") or request.get("tls"))
-            if _tls_on and (
-                "serving_ports" in phases
-                or sel.get("serving_ports")
-                or "stream_conf" in missing
-            ):
+            # G56 — two sources, ONE rule, mirroring HTTP: a SELECTED stream conf
+            # is used as-is (generation bypassed); absent → generated. The slot
+            # is applicable only when TLS is on and a serving-ports artifact is in
+            # play, because the stream rows come from it.
+            _gen_stream_conf = bool(
+                _tls_on
+                and not sel.get("stream_conf")
+                and ("serving_ports" in phases or sel.get("serving_ports"))
+            )
+            if _gen_stream_conf:
                 phases.append("stream_conf")
             if _gen_nginx:
                 phases.append("nginx")
@@ -539,7 +551,8 @@ class GenerationJobManager:
             # was a real gap, caught by the test for exactly this rule (R1.3 states
             # it for the compose: "a selected artifact is still validated").
             if (_sp_in_play and not sel.get("serving_ports_none")
-                    and (_gen_nginx or sel.get("nginx"))):
+                    and (_gen_nginx or sel.get("nginx")
+                         or _gen_stream_conf or sel.get("stream_conf"))):
                 phases.append("validate_conf")
             # The Source Projects panel passes skip_env (env is deploy-time
             # only — design §8.7).
@@ -870,6 +883,15 @@ class GenerationJobManager:
             job.updated_at = datetime.now(timezone.utc)
             db.commit()
             db.refresh(job)
+            # This write is the OTHER way a job reaches a terminal status, and
+            # the rule is about the status, not about who wrote it: a cancelled
+            # leg owns no session either. `None` = the leg produced nothing to
+            # hand on, so its record goes. `finish_leg` never touches a
+            # `paused`/`refused` session, which is what makes this safe to call
+            # unconditionally — the delete path's own cancel must not destroy the
+            # record the operator is looking at.
+            from ..services import pre_deploy_registry as _pdr
+            _pdr.finish_leg(job_id, None)
         return job
 
     def recover_stale_jobs(self, db: Session) -> int:
@@ -915,6 +937,13 @@ class GenerationJobManager:
             # found live: `generation_jobs.py` cancel is process-local). Refuse
             # to overwrite a cancelled row with a terminal status.
             if job.status == JOB_STATUS_CANCELLED and status != JOB_STATUS_CANCELLED:
+                # The ROW keeps the cancel (D1) — but the LEG is over either way,
+                # so its reservation is released here too. A cancel landing just
+                # as the run finishes is exactly when this fires, and returning
+                # without it leaves `generating` behind: the same stale
+                # reservation the terminal branch below exists to drop.
+                from ..services import pre_deploy_registry as _pdr
+                _pdr.finish_leg(job_id, None)
                 return
             job.status = status
             if status in (JOB_STATUS_COMPLETED, JOB_STATUS_FAILED, JOB_STATUS_CANCELLED):
@@ -961,6 +990,24 @@ class GenerationJobManager:
                 # and this is one row's UPDATE.
                 from ..services import pre_deploy_registry as _pdr
                 _pdr.set_state_for_job(job_id, "paused", _reason)
+            elif status in (JOB_STATUS_COMPLETED, JOB_STATUS_FAILED, JOB_STATUS_CANCELLED):
+                # ...and the mirror has a SECOND half: a leg that ENDS must stop
+                # holding the combination. The pause branch above was the whole
+                # of it, so a session whose job merely COMPLETED stayed
+                # `generating` — reserving a path nothing was working on — and the
+                # step that must follow was refused 409 until the 90 s sweep
+                # (measured 2026-10-14).
+                #
+                # COMPLETED gets the state, not the delete: its files are ready
+                # and the deploy has not been sent, so the record must survive —
+                # it is what the deploy panel's auto-run asks for once a second,
+                # and the operator's card. FAILED/CANCELLED produced nothing to
+                # hand on, so theirs goes. See `finish_leg` for both.
+                from ..services import pre_deploy_registry as _pdr
+                _pdr.finish_leg(
+                    job_id,
+                    _pdr.STATE_GENERATED if status == JOB_STATUS_COMPLETED else None,
+                )
         finally:
             db.close()
 
@@ -1650,37 +1697,42 @@ class GenerationJobManager:
                                 ]
                                 _res = validate_serving_ports(_sp_text, _vp_compose)
                             else:
-                                # The conf in play: this run's produced one, else the
-                                # selection's. It is a TEMPLATE at this point, so the
-                                # two known substitutions are applied before the
-                                # comparison — the served names are what the check is
-                                # about, and `{{ hostname }}` is the instance host.
-                                _conf_name = _names.get("nginx")
-                                # Same recording as the ports artifact above: the
-                                # pause names the conf that FAILED, not this job's
-                                # prospective name for it. (`_conf_source` is
-                                # already "" from the branch's own initialiser.)
-                                if _conf_name and _conf_name in result_files:
-                                    _conf_text = result_files[_conf_name]
-                                    _conf_source = _conf_name
-                                elif _sel.get("nginx"):
-                                    _p = recipe_dir / _sel["nginx"]
-                                    _conf_text = _p.read_text(encoding="utf-8", errors="replace") if _p.is_file() else ""
-                                    _conf_source = str(_sel["nginx"])
-                                else:
-                                    _conf_text = ""
-                                # R2-F46 — the template→rendered normalisation is
-                                # owned by the checker itself
-                                # (`serving_ports.validate_conf_agreement`), so the
-                                # caller passes the conf as it stands and cannot
-                                # forget the step.
-                                _res = validate_conf_agreement(
-                                    _ports, _conf_text,
-                                    service_name=service_name,
-                                    user_name=str(request.get("user_name") or "x"),
-                                    label=str(request.get("label") or "0"),
-                                    domain=_domain,
-                                )
+                                # G56 — BOTH categories, one name-agnostic check.
+                                # For each category in play: this run's produced
+                                # conf first, else the selected one. The blocks are
+                                # matched by their `--<sub>` suffix and their
+                                # upstream/port; NAMES ARE NOT COMPARED (the -api
+                                # renders them).
+                                _cat_confs: list[tuple[str, str, str]] = []
+                                for _cat, _slot in (("http", "nginx"), ("stream", "stream_conf")):
+                                    _conf_name = _names.get(_slot)
+                                    if _conf_name and _conf_name in result_files:
+                                        _cat_confs.append((_cat, result_files[_conf_name], _conf_name))
+                                    elif _sel.get(_slot):
+                                        _p = recipe_dir / _sel[_slot]
+                                        _text = _p.read_text(encoding="utf-8", errors="replace") if _p.is_file() else ""
+                                        _cat_confs.append((_cat, _text, str(_sel[_slot])))
+                                _errors_all: list[str] = []
+                                _warnings_all: list[str] = []
+                                for _cat, _conf_text, _src in _cat_confs:
+                                    _one = validate_conf_agreement(
+                                        _ports, _conf_text,
+                                        service_name=service_name,
+                                        user_name=str(request.get("user_name") or "x"),
+                                        label=str(request.get("label") or "0"),
+                                        domain=_domain,
+                                        category=_cat,
+                                    )
+                                    _errors_all.extend(_one.get("errors") or [])
+                                    _warnings_all.extend(_one.get("warnings") or [])
+                                    if not _one.get("valid") and not _conf_source:
+                                        # The pause names the file that FAILED.
+                                        _conf_source = _src
+                                _res = {
+                                    "valid": not _errors_all,
+                                    "errors": _errors_all,
+                                    "warnings": _warnings_all,
+                                }
 
                             warnings.extend(_res.get("warnings") or [])
                             if not _res.get("valid"):
@@ -1712,7 +1764,16 @@ class GenerationJobManager:
                                         _fix_unsel = {"serving_ports": None}
                                     else:
                                         _fix_file = _conf_source or "nginx.conf"
-                                        _fix_unsel = {"nginx": None}
+                                        # Re-generate the SLOT that failed: the
+                                        # stream conf is its own slot now (G56).
+                                        _stream_failed = (
+                                            ".stream." in (_conf_source or "")
+                                            or (_conf_source or "").endswith(".stream.conf")
+                                        )
+                                        _fix_unsel = (
+                                            {"stream_conf": None} if _stream_failed
+                                            else {"nginx": None}
+                                        )
                                     _guidance = (
                                         f"{_fix_file} failed the {phase} check: "
                                         + "; ".join(_errs)
@@ -1815,12 +1876,12 @@ class GenerationJobManager:
                                 cert_pem=str(_ssl_dir / _domain / "fullchain.pem"),
                                 cert_key=str(_ssl_dir / _domain / "privkey.pem"),
                             )
-                            # The name is PER-USER (it carries user and label), so
-                            # it cannot come from the token map the recipe-level
-                            # artifacts use.
-                            sc_name = (
-                                f"{service_name}.user-{request.get('user_name') or 'unknown'}"
-                                f".{request.get('label') or '0'}.stream.conf"
+                            # G56 — the generated artifact is RECIPE-LEVEL, like
+                            # `nginx.base.<token>.conf`: a stream TEMPLATE whose
+                            # names the -api renders per instance. No user/label in
+                            # the name — the file belongs to the recipe.
+                            sc_name = _names.get("stream_conf") or (
+                                f"nginx.stream.base.{job_id}.conf"
                             )
                             result_files[sc_name] = content
                             _swapped = dict(request.get("selection") or {})

@@ -12,10 +12,20 @@ export const getComposePreview = (
   serviceName: string,
   composeFiles: string[],
   recipePath: string = '',
+  // G60 — the target identity travels with the preview so the -api returns the
+  // golden `volume_paths`. Without it the response carries keys only.
+  userName: string = '',
+  label: string = '',
+  // The ACTIVE profiles: the -api filters the mount table to the services those
+  // profiles actually start. Repeated keys, like compose_files.
+  profiles: string[] = [],
 ) => {
   const qs = [
     ...composeFiles.map(f => `compose_files=${encodeURIComponent(f)}`),
     ...(recipePath ? [`recipe_path=${encodeURIComponent(recipePath)}`] : []),
+    ...(userName ? [`user_name=${encodeURIComponent(userName)}`] : []),
+    ...(label ? [`label=${encodeURIComponent(label)}`] : []),
+    ...profiles.map(p => `profiles=${encodeURIComponent(p)}`),
   ].join('&')
   return client.get(`/projects/${serviceName}/compose-preview?${qs}`)
 }

@@ -31,6 +31,24 @@ from typing import Any
 
 from ..models.pre_deploy_session import PreDeploySession
 
+# The session's states, named so the readers cannot drift from the writers.
+#   generating - a leg is live; this RESERVES the combination
+#   paused     - the leg stopped and is waiting on the operator; reserved, because
+#                a competing generation would overwrite the pause being answered
+#   refused    - the -api or the gateway's pool refused the deploy; reserved, so
+#                the Retry is the only path (it replays the stored options)
+#   generated  - the leg ENDED and its files are ready; the deploy has not been
+#                sent yet. NOT reserved (see `is_reserved`) and NOT stale (see
+#                `reconcile`) — the path is still in flight, it just holds nothing
+STATE_GENERATING = "generating"
+STATE_PAUSED = "paused"
+STATE_REFUSED = "refused"
+STATE_GENERATED = "generated"
+
+# Kept regardless of whether anything is working on them: these are waiting on a
+# PERSON, and dropping one destroys the operator's only record of it.
+OPERATOR_HELD_STATES = (STATE_REFUSED, STATE_PAUSED, STATE_GENERATED)
+
 
 def _sessions():
     """A short-lived session, resolved AT CALL TIME.
@@ -131,7 +149,7 @@ def migrate_legacy_json() -> int:
                 service_name=row.get("service_name") or "",
                 recipe_path=row.get("recipe_path") or "",
                 label=str(row.get("label", "0")),
-                state=row.get("state") or "generating",
+                state=row.get("state") or STATE_GENERATING,
                 reason=row.get("reason") or "",
                 detail=row.get("detail") or "",
                 job_id=row.get("job_id"),
@@ -180,15 +198,25 @@ def get_session(user: str, service: str, recipe_path: str, label: str) -> dict[s
 
 
 def is_reserved(user: str, service: str, recipe_path: str, label: str) -> bool:
-    """The combination is reserved while a session exists (doc §8b).
+    """The combination is reserved while a session is WORKING on it (doc §8b).
 
     A new generation/deploy for the same (user, service, label) is refused until
-    the operator checks, cancels or deletes the existing session.
+    the operator checks, cancels or deletes the existing session — because a
+    competing generation would clobber the live job, or overwrite the pause the
+    operator is still answering.
+
+    `generated` is the exception, and it is the whole point of that state: the
+    leg has ENDED and its files are ready, so there is nothing left to clobber
+    and nothing waiting on a person. It is still a record — the path is in flight
+    until the deploy registers — but it holds nothing. Counting it here is what
+    deadlocked the path on 2026-10-14: the deploy's own generation was refused
+    with 409 by a record whose job had finished second earlier.
     """
     db = _sessions()
     try:
         return db.query(PreDeploySession).filter(
-            PreDeploySession.key == _key(user, service, recipe_path, label)
+            PreDeploySession.key == _key(user, service, recipe_path, label),
+            PreDeploySession.state != STATE_GENERATED,
         ).count() > 0
     finally:
         db.close()
@@ -204,7 +232,7 @@ def add_session(
     guide: str = "", task_id: str = "", slot: str = "",
     use_global_proxy: bool = False,
 ) -> dict[str, Any]:
-    """Record a pre-deploy session (state: `generating` | `paused`), replacing
+    """Record a pre-deploy session (see the STATE_* constants), replacing
     any row already held for the same combination.
 
     ``guide`` and ``task_id`` belong to the LLM-fix pause (GRILLING G26); they
@@ -265,6 +293,44 @@ def set_state_for_job(job_id: int, state: str, reason: str | None = None) -> boo
         row.state = state
         if reason is not None:
             row.reason = reason
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
+def finish_leg(job_id: int, state: str | None) -> bool:
+    """The leg this session belongs to has ENDED: advance the session.
+
+    `state=STATE_GENERATED` when the leg COMPLETED — its files are ready and the
+    deploy has not been sent yet, so the record stays and stops reserving.
+    `state=None` when it produced nothing usable (failed, or the operator
+    cancelled it) — there is no path left to hold, so the record goes.
+
+    **This used to delete in both cases, and that was wrong.** The fix wanted to
+    stop the session RESERVING and reached for DELETION, which are two different
+    operations: it destroyed the record of a deployment still in flight. The
+    cost was measured on 2026-10-14 — the deploy panel's auto-run asks for this
+    record once a second (`GET /pre-deploy/{user}/{service}/{label}`), so with
+    nothing to find it logged ~60 red 404s per deploy, and in the preview path
+    the operator's card vanished between "the files are ready" and "the deploy
+    lands". `generated` is the state the model was missing: it holds nothing
+    (`is_reserved` skips it) and it is not stale (`reconcile` spares it).
+
+    A session in `paused` or `refused` is NEVER touched: those are the
+    OPERATOR's — a cancel arriving for a paused leg must not destroy the record
+    they are looking at (G34). Everything else this leg owns is advanced or
+    dropped, which also makes a repeated terminal write idempotent.
+    """
+    db = _sessions()
+    try:
+        row = db.query(PreDeploySession).filter(PreDeploySession.job_id == job_id).first()
+        if row is None or row.state in (STATE_PAUSED, STATE_REFUSED):
+            return False
+        if state is None:
+            db.delete(row)
+        else:
+            row.state = state
         db.commit()
         return True
     finally:
@@ -337,7 +403,7 @@ def mark_refused(*, user: str, service: str, recipe_path: str, label: str,
         if row is None:
             row = PreDeploySession(**fields)
             db.add(row)
-        row.state = "refused"
+        row.state = STATE_REFUSED
         row.reason = reason
         row.detail = _as_text(detail)
         # The EXACT deploy options, so Retry can replay the deployment verbatim:
@@ -354,49 +420,66 @@ def mark_refused(*, user: str, service: str, recipe_path: str, label: str,
         db.close()
 
 
-def reconcile(registered_keys: set[str], live_job_ids: set[int]) -> dict[str, Any]:
-    """Drop the sessions nothing is working on any more.
+def reconcile(live_job_ids: set[int]) -> dict[str, Any]:
+    """Drop the sessions nothing can still be working on.
 
-    ``registered_keys`` are the (user, service, recipe_path, label) keys present
-    in the -api registry; ``live_job_ids`` are jobs the gateway still considers
-    live. Returns a report so a caller can log what it removed and why.
+    ``live_job_ids`` are jobs the gateway still considers live. Returns a report
+    so the caller can log what it removed and why.
+
+    **It runs ONCE, at startup** — `main.py` calls it right after
+    `recover_stale_jobs` has marked every leftover queued/running job failed, so
+    at that moment nothing IS live and its `live_job_ids` guard is a formality.
+    It used to run on a 90-second loop as well, and that patrol is gone, for two
+    reasons:
+
+    1. **Its main rule only ever existed because of a missing state.** It dropped
+       a record whose job had finished but which was never deployed — and the
+       reason that mattered was that such a record kept its combination RESERVED
+       forever (its own docstring: *"refused with 409 until the gateway
+       restarted"*). With `STATE_GENERATED` a finished leg's record holds
+       nothing, so there is nothing to patrol for.
+    2. **Its second rule actively misfired.** It also dropped a session whose key
+       appeared in the -api registry, reading that as "the registration
+       succeeded". The key list was built from four buckets including
+       `failed_services`, so a RETRY of a failed instance had its live record
+       deleted mid-generation — measured 2026-10-14, 60 consecutive misses. That
+       rule is gone: the deploy's handoff already removes the record on its way
+       into the -api (remove-then-register), so there was nothing left for it to
+       catch.
+
+    What remains is the one job nothing else does: tidying records whose runner
+    died with the gateway, since nothing will ever write a state for those rows.
     """
-    dropped_registered: list[str] = []
     dropped_stale: list[str] = []
     db = _sessions()
     try:
         rows = db.query(PreDeploySession).all()
         for row in rows:
-            # A session WAITING FOR THE OPERATOR is never stale, whatever the job
-            # and registry say — `refused` (the deploy was refused before any
-            # task ran, so it has no job by construction and may share a key
-            # with an older registration) and `paused` (the G26 handoff writes
-            # the session and then deletes the -api entry, so it has no registry
-            # entry by construction and its job has already completed).
+            # A session in the OPERATOR's hands is never stale, whatever the job
+            # says. `refused` (the deploy was refused before any task ran, so it
+            # has no job by construction) and `paused` (the G26 handoff writes the
+            # session and then deletes the -api entry, so it has no registry entry
+            # by construction and its job has already completed) — and, since
+            # 2026-10-16, `generated`: its files are ready and the deploy has not
+            # been sent, so the path is still in flight.
             #
-            # Dropping either destroys the operator's only record of it — the
-            # refusal's Retry options, or the fixing guide and the task id that
-            # make `check` reachable. Found live in Round 1 for `refused`; the
-            # same rule was then needed for `paused`.
-            if row.state in ("refused", "paused"):
-                continue
-            if row.key in registered_keys:
-                # The registration succeeded → the session is done.
-                dropped_registered.append(row.key)
-                db.delete(row)
+            # Dropping one destroys the operator's only record of it — a
+            # refusal's Retry options, or the guide and task id that make `check`
+            # reachable. Found live in Round 1 for `refused`; needed again for
+            # `paused`, and again for the vanishing card on 2026-10-14.
+            if row.state in OPERATOR_HELD_STATES:
                 continue
             if row.job_id is not None and int(row.job_id) in live_job_ids:
                 continue
-            # No live job and no registry entry ⇒ nothing is working on it.
+            # No live job ⇒ nothing is working on it.
             dropped_stale.append(row.key)
             db.delete(row)
-        if dropped_registered or dropped_stale:
+        if dropped_stale:
             db.commit()
         remaining = db.query(PreDeploySession).count()
     finally:
         db.close()
     return {
-        "dropped_registered": dropped_registered,
         "dropped_stale": dropped_stale,
         "remaining": remaining,
     }

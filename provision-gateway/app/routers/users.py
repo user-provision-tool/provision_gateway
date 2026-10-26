@@ -249,42 +249,44 @@ async def deploy_user(
         _pdr_recipe_path(req), str(req.get("label", "0")),
     )
     # ------------------------------------------------------------------
-    # T9 / R8.4 — the stream conf is produced HERE, on the deploy path.
-    #
-    # NOT (only) in the generation pipeline: a deploy whose files are all
-    # selected runs no generation at all, so a generation-only phase leaves the
-    # exposure path unreachable for the normal, fully-configured recipe —
-    # measured 2026-10-10 during the end-to-end plan. It is the same shape as the
-    # per-user env, which is generated as the deploy's last step for the same
-    # reason. Conditional on the TLS toggle (R8.4) and on a stream row existing
-    # (R1.4); with TLS off nothing is produced, so nothing is carried.
+    # G55/G56 — the confs travel as ONE PER-CATEGORY MAP. No deploy-time
+    # generation: the stream conf is recipe-level now, produced by the
+    # generation path under its own selection slot exactly like the http one,
+    # so the old `produce_for_deploy` step is gone. A caller that still sends
+    # the legacy singular/list fields is passed through unchanged — the -api
+    # normalizes them (and refuses a duplicate category loudly).
     # ------------------------------------------------------------------
-    _tls = bool(req.get("tls") or req.get("https"))
-    if _tls:
-        from ..services.stream_conf import produce_for_deploy
+    # G41 — the stream category exists ONLY under TLS. The toggle governs both
+    # the vhost and the stream confs (they are not https at all); a stream conf
+    # deployed with the toggle off has no certificates to render and produced
+    # `ssl_certificate ;`, which failed `nginx -t` and silently stopped the
+    # reload — the new HTTP vhost never loaded (measured 2026-10-24).
+    _tls_on = bool(req.get("tls") or req.get("https"))
+    if "nginx_confs" not in req:
         _sel = req.get("selection") if isinstance(req.get("selection"), dict) else {}
-        _sp = (_sel or {}).get("serving_ports")
-        _conf = produce_for_deploy(
-            service_name=service_name,
-            user_name=req.get("user_name", ""),
-            label=str(req.get("label") or "0"),
-            domain=req.get("domain") or "localhost",
-            serving_ports_path=_sp,
-            ssl_dir=str(settings.SSL_DIR),
-            recipe_dir=str(Path(settings.SOURCE_PROJECTS_DIR) / service_name),
-        )
-        if _conf:
-            # R9.2's LIST: the instance's confs travel together. The singular
-            # field stays for the readers that predate the list.
-            _confs = list(req.get("nginx_conf_file_paths") or [])
-            _single = req.get("nginx_conf_file_path") or req.get("nginx_conf_template_path")
-            if _single and _single not in _confs:
-                _confs.append(_single)
-            if _conf not in _confs:
-                _confs.append(_conf)
-            req["nginx_conf_file_paths"] = _confs
-            req.pop("nginx_conf_file_path", None)
-            req.pop("nginx_conf_template_path", None)
+        _by_cat: dict[str, str] = {}
+        if _sel.get("nginx"):
+            _by_cat["http"] = _sel["nginx"]
+        if _sel.get("stream_conf") and _tls_on:
+            _by_cat["stream"] = _sel["stream_conf"]
+        if _sel.get("mail_conf"):
+            _by_cat["mail"] = _sel["mail_conf"]
+        # Older callers name the http conf only at the top level.
+        if not _by_cat and req.get("nginx_conf_file_path"):
+            _by_cat["http"] = req["nginx_conf_file_path"]
+        if not _by_cat and req.get("nginx_conf_template_path"):
+            _by_cat["http"] = req["nginx_conf_template_path"]
+        if _by_cat:
+            req["nginx_confs"] = _by_cat
+            for _legacy in (
+                "nginx_conf_file_path", "nginx_conf_template_path",
+                "nginx_conf_file_paths", "nginx_conf_template_paths",
+            ):
+                req.pop(_legacy, None)
+
+    # A caller that sends the map directly gets the same rule.
+    if not _tls_on and isinstance(req.get("nginx_confs"), dict):
+        req["nginx_confs"].pop("stream", None)
 
     try:
         result = await provision_service.register_user(**req)

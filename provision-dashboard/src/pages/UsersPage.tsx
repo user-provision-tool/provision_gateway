@@ -240,8 +240,19 @@ export default function UsersPage() {
         service_name: svc.service_name, user_name: svc.user_name,
         label: String(svc.label), sub_service: sub,
       })
-      setExposureUrls(prev => ({...prev, [canonical]: data.host}))
-      setExposureModal({url: data.host, port: data.stream_port, row: sub})
+      // `data.address` — the NAME and the stream PORT, and nothing else.
+      //
+      // The port is the half that must not be lost: `data.host` alone is what an
+      // operator pastes into a client, and a client given no port dials its
+      // protocol default (7687 for Bolt) — the instance's INTERNAL port, which
+      // answers nothing — so the row looked broken when the platform was fine.
+      // Measured 2026-10-16.
+      //
+      // No scheme: the platform does not name the stream protocol (user ruling
+      // 2026-10-16). Everything at or above the door is protocol-blind, and the
+      // client supplies its own protocol's spelling.
+      setExposureUrls(prev => ({...prev, [canonical]: data.address}))
+      setExposureModal({url: data.address, port: data.stream_port, row: sub})
     } catch (e: any) {
       message.error(e?.response?.data?.detail || 'Could not generate an exposure URL')
     }
@@ -909,9 +920,16 @@ export default function UsersPage() {
         badge={
           <Badge
             status={sess.state === 'generating' ? 'processing'
-                    : sess.state === 'refused' ? 'error' : 'warning'}
+                    : sess.state === 'refused' ? 'error'
+                    : sess.state === 'generated' ? 'success' : 'warning'}
             text={sess.state === 'generating' ? 'Generating…'
                   : sess.state === 'refused' ? `Refused (${sess.reason || 'unknown'})`
+                  // The leg ENDED and its files are ready; the deploy has not been
+                  // sent. Without this case the state fell into the `else` branch
+                  // and the card read "Paused (awaiting you)" — which was a lie
+                  // about a path that is simply waiting for the operator to press
+                  // Deploy.
+                  : sess.state === 'generated' ? 'Ready to deploy'
                   : `Paused (${sess.reason || 'awaiting you'})`}
           />
         }
@@ -953,11 +971,15 @@ export default function UsersPage() {
                 setDeployOpen(true)
               }}>Retry</Button>
           )}
-          {/* check — re-enter the PAUSED PATH (G15): the deploy pane as
+          {/* check — re-enter the PATH (G15): the deploy pane as
               if never closed, PLUS the pause popup. For a generation
               pause that is the panel attached to the parked job; for an
-              LLM-fix pause it is the panel pre-filled with the guide. */}
-          {sess.state === 'paused' && (
+              LLM-fix pause it is the panel pre-filled with the guide.
+              A `generated` record offers it too: the leg is over and its
+              files are ready, so re-opening the panel attached to that
+              leg is what lets the operator press Deploy on the handoff
+              instead of re-running the whole generation. */}
+          {(sess.state === 'paused' || sess.state === 'generated') && (
             <Button size="small" type="primary" onClick={() => {
               setPreselectedDeploy(sessionServiceValue(sess))
               setPreselectedUser(sess.user_name)
@@ -966,7 +988,11 @@ export default function UsersPage() {
               // label and the guide (G20): the restart is the SAME
               // path, so it replays the options it was created with.
               setPreselectedUseGlobalProxy(!!sess.use_global_proxy)
-              if (sess.reason === 'llm_fix') {
+              // The GUIDE only belongs to a pause that is still waiting. A
+              // `generated` record keeps the reason it was paused with, so
+              // matching on `reason` alone would replay a fix that has
+              // already run — and open the panel in fixing mode.
+              if (sess.state === 'paused' && sess.reason === 'llm_fix') {
                 setFixingGuide({ guide: sess.guide || '', slot: sess.slot || 'compose' })
               } else if (sess.job_id != null) {
                 setResumeJobId(sess.job_id)
@@ -1040,8 +1066,13 @@ export default function UsersPage() {
                   <Tag color={sess.options.compose_file_paths?.length ? 'green' : 'red'}>
                     compose: {sess.options.compose_file_paths?.join(', ') || 'none'}
                   </Tag>
-                  <Tag color={sess.options.nginx_conf_file_path ? 'green' : 'red'}>
-                    nginx: {sess.options.nginx_conf_file_path || 'none'}
+                  {/* G55 — one conf per category. The record's map is the
+                      authority; the legacy singular is shown for older rows. */}
+                  <Tag color={sess.options.nginx_confs?.http || sess.options.nginx_conf_file_path ? 'green' : 'red'}>
+                    nginx: {(sess.options.nginx_confs?.http || sess.options.nginx_conf_file_path) || 'none'}
+                  </Tag>
+                  <Tag color={sess.options.nginx_confs?.stream ? 'green' : 'red'}>
+                    stream: {sess.options.nginx_confs?.stream || 'none'}
                   </Tag>
                   <Tag color={sess.options.env_files?.length ? 'green' : 'red'}>
                     env: {sess.options.env_files?.join(', ') || 'none'}
@@ -1089,7 +1120,16 @@ export default function UsersPage() {
       <div style={{display:'flex',justifyContent:'space-between',marginBottom:16,flexWrap:'wrap',gap:8}}>
         <Title level={3} style={{margin:0}}>Services</Title>
         <Space>
-          <Input prefix={<SearchOutlined/>} placeholder="Filter..." value={search} onChange={e=>setSearch(e.target.value)} allowClear style={{width:240}}/>
+          {/* B1 / G58 — this is NOT a credential field, and it sits on a page
+              that also renders password inputs (the deploy panel). A bare
+              unannotated text input is exactly what a browser's password
+              manager treats as the username target, so opening the panel filled
+              it with the saved login and the filter matched nothing. Opt out by
+              shape (search, not text) and by name — never by name that looks
+              like a login. */}
+          <Input prefix={<SearchOutlined/>} placeholder="Filter..." type="search"
+            id="services-filter" name="services_filter" autoComplete="off"
+            value={search} onChange={e=>setSearch(e.target.value)} allowClear style={{width:240}}/>
           {isAdmin && <Button type="primary" icon={<RocketOutlined/>} onClick={()=>setDeployOpen(true)}>Deploy</Button>}
           <Button icon={<ReloadOutlined/>} onClick={loadServices}>Refresh</Button>
         </Space>
@@ -1420,10 +1460,24 @@ export default function UsersPage() {
                               return (
                                 <Space key={canonical} size={6} wrap>
                                   <Text code>{sub}</Text>
-                                  <Button size="small" type="primary" ghost
-                                    onClick={() => mintExposure(svc, canonical)}>
-                                    Generate exposure URL
-                                  </Button>
+                                  {/* Minting is REVOKE + INSERT: the row's previous URL dies at
+                                      its next connection. That is the one consequence the
+                                      operator has to agree to BEFORE it happens, so it is a
+                                      confirmation rather than a warning shown afterwards — the
+                                      old modal claimed the URL was shown only once, while the
+                                      card kept showing it, and the thing that actually matters
+                                      (the old one dying) was buried in the same sentence. */}
+                                  <Popconfirm
+                                    title="Old urls will be invalidated, confirm?"
+                                    description="The previous exposure URL for this row stops working at its next connection."
+                                    okText="Generate"
+                                    cancelText="Cancel"
+                                    onConfirm={() => mintExposure(svc, canonical)}
+                                  >
+                                    <Button size="small" type="primary" ghost>
+                                      Generate exposure URL
+                                    </Button>
+                                  </Popconfirm>
                                   {url && (
                                     <Text code copyable={{text: url}} style={{fontSize:12}}>{url}</Text>
                                   )}
@@ -1737,18 +1791,20 @@ export default function UsersPage() {
       </Drawer>
       <Modal
         open={!!exposureModal}
-        title="Exposure URL — shown once"
+        title="Exposure URL"
         onCancel={() => setExposureModal(null)}
         onOk={() => setExposureModal(null)}
-        okText="I have it"
+        okText="Close"
         cancelButtonProps={{style:{display:'none'}}}
       >
         {exposureModal && (
           <Space direction="vertical" size={8} style={{width:'100%'}}>
             <Text>
-              The client dials this name on port <Text code>{exposureModal.port}</Text> with TLS
-              (SNI = the name). It is a credential carried in the clear: this is the ONLY time it is
-              shown, and regenerating it invalidates this one at its next connection.
+              The client dials this NAME on this PORT with TLS — the name is the credential (it
+              travels as the SNI), and the protocol is yours to name: the platform is
+              protocol-blind, so add your client's own spelling (<Text code>bolt+s://</Text>,
+              <Text code>rediss://</Text>, …). Generating another one for this row invalidates
+              this one at its next connection.
             </Text>
             <Text code copyable style={{wordBreak:'break-all'}}>{exposureModal.url}</Text>
             <Text type="secondary" style={{fontSize:12}}>

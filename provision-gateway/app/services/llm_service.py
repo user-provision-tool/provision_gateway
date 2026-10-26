@@ -473,6 +473,13 @@ justify more (e.g. a database/cache service); no host port publishing (the
 converter strips ports — use `expose:` for internal ports); no padding.
 If profiles are listed above, gate optional services behind those exact
 profile names (e.g. a database behind the "postgresql" profile).
+
+PRESERVE `profiles:` EXACTLY. Every service defined in the selected base files
+keeps its own `profiles:` value verbatim — INCLUDING the default-stack marker
+`profiles: [""]`. Never drop that key. In compose, `[""]` runs only in the
+no-profile baseline and is EXCLUDED as soon as any profile is activated; a
+service with NO `profiles:` key always runs. Dropping `[""]` turns two mutually
+exclusive stacks (default vs. profiled) into one additive stack.
 {template_block}
 Output ONLY the raw YAML, no markdown fences, no explanations.""")
 
