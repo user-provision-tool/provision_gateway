@@ -98,6 +98,30 @@ def _ensure_schema(engine_=engine):
             # the pending request (and the resume payload) in this column.
             with engine_.begin() as conn:
                 conn.execute(text("ALTER TABLE generation_jobs ADD COLUMN pending_input TEXT"))
+    if "end_users" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("end_users")}
+        with engine_.begin() as conn:
+            if "is_public_shared" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE end_users ADD COLUMN is_public_shared "
+                    "BOOLEAN NOT NULL DEFAULT 0"
+                ))
+            if "deleted_at" not in cols:
+                conn.execute(text("ALTER TABLE end_users ADD COLUMN deleted_at DATETIME"))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_end_users_deleted_at "
+                "ON end_users (deleted_at)"
+            ))
+
+        # G78 / R16 — one-time conversion of the retired string into ID-keyed
+        # rows. It is safe to run in every worker: the unique pair makes the
+        # insert idempotent, and each converted source string is cleared.
+        if "acl_grants" in inspect(engine_).get_table_names():
+            from sqlalchemy.orm import Session as _Session
+            from .services.acl_service import migrate_legacy_grants
+            with _Session(bind=engine_) as _s:
+                migrate_legacy_grants(_s)
+
     if "api_keys" in insp.get_table_names():
         cols = {c["name"] for c in insp.get_columns("api_keys")}
         with engine_.begin() as conn:

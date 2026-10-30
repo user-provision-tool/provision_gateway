@@ -4,7 +4,7 @@ Gateway mounts the same filesystem as provision-api, so it can read
 user_registry.yml directly without HTTP calls. This enables:
 - Hostname resolution for /go/{hostname}
 - Subnet pool statistics (from the registry entries)
-- ACL checks (allowed_special_users per user)
+- ACL checks via the gateway account store (acl_grants)
 """
 
 from __future__ import annotations

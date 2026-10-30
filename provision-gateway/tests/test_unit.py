@@ -2810,8 +2810,9 @@ class TestGrantDialogSync:
             / "provision-dashboard" / "src" / "pages" / "UserManagementPage.tsx"
         )
         content = p.read_text()
-        assert "setSpecialUsersGlobal" in content
-        assert "role === 'special'" in content
+        assert "setCandidates" in content
+        assert "data.candidates" in content
+        assert "setSpecialUsersGlobal" not in content
 
 
 # ---------------------------------------------------------------------------
@@ -2958,17 +2959,13 @@ class TestGoServiceRedirect:
             / "provision-dashboard" / "src" / "pages" / "UsersPage.tsx"
         )
         content = p.read_text()
-        assert "return `/go/${instanceHost(svc)}`" in content, (
-            "service card must link to /go/{hostname} (gateway redirect) so the "
-            "browser gets the provision_token cookie for the service domain"
-        )
-        # R1.5 — and the host must be the INSTANCE's, read from the URL the -api
-        # reports. The old form composed `${service}-${user}-${label}.localhost`
-        # itself, so on a `snaprovision.com` deployment the card's own service URL
-        # — and, once R6.2's per-sub-service rows existed, every one of those too —
-        # pointed at a host that does not exist.
-        assert "new URL(svc.url || '').hostname" in content, (
-            "the /go/ host must come from the instance's own URL, not a literal")
+        # R14 — the card links each RECORDED endpoint, not the instance host:
+        # there is no instance URL field and no `primary` row.
+        assert "return `/go/${servedName}`" in content, (
+            "service card must link each endpoint to /go/{served name}")
+        assert "svc.http_endpoints" in content
+        assert "URL: " not in content
+        assert "<Text code>primary</Text>" not in content
 
     def test_deployment_files_links_use_instance_recipe_path(self):
         """Deployment-Files links must resolve inside the instance's RECIPE dir.
@@ -3102,6 +3099,120 @@ class TestVerifyAuthStatusCodes:
         monkeypatch.setattr(settings, "ENABLE_ACL", False)
         resp = verify_auth(self._req(accept="text/html"), MagicMock())
         assert resp.status_code == 401
+
+    # --- G78 public target verdict (T3) ---------------------------------
+
+    @staticmethod
+    def _owner(db, username="pub", **over):
+        from app.models.end_user import EndUser
+        u = EndUser(
+            username=username, password_hash="x", role="special", is_approved=True,
+            is_active=True, is_public_shared=False,
+        )
+        for k, v in over.items():
+            setattr(u, k, v)
+        db.add(u)
+        db.commit()
+        db.refresh(u)
+        return u
+
+    def test_public_target_without_token_returns_public_verdict(self, monkeypatch):
+        """R3 — no platform credential, 200 + X-Public-Service, no owner Basic."""
+        from unittest.mock import patch
+        from app.database import SessionLocal
+        from app.routers.auth import verify_auth
+        self._enable_acl(monkeypatch)
+        db = SessionLocal()
+        self._owner(db, is_public_shared=True)
+        req = self._req(accept="application/json", host="pub.localhost")
+        with patch("app.routers.auth._lookup_by_hostname",
+                   return_value={"user_name": "pub"}):
+            resp = verify_auth(req, db)
+        assert resp.status_code == 200
+        assert resp.headers["X-Public-Service"] == "1"
+        assert resp.headers.get("X-Service-Basic") is None
+
+    def test_public_wins_over_a_valid_token(self, monkeypatch):
+        """R3/6A — public is target-owned; a token does not switch injection on."""
+        from unittest.mock import patch
+        from app.database import SessionLocal
+        from app.routers.auth import verify_auth
+        self._enable_acl(monkeypatch)
+        db = SessionLocal()
+        self._owner(db, is_public_shared=True)
+        req = self._req(cookie="valid-token", accept="text/html", host="pub.localhost")
+        with patch("app.routers.auth._lookup_by_hostname",
+                   return_value={"user_name": "pub"}), \
+             patch("app.routers.auth.auth_service.verify_provision_token",
+                   return_value={"sub": "1", "user_type": "admin", "role": "admin"}):
+            resp = verify_auth(req, db)
+        assert resp.status_code == 200
+        assert resp.headers["X-Public-Service"] == "1"
+        assert resp.headers.get("X-Service-Basic") is None
+
+    def test_public_wins_over_a_valid_end_user_token(self, monkeypatch):
+        """R3/3A — an owner/viewer token does not switch a public target to
+        private owner-credential injection either."""
+        from unittest.mock import patch
+        from app.database import SessionLocal
+        from app.routers.auth import verify_auth
+        self._enable_acl(monkeypatch)
+        db = SessionLocal()
+        owner = self._owner(db, is_public_shared=True)
+        req = self._req(cookie="valid-end-user-token", accept="text/html",
+                        host="pub.localhost")
+        with patch("app.routers.auth._lookup_by_hostname",
+                   return_value={"user_name": "pub"}), \
+             patch("app.routers.auth.auth_service.verify_provision_token",
+                   return_value={"sub": str(owner.id), "user_type": "end_user",
+                                 "role": "viewer"}):
+            resp = verify_auth(req, db)
+        assert resp.status_code == 200
+        assert resp.headers["X-Public-Service"] == "1"
+        assert resp.headers.get("X-Service-Basic") is None
+
+    def test_inactive_public_owner_does_not_take_the_public_branch(self, monkeypatch):
+        from unittest.mock import patch
+        from app.database import SessionLocal
+        from app.routers.auth import verify_auth
+        self._enable_acl(monkeypatch)
+        db = SessionLocal()
+        self._owner(db, is_public_shared=True, is_active=False)
+        req = self._req(accept="application/json", host="pub.localhost")
+        with patch("app.routers.auth._lookup_by_hostname",
+                   return_value={"user_name": "pub"}):
+            resp = verify_auth(req, db)
+        assert resp.status_code == 401
+        assert "X-Public-Service" not in resp.headers
+
+    def test_public_flag_store_failure_never_defaults_to_public(self, monkeypatch):
+        """T3 fault injection: a store read failure is a 5xx, never a public
+        verdict. The edge then fails closed."""
+        from unittest.mock import MagicMock, patch
+        from app.routers.auth import verify_auth
+        self._enable_acl(monkeypatch)
+        db = MagicMock()
+        db.query.side_effect = RuntimeError("account store unavailable")
+        req = self._req(accept="application/json", host="pub.localhost")
+        with patch("app.routers.auth._lookup_by_hostname",
+                   return_value={"user_name": "pub"}):
+            with pytest.raises(RuntimeError):
+                verify_auth(req, db)
+
+    def test_client_public_header_cannot_spoof_a_private_target(self, monkeypatch):
+        from unittest.mock import patch
+        from app.database import SessionLocal
+        from app.routers.auth import verify_auth
+        self._enable_acl(monkeypatch)
+        db = SessionLocal()
+        self._owner(db, username="private", is_public_shared=False)
+        req = self._req(accept="application/json", host="private.localhost")
+        req.headers["X-Public-Service"] = "1"
+        with patch("app.routers.auth._lookup_by_hostname",
+                   return_value={"user_name": "private"}):
+            resp = verify_auth(req, db)
+        assert resp.status_code == 401
+        assert "X-Public-Service" not in resp.headers
 
 
 class TestKeysUseSharedDependency:
@@ -3238,7 +3349,7 @@ class TestAdminRoutesMigratedToGatewayToken:
         end_user.role = "viewer"
         end_user.is_active = True
         end_user.is_approved = True
-        end_user.allowed_special_users = ""
+        end_user.deleted_at = None
 
         req = MagicMock()
         req.cookies = {"provision_token": token}
@@ -4245,8 +4356,10 @@ class TestGenerationJobs:
         from app.services.generation_jobs import GenerationJobManager
         m = GenerationJobManager()
         phases = m._compute_phases("generate_missing", {})
+        # R15 — the stream artifact is generated regardless of TLS, so
+        # `stream_conf` sits between the ports validation and nginx.
         assert phases == ["compose", "validate", "serving_ports", "validate_ports",
-                          "nginx", "validate_conf", "env"]
+                          "stream_conf", "nginx", "validate_conf", "env"]
         assert phases.index("validate") == phases.index("compose") + 1
         assert phases.index("serving_ports") == phases.index("validate") + 1
         assert phases.index("validate_ports") == phases.index("serving_ports") + 1
@@ -4302,10 +4415,12 @@ class TestGenerationJobs:
         req["selection"]["nginx"] = "nginx.conf"
         assert "nginx" not in GenerationJobManager._compute_phases("generate_missing", req)
 
-    def test_standalone_generate_keeps_the_disk_reading(self, tmp_path, monkeypatch):
-        """The Source Projects panel sends no `user_name`; for it, "missing" is
-        exactly what its action means, so an unselected slot that EXISTS on disk
-        is not regenerated."""
+    def test_standalone_generate_also_treats_empty_as_generate(self, tmp_path, monkeypatch):
+        """The standalone panel has the same slot contract as the deploy panel.
+
+        An empty slot says "generate new", so an existing compose/nginx does NOT
+        suppress it. The disk scan no longer decides the phases.
+        """
         from pathlib import Path
         from app.config import settings
         from app.services.generation_jobs import GenerationJobManager
@@ -4318,12 +4433,16 @@ class TestGenerationJobs:
 
         req = {"service_name": "svc", "skip_env": True,
                "selection": {"compose": [], "nginx": None, "env": []}}
-        # The disk reading still holds for the two files that exist; the
-        # serving-ports artifact does NOT exist in this recipe, and a recipe
-        # without one cannot deploy (R1.1/G20) — so it (and the validation that
-        # follows it, once the artifact is in play) is what is left.
         phases = GenerationJobManager._compute_phases("generate_missing", req)
-        assert phases == ["serving_ports", "validate_ports"], phases
+        assert phases == ["compose", "validate", "serving_ports",
+                          "validate_ports", "stream_conf", "nginx",
+                          "validate_conf"], phases
+
+        # `serving_ports_none` is still the one deliberate skip.
+        req["selection"]["serving_ports_none"] = True
+        phases = GenerationJobManager._compute_phases("generate_missing", req)
+        assert "serving_ports" not in phases
+        assert "validate_ports" not in phases
 
     def test_compute_phases_unknown_raises(self):
         """Unknown categories must raise GenerationJobError (router → 400)."""
@@ -4353,7 +4472,7 @@ class TestGenerationJobs:
         assert job.id is not None
         assert job.status == "queued"
         assert job.phase == "compose"
-        assert job.phase_total == 7  # compose → validate → serving_ports → validate_ports → nginx → validate_conf → env
+        assert job.phase_total == 8  # compose → validate → serving_ports → validate_ports → stream_conf → nginx → validate_conf → env
         assert job.progress == "queued"
         m._run_job.assert_awaited_once()
 
@@ -5878,6 +5997,52 @@ class TestEnvReferencePicker:
         src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
         assert "payload.env_reference" not in src
 
+    def test_standalone_panel_uses_the_reference_picker_and_no_interpolation_slot(self):
+        src = (_DASH / "src" / "components" / "services" / "GenerateMissingPanel.tsx").read_text()
+        assert "showEnv={false}" in src
+        assert "Env reference (generation context)" in src
+        assert "env_reference: envRefs" in src
+        assert "Generate Base Files" in src
+        assert "Generate Missing Files" not in src
+        assert "env: []," in src, "selection.env stays empty; the reference travels separately"
+        # Selected recipe files stay openable/editable; saving forks to .fix.
+        assert "onOpenFile={openSelectedFile}" in src
+        assert "fixVariantFor" in src
+        assert "Save as .fix and use it" in src
+        # The reference picker sits below the prompt input.
+        assert src.index("Generation prompt") < src.index("Env reference (generation context)")
+        # Recipe-level generation is profile-blind; the standalone panel has
+        # no profile picker and sends no profiles.
+        assert "showProfiles={false}" in src
+        assert "profiles: []," in src
+
+    def test_deploy_generation_is_profile_blind_but_the_deploy_is_not(self):
+        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert "const generationSelection" in src
+        assert src.count("selection: generationSelection()") == 2
+        assert "if (sel.profiles.length > 0) payload.profiles = sel.profiles" in src
+
+    def test_generated_files_distinguish_recipe_from_per_user(self):
+        src = (_DASH / "src" / "pages" / "ServicesPage.tsx").read_text()
+        assert "export function generatedFileScope" in src
+        assert "color={scope === 'recipe' ? 'gold' : 'purple'}" in src
+        assert "Recipe-level generated artifact" in src
+        assert "Per-user, per-service generated file" in src
+        assert '<Tag color="gold">recipe</Tag><Tag color="purple">per-user</Tag>' in src
+
+    def test_serving_ports_has_the_same_generate_new_tag(self):
+        src = (_DASH / "src" / "components" / "services" / "FileSetSelection.tsx").read_text()
+        assert "!sel.serving_ports && !sel.serving_ports_none" in src
+        assert src.count("generate new — the pipeline will create one") >= 3, (
+            "compose, serving ports and nginx use the same generate-new tag")
+
+    def test_the_source_projects_robot_is_clickable_when_base_files_exist(self):
+        src = (_DASH / "src" / "pages" / "ServicesPage.tsx").read_text()
+        assert "disabled={isChecking || hasAll}" not in src
+        assert "type={hasAll ? 'default' : 'primary'}" in src
+        assert "Essential base files are already there; you can click to generate new ones." in src
+        assert "m !== '.env'" in src, "the readiness list excludes deploy-time env"
+
 
 class TestPreDeployRegistry:
     """§8b: pre-deploy sessions live in the gateway, never the -api registry."""
@@ -6708,22 +6873,17 @@ class TestValidateRunsForASelectedCompose:
     def test_validate_runs_when_a_compose_is_selected(self):
         from app.services.generation_jobs import GenerationJobManager
         m = GenerationJobManager()
-        # Compose already on disk (so not "missing") but selected for use.
-        import unittest.mock as _m
-        with _m.patch.object(GenerationJobManager, "_recipe_missing", return_value=["nginx.conf"]):
-            phases = m._compute_phases("generate_missing", {
-                "selection": {"compose": ["docker-compose.yml"]},
-            })
+        # Compose already on disk and selected for use.
+        phases = m._compute_phases("generate_missing", {
+            "selection": {"compose": ["docker-compose.yml"]},
+        })
         assert "validate" in phases, "the operator's own selected compose can carry the conflict"
         assert "compose" not in phases, "nothing to generate — it already exists"
 
-    def test_no_validate_when_no_compose_is_in_play(self):
+    def test_an_empty_compose_slot_generates_and_is_validated(self):
         from app.services.generation_jobs import GenerationJobManager
-        import unittest.mock as _m
-        m = GenerationJobManager()
-        with _m.patch.object(GenerationJobManager, "_recipe_missing", return_value=["nginx.conf"]):
-            phases = m._compute_phases("generate_missing", {"selection": {}})
-        assert "validate" not in phases
+        phases = GenerationJobManager._compute_phases("generate_missing", {"selection": {}})
+        assert "compose" in phases and "validate" in phases
 
 
 class TestFixValidatesItsOwnOutput:
@@ -8831,14 +8991,16 @@ class TestStreamExposureMint:
         assert resolved.id == owner.id and resolved.username == "shared2"
 
     def test_a_granted_special_user_may_mint(self):
-        """The mint applies the SAME matrix the gate does: a recorded
-        allowed_special_users grant is enough."""
+        """The mint applies the SAME matrix the gate does: an active ID-keyed
+        grant is enough."""
         from app.database import SessionLocal
         from app.routers.stream import _owner_for_mint
-        from unittest.mock import MagicMock
+        from app.services import acl_service
 
         db = SessionLocal()
-        viewer = self._user(db, username="alice", allowed_special_users="shared2")
+        viewer = self._user(db, username="alice")
+        shared = self._user(db, username="shared2")
+        acl_service.set_grant(db, viewer.id, shared.id, True)
         requester = {"id": viewer.id, "user_type": "end_user", "role": "viewer"}
         resolved = _owner_for_mint(db, self._entry(), requester)
         assert resolved.id == viewer.id
@@ -8924,18 +9086,19 @@ class TestStreamVerdict:
         assert stream_service.verify(db, _FakeRegistry([self._entry()]), raw)["allow"] is False
 
     def test_a_revoked_grant_bites_at_the_next_connection(self):
-        """R3.3: the matrix runs per connection and is uncached — a special
-        user's grant revoked between two connects denies the second."""
+        """R3.3: the matrix runs per connection and is uncached — a grant
+        deactivated between two connects denies the second."""
         from app.database import SessionLocal
-        from app.services import stream_service
+        from app.services import acl_service, stream_service
         db = SessionLocal()
-        viewer = self._user(db, username="alice", allowed_special_users="shared2")
+        viewer = self._user(db, username="alice")
+        shared = self._user(db, username="shared2")
+        acl_service.set_grant(db, viewer.id, shared.id, True)
         raw = self._mint(db, viewer)
         reg = _FakeRegistry([self._entry()])
         assert stream_service.verify(db, reg, raw)["allow"] is True
 
-        viewer.allowed_special_users = ""
-        db.commit()
+        acl_service.set_grant(db, viewer.id, shared.id, False)
         assert stream_service.verify(db, reg, raw)["allow"] is False
 
     def test_a_gateway_side_error_is_a_deny(self):
@@ -8957,17 +9120,18 @@ class TestStreamVerdict:
         from app.database import SessionLocal
         from app.config import settings
         from app.routers.auth import verify_auth
-        from app.services import stream_service
+        from app.services import acl_service, stream_service
 
         db = SessionLocal()
-        viewer = self._user(db, username="alice", allowed_special_users="")
-        db.add(self._user(db, username="shared2"))
-        db.commit()
+        viewer = self._user(db, username="alice")
+        shared = self._user(db, username="shared2")
 
-        def gate_allows(allowed_special: str) -> bool:
+        def set_active(active: bool) -> None:
+            acl_service.set_grant(db, viewer.id, shared.id, active)
+
+        def gate_allows(active: bool) -> bool:
             """The HTTP gate's answer for `alice` hitting the shared2 instance."""
-            viewer.allowed_special_users = allowed_special
-            db.commit()
+            set_active(active)
             req = MagicMock()
             req.cookies = {"provision_token": "t"}
             req.headers = {"Accept": "text/html", "Host": "graphiti-local-shared2-0.localhost"}
@@ -8977,9 +9141,8 @@ class TestStreamVerdict:
                  patch("app.routers.auth._get_service_basic_credential", return_value=""):
                 return verify_auth(req, db).status_code == 200
 
-        def stream_allows(allowed_special: str) -> bool:
-            viewer.allowed_special_users = allowed_special
-            db.commit()
+        def stream_allows(active: bool) -> bool:
+            set_active(active)
             raw = self._mint(db, viewer)
             return stream_service.verify(db, _FakeRegistry([self._entry()]), raw)["allow"]
 
@@ -8987,12 +9150,12 @@ class TestStreamVerdict:
         try:
             # The controls first: they prove the two directions are actually
             # reachable, so "they agree" cannot be agreement on a constant deny.
-            assert gate_allows("") is False, "without a grant the gate must deny (control)"
-            assert gate_allows("shared2") is True, "with the grant the gate must allow (control)"
+            assert gate_allows(False) is False, "without a grant the gate must deny (control)"
+            assert gate_allows(True) is True, "with the grant the gate must allow (control)"
 
-            for grant in ("", "shared2"):
-                assert gate_allows(grant) == stream_allows(grant), (
-                    f"the gate and the stream verdict disagree for grant={grant!r}")
+            for active in (False, True):
+                assert gate_allows(active) == stream_allows(active), (
+                    f"the gate and the stream verdict disagree for active={active!r}")
         finally:
             settings.ENABLE_ACL = False
 
@@ -9544,16 +9707,61 @@ class TestPhaseBodiesBindTheirOwnNames:
         assert self._unbound_loads(str(probe), "_run_job") == []
 
 
+class TestTheGeneratedNginxTemplateIsPlaceholderFree:
+    """T1 / R1 — the model is told to write a PLAIN conf with mock names.
+
+    The generation template is not a `.j2` file: it is the text the model is
+    told to copy. A `{{ … }}` in it would put placeholder insertion in the
+    model's hands, and a TLS instruction would put certificate paths there too.
+    """
+
+    def test_the_template_uses_mock_names_and_no_template_syntax(self):
+        from app.utils import skill_loader
+        tpl = skill_loader.get_nginx_template()
+        full = skill_loader._SKILL_PATH.read_text()
+        # R14 — there is no primary block: the template's one shape is the
+        # `--<sub_service>` endpoint, and a bare name is refused.
+        assert "server_name mock_server_name;" not in tpl
+        assert "server_name mock_server_name--{sub_service};" in tpl
+        assert "server_name mock_server_name--{sub_service};" in full
+        assert "{service_name}_hostname" not in full
+        assert "{{" not in tpl, "the model must not be told to write template syntax"
+        assert "ssl_certificate" not in tpl
+        assert "listen 443" not in tpl, "a generated HTTP conf is listen 80 only"
+
+    def test_the_https_guidance_is_gone(self):
+        from app.utils import skill_loader
+        text = skill_loader._SKILL_PATH.read_text()
+        assert "For HTTPS support, wrap the server blocks" not in text
+        assert "use `{{ ssl_certificate_path }}`" not in text
+
+    def test_the_extra_endpoint_prompt_names_the_mock_form(self, tmp_path):
+        from app.services.llm_service import LLMService
+        sp = tmp_path / "serving_ports.yml"
+        sp.write_text(
+            "ports:\n"
+            "  - sub_service: graph\n    port: 8000\n    kind: http\n    primary: true\n"
+            "  - sub_service: neo4j\n    port: 7474\n    kind: http\n"
+        )
+        prompt = LLMService()._build_generation_prompt(
+            "nginx_conf",
+            {"serving_ports_path": str(sp), "compose_service_names": ["graph", "neo4j"],
+             "deploy_metadata": {"domain": "example.test"}},
+        )
+        assert "server_name mock_server_name--neo4j;" in prompt
+        assert "server_name mock_server_name--graph;" in prompt
+        assert "_hostname--" not in prompt
+
+
 class TestValidateConfReadsTheRenderedConf:
     """F46/F47 — `validate_conf` must judge the conf the platform will SERVE.
 
     The conf in play is a template: the SKILL tells the generator to write
-    `server_name <service>_hostname` (SKILL.md:504), and the -api's converter
-    rewrites every `server_name …;` to `{{ hostname }}` at render time
-    (lib/nginx_converter.py:73-77). A checker reading the pre-conversion text
-    compares names the platform never serves — it refused a generated conf for
-    not serving a name it was about to be given (measured 2026-10-10, jobs
-    366/367).
+    `server_name mock_server_name` (and `mock_server_name--<sub>`), and the
+    -api's converter rewrites every `server_name …;` at conversion time. A
+    checker reading the pre-conversion text must therefore be name-agnostic —
+    it once refused a generated conf for not serving a name it was about to be
+    given (measured 2026-10-10, jobs 366/367).
     """
 
     _PORTS_ONE = {"ports": [
@@ -9568,9 +9776,9 @@ class TestValidateConfReadsTheRenderedConf:
             label="0", domain="snaprovision.com",
         )
 
-    def test_the_skill_placeholder_is_read_as_the_instance_host(self):
+    def test_the_skill_placeholder_is_read_as_an_endpoint(self):
         conf = (
-            "server {\n    listen 80;\n    server_name graph_hostname;\n"
+            "server {\n    listen 80;\n    server_name mock_server_name--graph;\n"
             "    location / {\n        proxy_pass http://graph:8000;\n    }\n}\n"
         )
         res = self._check(self._PORTS_ONE, conf)
@@ -9579,7 +9787,7 @@ class TestValidateConfReadsTheRenderedConf:
     def test_the_final_form_still_validates(self):
         conf = (
             "server {\n    listen 80;\n"
-            "    server_name {{ hostname }};\n"
+            "    server_name {{ hostname_stem }}--graph.{{ domain_name }};\n"
             "    location / {\n        proxy_pass http://graph:8000;\n    }\n}\n"
         )
         assert self._check(self._PORTS_ONE, conf)["valid"] is True
@@ -9596,9 +9804,9 @@ class TestValidateConfReadsTheRenderedConf:
             {"sub_service": "neo4j", "port": 7474, "kind": "http", "profiles": []},
         ]}
         conf = (
-            "server {\n    listen 80;\n    server_name graph_hostname;\n"
+            "server {\n    listen 80;\n    server_name mock_server_name--graph;\n"
             "    location / {\n        proxy_pass http://graph:8000;\n    }\n}\n"
-            "server {\n    listen 80;\n    server_name graph_hostname--neo4j;\n"
+            "server {\n    listen 80;\n    server_name mock_server_name--neo4j;\n"
             "    location / {\n        proxy_pass http://neo4j:7474;\n    }\n}\n"
         )
         res = self._check(ports, conf)
@@ -9633,7 +9841,7 @@ class TestProduceForDeploy:
         return produce_for_deploy(
             service_name="graphiti-local", user_name="shared2", label="0",
             domain="snaprovision.com", serving_ports_path=str(sp),
-            ssl_dir=str(tmp_path / "ssl"), recipe_dir=str(recipe),
+            recipe_dir=str(recipe),
         )
 
     def test_it_writes_a_file_for_a_stream_row(self, tmp_path):
@@ -9642,13 +9850,17 @@ class TestProduceForDeploy:
         text = Path(out).read_text()
         # Whitespace-insensitive on purpose: the conf's columns are padding, and a
         # spacing change is not a behavioural change.
-        # G56 — the produced file is a TEMPLATE: the -api renders the target
-        # instance's names, so a conf from another deployment is reusable.
+        # the produced file is PLAIN: a mock name, a plain upstream, and neither
+        # a certificate nor a policy — the -api supplies all three at conversion
+        # and render time (R2/R3/R4).
         assert re.search(
-            r"server_name\s+\{\{ hostname_stem \}\}--neo4j\.\{\{ domain_name \}\};", text
+            r"server_name\s+mock_server_name--neo4j\.mock\.invalid;", text
         ), text
-        assert "ssl_certificate" in text, "the per-block certificate (R5.4)"
-        # the last hop is plain (R5.5) and there is no http-only scaffolding
+        assert "proxy_pass          neo4j:7687;" in text
+        assert "ssl_certificate" not in text
+        assert "allow" not in text and "deny" not in text
+        assert "{{" not in text
+        # and there is no http-only scaffolding
         assert "auth_basic" not in text and "{% if" not in text
 
     def test_no_artifact_and_no_stream_row_write_nothing(self, tmp_path):
@@ -9658,7 +9870,7 @@ class TestProduceForDeploy:
         recipe.mkdir(exist_ok=True)
         assert produce_for_deploy(
             service_name="s", user_name="u", label="0", domain="d",
-            serving_ports_path=None, ssl_dir=str(tmp_path), recipe_dir=str(recipe),
+            serving_ports_path=None, recipe_dir=str(recipe),
         ) is None, "R1.4 by construction: nothing to expose, no file"
         only_http = self._produce(
             tmp_path,
@@ -9868,63 +10080,149 @@ class TestStreamConfGenerator:
         assert subs == ["neo4j", "falkordb"], (
             "http is not a stream row, and a row with NO kind is not exposed at all (R1.2)")
 
-    def test_the_generated_conf_has_the_shape_r9_2_converts(self):
+    def test_the_generated_conf_has_the_shape_the_converter_expects(self):
         from app.services.stream_conf import render_stream_conf, stream_rows
-        text = render_stream_conf(
-            stream_rows({"ports": self._ROWS}),
-            service_name="example-mcp", user_name="alice", label="3", domain="snaprovision.com",
-            cert_pem="/srv/provision_subnet_acl/ssl/snaprovision.com/fullchain.pem",
-            cert_key="/srv/provision_subnet_acl/ssl/snaprovision.com/privkey.pem",
-        )
-        # one block per stream row, selected by the -api-RENDERED canonical name
-        # (G56: the generated artifact is a TEMPLATE — no instance identity baked in)
+        text = render_stream_conf(stream_rows({"ports": self._ROWS}))
+        # one block per stream row, selected by a MOCK name the -api rebuilds.
+        # `.invalid` is reserved, so the mock can never be mistaken for a real
+        # endpoint (R2); the dot after the sub-service is what the stream
+        # converter parses.
         assert text.count("server {") == 2
-        assert "server_name         {{ hostname_stem }}--neo4j.{{ domain_name }};" in text
-        assert "server_name         {{ hostname_stem }}--falkordb.{{ domain_name }};" in text
-        # the per-block certificate, and NO `map` DIRECTIVE — these names are known
-        # when the conf is generated, so each block carries its own certificate
-        # (R4.3's per-listener rule). Checked against the CODE, not the prose: the
-        # comments legitimately say the word "map" while explaining its absence.
-        assert "ssl_certificate     /srv/provision_subnet_acl/ssl/snaprovision.com/fullchain.pem;" in text
+        assert "server_name         mock_server_name--neo4j.mock.invalid;" in text
+        assert "server_name         mock_server_name--falkordb.mock.invalid;" in text
+        # the last hop is PLAIN — the converter prefixes it — and STATIC, because
+        # the variable form defeats the SNI-based choice of virtual server
+        # (measured 2026-10-16: every SNI hit the first block).
+        assert "proxy_pass          neo4j:7687;" in text
+        assert "proxy_pass          falkordb:6379;" in text
         code = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("#"))
-        assert "map " not in code
-        # the guard and the PLAIN last hop
-        assert "allow               172.17.0.0/16;" in text and "deny                all;" in text
-        # The last hop is STATIC, and carries the -api's `{{ container_prefix }}`.
-        #
-        # Both halves are load-bearing, and both were measured on 2026-10-16:
-        #   * STATIC, because the variable form (`set $stream_upstream …` +
-        #     `resolver` + `proxy_pass $stream_upstream`) DEFEATS the SNI-based
-        #     choice of virtual server — in a minimal two-block reproduction both
-        #     SNIs hit the FIRST block, and on the live door the falkordb row
-        #     answered nothing (the bytes reached neo4j's Bolt listener) instead of
-        #     `+PONG`. Every row but the first was unreachable.
-        #   * the PLACEHOLDER, because this file is the handoff: the -api renders it
-        #     (`{{ container_prefix }}` = `<prefix><service>-user_<user>-<label>-`,
-        #     one home in `template_engine.container_prefix`), so the name is the
-        #     instance's OWN container and not one every instance shares.
-        assert "proxy_pass          {{ container_prefix }}neo4j:7687;" in text
-        assert "proxy_pass          {{ container_prefix }}falkordb:6379;" in text
-        # …and the variable form, which is the defect, must never come back.
-        # Checked against the CODE: the comments above name it on purpose.
-        assert "$stream_upstream" not in code, (
-            "a variable upstream makes nginx serve every SNI from the FIRST block")
+        assert "$stream_upstream" not in code
         assert "resolver" not in code, "a resolver is only needed for a variable upstream"
-        # `ssl_preread` is NOT required for this: the static form selects the block
-        # by SNI on its own (measured), so the conf stays free of it.
         assert "ssl_preread" not in code
-        # and the three things it must NEVER write
+        # and what it must NEVER write (R3, R4)
+        assert "ssl_certificate" not in code and "ssl_certificate_key" not in code
+        assert "allow" not in code and "deny" not in code
+        assert "{{" not in code, "a generated artifact is plain"
         assert "auth_basic" not in text, "the stream module has no such directive"
         assert "{% if" not in text, "a stream block's TLS listener is structural — no guard"
         assert "listen              7687 ssl;" in text
+
+    def test_a_single_row_yields_one_block(self):
+        from app.services.stream_conf import render_stream_conf, stream_rows
+        text = render_stream_conf(
+            stream_rows({"ports": [{"sub_service": "neo4j", "port": 7687, "kind": "bolt"}]})
+        )
+        assert text.count("server {") == 1
+        assert "mock_server_name--neo4j.mock.invalid" in text
+        assert "proxy_pass          neo4j:7687;" in text
+
+    def test_the_boundary_port_and_a_hyphenated_sub_service_survive_verbatim(self):
+        from app.services.stream_conf import render_stream_conf, stream_rows
+        text = render_stream_conf(
+            stream_rows({"ports": [
+                {"sub_service": "mcp-server", "port": 65535, "kind": "bolt"},
+            ]})
+        )
+        assert "mock_server_name--mcp-server.mock.invalid" in text
+        assert "proxy_pass          mcp-server:65535;" in text
 
     def test_no_stream_rows_means_no_file_at_all(self):
         """R1.4 by construction: nothing to write ⇒ nothing exposed."""
         from app.services.stream_conf import render_stream_conf, stream_rows
         rows = stream_rows({"ports": [{"sub_service": "graph", "port": 8000, "kind": "http"}]})
         assert rows == []
-        assert render_stream_conf(rows, service_name="s", user_name="u", label="0",
-                                  domain="d", cert_pem="c", cert_key="k") == ""
+        assert render_stream_conf(rows) == ""
+
+    def test_the_generated_artifact_agrees_with_its_own_serving_ports(self):
+        """T2 integration — coverage is matched by `--<sub>`, not by a full name.
+
+        The mock name is not the canonical name, so this also proves the
+        agreement check is name-agnostic for a stream artifact.
+        """
+        from app.services.serving_ports import validate_conf_agreement
+        from app.services.stream_conf import render_stream_conf, stream_rows
+        ports = {"ports": [
+            {"sub_service": "graph", "port": 8000, "kind": "http", "primary": True},
+            {"sub_service": "neo4j", "port": 7687, "kind": "bolt"},
+            {"sub_service": "falkordb", "port": 6379, "kind": "redis",
+             "profiles": ["falkordb"]},
+        ]}
+        text = render_stream_conf(stream_rows(ports))
+        res = validate_conf_agreement(
+            ports, text, service_name="example-mcp", user_name="alice", label="3",
+            domain="snaprovision.com", category="stream",
+        )
+        assert res["valid"] is True, res
+        assert not res["errors"]
+
+    def test_the_stream_phase_never_consults_the_llm(self, tmp_path, monkeypatch):
+        """T2 fault injection — a stub LLM that raises on every call.
+
+        Everything the phase needs is selected; the stream slot is absent, so it
+        is generated. If any step reached for the model the job would fail.
+        """
+        import asyncio
+        import json
+
+        from app.config import settings
+        from app.database import SessionLocal
+        from app.models.generation_job import GenerationJob
+        from app.services import llm_service as llm_mod
+        from app.services.generation_jobs import GenerationJobManager
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", Path(tmp_path))
+        recipe = tmp_path / "myapp"
+        recipe.mkdir(parents=True)
+        (recipe / "docker-compose.yml").write_text(
+            "services:\n"
+            "  graph:\n    image: alpine\n    ports:\n      - '8000:8000'\n"
+            "  neo4j:\n    image: alpine\n    ports:\n      - '7687:7687'\n"
+        )
+        (recipe / "serving_ports.yml").write_text(
+            "ports:\n"
+            "  - sub_service: graph\n    port: 8000\n    kind: http\n    primary: true\n"
+            "  - sub_service: neo4j\n    port: 7687\n    kind: bolt\n"
+        )
+        (recipe / "nginx.conf").write_text(
+            "server {\n listen 80;\n server_name mock_server_name--graph;\n"
+            " proxy_pass http://graph:8000;\n}\n"
+        )
+
+        async def _boom(*_a, **_k):
+            raise AssertionError("the stream phase must not call the LLM")
+
+        monkeypatch.setattr(llm_mod.llm_service, "generate_with_agent", _boom)
+        monkeypatch.setattr(llm_mod.llm_service, "generate_env_two_turn", _boom)
+        monkeypatch.setattr(llm_mod.llm_service, "generate_fix_guide", _boom)
+
+        async def scenario():
+            m = GenerationJobManager()   # fresh: the lock is loop-bound
+            db = SessionLocal()
+            job = m.create_job(db, "myapp", "", "generate_missing", {
+                "service_name": "myapp",
+                "selection": {"compose": ["docker-compose.yml"],
+                              "serving_ports": "serving_ports.yml",
+                              "nginx": "nginx.conf", "stream_conf": None, "env": []},
+                "skip_env": True, "user_name": "alice", "label": "0",
+                "deploy_metadata": {"https": True, "domain": "example.test"},
+            })
+            jid = job.id
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                if m.job_status(jid) in ("completed", "failed", "paused"):
+                    break
+            db.expire_all()
+            row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
+            return row.status, json.loads(row.result or "{}"), (row.error or "")
+
+        status, _result, err = asyncio.run(scenario())
+        assert status == "completed", f"the mechanical phase must stand alone: {status}: {err}"
+        confs = list(recipe.glob("nginx.stream.base.*.conf"))
+        assert confs, "the stream slot was generated"
+        text = confs[0].read_text()
+        assert "mock_server_name--neo4j.mock.invalid" in text
+        assert "proxy_pass          neo4j:7687;" in text
+        assert "allow" not in text and "deny" not in text
 
     def test_the_canonical_name_cannot_drift_from_the_exposure_service(self):
         """One name, two call sites: the minted handle stores it and the generated
@@ -9939,14 +10237,13 @@ class TestStreamConfGenerator:
             exposure_name(entry, "neo4j")
 
 
-class TestTheStreamConfSlotIsConditionalOnTls:
-    """T20 / R8.4 — the stream-conf slot exists only when TLS is in play.
+class TestTheStreamConfSlotIsIndependentOfTls:
+    """R15 / G68 — the stream ARTIFACT is generated regardless of TLS.
 
-    With TLS off the slot is NOT generated, NOT demanded by "every slot must come
-    out named", and NOT carried in the refusal record — so a replay reproduces the
-    same shape. A `serving_ports` row may still be declared: the file is about
-    ports and kinds, not about transport; that row simply has no conf, no route
-    and no exposure.
+    TLS gates the deploy SLOT (the dashboard omits it, the gateway strips it,
+    the -api refuses it) and stream VALIDATION on a TLS-off deploy; it never
+    gates generation. The standalone path validates the artifact as a
+    recipe-quality check.
     """
 
     def _req(self, tls: bool) -> dict:
@@ -9965,10 +10262,10 @@ class TestTheStreamConfSlotIsConditionalOnTls:
             "the conf is derived FROM the artifact, so the artifact comes first")
         assert phases.index("stream_conf") < phases.index("env")
 
-    def test_tls_off_omits_it_entirely(self):
+    def test_tls_off_still_generates_the_artifact(self):
         from app.services.generation_jobs import GenerationJobManager
         phases = GenerationJobManager._compute_phases("generate_missing", self._req(False))
-        assert "stream_conf" not in phases
+        assert "stream_conf" in phases
 
     def test_the_phase_order_places_it_after_the_artifact(self):
         from app.services.generation_jobs import PHASE_ORDER
@@ -10095,7 +10392,7 @@ class TestConfAgreement:
     ]}
     _CONF = """server {
     listen 80;
-    server_name example-mcp_hostname;
+    server_name example-mcp_hostname--graph;
     set $upstream graph:8000;
     proxy_pass $upstream;
 }
@@ -10131,15 +10428,11 @@ class TestConfAgreement:
         assert not r["valid"]
         assert any("no `server{}` block serves" in e for e in r["errors"]), r["errors"]
 
-    def test_the_primary_row_needs_a_block_at_all(self):
-        """The remaining shape of R1.3's primary rule.
-
-        A conf with NO `server{}` block serves nothing, so the primary row — and
-        every other row — is unserved. (Which *block* serves the primary is no
-        longer checkable by name: see the xfail below.)
-        """
+    def test_every_http_row_needs_a_block(self):
+        """R14 — there is no primary: every row is matched by its `--<sub>`
+        block, so a conf with no block serves none of them."""
         r = self._v("", self._PORTS)
-        assert any("primary" in e for e in r["errors"]), r["errors"]
+        assert any("graph" in e for e in r["errors"]), r["errors"]
 
     def test_a_block_that_disagrees_with_its_row_fails_the_upstream_port_check(self):
         """G56 — the upstream/port IS checked (the -api cannot invent the port);
@@ -10245,20 +10538,21 @@ class TestTheGoRelayKnowsExtraEndpoints:
         got = idx.get_by_hostname("graphiti-local-shared2-2--neo4j.snaprovision.com")
         assert got is not None and got["label"] == "2", got
 
-    def test_the_primary_still_resolves(self, tmp_path):
+    def test_the_instance_host_is_not_a_route(self, tmp_path):
+        """R14 — `/go/<instance host>` must answer 404: identity, not a route."""
         idx = self._index(tmp_path, [self._ENTRY])
-        assert idx.get_by_hostname("graphiti-local-shared2-2.snaprovision.com")["label"] == "2"
+        assert idx.get_by_hostname("graphiti-local-shared2-2.snaprovision.com") is None
 
-    def test_an_alias_never_shadows_another_instances_own_hostname(self, tmp_path):
-        """`setdefault`, not assignment: a real hostname always wins."""
+    def test_a_duplicate_alias_keeps_the_first_entry(self, tmp_path):
+        """`setdefault`, not assignment: the first entry claiming a name keeps it."""
         impostor = {
             "user_name": "alice", "service_name": "other", "label": "0",
-            "hostname": "graphiti-local-shared2-2--neo4j.snaprovision.com",
+            "http_endpoints": ["graphiti-local-shared2-2--neo4j.snaprovision.com"],
         }
         idx = self._index(tmp_path, [self._ENTRY, impostor])
         got = idx.get_by_hostname("graphiti-local-shared2-2--neo4j.snaprovision.com")
-        assert got["user_name"] == "alice", (
-            "the entry whose OWN hostname this is must keep it")
+        assert got["user_name"] == "shared2", (
+            "the FIRST entry that claims a served name keeps it")
 
 
 class TestTheRecordsTlsSwitch:
@@ -10504,3 +10798,799 @@ class TestComposePromptPreservesProfiles:
         src = (Path(__file__).resolve().parents[1] / "app/services/llm_service.py").read_text()
         assert "PRESERVE `profiles:` EXACTLY" in src
         assert 'profiles: [""]' in src
+
+
+# ---------------------------------------------------------------------------
+# R14 — no primary endpoint; R15 — the stream artifact is TLS-independent
+# ---------------------------------------------------------------------------
+
+
+class TestPrimaryRemovalGateway:
+    """R14 — every HTTP row is an equal `--<sub>` endpoint.
+
+    A `primary: true` field in an older artifact is ignored WITHOUT a warning,
+    and the validator never infers a primary from a block with no `--`.
+    """
+
+    def test_primary_is_ignored_without_a_warning(self, tmp_path):
+        from app.services.config_validation import validate_serving_ports
+
+        compose = tmp_path / "docker-compose.yml"
+        compose.write_text(
+            "services:\n"
+            "  graph:\n    image: alpine\n    expose: ['8000']\n"
+            "  neo4j:\n    image: alpine\n    expose: ['7474']\n"
+        )
+        content = (
+            "ports:\n"
+            "  - sub_service: graph\n    port: 8000\n    kind: http\n    primary: true\n"
+            "  - sub_service: neo4j\n    port: 7474\n    kind: http\n    primary: true\n"
+        )
+        res = validate_serving_ports(content, [compose])
+        assert res["valid"] is True, res
+        assert not any("primary" in w.lower() for w in res["warnings"]), res["warnings"]
+
+    def test_a_bare_block_serves_no_row(self):
+        from app.services.serving_ports import validate_conf_agreement
+
+        ports = {"ports": [
+            {"sub_service": "graph", "port": 8000, "kind": "http"},
+        ]}
+        conf = (
+            "server {\n    listen 80;\n    server_name mock_server_name;\n"
+            "    proxy_pass http://graph:8000;\n}\n"
+        )
+        res = validate_conf_agreement(
+            ports, conf, service_name="svc", user_name="alice", label="0",
+            domain="example.test",
+        )
+        assert res["valid"] is False
+        assert any("no `server{}` block serves" in e for e in res["errors"])
+
+    def test_every_http_row_needs_its_own_endpoint_block(self):
+        from app.services.serving_ports import validate_conf_agreement
+
+        ports = {"ports": [
+            {"sub_service": "graph", "port": 8000, "kind": "http"},
+            {"sub_service": "neo4j", "port": 7474, "kind": "http"},
+        ]}
+        conf = (
+            "server {\n    listen 80;\n    server_name mock_server_name--graph;\n"
+            "    proxy_pass http://graph:8000;\n}\n"
+            "server {\n    listen 80;\n    server_name mock_server_name--neo4j;\n"
+            "    proxy_pass http://neo4j:7474;\n}\n"
+        )
+        res = validate_conf_agreement(
+            ports, conf, service_name="svc", user_name="alice", label="0",
+            domain="example.test",
+        )
+        assert res["valid"] is True, res
+
+    def test_the_extra_endpoint_prompt_lists_every_http_row(self, tmp_path):
+        from app.services.llm_service import LLMService
+
+        sp = tmp_path / "serving_ports.yml"
+        sp.write_text(
+            "ports:\n"
+            "  - sub_service: graph\n    port: 8000\n    kind: http\n    primary: true\n"
+            "  - sub_service: neo4j\n    port: 7474\n    kind: http\n"
+        )
+        prompt = LLMService()._build_generation_prompt(
+            "nginx_conf",
+            {"serving_ports_path": str(sp),
+             "compose_service_names": ["graph", "neo4j"],
+             "deploy_metadata": {"domain": "example.test"}},
+        )
+        assert "server_name mock_server_name--graph;" in prompt
+        assert "server_name mock_server_name--neo4j;" in prompt
+        assert "NO primary block" in prompt
+
+
+class TestStreamValidationFollowsTheSlot:
+    """R15/G75 — a TLS-off DEPLOY skips stream validation; standalone validates."""
+
+    def _args(self, tmp_path, *, tls_on, origin):
+        from app.services.generation_jobs import validation_conf_sources
+
+        recipe = tmp_path / "recipe"
+        recipe.mkdir(exist_ok=True)
+        (recipe / "nginx.conf").write_text("server { server_name x--web; }\n")
+        (recipe / "stream.conf").write_text("server { server_name x--bolt; }\n")
+        return validation_conf_sources(
+            result_files={},
+            names={},
+            selection={"nginx": "nginx.conf", "stream_conf": "stream.conf"},
+            recipe_dir=recipe,
+            tls_on=tls_on,
+            origin=origin,
+        )
+
+    def test_a_tls_off_deploy_judges_http_only(self, tmp_path):
+        from app.models.generation_job import JOB_ORIGIN_DEPLOY
+
+        cats = [c for c, _t, _s in self._args(tmp_path, tls_on=False, origin=JOB_ORIGIN_DEPLOY)]
+        assert cats == ["http"]
+
+    def test_a_tls_on_deploy_judges_both(self, tmp_path):
+        from app.models.generation_job import JOB_ORIGIN_DEPLOY
+
+        cats = [c for c, _t, _s in self._args(tmp_path, tls_on=True, origin=JOB_ORIGIN_DEPLOY)]
+        assert cats == ["http", "stream"]
+
+    def test_the_standalone_path_judges_the_generated_artifact_without_tls(self, tmp_path):
+        from app.models.generation_job import JOB_ORIGIN_STANDALONE
+
+        cats = [c for c, _t, _s in self._args(
+            tmp_path, tls_on=False, origin=JOB_ORIGIN_STANDALONE)]
+        assert cats == ["http", "stream"]
+
+    def test_a_tls_off_deploy_phase_plans_generation(self):
+        from app.services.generation_jobs import GenerationJobManager
+
+        req = {
+            "service_name": "svc", "user_name": "alice", "label": "0",
+            "deploy_metadata": {"https": False},
+            "selection": {"compose": ["docker-compose.yml"],
+                          "nginx": "nginx.conf", "serving_ports": None},
+        }
+        phases = GenerationJobManager._compute_phases("generate_missing", req)
+        assert "stream_conf" in phases
+
+
+class TestGeneratedServingPortsIsAdopted:
+    """R19/R15 — a generated serving-ports artifact must be SELECTED and pickable.
+
+    The deploy panel adopted compose/nginx/stream from the job's reported
+    selection but not serving_ports, and its candidate lists were fetched before
+    the run — so a generated ports artifact could exist on disk while its picker
+    still read “generate new” and could not offer it (measured 2026-10-27 on
+    e2e-confs).  Both deploy paths now adopt it and refresh the candidates.
+    """
+
+    def _src(self):
+        from pathlib import Path
+        return (
+            Path(__file__).parent.parent.parent
+            / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
+        ).read_text()
+
+    def test_both_paths_adopt_the_reported_serving_ports(self):
+        src = self._src()
+        assert src.count("resultSel.serving_ports") + src.count("resSel.serving_ports") >= 2
+        assert "serving_ports_none = false" in src
+
+    def test_the_candidates_are_refreshed_after_generation(self):
+        src = self._src()
+        assert "refreshFileSetCandidates" in src
+        assert src.count("refreshFileSetCandidates(") >= 2  # both generation paths
+
+
+# ---------------------------------------------------------------------------
+# G78 — ID-keyed ACL grants (T6/T7)
+# ---------------------------------------------------------------------------
+
+
+class TestAclGrants:
+    """The grant table, its state machine and the legacy migration."""
+
+    @staticmethod
+    def _user(db, username, **over):
+        from app.models.end_user import EndUser
+        u = EndUser(
+            username=username, password_hash="x", role="special",
+            is_approved=True, is_active=True,
+        )
+        for k, v in over.items():
+            setattr(u, k, v)
+        db.add(u)
+        db.commit()
+        db.refresh(u)
+        return u
+
+    def test_two_shared_rows_are_two_rows_and_only_active_allows(self):
+        from app.database import SessionLocal
+        from app.services import acl_service
+        db = SessionLocal()
+        alice = self._user(db, "alice", role="viewer")
+        bob = self._user(db, "bob")
+        carol = self._user(db, "carol")
+        acl_service.set_grant(db, alice.id, bob.id, True)
+        acl_service.set_grant(db, alice.id, carol.id, True)
+        rows = acl_service.list_for_grantee(db, alice.id)
+        assert len(rows) == 2
+        assert acl_service.allows(db, alice, "bob") is True
+        assert acl_service.allows(db, alice, "carol") is True
+        acl_service.set_grant(db, alice.id, carol.id, False)
+        assert acl_service.allows(db, alice, "carol") is False
+        # The inactive row is kept, not deleted.
+        assert len(acl_service.list_for_grantee(db, alice.id)) == 2
+
+    def test_unique_pair(self):
+        import pytest
+        from sqlalchemy.exc import IntegrityError
+        from app.models.acl_grant import AclGrant
+        from app.database import SessionLocal
+        db = SessionLocal()
+        alice = self._user(db, "alice", role="viewer")
+        bob = self._user(db, "bob")
+        db.add(AclGrant(grantee_user_id=alice.id, shared_user_id=bob.id,
+                        state="active"))
+        db.commit()
+        db.add(AclGrant(grantee_user_id=alice.id, shared_user_id=bob.id,
+                        state="inactive"))
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+
+    def test_deactivation_inactivates_both_directions_and_activation_does_not_restore(self):
+        from app.database import SessionLocal
+        from app.services import acl_service
+        db = SessionLocal()
+        alice = self._user(db, "alice", role="viewer")
+        bob = self._user(db, "bob")
+        carol = self._user(db, "carol", role="viewer")
+        acl_service.set_grant(db, alice.id, bob.id, True)   # alice -> bob
+        acl_service.set_grant(db, carol.id, bob.id, True)   # carol -> bob
+        assert acl_service.inactivate_for_user(db, bob.id) == 2
+        db.commit()
+        assert all(g["state"] == "inactive"
+                   for g in acl_service.list_for_grantee(db, alice.id))
+        assert all(g["state"] == "inactive"
+                   for g in acl_service.list_for_grantee(db, carol.id))
+        # Reactivating bob does not reactivate either row.
+        bob.is_active = True
+        db.commit()
+        assert acl_service.allows(db, alice, "bob") is False
+        assert acl_service.allows(db, carol, "bob") is False
+
+    def test_historical_public_marker_from_audit_does_not_restore_access(self):
+        from datetime import datetime, timezone
+        from app.database import SessionLocal
+        from app.models.audit_log import AuditLog
+        from app.services import acl_service
+        db = SessionLocal()
+        # Simulate a tombstone written before the flag-retention change: flag
+        # cleared, but the registration-time public audit row remains.
+        user = self._user(db, "legacypub", role="special",
+                          is_public_shared=False,
+                          deleted_at=datetime.now(timezone.utc))
+        db.add(AuditLog(
+            action="public_flag", target_user="legacypub", status="success",
+            detail_json='{"is_public_shared": true, "at": "registration"}',
+        ))
+        db.commit()
+        assert acl_service.was_public_record(db, user) is True
+        assert acl_service.is_public_owner(user) is False
+
+    def test_public_flag_on_a_viewer_is_inert(self):
+        from app.database import SessionLocal
+        from app.services import acl_service
+        db = SessionLocal()
+        viewer = self._user(db, "viewerpub", role="viewer",
+                            is_public_shared=True)
+        assert acl_service.is_public_owner(viewer) is False
+        special = self._user(db, "specialpub", role="special",
+                             is_public_shared=True)
+        assert acl_service.is_public_owner(special) is True
+
+    def test_activation_requires_both_accounts_live(self):
+        import pytest
+        from app.database import SessionLocal
+        from app.services import acl_service
+        db = SessionLocal()
+        alice = self._user(db, "alice", role="viewer")
+        bob = self._user(db, "bob", is_active=False)
+        with pytest.raises(ValueError):
+            acl_service.set_grant(db, alice.id, bob.id, True)
+        # Deactivating a never-selected pair is a no-op, not an error.
+        assert acl_service.set_grant(db, alice.id, bob.id, False) is None
+
+    def test_target_inactive_or_deleted_denies_even_with_an_active_row(self):
+        from app.database import SessionLocal
+        from app.services import acl_service
+        db = SessionLocal()
+        alice = self._user(db, "alice", role="viewer")
+        bob = self._user(db, "bob")
+        acl_service.set_grant(db, alice.id, bob.id, True)
+        assert acl_service.allows(db, alice, "bob") is True
+        bob.is_active = False
+        db.commit()
+        assert acl_service.allows(db, alice, "bob") is False
+        bob.is_active = True
+        bob.deleted_at = __import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc)
+        db.commit()
+        assert acl_service.allows(db, alice, "bob") is False
+
+    def test_grant_toggle_is_audited(self):
+        from app.database import SessionLocal
+        from app.models.audit_log import AuditLog
+        from app.routers.auth import set_end_user_grant
+        db = SessionLocal()
+        alice = self._user(db, "alice", role="viewer")
+        bob = self._user(db, "bob")
+        set_end_user_grant(alice.id, {"shared_user_id": bob.id, "active": True},
+                           {"id": 1}, db)
+        rows = db.query(AuditLog).filter(AuditLog.action == "grant_update").all()
+        assert rows and "shared2" not in (rows[-1].detail_json or "")
+        assert "bob" in (rows[-1].detail_json or "")
+        assert "active" in (rows[-1].detail_json or "")
+
+    def test_migration_converts_active_inactive_and_drops_dangling(self):
+        from datetime import datetime, timezone
+        from app.database import SessionLocal
+        from app.services import acl_service
+        db = SessionLocal()
+        alice = self._user(
+            db, "alice", role="viewer",
+            allowed_special_users="bob,carol,ghost,deleted",
+        )
+        bob = self._user(db, "bob")
+        carol = self._user(db, "carol", is_active=False)
+        self._user(db, "deleted", deleted_at=datetime.now(timezone.utc))
+
+        result = acl_service.migrate_legacy_grants(db)
+        assert result["created"] == 2
+        assert result["inactive"] == 1
+        assert result["dropped"] == 2
+        db.refresh(alice)
+        assert alice.allowed_special_users is None
+        rows = {g["shared_username"]: g["state"]
+                for g in acl_service.list_for_grantee(db, alice.id)}
+        assert rows == {"bob": "active", "carol": "inactive"}
+        assert acl_service.allows(db, alice, "bob") is True
+        assert acl_service.allows(db, alice, "carol") is False
+
+        # Idempotent on the cleared store.
+        again = acl_service.migrate_legacy_grants(db)
+        assert again["sources"] == 0
+
+
+# ---------------------------------------------------------------------------
+# G78 — account lifecycle (T8/T9) and service annotations (T5/T10)
+# ---------------------------------------------------------------------------
+
+
+class TestAccountLifecycle:
+    """Soft delete, stop-before-delete, and the deactivation grant rule."""
+
+    @staticmethod
+    def _user(db, username="alice", **over):
+        from app.models.end_user import EndUser
+        u = EndUser(
+            username=username, password_hash="x", role="viewer",
+            is_approved=True, is_active=True,
+        )
+        for k, v in over.items():
+            setattr(u, k, v)
+        db.add(u)
+        db.commit()
+        db.refresh(u)
+        return u
+
+    def test_deactivation_inactivates_grants_and_activation_does_not_restore(self):
+        from app.database import SessionLocal
+        from app.models.audit_log import AuditLog
+        from app.models.end_user import EndUser
+        from app.routers.auth import update_end_user
+        from app.services import acl_service
+        db = SessionLocal()
+        alice = self._user(db, "alice")
+        bob = self._user(db, "bob")
+        acl_service.set_grant(db, alice.id, bob.id, True)
+
+        update_end_user(bob.id, {"is_active": False}, {"id": 1}, db)
+        assert acl_service.list_for_grantee(db, alice.id)[0]["state"] == "inactive"
+        assert db.query(EndUser).filter(EndUser.id == bob.id).first().is_active is False
+
+        update_end_user(bob.id, {"is_active": True}, {"id": 1}, db)
+        assert acl_service.list_for_grantee(db, alice.id)[0]["state"] == "inactive"
+        assert acl_service.allows(db, alice, "bob") is False
+        assert db.query(AuditLog).filter(AuditLog.action == "user_update").count() == 2
+
+    def test_public_flag_is_registration_only_and_audited(self):
+        import pytest
+        from fastapi import HTTPException
+        from app.database import SessionLocal
+        from app.models.audit_log import AuditLog
+        from app.models.end_user import EndUser
+        from app.routers.auth import register_end_user, update_end_user
+        db = SessionLocal()
+        register_end_user(
+            {"username": "pubnew", "password": "pass1234",
+             "role": "special", "is_public_shared": True}, db,
+        )
+        user = db.query(EndUser).filter(EndUser.username == "pubnew").first()
+        assert user.is_public_shared is True
+        rows = db.query(AuditLog).filter(AuditLog.action == "public_flag").all()
+        assert rows and rows[-1].target_user == "pubnew"
+        assert "is_public_shared" in (rows[-1].detail_json or "")
+
+        with pytest.raises(HTTPException) as exc:
+            update_end_user(user.id, {"is_public_shared": False}, {"id": 1}, db)
+        assert exc.value.status_code == 400
+        assert "registered" in str(exc.value.detail).lower()
+
+    def test_only_a_special_user_can_be_public(self):
+        import pytest
+        from fastapi import HTTPException
+        from app.database import SessionLocal
+        from app.routers.auth import register_end_user
+        db = SessionLocal()
+        with pytest.raises(HTTPException) as exc:
+            register_end_user(
+                {"username": "pubviewer", "password": "pass1234",
+                 "role": "viewer", "is_public_shared": True}, db,
+            )
+        assert exc.value.status_code == 400
+        assert "special" in str(exc.value.detail).lower()
+
+    def test_demoting_a_special_user_clears_public(self):
+        from app.database import SessionLocal
+        from app.models.end_user import EndUser
+        from app.routers.auth import register_end_user, update_end_user
+        db = SessionLocal()
+        register_end_user(
+            {"username": "pubdemote", "password": "pass1234",
+             "role": "special", "is_public_shared": True}, db,
+        )
+        user = db.query(EndUser).filter(EndUser.username == "pubdemote").first()
+        update_end_user(user.id, {"role": "viewer"}, {"id": 1}, db)
+        db.refresh(user)
+        assert user.is_public_shared is False
+
+    def test_soft_delete_stops_services_then_removes_relations(self, monkeypatch):
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+        from app.database import SessionLocal
+        from app.models.api_key import ApiKey
+        from app.models.audit_log import AuditLog
+        from app.models.end_user import EndUser
+        from app.models.pre_deploy_session import PreDeploySession
+        from app.models.stream_exposure import StreamExposure
+        from app.routers.auth import delete_end_user
+        from app.services import acl_service
+        from app.services.provision_service import provision_service as provision_client
+
+        db = SessionLocal()
+        alice = self._user(db, "alice", is_public_shared=True)
+        bob = self._user(db, "bob")
+        acl_service.set_grant(db, alice.id, bob.id, True)
+        acl_service.set_grant(db, bob.id, alice.id, True)
+        db.add(ApiKey(
+            user_id=alice.id, target_type="end_user", label="Default",
+            token_hash="hash-alice", is_default=True,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+        ))
+        db.add(PreDeploySession(
+            key="alice|svc||0", user_name="alice", service_name="svc",
+            recipe_path="", label="0", state="paused",
+        ))
+        db.add(StreamExposure(
+            handle_hash="h1", owner_user_id=alice.id, service_name="svc",
+            user_name="alice", label="0", sub_service="web", port=80,
+            canonical_name="svc-alice-0--web.localhost",
+        ))
+        db.commit()
+
+        calls = []
+        async def fake_stop(username):
+            calls.append(username)
+            return {"ok": True, "results": [{"service_name": "svc", "label": "0"}],
+                    "failed_services": []}
+        monkeypatch.setattr(provision_client, "stop_user_all", fake_stop)
+
+        result = asyncio.run(delete_end_user(alice.id, {"id": 1}))
+        assert calls == ["alice"]
+        assert result["soft_deleted"] is True
+
+        db = SessionLocal()
+        row = db.query(EndUser).filter(EndUser.id == alice.id).first()
+        assert row is not None
+        assert row.deleted_at is not None
+        assert row.is_active is False
+        assert row.is_approved is False
+        # The historical public tag is retained for review; access is denied by
+        # is_public_owner because the account is inactive/deleted.
+        assert row.is_public_shared is True
+        from app.services import acl_service as _acl
+        assert _acl.is_public_owner(row) is False
+        assert acl_service.list_for_grantee(db, alice.id) == []
+        assert acl_service.list_for_grantee(db, bob.id) == []
+        assert db.query(ApiKey).filter(ApiKey.user_id == alice.id).count() == 0
+        assert db.query(PreDeploySession).filter(
+            PreDeploySession.user_name == "alice").count() == 0
+        assert db.query(StreamExposure).filter(
+            StreamExposure.owner_user_id == alice.id,
+            StreamExposure.revoked_at.is_(None)).count() == 0
+        assert db.query(AuditLog).filter(AuditLog.action == "delete").count() == 1
+
+    def test_soft_delete_aborts_on_a_stop_failure(self, monkeypatch):
+        import asyncio
+        import pytest
+        from fastapi import HTTPException
+        from app.database import SessionLocal
+        from app.models.end_user import EndUser
+        from app.routers.auth import delete_end_user
+        from app.services.provision_service import provision_service as provision_client
+
+        db = SessionLocal()
+        alice = self._user(db, "alice")
+        async def fake_stop(username):
+            return {"ok": False, "results": [{"service_name": "svc", "label": "0"}],
+                    "failed_services": [{"service_name": "svc", "label": "0",
+                                         "error": "boom"}]}
+        monkeypatch.setattr(provision_client, "stop_user_all", fake_stop)
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(delete_end_user(alice.id, {"id": 1}))
+        assert exc.value.status_code == 502
+        db = SessionLocal()
+        row = db.query(EndUser).filter(EndUser.id == alice.id).first()
+        assert row is not None
+        assert row.deleted_at is None
+        assert row.is_active is True
+        from app.models.audit_log import AuditLog
+        assert db.query(AuditLog).filter(
+            AuditLog.action == "delete",
+            AuditLog.status == "failure",
+        ).count() == 1
+
+    def test_soft_delete_rolls_back_on_a_cleanup_failure(self, monkeypatch):
+        import asyncio
+        import pytest
+        from app.database import SessionLocal
+        from app.models.end_user import EndUser
+        from app.routers.auth import delete_end_user
+        from app.services import acl_service
+        from app.services.provision_service import provision_service as provision_client
+
+        db = SessionLocal()
+        alice = self._user(db, "alice")
+        async def fake_stop(username):
+            return {"ok": True, "results": [], "failed_services": []}
+        monkeypatch.setattr(provision_client, "stop_user_all", fake_stop)
+        def boom(*a, **k):
+            raise RuntimeError("grant cleanup failed")
+        monkeypatch.setattr(acl_service, "remove_for_user", boom)
+        with pytest.raises(RuntimeError):
+            asyncio.run(delete_end_user(alice.id, {"id": 1}))
+        db = SessionLocal()
+        row = db.query(EndUser).filter(EndUser.id == alice.id).first()
+        assert row is not None and row.deleted_at is None and row.is_active is True
+
+    def test_soft_delete_aborts_when_the_stop_call_raises(self, monkeypatch):
+        import asyncio
+        import pytest
+        from fastapi import HTTPException
+        from app.database import SessionLocal
+        from app.models.end_user import EndUser
+        from app.routers.auth import delete_end_user
+        from app.services.provision_service import provision_service as provision_client
+
+        db = SessionLocal()
+        alice = self._user(db, "alice")
+        async def fake_stop(username):
+            raise RuntimeError("provision-api unavailable")
+        monkeypatch.setattr(provision_client, "stop_user_all", fake_stop)
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(delete_end_user(alice.id, {"id": 1}))
+        assert exc.value.status_code == 502
+        db = SessionLocal()
+        row = db.query(EndUser).filter(EndUser.id == alice.id).first()
+        assert row is not None and row.deleted_at is None
+
+    def test_tombstoned_username_is_refused(self):
+        import pytest
+        from fastapi import HTTPException
+        from app.database import SessionLocal
+        from app.routers.auth import register_end_user
+        db = SessionLocal()
+        alice = self._user(db, "alice")
+        alice.deleted_at = __import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc)
+        db.commit()
+        with pytest.raises(HTTPException) as exc:
+            register_end_user({"username": "alice", "password": "pass"}, db)
+        assert exc.value.status_code == 409
+        assert "reserved" in str(exc.value.detail).lower()
+
+
+class TestServiceAnnotations:
+    """T5/T10 — public/orphan annotations come from the gateway, not the browser."""
+
+    def test_soft_deleted_public_owner_keeps_was_public(self, monkeypatch):
+        import asyncio
+        from datetime import datetime, timezone
+        from app.database import SessionLocal
+        from app.models.end_user import EndUser
+        from app.routers.users import list_users
+        from app.services.provision_service import provision_service as provision_client
+
+        db = SessionLocal()
+        db.add(EndUser(
+            username="pubgone", password_hash="x", role="special",
+            is_approved=True, is_active=False, is_public_shared=True,
+            deleted_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+        async def fake_list():
+            return {"user_status": [{
+                "user_name": "pubgone", "healthy_services": [{
+                    "service_name": "svc", "label": "0",
+                    "http_endpoints": ["pubgone.localhost"], "tls": False,
+                    "has_auth": False,
+                }], "unhealthy_services": [], "missing_services": [],
+                "failed_services": [],
+            }]}
+        monkeypatch.setattr(provision_client, "list_users", fake_list)
+        result = asyncio.run(list_users(current_user={
+            "role": "admin", "id": 1, "user_type": "admin",
+        }))
+        group = next(u for u in result["users"] if u["user_name"] == "pubgone")
+        assert group["owner_gone"] is True
+        assert group["is_public"] is False
+        assert group["was_public"] is True
+        assert group["healthy_services"][0]["was_public"] is True
+
+    def test_public_urls_and_orphan_alert_are_annotated(self, monkeypatch):
+        import asyncio
+        from datetime import datetime, timezone
+        from app.database import SessionLocal
+        from app.models.end_user import EndUser
+        from app.routers.users import list_users
+        from app.services.provision_service import provision_service as provision_client
+        from app.config import settings
+
+        db = SessionLocal()
+        pub = EndUser(username="pub", password_hash="x", role="special",
+                      is_approved=True, is_active=True, is_public_shared=True)
+        gone = EndUser(username="gone", password_hash="x", is_approved=True,
+                       is_active=False, deleted_at=datetime.now(timezone.utc))
+        db.add_all([pub, gone])
+        db.commit()
+
+        async def fake_list():
+            return {"user_status": [
+                {"user_name": "pub", "healthy_services": [{
+                    "service_name": "pubsvc", "label": "0",
+                    "http_endpoints": ["pub.localhost"], "tls": True,
+                    "has_auth": False,
+                }], "unhealthy_services": [], "missing_services": [],
+                 "failed_services": []},
+                {"user_name": "gone", "healthy_services": [{
+                    "service_name": "gonesvc", "label": "0",
+                    "http_endpoints": ["gone.localhost"], "tls": False,
+                    "has_auth": True,
+                }], "unhealthy_services": [], "missing_services": [],
+                 "failed_services": []},
+            ]}
+        monkeypatch.setattr(provision_client, "list_users", fake_list)
+
+        result = asyncio.run(list_users(current_user={
+            "role": "admin", "id": 1, "user_type": "admin",
+        }))
+        by_user = {u["user_name"]: u for u in result["users"]}
+        pub_svc = by_user["pub"]["healthy_services"][0]
+        assert pub_svc["is_public"] is True
+        assert pub_svc["owner_gone"] is False
+        assert pub_svc["public_urls"]["pub.localhost"].startswith("https://pub.localhost")
+        if settings.NGINX_HTTPS_PORT != 443:
+            assert pub_svc["public_urls"]["pub.localhost"].endswith(
+                f":{settings.NGINX_HTTPS_PORT}")
+        gone_svc = by_user["gone"]["healthy_services"][0]
+        assert gone_svc["owner_gone"] is True
+        assert gone_svc["is_public"] is False
+        assert result["orphans"] == ["gone"]
+
+
+# ---------------------------------------------------------------------------
+# G78 — edge Authorization selector (T4)
+# ---------------------------------------------------------------------------
+
+
+class TestEdgePublicAuthorizationSelector:
+    """The ACL-on service locations select client vs owner Authorization."""
+
+    @staticmethod
+    def _template() -> str:
+        from pathlib import Path
+        return (
+            Path(__file__).parent.parent.parent
+            / "nginx.acl" / "edge.conf.template"
+        ).read_text()
+
+    def test_both_scheme_locations_capture_the_public_verdict(self):
+        content = self._template()
+        assert content.count(
+            "auth_request_set $public_service $upstream_http_x_public_service;"
+        ) == 2, "both HTTP and HTTPS ACL-on locations must capture the verdict"
+        assert content.count(
+            "proxy_set_header Authorization $edge_authorization;"
+        ) == 2, "both ACL-on locations must use the selector"
+
+    def test_selector_maps_public_to_client_header_and_default_to_owner_basic(self):
+        content = self._template()
+        assert "map $public_service $edge_authorization {" in content
+        block = content.split("map $public_service $edge_authorization {", 1)[1].split("}", 1)[0]
+        assert '"1"     $http_authorization;' in block
+        assert 'default "Basic $service_basic";' in block
+
+    def test_selector_is_acl_on_only(self):
+        content = self._template()
+        before_map = content.split("map $public_service $edge_authorization {", 1)[0]
+        assert before_map.rstrip().endswith("# [if ENABLE_ACL=true]")
+        acl_off = content.split("# [else (ENABLE_ACL=false)]", 1)[1]
+        assert "edge_authorization" not in acl_off
+        assert "auth_request /_auth_jwt" not in acl_off
+
+
+# ---------------------------------------------------------------------------
+# G78 — dashboard surfaces (T2/T5/T7/T10)
+# ---------------------------------------------------------------------------
+
+
+class TestPublicAndOrphanDashboard:
+    """The card and user-management surfaces carry the G78 fields."""
+
+    @staticmethod
+    def _users_page() -> str:
+        from pathlib import Path
+        return (
+            Path(__file__).parent.parent.parent
+            / "provision-dashboard" / "src" / "pages" / "UsersPage.tsx"
+        ).read_text()
+
+    @staticmethod
+    def _user_admin() -> str:
+        from pathlib import Path
+        return (
+            Path(__file__).parent.parent.parent
+            / "provision-dashboard" / "src" / "pages" / "UserManagementPage.tsx"
+        ).read_text()
+
+    def test_public_card_uses_direct_urls_badge_and_warning(self):
+        src = self._users_page()
+        assert "public_urls" in src
+        assert "is_public && svc.public_urls" in src
+        assert "Public" in src
+        assert "public and unguarded" in src
+        assert "owner_gone" in src
+        assert "owner gone" in src
+
+    def test_orphan_alert_exact_text_is_admin_only(self):
+        src = self._users_page()
+        assert "isAdmin && orphans.length > 0" in src
+        assert "Users ${orphans.join(', ')} are gone — services should be deleted" in src
+
+    def test_user_management_has_public_active_and_grant_tags(self):
+        src = self._user_admin()
+        assert "is_public_shared" in src
+        assert "is_active" in src
+        assert "shared_user_id" in src
+        assert "grants" in src
+        assert "Grant activated" in src
+        assert "Grant deactivated" in src
+        assert "/grants" in src
+
+    def test_delete_aborts_with_the_stop_failure_detail(self):
+        src = self._user_admin()
+        assert "Deletion aborted" in src
+        assert "failed_services" in src
+
+    def test_no_public_switch_and_registration_toggle(self):
+        src = self._user_admin()
+        assert "togglePublic" not in src
+        assert "title: 'Public', key: 'public'" not in src
+        assert "Public functional user" in src
+        assert "is_public_shared: values.role === 'special'" in src
+        assert '(r.is_public_shared || r.was_public) && <Tag color="green">Public</Tag>' in src
+        assert "u.is_public_shared ? ' · Public'" in src
+        assert "g.is_public_shared ? ' · Public'" in src
+
+    def test_public_group_tag_is_like_owner_gone(self):
+        src = self._users_page()
+        assert "const publicGroup = userSvcs.some(s => s.is_public || s.was_public)" in src
+        assert '{publicGroup && <Tag color="green">Public</Tag>}' in src
+        assert "svc.is_public && <Tag" not in src, (
+            "the Public tag belongs on the user group, not on each service card")

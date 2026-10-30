@@ -109,4 +109,4 @@ services:
 networks:
   subnet_acl_shared:
     external: true
-    name: subnet_acl_shared
+    name: ${SHARED_NETWORK:-subnet_acl_shared}

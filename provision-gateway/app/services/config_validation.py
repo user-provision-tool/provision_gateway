@@ -193,9 +193,12 @@ def validate_serving_ports(
     * `--` appears anywhere in a name — it is the platform's reserved separator
       and an ambiguous name cannot be split again (R1.5);
     * a `profiles` entry the compose never declares (the deploy panel can only
-      select what exists);
-    * more than one `primary: true` — the instance hostname points at exactly
-      one service.
+      select what exists).
+
+    R14 — a `primary: true` field, when present in an older artifact, is
+    IGNORED without a warning: every `kind: http` row is an equal endpoint at
+    `<instance host>--<sub_service>.<domain>`, and the instance host is identity,
+    not a route.
 
     Two things are deliberately WARNINGS, not errors, because the doc leaves them
     to the operator's judgment (T14's `validate_ports` phase is where a guided fix
@@ -232,7 +235,6 @@ def validate_serving_ports(
     services = set(compose_service_names([Path(p) for p in compose_paths]))
     declared_profiles = set(_compose_profiles(compose_paths))
     seen_ports = {(r.get("sub_service"), r.get("port")) for r in compose_port_surface([Path(p) for p in compose_paths])}
-    primary_count = 0
 
     for i, row in enumerate(data["ports"]):
         where = f"ports[{i}]"
@@ -254,8 +256,6 @@ def validate_serving_ports(
             errors.append(f"{where}: `kind`, when present, must be a non-empty string")
         elif kind is None:
             warnings.append(f"{where}: no `kind` — this row is NOT exposed (fail-closed)")
-        if row.get("primary") is True:
-            primary_count += 1
         profiles = row.get("profiles") or []
         if not isinstance(profiles, list):
             errors.append(f"{where}: `profiles` must be a list")
@@ -265,9 +265,6 @@ def validate_serving_ports(
                     errors.append(f"{where}: `profiles` entries must be strings")
                 elif declared_profiles and p not in declared_profiles:
                     errors.append(f"{where}: profile {p!r} is not declared by the compose")
-
-    if primary_count > 1:
-        errors.append(f"{primary_count} rows are marked `primary` — the instance host points at exactly one service")
 
     for sub, port in sorted(seen_ports, key=lambda x: (str(x[0]), str(x[1]))):
         if (sub, port) not in {(r.get("sub_service"), r.get("port")) for r in data["ports"]}:

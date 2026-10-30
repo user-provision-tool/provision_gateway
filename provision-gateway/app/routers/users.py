@@ -15,13 +15,73 @@ from ..database import get_db
 from ..middleware import require_admin, require_gateway_token
 from ..models.end_user import EndUser
 from ..config import settings
-from ..services import audit_service, curl_service
+from ..services import acl_service, audit_service, curl_service
 from ..services.provision_service import provision_service
 from ..services import stream_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/services", tags=["services"])
+
+
+def _direct_url(served_name: str, tls: bool) -> str:
+    """The public card's direct link: scheme and published edge port."""
+    scheme = "https" if tls else "http"
+    port = settings.NGINX_HTTPS_PORT if tls else settings.NGINX_HTTP_PORT
+    default = 443 if tls else 80
+    suffix = "" if port == default else f":{port}"
+    return f"{scheme}://{served_name}{suffix}"
+
+
+def _annotate_user_status(
+    result: dict,
+    owners: dict[str, EndUser],
+    was_public_names: set[str] | None = None,
+) -> tuple[dict, list[str]]:
+    """Add public/orphan annotations to one -api user-status object.
+
+    The gateway owns the account store, so this is the only layer that can say
+    whether an instance's owner is public or gone. The -api supplies the
+    recorded service facts (``has_auth``, ``tls``, endpoints); the card must not
+    re-derive either.
+    """
+    user_name = str(result.get("user_name", ""))
+    owner = owners.get(user_name)
+    gone = acl_service.owner_is_gone(owner)
+    public = acl_service.is_public_owner(owner)
+    # Historical marker: a soft-deleted public user keeps is_public_shared for
+    # the tag, while is_public (the access verdict) is false. The Services group
+    # uses this so Public is not hidden by owner gone.
+    was_public = bool(
+        user_name in (was_public_names or set())
+        or (owner is not None and owner.is_public_shared)
+    )
+    orphan_names: list[str] = [user_name] if gone else []
+
+    def annotate(svc: dict) -> None:
+        tls = bool(svc.get("tls"))
+        svc["owner_gone"] = gone
+        svc["is_public"] = public
+        svc["was_public"] = was_public
+        svc["has_auth"] = bool(svc.get("has_auth"))
+        if public:
+            svc["public_urls"] = {
+                served: _direct_url(served, tls)
+                for served in (svc.get("http_endpoints") or [])
+                if isinstance(served, str) and served
+            }
+        else:
+            svc["public_urls"] = {}
+
+    for bucket in ("healthy_services", "unhealthy_services", "missing_services",
+                   "failed_services"):
+        for svc in (result.get(bucket) or []):
+            if isinstance(svc, dict):
+                annotate(svc)
+    result["owner_gone"] = gone
+    result["is_public"] = public
+    result["was_public"] = was_public
+    return result, orphan_names
 
 
 def _log_action_short(action: str, admin_id: int | None = None, **kw) -> None:
@@ -45,7 +105,7 @@ async def list_users(
 ):
     """List all end-users from provision-api, syncing missing users to gateway DB.
 
-    Viewers: results are filtered to own services + allowed_special_users.
+    Viewers: results are filtered to own services + active acl_grants rows.
     Admins: see all services.
 
     The EndUser sync/filter uses a short-lived session opened AFTER the
@@ -65,7 +125,8 @@ async def list_users(
 
     db = SessionLocal()
     try:
-        gateway_users = {u.username for u in db.query(EndUser).all()}
+        all_users = db.query(EndUser).all()
+        gateway_users = {u.username for u in all_users}
         for u in users:
             user_name = u.get("user_name", "").strip()
             if user_name and user_name not in gateway_users:
@@ -80,25 +141,34 @@ async def list_users(
                 db.add(new_user)
         db.commit()
 
-        # Filter for viewers: own services + allowed_special_users only
+        # Re-read after the sync so a just-created owner is in the map.
+        owners = {u.username: u for u in db.query(EndUser).all()}
+        was_public_names = {
+            u.username for u in owners.values()
+            if acl_service.was_public_record(db, u)
+        }
+        orphans: list[str] = []
+        for u in users:
+            if isinstance(u, dict):
+                _annotate_user_status(u, owners, was_public_names)
+                if u.get("owner_gone"):
+                    orphans.append(str(u.get("user_name", "")))
+
+        # Viewers see their own services plus active ID-keyed grants. The
+        # retired string is never consulted.
         if current_user["role"] != "admin":
-            viewer_name = current_user.get("email", "")
-            allowed_users = set()
-            if viewer_name:
-                allowed_users.add(viewer_name)
-            # Get allowed_special_users from the current user
-            if current_user.get("user_type") == "end_user":
-                eu = db.query(EndUser).filter(EndUser.id == current_user["id"]).first()
-                if eu and eu.allowed_special_users:
-                    for name in eu.allowed_special_users.split(","):
-                        name = name.strip()
-                        if name:
-                            allowed_users.add(name)
+            allowed_users = acl_service.allowed_usernames(
+                db, int(current_user["id"])
+            )
             users = [u for u in users if u.get("user_name") in allowed_users]
+            orphans = []  # the top alert is admin-only
     finally:
         db.close()
 
-    return {"users": users, "count": len(users)}
+    payload = {"users": users, "count": len(users)}
+    if current_user["role"] == "admin":
+        payload["orphans"] = sorted({n for n in orphans if n})
+    return payload
 
 
 @router.get("/{user_name}")
@@ -113,22 +183,14 @@ async def get_user(
     The ACL check uses a short-lived session, closed before the provision-api
     call so no DB connection is held during the await.
     """
-    # ACL check for viewers
+    # ACL check for viewers — the same ID-keyed matrix the gate uses.
     if current_user["role"] != "admin":
-        viewer_name = current_user.get("email", "")
-        allowed = {viewer_name}
-        if current_user.get("user_type") == "end_user":
-            from ..database import SessionLocal
-            db = SessionLocal()
-            try:
-                eu = db.query(EndUser).filter(EndUser.id == current_user["id"]).first()
-                if eu and eu.allowed_special_users:
-                    for name in eu.allowed_special_users.split(","):
-                        name = name.strip()
-                        if name:
-                            allowed.add(name)
-            finally:
-                db.close()
+        from ..database import SessionLocal
+        db = SessionLocal()
+        try:
+            allowed = acl_service.allowed_usernames(db, int(current_user["id"]))
+        finally:
+            db.close()
         if user_name not in allowed:
             raise HTTPException(403, "Access denied: you can only view your own services")
 
@@ -136,6 +198,20 @@ async def get_user(
         result = await provision_service.get_user(user_name)
     except Exception as e:
         raise HTTPException(502, f"provision-api error: {e}")
+
+    from ..database import SessionLocal
+    db = SessionLocal()
+    try:
+        owners = {u.username: u for u in db.query(EndUser).all()}
+        was_public_names = {
+            u.username for u in owners.values()
+            if acl_service.was_public_record(db, u)
+        }
+        for u in result.get("user_status", []):
+            if isinstance(u, dict):
+                _annotate_user_status(u, owners, was_public_names)
+    finally:
+        db.close()
     return result
 
 

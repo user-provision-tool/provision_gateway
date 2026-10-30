@@ -10,9 +10,6 @@ import FileSetSelection, {
   confCategory,
   fixVariantFor,
   phaseOfFile,
-  servingPortsRows,
-  setPrimary,
-  ServingPortsRow,
   EMPTY_CANDIDATES,
   EMPTY_SELECTION,
   FileSetCandidates,
@@ -470,6 +467,21 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
   // Load the stored file set + live candidates + stale markers for the
   // selected service/recipe (design §Selection & UI — dashboard pre-selection).
+  // R19 — refresh the CANDIDATE lists without resetting the selection.
+  // `loadFileSets` restores the STORED default, which is right when the
+  // service changes and wrong right after a generation: the files this run
+  // just wrote are not in the candidates the panel fetched earlier, so a
+  // generated serving-ports/nginx artifact could be selected in state but not
+  // offered in its picker (measured 2026-10-27, e2e-confs generation).
+  const refreshFileSetCandidates = async (baseName: string, recipePath: string) => {
+    try {
+      const { data } = await client.get(`/projects/${baseName}/file-sets`)
+      const rp = recipePath || '.'
+      setFileSetCandidates((data.candidates || {})[rp] || EMPTY_CANDIDATES)
+      setFileSetStale((data.stale || {})[rp] || {})
+    } catch { /* a stale candidate list must not fail the generation path */ }
+  }
+
   const loadFileSets = async (baseName: string, recipePath: string) => {
     setFileSetLoading(true)
     try {
@@ -583,48 +595,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     } finally { setCheckingMissing(false) }
   }
 
-  // Selection used for generation/deploy requests — stale stored entries are
-  // excluded (kept + flagged in the UI, never sent, design §Selection & UI).
-  // R1.3 — the `primary` picker's rows, read from the artifact the picker names.
-  // The picker is a field OF that file, so it appears only when one is selected
-  // (never for `None`), and changing it EDITS the file rather than a panel
-  // field: the edit forks `.fix` and the selection flips to the fork, exactly
-  // as editing the file itself does.
-  const [spRows, setSpRows] = useState<ServingPortsRow[]>([])
-  const spFile = selection.serving_ports
-  useEffect(() => {
-    let cancelled = false
-    if (!spFile) { setSpRows([]); return }
-    const svcVal = form.getFieldValue('service_name') || ''
-    const { baseName, recipePath } = parseServiceValue(svcVal)
-    if (!baseName) { setSpRows([]); return }
-    const path = recipePath ? `${recipePath}/${spFile}` : spFile
-    client.get(`/projects/${baseName}/files/${path}`)
-      .then(({ data }) => { if (!cancelled) setSpRows(servingPortsRows(typeof data?.content === 'string' ? data.content : '')) })
-      .catch(() => { if (!cancelled) setSpRows([]) })
-    return () => { cancelled = true }
-  }, [spFile])
-
-  const changePrimary = async (subService: string) => {
-    if (!spFile) return
-    const svcVal = form.getFieldValue('service_name') || ''
-    const { baseName, recipePath } = parseServiceValue(svcVal)
-    const path = recipePath ? `${recipePath}/${spFile}` : spFile
-    try {
-      const { data } = await client.get(`/projects/${baseName}/files/${path}`)
-      const content = typeof data?.content === 'string' ? data.content : ''
-      const next = setPrimary(content, subService)
-      const targetName = fixVariantFor(spFile)
-      await client.post('/projects/save-generated', {
-        service_name: baseName, recipe_path: recipePath, files: { [targetName]: next },
-      })
-      setSpRows(servingPortsRows(next))
-      setSelection(prev => ({ ...prev, serving_ports: targetName }))
-      message.success(`${subService} is now the primary — saved as ${targetName}, and the picker uses it`)
-    } catch (err: any) {
-      message.error(err?.response?.data?.detail || 'Could not set the primary')
-    }
-  }
+  // Generation is recipe-level and profile-BLIND: every service/block is
+  // generated and the -api filters blocks at render for the profiles this
+  // deployment activates. The deploy payload still carries `sel.profiles`.
+  const generationSelection = (): FileSetSelectionData => ({
+    ...effectiveSelection(),
+    profiles: [],
+  })
 
   const effectiveSelection = (): FileSetSelectionData => {
     const st = fileSetStale || {}
@@ -756,7 +733,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         // G25 — the NAMING follows the TRIGGER: on a guided restart the
         // generation emits `.fix` files, not `.base`.
         ...(fixingGuide ? { fix: true } : {}),
-        selection: effectiveSelection(),
+        selection: generationSelection(),
         // G20 — the session this job opens must record the proxy the panel is
         // showing, or a `check` restart replays `false` (see
         // `effectiveUseGlobalProxy`).
@@ -820,7 +797,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       ...(fixingGuide ? { fix: true } : {}),
       // §5: the reference is CONTEXT for the env phase, not a handoff.
       env_reference: envRefs,
-      selection: effectiveSelection(),
+      selection: generationSelection(),
       // G20 — same as the generate entry point: the session this job opens must
       // record the proxy. Read from the SNAPSHOT, never `form.getFieldValue`:
       // `handleDeploy` already closed the panel (destroyOnClose), so the live
@@ -946,6 +923,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         if (typeof resultSel.nginx === 'string' && resultSel.nginx) next.nginx = resultSel.nginx
         if (typeof resultSel.stream_conf === 'string' && resultSel.stream_conf) next.stream_conf = resultSel.stream_conf
         if (typeof resultSel.mail_conf === 'string' && resultSel.mail_conf) next.mail_conf = resultSel.mail_conf
+        // The serving-ports slot was generated by this run too, and the
+        // gateway swapped it in its reported selection — adopt it like every
+        // other slot (it used to be missing from this hand-rebuilt list).
+        if (typeof resultSel.serving_ports === 'string' && resultSel.serving_ports) {
+          next.serving_ports = resultSel.serving_ports
+          next.serving_ports_none = false
+        }
         if (Array.isArray(resultSel.env) && resultSel.env.length) next.env = resultSel.env
         return next
       })
@@ -966,6 +950,19 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       const producedStream = Object.keys(files).find(n => n.endsWith('.conf') && !n.endsWith('.j2')
         && confCategory(n) === 'stream')
       if (producedStream) setSelection(prev => ({ ...prev, stream_conf: producedStream }))
+      const producedPorts = Object.keys(files).find(
+        n => /^serving[_-]ports.*\.ya?ml$/.test(n.split('/').pop() || n)
+      )
+      if (producedPorts) {
+        setSelection(prev => ({ ...prev, serving_ports: producedPorts, serving_ports_none: false }))
+      }
+    }
+    // The files exist now; re-read the candidates so every picker can OFFER
+    // what this run produced.
+    {
+      const svcVal = form.getFieldValue('service_name') || ''
+      const { baseName, recipePath } = parseServiceValue(svcVal)
+      if (baseName) void refreshFileSetCandidates(baseName, recipePath)
     }
     if (!isDeployAuto) genJob.reset()
   }, [genJob.jobState])
@@ -1158,6 +1155,10 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           if (typeof resSel.nginx === 'string' && resSel.nginx) sel.nginx = resSel.nginx
           if (typeof resSel.stream_conf === 'string' && resSel.stream_conf) sel.stream_conf = resSel.stream_conf
           if (typeof resSel.mail_conf === 'string' && resSel.mail_conf) sel.mail_conf = resSel.mail_conf
+          if (typeof resSel.serving_ports === 'string' && resSel.serving_ports) {
+            sel.serving_ports = resSel.serving_ports
+            sel.serving_ports_none = false
+          }
           if (Array.isArray(resSel.env) && resSel.env.length) sel.env = resSel.env
         } else {
           // No reported selection — name what THIS run produced instead, by
@@ -1172,7 +1173,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           const producedStream = Object.keys(genNow).find(n => n.endsWith('.conf') && !n.endsWith('.j2')
             && confCategory(n) === 'stream')
           if (producedStream) sel.stream_conf = producedStream
+          const producedPorts = Object.keys(genNow).find(
+            n => /^serving[_-]ports.*\.ya?ml$/.test(n.split('/').pop() || n)
+          )
+          if (producedPorts) { sel.serving_ports = producedPorts; sel.serving_ports_none = false }
         }
+        // Make the generated artifacts selectable in every picker too.
+        await refreshFileSetCandidates(baseName, recipePath)
       }
       // Merge previously generated (reviewed) files with the just-generated
       // ones — the Deploy auto-run MUST see them (compose/nginx are persisted
@@ -1618,8 +1625,6 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
             needsEnv={needsEnv}
             onChange={setSelection}
             onOpenFile={(name) => openSelectedFile(name)}
-            spRows={spRows}
-            onPrimaryChange={changePrimary}
           />
 
           {/* ---- Deploy-time per-user env (pipeline env phase, design §2) ---- */}

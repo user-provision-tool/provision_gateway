@@ -87,13 +87,13 @@ def require_gateway_token(
             return {"id": admin.id, "email": admin.email, "role": admin.role, "user_type": "admin"}
         else:
             end_user = get_end_user_by_id(db, user_id)
-            if end_user is None or not end_user.is_active:
+            if (end_user is None or not end_user.is_active
+                    or end_user.deleted_at is not None):
                 raise HTTPException(status_code=401, detail="User not found or inactive")
             if not end_user.is_approved:
                 raise HTTPException(status_code=401, detail="User not yet approved")
             return {"id": end_user.id, "email": end_user.username,
-                    "role": end_user.role, "user_type": "end_user",
-                    "allowed_special_users": (end_user.allowed_special_users or "").split(",") if end_user.allowed_special_users else []}
+                    "role": end_user.role, "user_type": "end_user"}
     finally:
         db.close()
 
@@ -192,7 +192,8 @@ def get_current_user(
             return {"id": admin.id, "email": admin.email, "role": admin.role, "user_type": "admin"}
         else:
             end_user = get_end_user_by_id(db, user_id)
-            if end_user is None or not end_user.is_active:
+            if (end_user is None or not end_user.is_active
+                    or end_user.deleted_at is not None):
                 raise HTTPException(status_code=401, detail="User not found or inactive")
             if not end_user.is_approved:
                 raise HTTPException(status_code=401, detail="User not yet approved")

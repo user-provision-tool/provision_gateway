@@ -260,7 +260,7 @@ def _owner_for_mint(db: Session, entry: dict, requester: dict) -> EndUser:
         raise HTTPException(status_code=401, detail="User not found")
     from ..services.auth_service import acl_allows
 
-    if not acl_allows(owner, instance_user_name):
+    if not acl_allows(db, owner, instance_user_name):
         raise HTTPException(status_code=403, detail="ACL denied")
     return owner
 

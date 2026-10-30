@@ -36,6 +36,24 @@ interface TableRow extends ServiceInfo {
   recipeGeneratedFiles: string[]
 }
 
+/**
+ * Two kinds of file share the recipe directory:
+ *  - RECIPE-LEVEL generated artifacts: base/fix compose, nginx and serving-ports
+ *    files and their `.j2` templates — reusable by every deployment;
+ *  - PER-USER / PER-SERVICE files: the rendered compose, `.env` and `.env.raw`
+ *    copies whose names carry `<user>.<label>`.
+ * The list styles them differently (gold vs purple) so the operator can tell
+ * what belongs to the recipe from what belongs to one instance.
+ */
+export function generatedFileScope(name: string): 'recipe' | 'instance' {
+  const base = name.split('/').pop() || name
+  // docker-compose.user-<user>.<label>.yml, nginx.user-<user>.<label>.conf, …
+  if (/\.user-[^./]+\.\d+/.test(base)) return 'instance'
+  // .env.1.<user>.<label>, .env.raw.<user>.<label>
+  if (/^\.env(?:\.raw)?(?:\.\d+)?\.[^./]+\.\d+$/.test(base)) return 'instance'
+  return 'recipe'
+}
+
 export default function ServicesPage() {
   const { name } = useParams<{ name?: string }>()
   const navigate = useNavigate()
@@ -108,7 +126,9 @@ export default function ServicesPage() {
           const params: any = {}
           if (r.path) params.recipe_path = r.path
           const { data } = await client.get(`/projects/${s.name}/check-missing-files`, { params })
-          map[key] = data.missing || []
+          // Base-files readiness: only what this action can generate. `.env`
+          // is deploy-time and must not make the robot look not-ready.
+          map[key] = (data.missing || []).filter((m: string) => m !== '.env' && m !== 'env')
         } catch { map[key] = [] }
         finally { setCheckingMap(prev => ({ ...prev, [key]: false })) }
       })
@@ -320,10 +340,19 @@ export default function ServicesPage() {
         return <Space size={4} wrap>{temps.length>0 ? temps.map(f=><Tag key={f} color="green" style={{cursor:'pointer'}} onClick={()=>navigate(`/projects/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
       }
     },
-    { title: 'Generated Files', key: 'generated',
+    { title: <Space size={4}>Generated Files <Tag color="gold">recipe</Tag><Tag color="purple">per-user</Tag></Space>, key: 'generated',
       render: (_:any, r: TableRow) => {
         const gens = r.recipeGeneratedFiles || r.generated_files || []
-        return <Space size={4} wrap>{gens.length>0 ? gens.map(f=><Tag key={f} color="gold" style={{cursor:'pointer'}} onClick={()=>navigate(`/projects/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
+        return <Space size={4} wrap>{gens.length>0 ? gens.map(f=>{
+          const scope = generatedFileScope(f)
+          return <Tag
+            key={f}
+            color={scope === 'recipe' ? 'gold' : 'purple'}
+            title={scope === 'recipe' ? 'Recipe-level generated artifact' : 'Per-user, per-service generated file'}
+            style={{cursor:'pointer'}}
+            onClick={()=>navigate(`/projects/${r.name}?file=${f}`)}
+          >{f}</Tag>
+        }) : <Tag>none</Tag>}</Space>
       }
     },
     { title: 'AI Generate', key: 'actions',
@@ -357,8 +386,13 @@ export default function ServicesPage() {
         const checking = checkingMap[genKey] === true
         const hasAll = !checking && missing !== null && missing.length === 0
         const isChecking = checking || missing === null
-        return <Tooltip title={isChecking ? 'Checking deployment readiness...' : hasAll ? 'No missing basic files, ready for deployment' : `Missing: ${(missing||[]).join(', ')} — open generate-missing panel`}>
-          <Button size="small" type="primary" icon={<RobotOutlined/>} disabled={isChecking || hasAll} loading={isChecking} onClick={()=>setGenPanel({ name: r.name, recipePath: r.recipePath })}/>
+        const hint = isChecking
+          ? 'Checking base files — you can still open the panel'
+          : hasAll
+            ? 'Essential base files are already there; you can click to generate new ones.'
+            : `Missing: ${(missing||[]).join(', ')} — open Generate Base Files`
+        return <Tooltip title={hint}>
+          <Button size="small" type={hasAll ? 'default' : 'primary'} icon={<RobotOutlined/>} onClick={()=>setGenPanel({ name: r.name, recipePath: r.recipePath })}/>
         </Tooltip>
       } },
   ]

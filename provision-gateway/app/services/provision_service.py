@@ -134,6 +134,15 @@ class ProvisionService:
             "POST", f"/users/{user_name}/services/{service_name}/{label}/down"
         )
 
+    async def stop_user_all(self, user_name: str) -> dict[str, Any]:
+        """Stop EVERY service of a username, keeping registry/files/containers.
+
+        The -api returns per-service results and an ``ok`` flag; a partial
+        failure is a 200 with ``ok: false`` (the account-deletion caller must
+        abort on it), not an HTTP error that hides which service failed.
+        """
+        return await self._request("POST", f"/users/{user_name}/stop")
+
     async def change_user_password(
         self, user_name: str, service_name: str, label: str, passwd: str
     ) -> dict[str, Any]:

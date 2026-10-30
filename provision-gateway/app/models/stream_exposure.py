@@ -15,7 +15,7 @@ that carry the same meaning as they do in ``api_keys``:
 ``user_name``
     the **instance's** registry user — the ACL matrix's target side, so the
     matrix is one comparison: ``user_name == owner.username`` means "their own
-    instance", and the owner's ``allowed_special_users`` grants the rest.
+    instance", and an active ``acl_grants`` row grants the rest.
 
 The exposure URL's label is the handle, so the handle must stay a single DNS
 label; ``canonical_name`` is therefore *not* the client-facing name but the

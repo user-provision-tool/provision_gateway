@@ -19,7 +19,8 @@ from ..schemas.auth import (
     RegisterRequest,
     SetupRequest,
 )
-from ..services import auth_service
+from ..services import acl_service, auth_service, audit_service
+from ..services.provision_service import provision_service
 from ..services.registry_entry import entry_tls
 from ..config import settings
 import bcrypt as _bcrypt
@@ -211,6 +212,28 @@ def verify_auth(
         # nginx's @auth_401 can still act on the client type.
         return _deny("login_required", 401, "ACL disabled")
 
+    # G78 public target classification runs BEFORE any credential check. The
+    # target is the served Host -> registry entry -> owner account; a client
+    # header is never consulted. Public wins for every caller, including an
+    # admin or owner holding a valid token.
+    host = request.headers.get("Host", "")
+    registry_entry = _lookup_by_hostname(host, request)
+    if registry_entry:
+        owner = (
+            db.query(EndUser)
+            .filter(EndUser.username == registry_entry.get("user_name", ""))
+            .first()
+        )
+        if acl_service.is_public_owner(owner):
+            return _respond(
+                200,
+                {
+                    acl_service.PUBLIC_VERDICT_HEADER:
+                        acl_service.PUBLIC_VERDICT_VALUE,
+                },
+                None,
+            )
+
     cookie_token = request.cookies.get("provision_token")
     header_token = request.headers.get("X-Provision-Token", "")
     token = cookie_token or header_token
@@ -247,14 +270,13 @@ def verify_auth(
     if not end_user or not end_user.is_active or not end_user.is_approved:
         return _deny("login_required", 401, "User not found, inactive, or not approved")
 
-    # Extract target service from request hostname
-    host = request.headers.get("Host", "")
-    registry_entry = _lookup_by_hostname(host, request)
-
-    if registry_entry and auth_service.acl_allows(end_user, registry_entry.get("user_name", "")):
-        # The ONE matrix (auth_service.acl_allows): own instance, or a recorded
-        # special-user grant (trimmed on parse — N1). The stream verdict applies
-        # this same function per connection (GRILLING G39 §3 / task-doc R3.3).
+    # The target service is the one resolved above (same Host).
+    if registry_entry and auth_service.acl_allows(
+        db, end_user, registry_entry.get("user_name", "")
+    ):
+        # The ONE matrix (auth_service.acl_allows): own instance, or an active
+        # ID-keyed grant. The stream verdict applies this same function per
+        # connection (GRILLING G39 §3 / task-doc R3.3).
         svc_basic = _get_service_basic_credential(request, db)
         return _respond(200, {"X-Service-Basic": svc_basic}, None)
 
@@ -508,15 +530,12 @@ def go_to_service(
     if entry is None:
         raise HTTPException(404, f"Service not found: {hostname}")
 
-    # ACL check for viewers
+    # ACL check for viewers — the same ID-keyed matrix the gate uses.
     if current_user["role"] != "admin":
         target_user = entry.get("user_name", "")
-        if target_user != current_user["email"]:
-            # Check allowed_special_users (trimmed — N1)
-            eu = db.query(EndUser).filter(EndUser.id == current_user["id"]).first()
-            allowed = _parse_allowed_special_users(eu.allowed_special_users) if eu else []
-            if target_user not in allowed:
-                raise HTTPException(403, "Access denied: service not in your allowed list")
+        eu = db.query(EndUser).filter(EndUser.id == current_user["id"]).first()
+        if not auth_service.acl_allows(db, eu, target_user):
+            raise HTTPException(403, "Access denied: service not in your allowed list")
 
     # Scheme/port from the service's https flag (GAP-19): https services get
     # https + NGINX_HTTPS_PORT; http services get http + NGINX_HTTP_PORT.
@@ -643,9 +662,90 @@ def list_end_users(
     current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """List all registered end-users (admin-only)."""
+    """List all registered end-users, including reserved tombstones (admin).
+
+    Each row carries its grant rows (active and inactive), because the admin's
+    tag surface is a per-row toggle and needs to know which pairs exist. The
+    legacy ``allowed_special_users`` string is not returned.
+    """
     users = db.query(EndUser).order_by(EndUser.created_at.desc()).all()
-    return {"users": [u.to_dict() for u in users]}
+    out = []
+    for user in users:
+        row = user.to_dict()
+        row["was_public"] = acl_service.was_public_record(db, user)
+        row["grants"] = acl_service.list_for_grantee(db, user.id)
+        out.append(row)
+    return {
+        "users": out,
+        "candidates": acl_service.candidates(db),
+    }
+
+
+@router.get("/users/{user_id}/grants")
+def list_end_user_grants(
+    user_id: int,
+    current_admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """The grant rows where ``user_id`` is grantee, plus eligible shared users."""
+    user = db.query(EndUser).filter(EndUser.id == user_id).first()
+    if user is None:
+        raise HTTPException(404, "User not found")
+    return {
+        "user_id": user.id,
+        "username": user.username,
+        "grants": acl_service.list_for_grantee(db, user.id),
+        "candidates": acl_service.candidates(db, exclude_user_id=user.id),
+    }
+
+
+@router.put("/users/{user_id}/grants")
+def set_end_user_grant(
+    user_id: int,
+    req: dict,
+    current_admin: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Create or toggle one grant tag (admin).
+
+    ``active=true`` activates (both accounts must be live); ``active=false``
+    inactivates and KEEPS the row, which is the greyed-tag state. An account
+    deactivation is not undone by account reactivation — this endpoint is the
+    only way a tag becomes active again.
+    """
+    try:
+        shared_id = int(req.get("shared_user_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "shared_user_id is required")
+    if "active" in req:
+        active = bool(req["active"])
+    else:
+        state = str(req.get("state", "")).lower()
+        if state not in ("active", "inactive"):
+            raise HTTPException(400, "active (or state=active|inactive) is required")
+        active = state == "active"
+
+    try:
+        row = acl_service.set_grant(db, user_id, shared_id, active)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    user = db.query(EndUser).filter(EndUser.id == user_id).first()
+    shared = db.query(EndUser).filter(EndUser.id == shared_id).first()
+    audit_service.log_action(
+        db,
+        action="grant_update",
+        admin_id=current_admin["id"],
+        target_user=user.username if user else str(user_id),
+        detail={
+            "shared_user_id": shared_id,
+            "shared_username": shared.username if shared else None,
+            "active": active,
+            "state": row["state"] if row else "none",
+        },
+        status="success",
+    )
+    return {"updated": True, "grant": row}
 
 
 @router.post("/users/register")
@@ -661,21 +761,34 @@ def register_end_user(
     """
     username = req.get("username", "").strip()
     password = req.get("password", "")
+    role = req.get("role", "viewer")
+    wants_public = bool(req.get("is_public_shared", False))
     if not username or not password:
         raise HTTPException(400, "username and password required")
     if len(password) < 4:
         raise HTTPException(400, "password too short (min 4 chars)")
-    
+    if wants_public and role != "special":
+        raise HTTPException(
+            400,
+            "Only a special functional user can be public",
+        )
+
     existing = db.query(EndUser).filter(EndUser.username == username).first()
     if existing:
+        if existing.deleted_at is not None:
+            raise HTTPException(
+                409,
+                f"Username '{username}' is permanently reserved by a deleted account",
+            )
         raise HTTPException(409, f"User '{username}' already exists")
-    
+
     user = EndUser(
         username=username,
         password_hash=_bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode(),
-        role=req.get("role", "viewer"),
+        role=role,
         is_approved=False,
         is_active=True,
+        is_public_shared=bool(wants_public and role == "special"),
     )
     db.add(user)
     db.flush()
@@ -687,6 +800,14 @@ def register_end_user(
         pass
     db.commit()
     db.refresh(user)
+    if user.is_public_shared:
+        # Publicness is decided HERE, at registration, by the special-user
+        # toggle; record the decision even before approval.
+        audit_service.log_action(
+            db, action="public_flag", admin_id=None, target_user=user.username,
+            detail={"is_public_shared": True, "at": "registration"},
+            status="success",
+        )
     return {"created": True, "user": user.to_dict(), "message": "Registration submitted. Awaiting admin approval."}
 
 
@@ -700,6 +821,8 @@ def approve_end_user(
     user = db.query(EndUser).filter(EndUser.id == user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
+    if user.deleted_at is not None:
+        raise HTTPException(409, "Cannot approve a deleted account")
     user.is_approved = True
     user.approved_at = datetime.now(timezone.utc)
     db.commit()
@@ -713,18 +836,58 @@ def update_end_user(
     current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Update end-user settings (role, special users, active status)."""
+    """Update role, active state and the public flag.
+
+    Deactivating an account inactivates every grant where it is grantee OR
+    shared. Reactivating it does NOT restore a grant; the admin must re-approve
+    each greyed tag. The retired ``allowed_special_users`` field is refused.
+    """
     user = db.query(EndUser).filter(EndUser.id == user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
+    if user.deleted_at is not None:
+        raise HTTPException(409, "Cannot update a deleted account")
+    if "allowed_special_users" in req:
+        raise HTTPException(
+            400,
+            "allowed_special_users is retired; use PUT /auth/users/{id}/grants",
+        )
+
+    detail: dict = {}
+    grants_inactivated = 0
+    if "is_public_shared" in req or "public" in req:
+        raise HTTPException(
+            400,
+            "The public flag is chosen when a special functional user is registered; "
+            "it cannot be changed from user management",
+        )
     if "role" in req:
         user.role = req["role"]
+        detail["role"] = user.role
+        if user.role != "special" and user.is_public_shared:
+            user.is_public_shared = False
+            detail["is_public_shared"] = False
     if "is_active" in req:
-        user.is_active = bool(req["is_active"])
-    if "allowed_special_users" in req:
-        user.allowed_special_users = ",".join(req["allowed_special_users"]) if isinstance(req["allowed_special_users"], list) else req["allowed_special_users"]
+        new_active = bool(req["is_active"])
+        if not new_active:
+            grants_inactivated = acl_service.inactivate_for_user(db, user.id)
+        detail["is_active"] = new_active
+        detail["grants_inactivated"] = grants_inactivated
+        user.is_active = new_active
     db.commit()
-    return {"updated": True, "user": user.to_dict()}
+
+    if detail:
+        audit_service.log_action(
+            db,
+            action="user_update",
+            admin_id=current_admin["id"],
+            target_user=user.username,
+            detail=detail,
+            status="success",
+        )
+    row = user.to_dict()
+    row["grants"] = acl_service.list_for_grantee(db, user.id)
+    return {"updated": True, "user": row}
 
 
 @router.put("/users/{user_id}/password")
@@ -743,6 +906,8 @@ def reset_end_user_password(
     user = db.query(EndUser).filter(EndUser.id == user_id).first()
     if not user:
         raise HTTPException(404, "User not found")
+    if user.deleted_at is not None:
+        raise HTTPException(409, "Cannot reset the password of a deleted account")
     password = (req or {}).get("password", "")
     if len(password) < 4:
         raise HTTPException(400, "password too short (min 4 chars)")
@@ -752,23 +917,147 @@ def reset_end_user_password(
 
 
 @router.delete("/users/{user_id}")
-def delete_end_user(
+async def delete_end_user(
     user_id: int,
     current_admin: dict = Depends(require_admin),
-    db: Session = Depends(get_db),
 ):
-    """Delete an end-user.
+    """Soft-delete an end-user after stopping every service (G78).
 
-    G2 (v4 §6.1.3): user deletion cascades to api_keys — leaving orphaned keys
-    behind lets SQLite id-reuse attach a stale default to the next user.
+    Order is load-bearing: the -api stops all services FIRST. If any stop fails,
+    the account is not touched and the operator is told which services failed;
+    services already stopped stay stopped (no restart). Only a fully stopped
+    account is soft-deleted: tombstone row, reserved username, stable id, grants
+    removed in both directions, keys/sessions/exposures revoked, public flag
+    cleared, and the services left in place as orphans.
     """
-    user = db.query(EndUser).filter(EndUser.id == user_id).first()
-    if not user:
-        raise HTTPException(404, "User not found")
-    auth_service.delete_api_keys_for_user(db, user.id, "end_user")
-    db.delete(user)
-    db.commit()
-    return {"deleted": True}
+    from ..database import SessionLocal
+    from ..models.api_key import ApiKey
+    from ..models.pre_deploy_session import PreDeploySession
+    from ..models.stream_exposure import StreamExposure
+
+    db = SessionLocal()
+    try:
+        user = db.query(EndUser).filter(EndUser.id == user_id).first()
+        if user is None:
+            raise HTTPException(404, "User not found")
+        if user.deleted_at is not None:
+            raise HTTPException(409, "Account is already deleted")
+        username = user.username
+    finally:
+        db.close()
+
+    # NO database connection is held across this external call.
+    try:
+        stopped = await provision_service.stop_user_all(username)
+    except Exception as exc:  # noqa: BLE001 — abort, account stays
+        db = SessionLocal()
+        try:
+            audit_service.log_action(
+                db, action="delete", admin_id=current_admin["id"],
+                target_user=username, status="failure",
+                error_message=f"service stop failed: {exc}",
+            )
+        finally:
+            db.close()
+        raise HTTPException(
+            502,
+            detail={
+                "error": "stop_failed",
+                "message": f"Service stop failed; account '{username}' was not deleted",
+                "detail": str(exc),
+            },
+        )
+
+    failed = list((stopped or {}).get("failed_services") or [])
+    if not stopped or stopped.get("ok") is not True or failed:
+        db = SessionLocal()
+        try:
+            audit_service.log_action(
+                db, action="delete", admin_id=current_admin["id"],
+                target_user=username, status="failure",
+                error_message="one or more services could not be stopped",
+                detail={"failed_services": failed, "results": stopped},
+            )
+        finally:
+            db.close()
+        raise HTTPException(
+            502,
+            detail={
+                "error": "stop_failed",
+                "message": (
+                    f"One or more services of '{username}' could not be stopped; "
+                    "the account was not deleted"
+                ),
+                "failed_services": failed,
+            },
+        )
+
+    db = SessionLocal()
+    try:
+        user = db.query(EndUser).filter(EndUser.id == user_id).first()
+        if user is None:
+            raise HTTPException(404, "User not found")
+        if user.deleted_at is not None:
+            raise HTTPException(409, "Account is already deleted")
+
+        now = datetime.now(timezone.utc)
+        grants_removed = acl_service.remove_for_user(db, user.id)
+        keys_removed = (
+            db.query(ApiKey)
+            .filter(ApiKey.user_id == user.id, ApiKey.target_type == "end_user")
+            .delete(synchronize_session=False)
+        )
+        sessions_removed = (
+            db.query(PreDeploySession)
+            .filter(PreDeploySession.user_name == username)
+            .delete(synchronize_session=False)
+        )
+        exposures_revoked = (
+            db.query(StreamExposure)
+            .filter(
+                StreamExposure.user_name == username,
+                StreamExposure.revoked_at.is_(None),
+            )
+            .update({StreamExposure.revoked_at: now}, synchronize_session=False)
+        )
+
+        user.is_active = False
+        user.is_approved = False
+        # Keep the public marker for the historical tag: public ACCESS is denied
+        # by is_public_owner() because the account is inactive/deleted, but the
+        # user page must show Public alongside Deleted and the Services group
+        # must show Public alongside owner gone.
+        user.deleted_at = now
+        user.allowed_special_users = None
+        db.commit()
+
+        audit_service.log_action(
+            db,
+            action="delete",
+            admin_id=current_admin["id"],
+            target_user=username,
+            detail={
+                "soft_delete": True,
+                "services_stopped": len((stopped or {}).get("results") or []),
+                "grants_removed": grants_removed,
+                "api_keys_removed": keys_removed,
+                "pre_deploy_sessions_removed": sessions_removed,
+                "stream_exposures_revoked": exposures_revoked,
+            },
+            status="success",
+        )
+        return {
+            "deleted": True,
+            "soft_deleted": True,
+            "username": username,
+            "services_stopped": len((stopped or {}).get("results") or []),
+            "grants_removed": grants_removed,
+            "api_keys_removed": keys_removed,
+            "pre_deploy_sessions_removed": sessions_removed,
+            "stream_exposures_revoked": exposures_revoked,
+        }
+    finally:
+        db.close()
 
 
 @router.get("/users/deployable")
@@ -781,6 +1070,7 @@ def list_deployable_users(
     users = db.query(EndUser).filter(
         EndUser.is_approved == True,
         EndUser.is_active == True,
+        EndUser.deleted_at.is_(None),
     ).all()
     result = [u.to_dict() for u in users]
     # Special users are those registered with role="special" in end_users

@@ -213,7 +213,7 @@ def get_end_user_by_id(db: Session, user_id: int) -> EndUser | None:
 def authenticate_end_user(db: Session, username: str, password: str) -> EndUser | None:
     """Authenticate an end-user by username and password. Returns the user or None."""
     user = get_end_user_by_username(db, username)
-    if not user or not user.is_active:
+    if not user or not user.is_active or user.deleted_at is not None:
         return None
     if not user.is_approved:
         return None  # Not yet approved by admin
@@ -390,13 +390,16 @@ def _hash_token(token: str) -> str:
 
 
 def parse_allowed_special_users(raw: str | None) -> list[str]:
-    """Parse the comma-separated ``allowed_special_users`` list, trimming (N1)."""
-    if not raw:
-        return []
-    return [u.strip() for u in raw.split(",") if u.strip()]
+    """Parse the RETIRED comma-separated list, trimming (N1).
+
+    Kept only for the one-time migration and the historical parser test; no
+    authorization path reads it. The ACL matrix is ``acl_service.allows``.
+    """
+    from .acl_service import parse_legacy
+    return parse_legacy(raw)
 
 
-def acl_allows(end_user, target_user_name: str) -> bool:
+def acl_allows(db: Session, end_user, target_user_name: str) -> bool:
     """Does ``end_user`` reach an instance owned by ``target_user_name``?
 
     This IS the ACL matrix: the rule the HTTP gate applies at
@@ -406,17 +409,12 @@ def acl_allows(end_user, target_user_name: str) -> bool:
     **G39** §3 requires the stream path to evaluate "the same ACL matrix the HTTP
     path uses" (task-doc R3.3), and two copies of a security rule drift.
 
-    The matrix proper is only *own instance, or a recorded special-user grant*.
-    The checks around it stay with each caller, because they answer with
-    different things: the HTTP gate must return ``login_required`` (401) for an
-    inactive or unapproved user *before* ``acl_denied`` (403) can be the answer,
-    while the stream verdict turns any of them into a deny.
+    The matrix is ID-keyed (GRILLING G78): own instance by username, or an
+    active ``acl_grants`` row whose grantee and shared accounts are both live.
+    The legacy comma-separated string is never consulted.
     """
-    if target_user_name == getattr(end_user, "username", None):
-        return True
-    return target_user_name in parse_allowed_special_users(
-        getattr(end_user, "allowed_special_users", None)
-    )
+    from .acl_service import allows
+    return allows(db, end_user, target_user_name)
 
 
 TARGET_TYPES = ("end_user", "admin")
@@ -477,7 +475,7 @@ def _target_identity(db: Session, user_id: int,
             raise ValueError(f"No admin with id {user_id}")
         return ("admin", admin.email, admin.role or "admin")
     end_user = db.query(EndUser).filter(EndUser.id == user_id).first()
-    if end_user is None:
+    if end_user is None or end_user.deleted_at is not None:
         raise ValueError(f"No end user with id {user_id}")
     return ("end_user", end_user.username, end_user.role or "viewer")
 

@@ -8,6 +8,7 @@ from .service_template import ServiceTemplate
 from .gateway_setting import GatewaySetting
 from .proxy_config import ProxyConfig
 from .end_user import EndUser
+from .acl_grant import AclGrant
 from .api_key import ApiKey
 from .generation_job import GenerationJob
 from .pre_deploy_session import PreDeploySession
@@ -22,6 +23,7 @@ __all__ = [
     "GatewaySetting",
     "ProxyConfig",
     "EndUser",
+    "AclGrant",
     "ApiKey",
     "GenerationJob",
     "PreDeploySession",

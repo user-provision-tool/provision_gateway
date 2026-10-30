@@ -495,17 +495,17 @@ Output ONLY the raw YAML, no markdown fences, no explanations.""")
                     + ".\nYour proxy_pass MUST use one of these exact service names as the host "
                     "(e.g. proxy_pass http://<service>:PORT;)."
                 )
-            # R1.5 / T16 — the EXTRA http endpoints this deployment declares.
+            # R1.5 / R14 — EVERY http endpoint this deployment declares.
             #
-            # R1.3 makes it an ERROR for a surviving `kind: http` row to have no
+            # R1.3 makes it an ERROR for a `kind: http` row to have no
             # `server{}` block serving `<instance host>--<sub_service>.<domain>`,
-            # and the serving_ports artifact is where those rows live. Without
+            # and the serving_ports artifact is where those rows live. R14
+            # removed the primary: there is no bare instance-host block, so all
+            # http rows — not "all but the primary" — are listed here. Without
             # this the model saw only the compose, wrote ONE block, and every
             # generation failed its own validation (measured 2026-10-10, jobs
-            # 366/367). The artifact is authoritative here for the same reason it
-            # is in the serving_ports phase: it is the deployment's own
-            # declaration of what exists.
-            extras_block = ""
+            # 366/367).
+            endpoints_block = ""
             _sp_path = context.get("serving_ports_path")
             if _sp_path:
                 try:
@@ -516,27 +516,25 @@ Output ONLY the raw YAML, no markdown fences, no explanations.""")
                     _rows = _http_rows(
                         _yaml.safe_load(Path(_sp_path).read_text(encoding="utf-8", errors="replace"))
                     )
-                    _extra = [
-                        r for r in _rows
-                        if r.get("primary") is not True and r.get("sub_service")
-                    ]
-                    if _extra:
+                    if _rows:
                         _lines = "\n".join(
-                            "  - server_name {service_name}_hostname--%s;  with proxy_pass "
+                            "  - server_name mock_server_name--%s;  with proxy_pass "
                             "http://%s:%s;" % (r["sub_service"], r["sub_service"], r["port"])
-                            for r in _extra
+                            for r in _rows if r.get("sub_service")
                         )
-                        extras_block = (
-                            "\nThis deployment declares these ADDITIONAL http endpoints "
+                        endpoints_block = (
+                            "\nThis deployment declares these HTTP endpoints "
                             "(from its serving_ports artifact — one `server { listen 80; … }` "
-                            "block EACH, server_name and proxy_pass exactly as shown, and no "
-                            "other extra blocks):\n" + _lines
+                            "block EACH, `server_name` and `proxy_pass` exactly as shown, and "
+                            "no other blocks). There is NO primary block: the instance "
+                            "hostname is not a route; every endpoint carries "
+                            "`--<sub_service>`:\n" + _lines
                         )
                 except Exception:  # noqa: BLE001 — a missing artifact must not fail the prompt
-                    extras_block = ""
+                    endpoints_block = ""
             parts.append(f"""
 Generate an nginx reverse proxy configuration. It sits behind provision-nginx,
-serving hostname {deploy_meta.get('domain','localhost')} with basic auth support.{hint}{extras_block}
+serving endpoints under {deploy_meta.get('domain','localhost')} with basic auth support.{hint}{endpoints_block}
 Follow these rules from the provision-api skill:
 
 {rules}

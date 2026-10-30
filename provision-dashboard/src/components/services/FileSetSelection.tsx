@@ -75,9 +75,8 @@ export function fixVariantFor(name: string): string {
   // ALREADY a fork: `serving_ports.base.362.fix.yml` became
   // `serving_ports.base.362.fix.fix.yml`. It bites the moment a fork is opened
   // and saved again — which is the ordinary second edit of an artifact the
-  // operator has already touched once, and also what the new `primary` picker
-  // does when the picker is already pointing at a fork. Single-slotted means
-  // idempotent: a name that carries the tag is returned as it is.
+  // operator has already touched once. Single-slotted means idempotent: a name
+  // that carries the tag is returned as it is.
   if (/\.env/.test(name) && !name.includes('.raw.')) {
     const stem = name.split('.').slice(0, -1).join('.') || '.env'
     return /\.fix$/.test(stem) ? name : `${stem}.fix`
@@ -92,99 +91,18 @@ interface Props {
   candidates: FileSetCandidates
   stale?: FileSetStale
   needsEnv: boolean
+  // The standalone Generate Base Files panel has no interpolation env slot;
+  // it supplies an Env reference picker instead.
+  showEnv?: boolean
+  // Profiles are a DEPLOY-time activation control; a recipe-level generation
+  // must be profile-blind (the -api filters blocks at render), so the
+  // standalone panel hides this section.
+  showProfiles?: boolean
   onChange: (next: FileSetSelectionData) => void
   // §5b: clicking a SELECTED file's name opens it for view/edit. Saving forks
   // into the `.fix` variant rather than writing back over the selection, so a
   // repo-original is never rewritten by an edit made here.
   onOpenFile?: (name: string) => void
-  // R1.3 — the `primary` row of the serving-ports artifact (the service the
-  // instance hostname points at). The rows are read by the CALLER, which owns
-  // the file fetch; this component only renders the choice.
-  spRows?: ServingPortsRow[]
-  onPrimaryChange?: (subService: string) => void
-}
-
-/** One row of a serving-ports artifact, as the picker needs it.
- *
- * Keyed by sub-service AND port, not by sub-service alone: an artifact may
- * declare one sub-service on two rows — neo4j's Browser (7474, http) and its
- * Bolt port (7687, stream) are the worked example — and "which row is primary"
- * is a question about a ROW. Keyed by name alone the picker would offer the
- * same entry twice and an edit would mark both.
- */
-export interface ServingPortsRow { subService: string; port: string; primary: boolean }
-
-/** The identity of a row, for the picker's value and for `setPrimary`. */
-export const servingPortsKey = (r: ServingPortsRow): string => `${r.subService}:${r.port}`
-
-/**
- * Read a serving-ports artifact's rows — enough for the `primary` picker, and
- * nothing more. A line scan rather than a YAML parse on purpose: this runs in
- * the browser, the file is small and machine-shaped, and a parse/serialize
- * round-trip would rewrite the operator's comments and formatting.
- */
-export function servingPortsRows(content: string): ServingPortsRow[] {
-  const rows: ServingPortsRow[] = []
-  let cur: ServingPortsRow | null = null
-  for (const line of content.split('\n')) {
-    const m = /^\s*-\s*sub_service:\s*(.+?)\s*$/.exec(line)
-    if (m) {
-      cur = { subService: m[1].replace(/^['"]|['"]$/g, ''), port: '', primary: false }
-      rows.push(cur)
-      continue
-    }
-    if (!cur) continue
-    const pm = /^\s*port:\s*(\S+)\s*$/.exec(line)
-    if (pm) cur.port = pm[1].replace(/^['"]|['"]$/g, '')
-    if (/^\s*primary:\s*true\s*$/.test(line)) cur.primary = true
-  }
-  return rows
-}
-
-/**
- * Move `primary: true` to *subService*, preserving every other line byte for
- * byte — comments included. R1.3: "any row edit, `primary` included, forks
- * `.fix` and flips the picker to the fork"; this is the edit, the caller does
- * the fork.
- *
- * The chosen row keeps its own line (its value replaced); every other row's
- * `primary:` line is dropped; a chosen row that has none gets one after its
- * `port:` line, at that line's own indentation.
- */
-export function setPrimary(content: string, key: string): string {
-  const [wantSub, wantPort] = key.split(':')
-  const lines = content.split('\n')
-  const isRow = (line: string) => /^\s*-\s*sub_service:\s*(.+?)\s*$/.test(line)
-  const subOf = (line: string) => (line.match(/^\s*-\s*sub_service:\s*(.+?)\s*$/) || [])[1]?.replace(/^['"]|['"]$/g, '') || ''
-  const portOf = (line: string) => (line.match(/^\s*port:\s*(\S+)\s*$/) || [])[1]?.replace(/^['"]|['"]$/g, '') || ''
-
-  // Walk the rows once to learn the chosen row's identity and whether it
-  // already carries a `primary:` line of its own.
-  let curSub = '', curPort = '', hasLine = false, curIsChosen = false
-  for (const line of lines) {
-    if (isRow(line)) { curSub = subOf(line); curPort = ''; curIsChosen = curSub === wantSub && (wantPort === '' || wantPort === undefined) }
-    else if (curSub) { const p = portOf(line); if (p) curPort = p }
-    if (curSub && wantPort !== '' && wantPort !== undefined && curPort) curIsChosen = curSub === wantSub && curPort === wantPort
-    if (curIsChosen && /^\s*primary:\s*/.test(line)) hasLine = true
-  }
-
-  const out: string[] = []
-  curSub = ''; curPort = ''; curIsChosen = false
-  let inserted = false
-  for (const line of lines) {
-    if (isRow(line)) { curSub = subOf(line); curPort = ''; curIsChosen = curSub === wantSub && (wantPort === '' || wantPort === undefined) }
-    else if (curSub) { const p = portOf(line); if (p) { curPort = p; if (wantPort !== '' && wantPort !== undefined) curIsChosen = curSub === wantSub && curPort === wantPort } }
-    if (curSub && /^(\s*)primary:\s*/.test(line)) {
-      if (curIsChosen) out.push(line.replace(/primary:\s*\S+/, 'primary: true'))
-      continue                       // every other row loses its primary line
-    }
-    out.push(line)
-    if (!hasLine && !inserted && curIsChosen && /^(\s*)port:\s*/.test(line)) {
-      out.push(`${/^(\s*)/.exec(line)![1]}primary: true`)
-      inserted = true
-    }
-  }
-  return out.join('\n')
 }
 
 export function phaseOfFile(filename: string): string {
@@ -263,7 +181,7 @@ function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled, 
   )
 }
 
-export default function FileSetSelection({ selection, candidates, stale, needsEnv, onChange, onOpenFile, spRows, onPrimaryChange }: Props) {
+export default function FileSetSelection({ selection, candidates, stale, needsEnv, showEnv = true, showProfiles = true, onChange, onOpenFile }: Props) {
   const sel = selection
   const st = stale || {}
   const isStale = (cat: keyof FileSetStale, name: string) => (st[cat] || []).includes(name)
@@ -333,6 +251,11 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
           }}
           options={spOptions}
         />
+        {!sel.serving_ports && !sel.serving_ports_none && (
+          <Tag color="blue" style={{ width: 'fit-content', marginTop: 4 }}>
+            generate new — the pipeline will create one
+          </Tag>
+        )}
         {/* R1.4/R1.3 — the rule, said where the choice is made. With no file and
             no `None`, the pipeline generates one; with `None` nothing is
             generated, both validations are skipped, and no stream row exists to
@@ -347,22 +270,6 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
               style={{ padding: 0, fontFamily: 'monospace', fontSize: 13,
                 ...(isStale('serving_ports', sel.serving_ports) ? strike : {}) }}
               onClick={() => onOpenFile(sel.serving_ports as string)}>{sel.serving_ports}</Button>
-          </div>
-        )}
-        {/* R1.3 — `primary`, "between the serving-ports and nginx pickers", and
-            only when a ports file is in play: it is a field OF that file. */}
-        {sel.serving_ports && (spRows || []).length > 0 && (
-          <div style={{ marginTop: 6 }}>
-            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              primary — the service the instance hostname points at
-            </Typography.Text>
-            <Select
-              style={{ width: '100%', marginTop: 2 }}
-              value={(() => { const p = (spRows || []).find(r => r.primary); return p ? servingPortsKey(p) : undefined })()}
-              placeholder="(no primary declared)"
-              onChange={(v) => onPrimaryChange?.(String(v))}
-              options={(spRows || []).map(r => ({ value: servingPortsKey(r), label: r.port ? `${r.subService}  (${r.port})` : r.subService }))}
-            />
           </div>
         )}
         {sel.serving_ports_none && (
@@ -414,11 +321,12 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
         />
         {selectedConfs.length === 0 && (
           <Tag color="blue" style={{ width: 'fit-content', marginTop: 4 }}>
-            generate new — the pipeline will create what is missing
+            generate new — the pipeline will create one
           </Tag>
         )}
       </div>
 
+      {showEnv && (
       <div>
         <Typography.Text strong>Interpolation env files</Typography.Text>
         <Typography.Text type="secondary" style={{ fontSize: 12 }}> — later wins</Typography.Text>
@@ -439,7 +347,9 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
           />
         )}
       </div>
+      )}
 
+      {showProfiles && (
       <div>
         <Typography.Text strong>Compose profiles</Typography.Text>
         <Typography.Text type="secondary" style={{ fontSize: 12 }}> — gate optional services</Typography.Text>
@@ -462,6 +372,7 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
           <span key={p} style={{ marginTop: 4, display: 'inline-block', ...strike }}>{p}</span>
         ))}
       </div>
+      )}
     </Space>
   )
 }

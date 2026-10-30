@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Modal, Drawer, Checkbox, Popconfirm } from 'antd'
+import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Collapse, Badge, Tooltip, Modal, Drawer, Checkbox, Popconfirm, Alert } from 'antd'
 import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, UnlockOutlined, SwapOutlined, UnorderedListOutlined, DashboardOutlined, GlobalOutlined, StopOutlined, RobotOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
@@ -21,10 +21,10 @@ interface ServiceInstance {
   // absent means nothing is exposed — which is also the TLS-off case by
   // construction, so the panel needs NO logic of its own for it.
   stream_sub_services?: string[]
-  // R1.5/R6.2: the instance's EXTRA http endpoints, as the whole served names
+  // R1.5/R6.2/R14: the instance's HTTP endpoints, as the whole served names
   // (`<instance host>--<sub_service>.<domain>`) the -api read out of the rendered
-  // conf. The URL section lists one `/go/` row per entry, keyed by the
-  // sub-service, beside the primary's own row keyed `primary` — and offers
+  // conf. The Endpoints section lists one `/go/` row per entry, keyed by the
+  // sub-service — there is no primary row and no instance URL — and offers
   // nothing that the deployment did not create.
   http_endpoints?: string[]
   nginx_conf_paths?: string[]
@@ -39,6 +39,15 @@ interface ServiceInstance {
   recipe_path?: string
   env_file_path?: string
   has_auth?: boolean; url?: string
+  // G78 public-card annotation, supplied by the gateway (never re-derived in
+  // the browser): is_public is true only for an active public owner; public_urls
+  // maps each served name to its direct scheme/edge-port URL.
+  is_public?: boolean
+  // Historical marker for a soft-deleted public owner: public ACCESS is gone
+  // (is_public false), but the group keeps its Public tag alongside owner gone.
+  was_public?: boolean
+  owner_gone?: boolean
+  public_urls?: Record<string, string>
   // R1.5 — the instance's own host, recorded in the registry entry and reported
   // by the -api. Every `/go/` link on the card is built from it.
   hostname?: string
@@ -192,12 +201,30 @@ function FailedAlert({ svc, isAnalyzing }: { svc: ServiceInstance; isAnalyzing: 
   )
 }
 
+// G78 — a public instance without auth_basic is genuinely open. The warning is
+// inline on the card header (visible folded), and the Public badge lives in the
+// same header. The gateway supplies both facts; the browser does not guess.
+function PublicHeaderNote({ svc }: { svc: ServiceInstance }) {
+  if (!svc.is_public || svc.has_auth) return null
+  return (
+    <HeaderNote
+      tone="warning"
+      text="public and unguarded — anyone can access this service"
+      detail="This functional user is public and the instance has no preset Basic auth. Add a service password, or accept that the URL is open."
+    />
+  )
+}
+
 export default function UsersPage() {
   const { admin } = useAuth()
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const isAdmin = admin?.role === 'admin'
   const [services, setServices] = useState<ServiceInstance[]>([])
+  // Admin-only top alert: registry owners whose account row is soft-deleted (or
+  // absent). The gateway derives this join; the alert clears when the last
+  // service of those users is deleted.
+  const [orphans, setOrphans] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
   const deployParam = searchParams.get('deploy') || ''
   const [deployOpen, setDeployOpen] = useState(!!deployParam)
@@ -365,34 +392,20 @@ export default function UsersPage() {
 
   // Build the service-access redirect URL (Gap 9). Clicking it goes to
   // `/go/{hostname}` on the dashboard domain, which the gateway turns into a
-  // 302 → `{hostname}/_set_token?token=…` (setting the provision_token cookie for
+  // 302 → `{hostname}/_set_token?code=…` (setting the provision_token cookie for
   // the service domain) → service loads silently. This is required because the
   // login cookie is host-scoped and is NOT sent to the service hostname directly.
-  // The instance's OWN host, taken from the URL the -api reports — its domain is
-  // whatever the deployment used, and the `/go/` relay is on the dashboard's
-  // domain, so only the host part is needed. The previous form hard-coded
-  // `.localhost`, so on any other domain every `/go/` link pointed at a host that
-  // does not exist.
-  const instanceHost = useCallback((svc: ServiceInstance): string => {
-    // The RECORDED host first — the registry entry carries it, and it is the
-    // single source of truth the deploy itself used.
-    if (svc.hostname) return svc.hostname
-    try {
-      const h = new URL(svc.url || '').hostname
-      if (h) return h
-    } catch { /* no url yet — fall through to the composed name */ }
-    return `${svc.service_name}-${svc.user_name}-${svc.label}.localhost`
-  }, [])
-
-  const buildServiceUrl = useCallback((svc: ServiceInstance): string => {
-    return `/go/${instanceHost(svc)}`
-  }, [instanceHost])
-
-  // R1.5/R6.2 — one `/go/` row per EXTRA http endpoint. The recorded name IS the
+  //
+  // R1.5/R6.2/R14 — one `/go/` row per HTTP endpoint. The recorded name IS the
   // host to dial (`<instance host>--<sub_service>.<domain>`), and the key shown
   // is the sub-service: the same shape the stream rows use, so one convention
-  // covers both.
+  // covers both. There is no primary row — the instance host is identity only.
   const goUrlFor = useCallback((svc: ServiceInstance, servedName: string): string => {
+    // G78 / R15: a public endpoint links DIRECTLY to its served name (scheme and
+    // published edge port supplied by the gateway). Private keeps /go/.
+    if (svc.is_public && svc.public_urls?.[servedName]) {
+      return svc.public_urls[servedName]
+    }
     return `/go/${servedName}`
   }, [])
 
@@ -674,6 +687,7 @@ export default function UsersPage() {
     // admin.email) continue` dropped granted special-user services, hiding them
     // from the viewer despite the backend returning them (Gap 3).
     const users = data.users || data.user_status || []
+    setOrphans(Array.isArray(data.orphans) ? data.orphans : [])
     const all: ServiceInstance[] = []
     for (const u of users) {
       for (const s of (u.healthy_services||[])) all.push({...s, user_name: u.user_name})
@@ -1135,6 +1149,15 @@ export default function UsersPage() {
         </Space>
       </div>
 
+      {isAdmin && orphans.length > 0 && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{marginBottom:12}}
+          message={`Users ${orphans.join(', ')} are gone — services should be deleted`}
+        />
+      )}
+
       {selectedKeys.size > 0 && isAdmin && (
         <Card size="small" style={{marginBottom:12,background:'#fffbe6',borderColor:'#faad14'}}>
           <Space>
@@ -1161,6 +1184,10 @@ export default function UsersPage() {
           // A failed entry is its own state, not "unhealthy" — it has no
           // containers to be unhealthy about (failed-instance-state-todo.md §3).
           const failedCount = userSvcs.filter(s => s.status === 'failed').length
+          const ownerGone = userSvcs.some(s => s.owner_gone)
+          // The group itself is marked public, with the same inline-tag style
+          // as the owner-gone tag; every card in it carries its own Public badge.
+          const publicGroup = userSvcs.some(s => s.is_public || s.was_public)
           const unhealthyCount = userSvcs.length - healthyCount - buildingCount - failedCount
           // The group tag counts INSTANCES (it is a health summary, and a session
           // has no containers to be healthy about); a user holding only sessions
@@ -1184,7 +1211,11 @@ export default function UsersPage() {
                   indeterminate={userSvcs.some(s => selectedKeys.has(`${s.user_name}-${s.service_name}-${s.label}`)) && !userSvcs.every(s => selectedKeys.has(`${s.user_name}-${s.service_name}-${s.label}`))}
                   onChange={() => toggleSelectAll(userName)}
                 />}
-                <Title level={4} style={{margin:0}}>{highlight(userName, search)}</Title>
+                <Title level={4} style={{margin:0, color: ownerGone ? '#cf1322' : undefined}}>
+                  {highlight(userName, search)}
+                </Title>
+                {ownerGone && <Tag color="red">owner gone</Tag>}
+                {publicGroup && <Tag color="green">Public</Tag>}
                 <Tag color={failedCount > 0 ? 'red' : (userSvcs.length === 0 ? 'blue' : (allHealthy?'green':'orange'))}>{groupTag}</Tag>
               </Space>
               <Space>
@@ -1232,7 +1263,10 @@ export default function UsersPage() {
                         </span>
                       )}
                     </>}
-                    alert={<FailedAlert svc={svc} isAnalyzing={isAnalyzing} />}
+                    alert={<>
+                      <FailedAlert svc={svc} isAnalyzing={isAnalyzing} />
+                      <PublicHeaderNote svc={svc} />
+                    </>}
                     actions={isAdmin && <>
                           {/* A `building` entry is cancellable (§4b). Under the hood
                               this cancels the underlying -api task — the same
@@ -1402,30 +1436,17 @@ export default function UsersPage() {
                           </Space>
                         </div>
                       )}
-                      <div>
-                        <Text strong>URL: </Text>
-                        <a href={buildServiceUrl(svc)} target="_blank" rel="noopener noreferrer">
-                          <Text code style={{color:'#1677ff'}}>{buildServiceUrl(svc)}</Text>
-                        </a>
-                        {svc.has_auth && <Tag color="blue" style={{marginLeft:4}}>Auth</Tag>}
-                      </div>
-                      {/* R6.2 — the URL section: one `/go/` row per exposed HTTP
-                          endpoint, keyed by the sub-service name, the primary
-                          keyed `primary`. Every row is read from the artifacts
-                          (the entry's recorded endpoints), never typed, and the
-                          section appears only when the deployment HAS an extra
-                          endpoint — an instance with just its primary shows the
-                          single URL above, unchanged. */}
+                      {/* R14 — Endpoints list ONLY: no instance URL field, no
+                          `primary` row. Every HTTP endpoint is
+                          `<instance host>--<sub_service>.<domain>` and is read
+                          from the artifact the deployment recorded, never
+                          typed. The Auth tag lives here, with the section it
+                          qualifies. */}
                       {(svc.http_endpoints || []).length > 0 && (
                         <div>
                           <Text strong>Endpoints: </Text>
+                          {svc.has_auth && <Tag color="blue" style={{marginLeft:4}}>Auth</Tag>}
                           <Space direction="vertical" size={2}>
-                            <Space size={6} wrap>
-                              <Text code>primary</Text>
-                              <a href={buildServiceUrl(svc)} target="_blank" rel="noopener noreferrer">
-                                <Text code style={{color:'#1677ff'}}>{instanceHost(svc)}</Text>
-                              </a>
-                            </Space>
                             {(svc.http_endpoints || []).map((served: string) => {
                               const sub = served.includes('--')
                                 ? served.split('--').slice(1).join('--').split('.')[0]

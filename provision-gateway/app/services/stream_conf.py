@@ -7,12 +7,12 @@ and its LLM inference; what is left here is arithmetic — pick the rows whose
 internal nginx can select by `server_name`.
 
 The shape it emits is the one the -api's own conversion expects
-(`convert_stream_conf`, R9.2), and the two are a pair: the conf carries the
-canonical name verbatim (the edge dials exactly that as the inner hop's SNI —
-R4.4), the container by its COMPOSE service name (the -api prefixes it with
-`{{ container_prefix }}`), and the certificate path from the deploy's own store
-(the -api turns it into `{{ ssl_certificate_path }}`). Nothing here needs to know
-any of those substitutions — it writes the plain conf, and the -api converts it.
+(`convert_stream_conf`, R9.2), and the two are a pair: the conf carries a MOCK
+`server_name` (the -api rebuilds it from `<instance>--<sub>.<domain>`), a PLAIN
+compose-service upstream (the -api prefixes it with `{{ container_prefix }}`),
+and neither a certificate nor an access policy (the -api injects both). Nothing
+here needs to know any instance identity or the platform's network — it writes a
+plain, portable artifact, and the -api converts it.
 
 What this file must NOT write, and why (each is a measured defect avoided):
 
@@ -21,8 +21,10 @@ What this file must NOT write, and why (each is a measured defect avoided):
   password-protected one;
 * **no ssl guard** — a stream block's TLS listener is structural, and the FILE'S
   EXISTENCE is the switch (R8.4/R9.3), so the block is never conditional;
-* **no `map`** — the canonical names are known when this conf is generated, so
-  each block carries its own certificate (R4.3's per-listener rule).
+* **no certificate line** — the deploy pair is injected by the -api, the one
+  owner of certificate material; a generated path could only be a guess;
+* **no `allow`/`deny`** — the platform subnet is a property of the stack the conf
+  is deployed into, never of the recipe, and the gateway cannot see that stack.
 """
 
 from __future__ import annotations
@@ -35,12 +37,6 @@ from .serving_ports import category_of
 # The internal listener's container port (task-doc R5.1: the port the compose
 # publishes; the container port is an implementation detail no client sees).
 INTERNAL_STREAM_PORT = 7687
-
-# The shared network the internal nginx sits on, which is the only source allowed
-# to reach this listener. Deliberately NOT a door control (R5.2): a client
-# arriving through a published port passes docker's NAT and can appear inside
-# this range, so the guard is tenant isolation and nothing more.
-SHARED_SUBNET = "172.17.0.0/16"
 
 # The docker embedded DNS is deliberately NOT used here any more: the blocks
 # upstream STATICALLY (see `render_stream_conf`), because the variable form that
@@ -99,16 +95,7 @@ def canonical_name(*, service_name: str, user_name: str, label: str, domain: str
     return f"{service_name}-{user_name}-{label}--{sub_service}.{domain}"
 
 
-def render_stream_conf(
-    rows: list[dict[str, Any]],
-    *,
-    service_name: str,
-    user_name: str,
-    label: str,
-    domain: str,
-    cert_pem: str,
-    cert_key: str,
-) -> str:
+def render_stream_conf(rows: list[dict[str, Any]]) -> str:
     """The conf text for one instance's stream rows — one `server{}` per row.
 
     Empty when there are no stream rows: the caller writes no file at all, which
@@ -122,65 +109,34 @@ def render_stream_conf(
         blocks.append(
             f"server {{\n"
             f"    listen              {INTERNAL_STREAM_PORT} ssl;\n"
+            # A MOCK name, in the shape the stream converter parses:
+            # `<anything>--<sub>.<domain>`. `.invalid` is reserved and can never
+            # resolve, so the mock cannot be mistaken for a real endpoint; the
+            # -api rebuilds the name from the instance it renders for.
+            #
             # NO `ssl_preread` here, deliberately: the static upstream below is
             # enough for nginx to choose the block by the SNI (measured on a
             # minimal reproduction — two blocks, one certificate, two upstreams,
-            # and the SNI selected correctly with and without the line). The
-            # defect this block had was the upstream FORM, not a missing preread.
-            #
-            # G56 (D7) — TEMPLATED, like the http category's `server_name`. The
-            # -api renders `hostname_stem` and `domain_name` for the target
-            # instance, so a conf selected from another deployment is portable and
-            # the gateway never bakes an instance identity into a recipe artifact.
-            f"    server_name         {{{{ hostname_stem }}}}--{sub}.{{{{ domain_name }}}};\n"
+            # and the SNI selected correctly with and without the line).
+            f"    server_name         mock_server_name--{sub}.mock.invalid;\n"
             f"\n"
-            f"    # The domain wildcard, named per block: these names are known when\n"
-            f"    # this conf is generated, so no map is needed (R4.3/R5.4).\n"
-            f"    ssl_certificate     {cert_pem};\n"
-            f"    ssl_certificate_key {cert_key};\n"
-            f"\n"
-            f"    # Tenant isolation, NOT a door control (R5.2).\n"
-            f"    allow               {SHARED_SUBNET};\n"
-            f"    deny                all;\n"
-            f"\n"
-            # The last hop names the instance's OWN container, and it is STATIC —
+            # The last hop names the recipe's OWN compose service, STATICALLY —
             # deliberately NOT `set $stream_upstream <name>; proxy_pass
-            # $stream_upstream;` with a `resolver`.
-            #
-            # The variable form DEFEATS the SNI-based choice of virtual server: every
-            # connection lands on the FIRST block, so every row but the first is
-            # unreachable. Measured 2026-10-16 on a minimal reproduction — one nginx,
-            # one certificate, two blocks, two distinguishable upstreams:
-            #
-            #   static proxy_pass          -> SNI a.test hit block 1, b.test hit block 2
-            #   set + variable + resolver  -> BOTH hit block 1
-            #
-            # …and on the live door, one handle per row: under the variable form the
-            # falkordb name answered NOTHING — the bytes reached neo4j's Bolt listener,
-            # which dropped them (`TCP 200, read 0`), and FalkorDB's MONITOR showed the
-            # command never arrived — while under this one it answered `+PONG` from
-            # FalkorDB itself. `ssl_preread` is NOT the missing piece: the static form
-            # selects correctly without it (measured).
-            #
-            # The price is R5.3's: nginx resolves a static upstream at LOAD time, so a
-            # conf left behind by a deleted instance makes the next reload fail. That
-            # is the cost of the routing working at all — the alternative is rows that
-            # cannot be reached.
-            #
-            # `{{ container_prefix }}` is substituted by the -api at register time
-            # (its own naming, one home in `template_engine.container_prefix`), which
-            # is what keeps this the instance's own container rather than a name every
-            # instance shares. Its converter leaves this line alone: it rewrites
-            # `<name>` in a `set $stream_upstream` line, and this is not one.
-            f"    proxy_pass          {{{{ container_prefix }}}}{sub}:{port};\n"
+            # $stream_upstream;` with a `resolver`. The variable form DEFEATS the
+            # SNI-based choice of virtual server (every connection lands on the
+            # FIRST block; measured 2026-10-16), and it is also the form nginx can
+            # evaluate empty. `{{ container_prefix }}` is the -api's substitution:
+            # it rewrites this host at conversion time, so the rendered conf names
+            # the instance's own container.
+            f"    proxy_pass          {sub}:{port};\n"
             f"}}\n"
         )
     if not blocks:
         return ""
     header = (
         "# Generated by the provision gateway (one block per stream row).\n"
-        "# The -api converts and renders this file; the edge dials each block by the\n"
-        "# canonical name in its `server_name`.\n"
+        "# Mock name and plain upstream: the -api rewrites the name, prefixes the\n"
+        "# upstream, and injects the deploy certificate and the platform policy.\n"
     )
     return header + "\n" + "\n".join(blocks)
 
@@ -209,7 +165,6 @@ def produce_for_deploy(
     label: str,
     domain: str,
     serving_ports_path: str | None,
-    ssl_dir: str,
     recipe_dir: str,
 ) -> str | None:
     """Write this instance's stream conf for ONE deploy; return its path or None.
@@ -242,12 +197,7 @@ def produce_for_deploy(
     if not rows:
         return None
 
-    content = render_stream_conf(
-        rows,
-        service_name=service_name, user_name=user_name, label=label, domain=domain,
-        cert_pem=str(Path(ssl_dir) / domain / "fullchain.pem"),
-        cert_key=str(Path(ssl_dir) / domain / "privkey.pem"),
-    )
+    content = render_stream_conf(rows)
     if not content:
         return None
     out = Path(recipe_dir) / f"{service_name}.user-{user_name}.{label}.stream.conf"

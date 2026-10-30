@@ -108,6 +108,27 @@ http {
         default $http_host;
     }
 
+    # ------------------------------------------------------------------
+    # G78 / R7 — the ONE Authorization selector for ACL-on service traffic.
+    #
+    # The gateway returns X-Public-Service: 1 for a public functional user's
+    # target (it also returns NO X-Service-Basic on that path). Public means the
+    # CLIENT's own Authorization is forwarded unchanged — the internal nginx's
+    # preset auth_basic is then the only HTTP guard. Every other target keeps
+    # the historical behavior: inject the owner credential as Basic.
+    #
+    # An empty $http_authorization produces an empty value, so no Authorization
+    # header is sent upstream and the internal nginx can issue its challenge.
+    # The verdict comes ONLY from the auth subrequest response; a client-supplied
+    # X-Public-Service header is never read here.
+    # ------------------------------------------------------------------
+    # [if ENABLE_ACL=true]
+    map $public_service $edge_authorization {
+        "1"     $http_authorization;
+        default "Basic $service_basic";
+    }
+    # [endif]
+
     # ------- Portal (portal host) -------
     # Portal http — serves when PORTAL_MODE=http; 301→https when PORTAL_MODE=https.
     server {
@@ -163,9 +184,10 @@ http {
             auth_request_set $service_basic $upstream_http_x_service_basic;
             auth_request_set $auth_action  $upstream_http_x_auth_action;
             auth_request_set $client_type  $upstream_http_x_client_type;
+            auth_request_set $public_service $upstream_http_x_public_service;
             error_page 401 = @auth_401;
             error_page 403 = @auth_403;
-            proxy_set_header Authorization "Basic $service_basic";
+            proxy_set_header Authorization $edge_authorization;
             # R4-F63 — the client's Host, port included (see the map above).
             proxy_set_header Host $forwarded_host;
             proxy_set_header X-Forwarded-Proto http;
@@ -188,9 +210,10 @@ http {
             auth_request_set $service_basic $upstream_http_x_service_basic;
             auth_request_set $auth_action  $upstream_http_x_auth_action;
             auth_request_set $client_type  $upstream_http_x_client_type;
+            auth_request_set $public_service $upstream_http_x_public_service;
             error_page 401 = @auth_401;
             error_page 403 = @auth_403;
-            proxy_set_header Authorization "Basic $service_basic";
+            proxy_set_header Authorization $edge_authorization;
             # R4-F63 — the client's Host, port included (see the map above).
             proxy_set_header Host $forwarded_host;
             proxy_set_header X-Forwarded-Proto https;

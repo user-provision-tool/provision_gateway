@@ -45,20 +45,19 @@ class HostnameIndex:
                 return False
             new_index: dict[str, dict[str, Any]] = {}
             for entry in entries:
-                hostname = entry.get("hostname", "")
-                if hostname:
-                    new_index[hostname.lower()] = entry
-                # R1.5 — an instance's EXTRA HTTP endpoints resolve to the SAME
-                # entry, so `/go/<instance host>--<sub_service>.<domain>` reaches
-                # the sub-service with the instance's own cookie exactly as its
-                # primary URL does (the reason the platform relays through /go/ at
-                # all: the login cookie is host-scoped). Without these aliases the
-                # card offered a link that answered `Service not found` — measured
-                # 2026-10-10 on a live deployment whose entry recorded both extra
-                # endpoints.
+                # R14 — the instance hostname is IDENTITY, not a route. It is
+                # deliberately NOT indexed: `/go/<instance host>` must answer
+                # 404, and a request to that host through the edge has no vhost
+                # to reach. Every served HTTP endpoint is one of the recorded
+                # `http_endpoints` below.
                 #
-                # `setdefault`, never assignment: a name that is also some other
-                # instance's primary hostname must keep resolving to that instance.
+                # R1.5 — each served endpoint resolves to the SAME entry, so
+                # `/go/<instance host>--<sub_service>.<domain>` reaches the
+                # sub-service with the instance's own cookie (the reason the
+                # platform relays through /go/ at all: the login cookie is
+                # host-scoped). Without these aliases the card offered a link
+                # that answered `Service not found` — measured 2026-10-10 on a
+                # live deployment whose entry recorded both endpoints.
                 for _extra in (entry.get("http_endpoints") or []):
                     if isinstance(_extra, str) and _extra:
                         new_index.setdefault(_extra.lower(), entry)

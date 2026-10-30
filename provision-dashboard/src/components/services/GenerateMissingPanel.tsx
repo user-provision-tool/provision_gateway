@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button, Divider, Input, Modal, Progress, Space, Spin, Tag, Typography, message } from 'antd'
+import { Alert, Button, Divider, Input, Modal, Progress, Select, Space, Spin, Tag, Typography, message } from 'antd'
 import Editor from '@monaco-editor/react'
 import client from '../../api/client'
 import { deriveProfiles } from '../../api/services'
@@ -12,6 +12,7 @@ import FileSetSelection, {
   FileSetCandidates,
   FileSetSelectionData,
   FileSetStale,
+  fixVariantFor,
 } from './FileSetSelection'
 
 const { Text } = Typography
@@ -46,6 +47,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
   const [stale, setStale] = useState<FileSetStale>({})
   const [selection, setSelection] = useState<FileSetSelectionData>(EMPTY_SELECTION)
   const [needsEnv, setNeedsEnv] = useState(true)
+  const [envRefs, setEnvRefs] = useState<string[]>([])
   const [prompt, setPrompt] = useState('')
   const { jobId, jobState, polling, startJob, cancelJob, submitInput, resumeJob, reset } = useGenerationJob()
 
@@ -54,6 +56,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
   const [validations, setValidations] = useState<Record<string, any>>({})
   const [editorFile, setEditorFile] = useState<string | null>(null)
   const [editorContent, setEditorContent] = useState('')
+  const [editorFromPicker, setEditorFromPicker] = useState(false)
   const [saving, setSaving] = useState(false)
   // The resume target already attached in THIS open (see the init effect).
   const resumedRef = useRef<number | null>(null)
@@ -64,6 +67,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
     setReviewFiles(null)
     setValidations({})
     setPrompt('')
+    setEnvRefs([])
     reset()
     // Re-attach to a paused leg (the row's `Check`). The job runs in the GATEWAY,
     // not the browser, so it outlives the panel that started it — without this
@@ -152,8 +156,12 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
     mail_conf: selection.mail_conf
       && !(stale.mail_conf || []).includes(selection.mail_conf)
       ? selection.mail_conf : null,
-    env: selection.env.filter(p => !(stale.env || []).includes(p)),
-    profiles: selection.profiles.filter(p => !(stale.profiles || []).includes(p)),
+    // This panel has no interpolation env slot; env is deploy-time. The
+    // reference files travel as `env_reference`, never as selection.env.
+    env: [],
+    // Recipe-level generation is profile-blind; the -api filters conf blocks
+    // at render. The standalone panel has no profile picker.
+    profiles: [],
     // R4-F62 — the serving-ports slot must travel here too, and it did NOT.
     //
     // This panel renders the serving-ports picker (it uses the same
@@ -176,6 +184,53 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
     serving_ports_none: !selection.serving_ports && !!selection.serving_ports_none,
   })
 
+  const openSelectedFile = async (name: string) => {
+    const path = recipePath ? `${recipePath}/${name}` : name
+    try {
+      const { data } = await client.get(`/projects/${serviceName}/files/${path}`)
+      setEditorFile(name)
+      setEditorContent(typeof data?.content === 'string' ? data.content : '')
+      setEditorFromPicker(true)
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || `Could not open ${name}`)
+    }
+  }
+
+  const saveEditor = async () => {
+    if (!editorFile) return
+    if (editorFromPicker) {
+      const targetName = fixVariantFor(editorFile)
+      try {
+        await client.post('/projects/save-generated', {
+          service_name: serviceName,
+          recipe_path: recipePath,
+          files: { [targetName]: editorContent },
+        })
+        setSelection(prev => ({
+          ...prev,
+          compose: prev.compose.map(p => (p === editorFile ? targetName : p)),
+          nginx: prev.nginx === editorFile ? targetName : prev.nginx,
+          stream_conf: prev.stream_conf === editorFile ? targetName : prev.stream_conf,
+          mail_conf: prev.mail_conf === editorFile ? targetName : prev.mail_conf,
+          serving_ports: prev.serving_ports === editorFile ? targetName : prev.serving_ports,
+          env: prev.env.map(p => (p === editorFile ? targetName : p)),
+        }))
+        message.success(`Saved as ${targetName} — the selection now uses it`)
+        setEditorFile(null)
+        setEditorContent('')
+        setEditorFromPicker(false)
+      } catch (err: any) {
+        message.error(err.response?.data?.detail || 'Failed to save file')
+      }
+      return
+    }
+    if (reviewFiles) {
+      setReviewFiles({ ...reviewFiles, [editorFile]: editorContent })
+      setEditorFile(null)
+      setEditorContent('')
+    }
+  }
+
   const startGeneration = async () => {
     if (!llmActive) return
     try {
@@ -185,6 +240,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
         job_type: 'generate_missing',
         skip_env: true,  // env is generated per-user at deploy time (§8.7)
         prompt,
+        env_reference: envRefs,
         selection: effectiveSelection(),
         deploy_metadata: { service_name: serviceName, user_name: '', label: '0', domain: 'localhost' },
       })
@@ -227,7 +283,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
 
   return (
     <Modal
-      title={`Generate Missing Files${serviceName ? `: ${serviceName}${recipePath ? ` @ ${recipePath}` : ''}` : ''}`}
+      title={`Generate Base Files${serviceName ? `: ${serviceName}${recipePath ? ` @ ${recipePath}` : ''}` : ''}`}
       open={open}
       onCancel={onClose}
       footer={null}
@@ -256,7 +312,10 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
             candidates={candidates}
             stale={stale}
             needsEnv={needsEnv}
+            showEnv={false}
+            showProfiles={false}
             onChange={setSelection}
+            onOpenFile={openSelectedFile}
           />
 
           <Divider plain style={{ margin: '8px 0' }}>Generation prompt</Divider>
@@ -267,6 +326,24 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
             onChange={(e) => setPrompt(e.target.value)}
             placeholder="Describe the deployment — REQUIRED when the recipe has no base files at all (empty recipe). You may include doc URLs; the agent fetches them."
           />
+
+          {(candidates.env || []).length > 0 && (
+            <div>
+              <Text strong>Env reference (generation context)</Text>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {' '}— base/example env files the model reads as reference. Not passed to the deployment.
+              </Text>
+              <Select
+                mode="multiple"
+                allowClear
+                style={{ width: '100%', marginTop: 4 }}
+                placeholder="None — the model works from the compose alone"
+                value={envRefs}
+                onChange={(v) => setEnvRefs(v as string[])}
+                options={(candidates.env || []).map(c => ({ value: c, label: c }))}
+              />
+            </div>
+          )}
 
           {jobState && (
             <div style={{ border: '1px solid #f0f0f0', borderRadius: 8, padding: 12 }}>
@@ -283,7 +360,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
                             {ok ? '✓ valid' : '✗ invalid'}
                           </Tag>
                           <span style={{ fontFamily: 'monospace', fontSize: 13 }}>{fn}</span>
-                          <Button size="small" onClick={() => { setEditorFile(fn); setEditorContent(reviewFiles[fn] || '') }}>Edit</Button>
+                          <Button size="small" onClick={() => { setEditorFile(fn); setEditorContent(reviewFiles[fn] || ''); setEditorFromPicker(false) }}>Edit</Button>
                           {!ok && (
                             <Text type="danger" style={{ fontSize: 12, flex: 1 }}>
                               {((v && v.errors) || []).join('; ').slice(0, 200)}
@@ -339,7 +416,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
               loading={polling}
               onClick={startGeneration}
             >
-              Generate missing files
+              Generate Base Files
             </Button>
           </Space>
         </>)}
@@ -349,16 +426,13 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
       <Modal
         title={editorFile || ''}
         open={editorFile !== null}
-        onCancel={() => setEditorFile(null)}
+        onCancel={() => { setEditorFile(null); setEditorFromPicker(false) }}
         footer={
           <Space>
-            <Button onClick={() => setEditorFile(null)}>Close</Button>
-            <Button type="primary" onClick={() => {
-              if (editorFile && reviewFiles) {
-                setReviewFiles({ ...reviewFiles, [editorFile]: editorContent })
-                setEditorFile(null)
-              }
-            }}>Apply edit</Button>
+            <Button onClick={() => { setEditorFile(null); setEditorFromPicker(false) }}>Close</Button>
+            <Button type="primary" onClick={saveEditor}>
+              {editorFromPicker ? 'Save as .fix and use it' : 'Apply edit'}
+            </Button>
           </Space>
         }
         width="80%"

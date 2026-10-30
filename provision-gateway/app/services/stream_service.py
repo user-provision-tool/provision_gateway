@@ -300,7 +300,7 @@ def verify(
             return _deny("owner gone")
         if not owner.is_active or not owner.is_approved:
             return _deny("owner not entitled")
-        if not acl_allows(owner, str(entry.get("user_name", ""))):
+        if not acl_allows(db, owner, str(entry.get("user_name", ""))):
             return _deny("acl")
 
         return {"allow": True, "canonical_name": row.canonical_name, "reason": "allowed"}

@@ -474,7 +474,7 @@ Copy this template and fill in the placeholders for the specific service:
 ```nginx
 server {
     listen 80;
-    server_name {service_name}_hostname;
+    server_name mock_server_name--{sub_service};
 
     location / {
         proxy_pass http://{service_name}:{internal_port};
@@ -498,15 +498,16 @@ server {
 }
 ```
 
-**One block per additional http endpoint.** The `serving_ports` artifact declares every port the
-deployment exposes; the block above is the **primary** one (the service the instance's own hostname points
-at). For **every other row whose `kind` is `http`** — and only those — add a **separate** `server{}` block
-whose `server_name` carries the sub-service after the reserved separator:
+**One block per http endpoint — there is no primary.** The `serving_ports` artifact declares every port
+the deployment exposes, and **every row whose `kind` is `http`** gets its own `server{}` block whose
+`server_name` carries the sub-service after the reserved separator. The instance hostname is identity,
+not a route: a block with a bare `server_name` (no `--`) is refused, and no row is more equal than
+another:
 
 ```nginx
 server {
     listen 80;
-    server_name {service_name}_hostname--{sub_service};
+    server_name mock_server_name--{sub_service};
     location / { proxy_pass http://{sub_service}:{port}; }
 }
 ```
@@ -519,17 +520,15 @@ link. A stream row (`kind` other than http/https) gets **no** block here: it is 
 > deployment would not have the endpoint its own artifact declares), and a block for a sub-service that has
 > no row is a warning. The prompt lists the extra endpoints this deployment declares; use exactly those.
 
-For HTTPS support, wrap the server blocks in `{% if https %}...{% endif %}` conditionals
-and use `{{ ssl_certificate_path }}` / `{{ ssl_certificate_key_path }}` for the cert paths.
-The converter automatically replaces `ssl_certificate` and `ssl_certificate_key` paths with
-template variables and wraps `listen 443 ssl` server blocks in `{% if https %}` blocks.
+Write **no** TLS listener and **no** certificate directive in a generated conf: the generated
+artifact is `listen 80` only. The platform synthesises the HTTPS server block and injects the
+deployment's certificate pair itself, so certificate paths are never the model's job.
 
 **Placeholders to fill in:**
 
 | Placeholder | What to put | Converter does |
 |---|---|---|
-| `{service_name}_hostname` | E.g. `myapp_hostname` | Replaced with `{{ hostname }}` → `{service}-{user}-{label}.{domain}` |
-| `{service_name}_hostname--{sub_service}` | E.g. `myapp_hostname--neo4j` — an **additional http endpoint** (R1.5) | Replaced with `{{ hostname_stem }}--{sub_service}.{{ domain_name }}` → `{service}-{user}-{label}--{sub_service}.{domain}`. Only the part **after** the separator is kept, so the prefix is a convention, not a value |
+| `mock_server_name--{sub_service}` | E.g. `mock_server_name--neo4j` — one for **every** `kind: http` row | Replaced with `{{ hostname_stem }}--{sub_service}.{{ domain_name }}` → `{service}-{user}-{label}--{sub_service}.{domain}`. Only the part **after** the separator is kept, so the prefix is a convention, not a value. A bare `server_name` with no `--` is refused |
 | `{service_name}` | **Compose service key** — read directly from the `services:` section of `docker-compose.yml`. Must be an exact match (case-insensitive). E.g. `web`, `mcp-server`, `db`. Do NOT add prefixes like `myapp-` — use the raw key. | Validated against compose service names; rejected if no match. Matching hosts become `{{ container_prefix }}<name>`. |
 | `{internal_port}` | The internal port the service listens on, e.g. `8000` — from `expose:` or the Dockerfile | Left as-is |
 
@@ -584,7 +583,6 @@ ports:
   - sub_service: graph      # a service name FROM THE COMPOSE
     port: 8000              # that service's CONTAINER port
     kind: http              # what speaks on it (see below)
-    primary: true           # the service the instance hostname points at
     profiles: []            # the service's compose profiles (NOT the platform's)
   - sub_service: neo4j
     port: 7687
@@ -602,9 +600,10 @@ Rules for the file:
   spells it. The platform already reserves double-dash (`--`) as a separator, so
   a service name containing it is refused — say so in your answer rather than
   writing the row.
-* **Exactly one row is `primary: true`** — the service the instance's own
-  hostname serves (usually the web/app service). Omit `primary` on every other
-  row.
+* **Every `kind: http` row is an equal endpoint** — served at
+  `<instance host>--<sub_service>.<domain>`. Write **no** `primary` field: the
+  instance hostname is identity, not a route. (An older artifact carrying
+  `primary: true` is still accepted; the field is ignored.)
 * **`profiles` is the compose's own per-service `profiles:` list, copied — not
   invented.** It gates PLATFORM reachability: the container always listens on
   everything it exposes, and this list decides what the platform exposes. A row
@@ -640,9 +639,9 @@ only** — verify against the compose's own context:
 | web apps | 80 (http), 443 (https), 3000/8000/8080 (http, by convention only) |
 | databases with a web console | +1 on the driver port (7474 next to 7687, 8081 next to 27017) |
 
-### Serving an extra HTTP endpoint (kind: http beyond the primary)
+### Serving an HTTP endpoint (every `kind: http` row)
 
-An instance's OWN hostname serves ONE service — the primary. Every other
+An instance's own hostname is identity only — it serves NO service. Every
 `kind: http` row the `serving_ports` artifact declares is served at
 
     <instance host>--<sub_service>.<domain>
@@ -656,7 +655,7 @@ proxying that row's service and port. Two reasons this shape and not another:
 * `--` is reserved as the separator, so the served name always parses back into
   (instance, sub-service).
 
-So a recipe whose neo4j sub-service exposes a Browser on 7474 gets a SECOND
+So a recipe whose neo4j sub-service exposes a Browser on 7474 gets its own
 server block:
 
 ```nginx
@@ -667,9 +666,10 @@ server {
 }
 ```
 
-Do NOT give the extra endpoint the instance's own hostname: the primary owns it,
-and two services behind one name is the ambiguity this convention exists to
-remove. When the artifact declares no extra http row, write no such block.
+Never give an endpoint the instance's own hostname: a bare `server_name` is
+refused, because the old host is not a route and two services behind one name
+is the ambiguity this convention exists to remove. When the artifact declares
+no `kind: http` row, write no such block.
 
 ## File placement checklist for a new service
 

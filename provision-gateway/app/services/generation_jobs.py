@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..models.generation_job import (
     JOB_ORIGIN_DEPLOY,
+    JOB_ORIGIN_STANDALONE,
     JOB_STATUS_CANCELLED,
     JOB_STATUS_AWAITING_INPUT,
     JOB_STATUS_PAUSED,
@@ -52,6 +53,37 @@ ProgressFn = Callable[[str], Awaitable[None]]
 # conf is derived from it in turn (GRILLING G37's "generated after compose and
 # before nginx").
 PHASE_ORDER = ("compose", "serving_ports", "validate_ports", "stream_conf", "nginx", "validate_conf", "env")
+
+
+def validation_conf_sources(
+    *,
+    result_files: dict[str, str],
+    names: dict[str, str],
+    selection: dict[str, Any],
+    recipe_dir: Path,
+    tls_on: bool,
+    origin: str,
+) -> list[tuple[str, str, str]]:
+    """The ``(category, text, source)`` confs `validate_conf` must judge.
+
+    R15/G75 — the stream category follows the deploy SLOT: a TLS-off DEPLOY does
+    not send a stream conf, so judging one would block the deployment for an
+    artifact outside it. The STANDALONE path validates the generated artifact as
+    a recipe-quality check even with TLS off. HTTP is always judged when in play.
+    """
+    out: list[tuple[str, str, str]] = []
+    validate_stream = bool(tls_on or origin == JOB_ORIGIN_STANDALONE)
+    for _cat, _slot in (("http", "nginx"), ("stream", "stream_conf")):
+        if _cat == "stream" and not validate_stream:
+            continue
+        _conf_name = names.get(_slot)
+        if _conf_name and _conf_name in result_files:
+            out.append((_cat, result_files[_conf_name], _conf_name))
+        elif selection.get(_slot):
+            _p = Path(recipe_dir) / selection[_slot]
+            _text = _p.read_text(encoding="utf-8", errors="replace") if _p.is_file() else ""
+            out.append((_cat, _text, str(selection[_slot])))
+    return out
 
 # Phase → config_type used by the LLM.
 PHASE_CONFIG_TYPE = {
@@ -449,56 +481,20 @@ class GenerationJobManager:
             # carried by the pause, so there is no LLM call and no re-scan.
             return ["env"]
         if job_type == "generate_missing":
-            # Deploy-time auto-generation runs the phases whose target is
-            # missing — a project with an existing compose/nginx does NOT re-run
-            # the LLM on those (design §8.3: "first deploy with existing
-            # compose/nginx still shows the env step"). The recipe missing-scan
-            # mirrors the provision-api check_missing_files.
-            missing = cls._recipe_missing(request)
+            # An EMPTY slot means GENERATE — the slot's own label
+            # ("generate new — the pipeline will create one") is the contract,
+            # and it now reads the same on the standalone Generate Base Files
+            # panel and the deploy panel. The disk scan no longer decides the
+            # work: a file that happens to exist does not suppress a slot the
+            # operator left empty.
+            #
+            # `serving_ports_none` remains the deliberate "no file" state and
+            # suppresses generation exactly as it suppresses both validations.
             sel = request.get("selection") or {}
-            # G13/G20/G25 — `generate new` means NOT SELECTED, and the SELECTION
-            # SET is what decides the work, not the disk. On a DEPLOY-scoped run
-            # every slot must come out NAMED, because all three paths are what the
-            # -api is sent and a refused deployment must carry all three (G20).
-            # So an unselected slot is generated even when a file of that kind
-            # already sits in the recipe.
-            #
-            # Without this the nginx phase was skipped whenever the recipe
-            # already had an nginx.conf: `selection.nginx` stayed null, the
-            # deploy payload carried NO nginx path, and the -api was asked to
-            # deploy an unroutable instance. Found live on `bob|probe-interp||3`,
-            # whose refused options held compose + env and no nginx at all.
-            #
-            # Scoped to deploy-scoped runs. `user_name` is what the deploy panel
-            # sends and the standalone Generate panel does not — for that panel
-            # "missing" is exactly what its action means, so it keeps the
-            # disk-based reading. `conflict_unselected` (G21) marks a resumed
-            # conflict path, which is deploy-scoped by construction.
-            _deploy_scoped = (
-                bool(request.get("user_name"))
-                or request.get("conflict_unselected") is not None
-            )
-            _gen_compose = "docker-compose" in missing or (
-                _deploy_scoped and not sel.get("compose")
-            )
-            _gen_nginx = "nginx.conf" in missing or (
-                _deploy_scoped and not sel.get("nginx")
-            )
-            # The serving-ports artifact (task-doc R1.1/T12), by the SAME rule as
-            # its siblings: deploy-scoped runs demand every slot be NAMED (G20),
-            # so an unselected one is generated even if a file of that kind
-            # already sits in the recipe. Positioned after the compose's
-            # validation — it is derived from that compose — and before nginx.
-            # R1.3's `None` is a first-class RECORDED state: "deliberately no file".
-            # It suppresses the generation exactly as it suppresses both
-            # validations — and the recording is what tells this apart from "no
-            # file exists", both here and on the card.
             _sp_none = bool(sel.get("serving_ports_none"))
-            _gen_serving_ports = (not _sp_none) and (
-                "serving_ports" in missing or (
-                    _deploy_scoped and not sel.get("serving_ports")
-                )
-            )
+            _gen_compose = not sel.get("compose")
+            _gen_serving_ports = (not _sp_none) and not sel.get("serving_ports")
+            _gen_nginx = not sel.get("nginx")
             phases: list[str] = []
             if _gen_compose:
                 phases.append("compose")
@@ -513,13 +509,15 @@ class GenerationJobManager:
                 phases.append("validate")
             if _gen_serving_ports:
                 phases.append("serving_ports")
-            # T9 — the internal stream conf, produced from the serving-ports rows
-            # whose kind is a STREAM protocol, and **conditional on the TLS toggle**
-            # (R8.4): with TLS off the slot is not generated, not demanded by "every
-            # slot must come out named", and not carried in the refusal record — so
-            # a replay reproduces the same shape. A `serving_ports` row may still be
-            # declared with TLS off; that row simply has no conf, no route and no
-            # exposure.
+            # T9 / R15 — the internal stream conf, produced from the serving-ports
+            # rows whose kind is a STREAM protocol. The ARTIFACT is generated
+            # regardless of the TLS toggle: it is recipe-level and identity-free,
+            # and the -api injects the deploy's certificates at render. TLS gates
+            # the deploy SLOT only (the dashboard omits it, the gateway strips it,
+            # the -api refuses it), so a TLS-off deploy skips STREAM VALIDATION
+            # below but still gets the artifact for a later TLS deploy; the
+            # standalone panel generates and validates it as a recipe-quality
+            # check (G68/G75).
             # T14 / R1.3: the two validations are STEPS, and the skip rule is
             # stated over ARTIFACTS, not phases — a step runs when its input
             # artifact is IN PLAY (selected, or produced by this run), and is
@@ -533,12 +531,11 @@ class GenerationJobManager:
             _tls_on = bool((request.get("deploy_metadata") or {}).get("https")
                            or request.get("https") or request.get("tls"))
             # G56 — two sources, ONE rule, mirroring HTTP: a SELECTED stream conf
-            # is used as-is (generation bypassed); absent → generated. The slot
-            # is applicable only when TLS is on and a serving-ports artifact is in
-            # play, because the stream rows come from it.
+            # is used as-is (generation bypassed); absent → generated. R15 — the
+            # artifact is generated regardless of TLS; the deploy slot's TLS
+            # gate lives in the dashboard/gateway/-api, never here.
             _gen_stream_conf = bool(
-                _tls_on
-                and not sel.get("stream_conf")
+                not sel.get("stream_conf")
                 and ("serving_ports" in phases or sel.get("serving_ports"))
             )
             if _gen_stream_conf:
@@ -1703,15 +1700,20 @@ class GenerationJobManager:
                                 # matched by their `--<sub>` suffix and their
                                 # upstream/port; NAMES ARE NOT COMPARED (the -api
                                 # renders them).
-                                _cat_confs: list[tuple[str, str, str]] = []
-                                for _cat, _slot in (("http", "nginx"), ("stream", "stream_conf")):
-                                    _conf_name = _names.get(_slot)
-                                    if _conf_name and _conf_name in result_files:
-                                        _cat_confs.append((_cat, result_files[_conf_name], _conf_name))
-                                    elif _sel.get(_slot):
-                                        _p = recipe_dir / _sel[_slot]
-                                        _text = _p.read_text(encoding="utf-8", errors="replace") if _p.is_file() else ""
-                                        _cat_confs.append((_cat, _text, str(_sel[_slot])))
+                                _tls_on = bool(
+                                    (request.get("deploy_metadata") or {}).get("https")
+                                    or request.get("https") or request.get("tls")
+                                )
+                                # R15/G75 — stream validation follows the SLOT,
+                                # not the artifact (see `validation_conf_sources`).
+                                _cat_confs = validation_conf_sources(
+                                    result_files=result_files,
+                                    names=_names,
+                                    selection=_sel,
+                                    recipe_dir=recipe_dir,
+                                    tls_on=_tls_on,
+                                    origin=job_origin(request, job.job_type),
+                                )
                                 _errors_all: list[str] = []
                                 _warnings_all: list[str] = []
                                 for _cat, _conf_text, _src in _cat_confs:
@@ -1865,17 +1867,7 @@ class GenerationJobManager:
                                 })
                                 continue
 
-                            _domain = (request.get("deploy_metadata") or {}).get("domain") or "localhost"
-                            _ssl_dir = Path(getattr(settings, "SSL_DIR", ""))
-                            content = render_stream_conf(
-                                _rows,
-                                service_name=service_name,
-                                user_name=str(request.get("user_name") or ""),
-                                label=str(request.get("label") or "0"),
-                                domain=_domain,
-                                cert_pem=str(_ssl_dir / _domain / "fullchain.pem"),
-                                cert_key=str(_ssl_dir / _domain / "privkey.pem"),
-                            )
+                            content = render_stream_conf(_rows)
                             # G56 — the generated artifact is RECIPE-LEVEL, like
                             # `nginx.base.<token>.conf`: a stream TEMPLATE whose
                             # names the -api renders per instance. No user/label in

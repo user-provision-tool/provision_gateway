@@ -231,12 +231,12 @@ def extra_http_host(*, service_name: str, user_name: str, label: str, domain: st
                     sub_service: str) -> str:
     """`<instance host>--<sub_service>.<domain>` — one label before the domain.
 
-    Every `kind: http` row beyond the primary is served here (R1.5), the primary
-    keeping the instance's own hostname. Deliberately the same
-    `<instance host>--<sub_service>` form the stream path uses as its canonical
-    name, so ONE name identifies a sub-service on both paths — and like every
-    other platform name it is exactly one label under the domain, which is what
-    lets the single wildcard certificate serve it.
+    EVERY `kind: http` row is served here (R14); the instance hostname itself is
+    identity, not a route. Deliberately the same `<instance host>--<sub_service>`
+    form the stream path uses as its canonical name, so ONE name identifies a
+    sub-service on both paths — and like every other platform name it is exactly
+    one label under the domain, which is what lets the single wildcard
+    certificate serve it.
     """
     host = f"{service_name}-{user_name}-{label}"
     if contains_reserved(host) or contains_reserved(sub_service):
@@ -302,9 +302,11 @@ def validate_conf_agreement(
     worst. What the gateway still checks is what the -api cannot infer from the
     conf alone:
 
-    * **coverage** — every row of this category has a ``server{}`` block. A block
-      is identified by its ``--<sub_service>`` suffix; the primary http block is
-      the one with no ``--``. A block for an undeclared sub-service is a warning.
+    * **coverage** — every row of this category has a ``server{}`` block, and a
+      block is identified by its ``--<sub_service>`` suffix. R14 — there is no
+      primary: every http row is an equal endpoint, and a block with no ``--``
+      serves no row (the instance host is identity, not a route). A block for an
+      undeclared sub-service is a warning.
     * **upstream/port agreement** — a block's upstream port equals the row's
       port. A host that does not look like ``<prefix><sub_service>`` is a
       warning (the conf may legitimately target something the artifact does not
@@ -329,9 +331,10 @@ def validate_conf_agreement(
     def _block_info(block: str) -> tuple[list[str | None], list[tuple[str, int | None]]]:
         """``(sub-service markers, upstreams)`` of one block.
 
-        A marker is the sub-service a token names, or ``None`` for a primary
-        (no ``--``). A templated ``server_name`` is read by its literal
-        ``--<sub>.`` fragment, which survives until the -api renders it.
+        A marker is the sub-service a token names, or ``None`` for a name with
+        no ``--`` — which R14 serves no row (there is no primary). A templated
+        ``server_name`` is read by its literal ``--<sub>.`` fragment, which
+        survives until the -api renders it.
         """
         subs: list[str | None] = []
         m = re.search(r"server_name[ \t]+([^;\n]+);", block)
@@ -357,21 +360,20 @@ def validate_conf_agreement(
         sub = str(row.get("sub_service") or "")
         if not sub:
             continue
-        is_primary = category == "http" and row.get("primary") is True
-        # The block that serves this row: the primary (no `--`) for the primary
-        # row, otherwise the block whose marker names this sub-service.
+        # R14 — every row is served by the block whose marker names its
+        # sub-service. A `primary: true` field is ignored (no primary exists),
+        # and a block with no `--` matches nothing.
         match = next(
             (
                 (subs, ups)
                 for subs, ups in infos
-                if (None in subs if is_primary else sub in subs)
+                if sub in subs
             ),
             None,
         )
         if match is None:
-            where = "the instance host (primary)" if is_primary else repr(sub)
             errors.append(
-                f"row {sub}: no `server{{}}` block serves {where} — the row declares an "
+                f"row {sub}: no `server{{}}` block serves {sub!r} — the row declares an "
                 f"endpoint the conf does not serve"
             )
             continue
