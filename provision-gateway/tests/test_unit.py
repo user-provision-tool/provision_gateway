@@ -8753,12 +8753,14 @@ class TestStreamExposureStore(_StreamBase):
             sub_service=sub_service, port=port,
         )
 
-    def test_mint_stores_a_hash_and_never_the_raw_handle(self):
-        """R2.1: hashed only, so the store can verify a handle and never
-        reproduce one."""
+    def test_mint_stores_the_hash_and_the_encrypted_handle_label(self):
+        """The door matches the sha256; the label is kept ONLY encrypted so an
+        authorized user can be shown the URL later (operator ruling 2026-11-02).
+        The plaintext host is never stored."""
         from app.database import SessionLocal
         from app.models.stream_exposure import StreamExposure
-        from app.services.stream_service import hash_handle
+        from app.services import keyring
+        from app.services.stream_service import domain_of, hash_handle
 
         db = SessionLocal()
         try:
@@ -8766,14 +8768,51 @@ class TestStreamExposureStore(_StreamBase):
             raw, row = self._mint(db, owner, entry)
             assert row.handle_hash == hash_handle(raw)
             assert raw != row.handle_hash
-            stored = {k: v for k, v in vars(row).items() if not k.startswith("_")}
-            assert raw not in {str(v) for v in stored.values()}
-            assert "handle" not in row.to_dict()
+            assert row.handle_enc is not None
+            label = keyring.decrypt(row.handle_enc)
+            assert label and raw == f"{label}.{domain_of(entry)}"
             assert raw not in str(row.to_dict())
             columns = {c.name for c in StreamExposure.__table__.columns}
-            assert {"handle_hash", "owner_user_id", "service_id", "sub_service",
-                    "port", "canonical_name", "created_at", "revoked_at"} <= columns
+            assert {"handle_hash", "handle_enc", "owner_user_id", "service_id",
+                    "sub_service", "port", "canonical_name", "created_at",
+                    "revoked_at"} <= columns
             assert "service_name" not in columns and "user_name" not in columns
+        finally:
+            db.close()
+
+    def test_readable_address_round_trips(self):
+        """The show path rebuilds the exact minted address from the encrypted
+        label; a pre-change row (no secret) and a revoked row are unshowable."""
+        from app.database import SessionLocal
+        from app.services import stream_service
+
+        db = SessionLocal()
+        try:
+            owner, service_id, entry = self._seed(db)
+            raw, row = self._mint(db, owner, entry)
+            assert stream_service.readable_address(row, entry, 17687) == f"{raw}:17687"
+            row.handle_enc = None
+            assert stream_service.readable_address(row, entry, 17687) is None
+            row.handle_enc = b"v1:not:an-envelope"
+            assert stream_service.readable_address(row, entry, 17687) is None
+            row.handle_enc = b"v1:x:y"
+            row.revoked_at = row.created_at
+            assert stream_service.readable_address(row, entry, 17687) is None
+        finally:
+            db.close()
+
+    def test_the_store_dict_carries_no_address(self):
+        """`to_dict` is metadata + `has_url`; the address is assembled only by
+        the authorized list route."""
+        from app.database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            owner, service_id, entry = self._seed(db)
+            raw, row = self._mint(db, owner, entry)
+            assert raw not in str(row.to_dict())
+            assert row.to_dict()["has_url"] is True
+            assert "address" not in row.to_dict()
         finally:
             db.close()
 
@@ -8830,7 +8869,7 @@ class TestStreamExposureStore(_StreamBase):
         finally:
             db.close()
 
-    def test_list_shows_existence_without_the_handle(self):
+    def test_the_store_list_does_not_leak_the_raw_handle(self):
         from app.database import SessionLocal
         from app.services import stream_service
 
@@ -8867,7 +8906,7 @@ class TestStreamExposureMint(_StreamBase):
             assert len(h) <= 63, f"{h!r} exceeds one DNS label"
             assert re.fullmatch(r"[a-z2-7]+", h), f"{h!r} is not lowercase base32"
 
-    def test_mint_returns_the_handle_exactly_once(self):
+    def test_mint_returns_the_address_once_and_keeps_only_the_encrypted_label(self):
         from app.database import SessionLocal
         from app.services import stream_service
 
@@ -8951,6 +8990,77 @@ class TestStreamExposureMint(_StreamBase):
             with pytest.raises(HTTPException) as exc:
                 _require_owner_or_admin(db, entry, {"id": str(viewer.id),
                                                     "role": "viewer"})
+            assert exc.value.status_code == 403
+        finally:
+            db.close()
+
+
+class TestStreamExposureShow(_StreamBase):
+    """2026-11-02 ruling: admin, owner and granted viewers may read a live
+    exposure URL; an ungranted viewer may not — a public owner does not widen
+    the audience (the URL is a credential)."""
+
+    @staticmethod
+    def _requester(user, role=None):
+        return {"id": str(user.id), "role": role or user.role}
+
+    def test_admin_and_owner_are_privileged(self):
+        from app.database import SessionLocal
+        from app.routers.stream import _may_view_exposures
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            owner, service_id, entry = self._seed(db)
+            admin = mk_user(db, "showadmin", role="admin")
+            assert _may_view_exposures(db, entry, self._requester(admin))[1] is True
+            assert _may_view_exposures(db, entry, self._requester(owner))[1] is True
+        finally:
+            db.close()
+
+    def test_a_granted_viewer_may_read_a_live_address(self):
+        from app.database import SessionLocal
+        from app.routers.stream import _may_view_exposures
+        from app.services import acl_service, stream_service
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            owner, service_id, entry = self._seed(db)
+            viewer = mk_user(db, "showviewer", role="viewer")
+            acl_service.set_grant(db, viewer.id, owner.id, True)
+            _owner, privileged = _may_view_exposures(
+                db, entry, self._requester(viewer))
+            assert privileged is False
+            raw, row = stream_service.mint(
+                db, owner_user_id=owner.id, entry=entry,
+                sub_service="neo4j", port=7687)
+            assert stream_service.readable_address(row, entry, 17687) == f"{raw}:17687"
+            # Deactivating the grant closes the show path again.
+            acl_service.set_grant(db, viewer.id, owner.id, False)
+            import pytest
+            from fastapi import HTTPException
+            with pytest.raises(HTTPException) as exc:
+                _may_view_exposures(db, entry, self._requester(viewer))
+            assert exc.value.status_code == 403
+        finally:
+            db.close()
+
+    def test_an_ungranted_viewer_is_refused_even_for_a_public_owner(self):
+        import pytest
+        from fastapi import HTTPException
+        from app.database import SessionLocal
+        from app.routers.stream import _may_view_exposures
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            owner, service_id, entry = self._seed(db)
+            owner.is_public_shared = True
+            db.commit()
+            viewer = mk_user(db, "noshowviewer", role="viewer")
+            with pytest.raises(HTTPException) as exc:
+                _may_view_exposures(db, entry, self._requester(viewer))
             assert exc.value.status_code == 403
         finally:
             db.close()
@@ -9251,7 +9361,11 @@ class TestStreamEndpointsAreWired:
             r = client.get("/api/stream/exposures", params={"service_id": str(sid)})
             assert r.status_code == 200, r.text
             rows = r.json()["rows"]
-            assert len(rows) == 1 and host not in str(rows), "the raw handle is never listed"
+            assert len(rows) == 1
+            # The owner may read the live URL back (2026-11-02 ruling): the
+            # handle is stored encrypted and the list assembles the address.
+            assert rows[0]["live"] is True and rows[0]["has_url"] is True
+            assert rows[0]["address"] == body["address"]
 
             r = client.post("/api/stream/verify", json={"handle": host})
             assert r.status_code == 200 and r.json()["allow"] is True
@@ -9261,6 +9375,8 @@ class TestStreamEndpointsAreWired:
             assert r.status_code == 200 and r.json()["revoked"] == 1
             r = client.post("/api/stream/verify", json={"handle": host})
             assert r.json()["allow"] is False
+            r = client.get("/api/stream/exposures", params={"service_id": str(sid)})
+            assert r.json()["rows"][0]["address"] is None, "a revoked row is unshowable"
         finally:
             db.close()
 

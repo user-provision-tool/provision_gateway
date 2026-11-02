@@ -11,6 +11,8 @@ from ..database import get_db
 from ..middleware import require_gateway_token
 from ..models.user import User
 from ..services import stream_service
+from ..services.acl_service import allows
+from ..services.keyring import KeyringUnavailable
 
 router = APIRouter(prefix="/api/stream", tags=["stream"])
 
@@ -50,6 +52,29 @@ def _require_owner_or_admin(db: Session, entry: dict, requester: dict) -> User:
     return owner
 
 
+def _may_view_exposures(db: Session, entry: dict,
+                        requester: dict) -> tuple[User | None, bool]:
+    """The list/show audience: admin, the service owner, or a granted viewer.
+
+    Public services do NOT widen this: the exposure URL is a credential, so only
+    the owner, an admin, or an explicitly granted viewer may read it (operator
+    ruling 2026-11-02). Returns ``(owner, privileged)`` where ``privileged`` is
+    admin-or-owner (a granted viewer gets live rows only).
+    """
+    owner = _owner_user(db, entry)
+    if requester["role"] == "admin":
+        if owner is None:
+            raise HTTPException(409, "Instance owner has no gateway account")
+        return owner, True
+    if owner is not None and str(owner.id) == requester["id"]:
+        return owner, True
+    viewer = db.query(User).filter(User.id == requester["id"]).first()
+    if owner is not None and allows(db, viewer, owner.id):
+        return owner, False
+    raise HTTPException(
+        403, "Only the service owner, an admin, or a granted viewer may view exposures")
+
+
 def _stream_row(entry: dict, sub_service: str, port: int | None) -> int:
     for row in entry.get("stream_rows") or []:
         if row.get("sub_service") == sub_service:
@@ -70,10 +95,15 @@ async def mint_exposure(request: Request, payload: MintRequest,
     entry = _entry(request, payload.service_id)
     owner = _require_owner_or_admin(db, entry, current_user)
     resolved_port = _stream_row(entry, payload.sub_service, payload.port)
-    host, row = stream_service.mint(
-        db, owner_user_id=owner.id, entry=entry,
-        sub_service=payload.sub_service, port=resolved_port,
-    )
+    try:
+        host, row = stream_service.mint(
+            db, owner_user_id=owner.id, entry=entry,
+            sub_service=payload.sub_service, port=resolved_port,
+        )
+    except KeyringUnavailable as exc:
+        # The secret must be storable, otherwise the URL could never be shown
+        # again; fail closed and say why rather than minting blind.
+        raise HTTPException(503, f"Exposure URL cannot be stored: {exc}")
     return {
         "host": host,
         "stream_port": settings.STREAM_PORT,
@@ -90,9 +120,17 @@ async def list_exposures(request: Request,
                          current_user: dict = Depends(require_gateway_token),
                          db: Session = Depends(get_db)):
     entry = _entry(request, service_id)
-    _require_owner_or_admin(db, entry, current_user)
+    _owner, privileged = _may_view_exposures(db, entry, current_user)
     rows = stream_service.list_for_instance(db, service_id)
-    return {"rows": [r.to_dict() for r in rows]}
+    if not privileged:
+        rows = [r for r in rows if r.revoked_at is None]
+    out = []
+    for r in rows:
+        row = r.to_dict()
+        row["address"] = stream_service.readable_address(
+            r, entry, settings.STREAM_PORT)
+        out.append(row)
+    return {"rows": out, "stream_port": settings.STREAM_PORT}
 
 
 @router.delete("/exposures")

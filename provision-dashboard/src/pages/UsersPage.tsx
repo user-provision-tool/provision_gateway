@@ -227,6 +227,9 @@ export default function UsersPage() {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const isAdmin = admin?.role === 'admin'
+  // The service owner is the account the card is grouped under; a granted
+  // viewer sees another owner's card but may not mint (the gateway refuses).
+  const myUsername = (admin as any)?.username
   const [services, setServices] = useState<ServiceInstance[]>([])
   // Admin-only top alert: registry owners whose account row is soft-deleted (or
   // absent). The gateway derives this join; the alert clears when the last
@@ -290,6 +293,35 @@ export default function UsersPage() {
       message.error(e?.response?.data?.detail || 'Could not generate an exposure URL')
     }
   }
+  // Show the LIVE exposure URL on demand (operator ruling 2026-11-02): the
+  // gateway keeps the handle encrypted, so an admin, the owner, or a granted
+  // viewer can read it back at any time. The URL lives only in the popup's
+  // state and dies when the popup closes.
+  const showExposure = async (svc: ServiceInstance, canonical: string) => {
+    const sub = canonical.includes('--')
+      ? canonical.split('--').slice(1).join('--').split('.')[0]
+      : canonical.split('.')[0]
+    try {
+      const { data } = await client.get('/stream/exposures', {
+        params: { service_id: svc.service_id },
+      })
+      const row = (data.rows || []).find(
+        (r: any) => r.sub_service === sub && !r.revoked_at)
+      if (!row) {
+        message.info('No live exposure for this endpoint — generate one first')
+        return
+      }
+      if (!row.address) {
+        message.info(
+          'This exposure was minted before its URL was kept; generate a new one to make it showable')
+        return
+      }
+      setExposureModal({ url: row.address, port: data.stream_port ?? 0, row: sub })
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || 'Could not read the exposure URL')
+    }
+  }
+
   // G29: for a GATEWAY-side refusal the retry is NOT a replay. The generation
   // pool refused before anything was produced, so the retry has to run the
   // generation again — the panel seeds itself from the record, and the pipeline
@@ -1505,6 +1537,8 @@ export default function UsersPage() {
                                 ? canonical.split('--').slice(1).join('--').split('.')[0]
                                 : canonical
                               const url = exposureUrls[canonical]
+                              const isOwner = !!myUsername && svc.user_name === myUsername
+                              const canGenerate = isAdmin || isOwner
                               return (
                                 <Space key={canonical} size={6} wrap>
                                   <Text code>{sub}</Text>
@@ -1514,18 +1548,26 @@ export default function UsersPage() {
                                       confirmation rather than a warning shown afterwards — the
                                       old modal claimed the URL was shown only once, while the
                                       card kept showing it, and the thing that actually matters
-                                      (the old one dying) was buried in the same sentence. */}
-                                  <Popconfirm
-                                    title="Old urls will be invalidated, confirm?"
-                                    description="The previous exposure URL for this row stops working at its next connection."
-                                    okText="Generate"
-                                    cancelText="Cancel"
-                                    onConfirm={() => mintExposure(svc, canonical)}
-                                  >
-                                    <Button size="small" type="primary" ghost>
-                                      Generate exposure URL
-                                    </Button>
-                                  </Popconfirm>
+                                      (the old one dying) was buried in the same sentence.
+                                      Only the owner and an admin may mint; a granted viewer
+                                      sees the Show action below. */}
+                                  {canGenerate && (
+                                    <Popconfirm
+                                      title="Old urls will be invalidated, confirm?"
+                                      description="The previous exposure URL for this row stops working at its next connection."
+                                      okText="Generate"
+                                      cancelText="Cancel"
+                                      onConfirm={() => mintExposure(svc, canonical)}
+                                    >
+                                      <Button size="small" type="primary" ghost>
+                                        Generate exposure URL
+                                      </Button>
+                                    </Popconfirm>
+                                  )}
+                                  <Button size="small" onClick={() => showExposure(svc, canonical)}
+                                    title="Read the live exposure URL from the gateway; it is shown in a popup and cleared when the popup closes">
+                                    Show exposure URL
+                                  </Button>
                                   {url && (
                                     <Text code copyable={{text: url}} style={{fontSize:12}}>{url}</Text>
                                   )}
@@ -1840,6 +1882,7 @@ export default function UsersPage() {
       </Drawer>
       <Modal
         open={!!exposureModal}
+        destroyOnClose
         title="Exposure URL"
         onCancel={() => setExposureModal(null)}
         onOk={() => setExposureModal(null)}

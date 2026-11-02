@@ -70,9 +70,16 @@ def mint(db: Session, *, owner_user_id, entry: dict[str, Any],
         StreamExposure.sub_service == sub_service,
         StreamExposure.port == int(port),
     ))
-    host = exposure_host(new_handle(), domain_of(entry))
+    handle = new_handle()
+    host = exposure_host(handle, domain_of(entry))
+    # The secret is kept so an authorized user can show the URL later; the
+    # envelope embeds its keyring version. If the keyring is unavailable the
+    # mint fails closed (the route maps KeyringUnavailable to 503) rather than
+    # silently producing an unshowable exposure.
+    from . import keyring
     row = StreamExposure(
         handle_hash=hash_handle(host),
+        handle_enc=keyring.encrypt(handle),
         owner_user_id=owner_user_id,
         service_id=service_id,
         sub_service=sub_service,
@@ -85,6 +92,24 @@ def mint(db: Session, *, owner_user_id, entry: dict[str, Any],
     db.commit()
     db.refresh(row)
     return host, row
+
+
+def readable_address(row: StreamExposure, entry: dict[str, Any],
+                     stream_port: int) -> str | None:
+    """The dialable address for a live, showable row, or None.
+
+    The stored secret is the handle LABEL only; the domain and the shared
+    stream port are read at call time (operator ruling 2026-11-02). A row
+    minted before the secret was kept has no handle_enc and stays unshowable
+    until it is rotated.
+    """
+    if row.revoked_at is not None or not row.handle_enc:
+        return None
+    from . import keyring
+    handle = keyring.decrypt(row.handle_enc)
+    if not handle:
+        return None
+    return f"{exposure_host(handle, domain_of(entry))}:{stream_port}"
 
 
 def list_for_instance(db: Session, service_id: str) -> list[StreamExposure]:

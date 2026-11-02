@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, Text, text
+from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, LargeBinary, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 
 from ..database import Base
@@ -22,6 +22,11 @@ class StreamExposure(Base):
     )
 
     handle_hash = Column(Text, primary_key=True)
+    # The raw handle label, AES-GCM encrypted with the gateway keyring (the
+    # envelope carries its key version). NULL for rows minted before the
+    # secret was stored: their URL was deliberately never kept and can be
+    # shown only after a rotation (operator ruling 2026-11-02).
+    handle_enc = Column(LargeBinary, nullable=True)
     owner_user_id = Column(UUID(as_uuid=True), ForeignKey("gateway.users.id"), nullable=False, index=True)
     service_id = Column(UUID(as_uuid=True), ForeignKey("registry.services.id"), nullable=False, index=True)
     sub_service = Column(Text, nullable=False)
@@ -37,6 +42,7 @@ class StreamExposure(Base):
             "sub_service": self.sub_service,
             "port": self.port,
             "canonical_name": self.canonical_name,
+            "has_url": self.handle_enc is not None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "revoked_at": self.revoked_at.isoformat() if self.revoked_at else None,
             "live": self.revoked_at is None,
