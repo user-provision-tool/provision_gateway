@@ -14,7 +14,8 @@ router = APIRouter(prefix="/api/audit", tags=["audit"])
 
 @router.get("")
 async def list_audit_logs(
-    admin_id: int | None = Query(None),
+    actor_user_id: str | None = Query(None, alias="actor_user_id"),
+    admin_id: str | None = Query(None),
     action: str | None = Query(None),
     user: str | None = Query(None, alias="target_user"),
     from_date: str | None = Query(None, alias="from"),
@@ -27,7 +28,7 @@ async def list_audit_logs(
     """Query audit logs with optional filters."""
     entries, total = query_logs(
         db,
-        admin_id=admin_id,
+        actor_user_id=actor_user_id or admin_id,
         action=action,
         target_user=user,
         from_date=from_date,

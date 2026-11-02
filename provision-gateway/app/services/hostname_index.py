@@ -1,77 +1,56 @@
-"""HostnameIndex — in-memory hostname-to-registry-entry lookup.
-
-Gateway reads the registry YAML file via shared filesystem mount (no HTTP calls).
-The index maps hostname strings (e.g. "myapp-alice-0.localhost") to
-their corresponding registry entries, enabling fast /go/{hostname} resolution.
-"""
+"""Hostname lookup by ``(served_name, kind)`` — on demand, no cache (T9)."""
 
 from __future__ import annotations
 
-import threading
-from pathlib import Path
 from typing import Any
+
+from sqlalchemy import text
+
+from ..database import reader_engine
+from .registry import _entry
 
 
 class HostnameIndex:
-    """Thread-safe, in-memory hostname index backed by the registry YAML.
-
-    On each lookup, the index is refreshed from disk if the file has changed.
-    This gives eventual consistency without polling HTTP endpoints.
-    """
-
-    def __init__(self, registry_path: str) -> None:
-        self._registry_path = Path(registry_path)
-        self._lock = threading.Lock()
-        self._index: dict[str, dict[str, Any]] = {}
-        self._mtime: float = 0.0
-
-    def _reload_if_stale(self) -> bool:
-        """Reload index from disk if the YAML file has been modified. Thread-safe."""
-        if not self._registry_path.exists():
-            return False
-        current_mtime = self._registry_path.stat().st_mtime
-        if current_mtime <= self._mtime:
-            return False
-        with self._lock:
-            # Double-check inside lock
-            if current_mtime <= self._mtime:
-                return False
-            try:
-                import yaml as _yaml
-                with open(self._registry_path) as f:
-                    data = _yaml.safe_load(f)
-                entries = data if isinstance(data, list) else []
-            except Exception:
-                return False
-            new_index: dict[str, dict[str, Any]] = {}
-            for entry in entries:
-                # R14 — the instance hostname is IDENTITY, not a route. It is
-                # deliberately NOT indexed: `/go/<instance host>` must answer
-                # 404, and a request to that host through the edge has no vhost
-                # to reach. Every served HTTP endpoint is one of the recorded
-                # `http_endpoints` below.
-                #
-                # R1.5 — each served endpoint resolves to the SAME entry, so
-                # `/go/<instance host>--<sub_service>.<domain>` reaches the
-                # sub-service with the instance's own cookie (the reason the
-                # platform relays through /go/ at all: the login cookie is
-                # host-scoped). Without these aliases the card offered a link
-                # that answered `Service not found` — measured 2026-10-10 on a
-                # live deployment whose entry recorded both endpoints.
-                for _extra in (entry.get("http_endpoints") or []):
-                    if isinstance(_extra, str) and _extra:
-                        new_index.setdefault(_extra.lower(), entry)
-            self._index = new_index
-            self._mtime = current_mtime
-            return True
-        return False
+    def __init__(self, registry_path: str | None = None) -> None:
+        self._registry_path = registry_path  # compatibility; no file is read
 
     def get_by_hostname(self, hostname: str) -> dict[str, Any] | None:
-        """Look up a registry entry by hostname. Returns None if not found."""
-        self._reload_if_stale()
-        return self._index.get(hostname.lower())
+        if not hostname:
+            return None
+        with reader_engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT s.id AS service_id, s.owner_api_user_id, a.username AS user_name, "
+                    "       a.deleted_at AS owner_deleted_at, s.service_name, s.label, "
+                    "       s.recipe_path, s.deleted_at AS service_deleted_at, "
+                    "       i.status, i.hostname, i.subnet, i.gateway, i.network_name, "
+                    "       i.compose_template_path, i.compose_file_path, "
+                    "       i.nginx_conf_template_path, i.nginx_conf_path, "
+                    "       i.nginx_conf_paths, i.nginx_conf_paths_by_category, "
+                    "       i.htpasswd_path, i.ssl_certificate_path, i.ssl_certificate_key_path, "
+                    "       i.env_file_path, i.env_files, i.container_names, i.profiles, "
+                    "       i.volumes, i.build_args, i.tls "
+                    "  FROM registry.service_endpoints e "
+                    "  JOIN registry.services s ON s.id = e.service_id "
+                    "  JOIN registry.api_users a ON a.id = s.owner_api_user_id "
+                    "  LEFT JOIN registry.service_instances i ON i.service_id = s.id "
+                    " WHERE lower(e.served_name) = lower(:host) "
+                    "   AND e.kind = 'http' AND s.deleted_at IS NULL"
+                ),
+                {"host": hostname},
+            ).mappings().first()
+            if not row:
+                return None
+            eps = conn.execute(
+                text(
+                    "SELECT service_id, served_name, kind, sub_service, port "
+                    "FROM registry.service_endpoints WHERE service_id=:id ORDER BY id"
+                ),
+                {"id": row["service_id"]},
+            ).mappings().all()
+        return _entry(dict(row), [dict(e) for e in eps])
 
-    def get_by_service(self, user_name: str, service_name: str, label: str, domain: str = "localhost") -> dict[str, Any] | None:
-        """Look up by user/service/label. Constructs the hostname from these."""
-        hostname = f"{service_name}-{user_name}-{label}.{domain}"
-        return self.get_by_hostname(hostname)
+    def get_by_service(self, user_name: str, service_name: str, label: str,
+                       domain: str = "localhost") -> dict[str, Any] | None:
+        from .registry import Registry
+        return Registry().get_entry(user_name, service_name, str(label))

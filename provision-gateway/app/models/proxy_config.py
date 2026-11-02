@@ -13,6 +13,7 @@ class ProxyConfig(Base):
     """A saved proxy configuration. Only one row can have is_active=True at a time."""
 
     __tablename__ = "proxy_configs"
+    __table_args__ = {"schema": "gateway"}
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(255), nullable=True)  # optional display name

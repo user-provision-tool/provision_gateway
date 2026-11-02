@@ -11,6 +11,7 @@ from ..database import Base
 
 class GatewaySetting(Base):
     __tablename__ = "gateway_settings"
+    __table_args__ = {"schema": "gateway"}
 
     key = Column(String(255), primary_key=True)
     value = Column(Text, nullable=False)

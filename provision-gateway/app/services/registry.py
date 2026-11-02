@@ -1,64 +1,116 @@
-"""Registry wrapper — read-only access to the provision-api registry YAML.
+"""Read-only registry access — on demand, as gateway_reader (T9/R1.3).
 
-Gateway mounts the same filesystem as provision-api, so it can read
-user_registry.yml directly without HTTP calls. This enables:
-- Hostname resolution for /go/{hostname}
-- Subnet pool statistics (from the registry entries)
-- ACL checks via the gateway account store (acl_grants)
+No YAML file, no mtime cache, no version row: every call reads committed
+PostgreSQL state through the read-only role. The gateway may read registry
+tables; it never writes them and never calls backwards into the -api for a
+registry read.
 """
 
 from __future__ import annotations
 
-import threading
-from pathlib import Path
 from typing import Any
+
+from sqlalchemy import text
+
+from ..database import reader_engine
+
+_BASE = """
+SELECT s.id                AS service_id,
+       s.owner_api_user_id,
+       a.username          AS user_name,
+       a.deleted_at        AS owner_deleted_at,
+       s.service_name,
+       s.label,
+       s.recipe_path,
+       s.deleted_at        AS service_deleted_at,
+       i.status,
+       i.hostname,
+       i.subnet,
+       i.gateway,
+       i.network_name,
+       i.compose_template_path,
+       i.compose_file_path,
+       i.nginx_conf_template_path,
+       i.nginx_conf_path,
+       i.nginx_conf_paths,
+       i.nginx_conf_paths_by_category,
+       i.htpasswd_path,
+       i.ssl_certificate_path,
+       i.ssl_certificate_key_path,
+       i.env_file_path,
+       i.env_files,
+       i.container_names,
+       i.profiles,
+       i.volumes,
+       i.build_args,
+       i.tls
+  FROM registry.services s
+  JOIN registry.api_users a ON a.id = s.owner_api_user_id
+  LEFT JOIN registry.service_instances i ON i.service_id = s.id
+ WHERE s.deleted_at IS NULL
+"""
+
+
+def _endpoints(service_ids: list[str]) -> dict[str, list[dict]]:
+    if not service_ids:
+        return {}
+    with reader_engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT service_id, served_name, kind, sub_service, port "
+                "FROM registry.service_endpoints WHERE service_id = ANY(:ids) ORDER BY id"
+            ),
+            {"ids": service_ids},
+        ).mappings().all()
+    out: dict[str, list[dict]] = {}
+    for row in rows:
+        out.setdefault(str(row["service_id"]), []).append(dict(row))
+    return out
+
+
+def _entry(row: dict, endpoints: list[dict]) -> dict[str, Any]:
+    entry = dict(row)
+    entry["service_id"] = str(row["service_id"])
+    entry["owner_api_user_id"] = str(row["owner_api_user_id"])
+    entry["label"] = str(row["label"])
+    entry["http_endpoints"] = [e["served_name"] for e in endpoints if e["kind"] == "http"]
+    entry["stream_sub_services"] = [e["served_name"] for e in endpoints if e["kind"] == "stream"]
+    entry["stream_rows"] = [e for e in endpoints if e["kind"] == "stream"]
+    entry["recipe_path"] = row.get("recipe_path") or ""
+    entry["tls"] = bool(row.get("tls"))
+    return entry
+
+
+def _rows(sql: str, params: dict | None = None) -> list[dict]:
+    with reader_engine.connect() as conn:
+        return [dict(r) for r in conn.execute(text(sql), params or {}).mappings().all()]
 
 
 class Registry:
-    """Read-only registry wrapper with file-change detection.
+    """Compatibility façade over the read-on-demand registry."""
 
-    On each read, the file is re-loaded if its mtime has changed.
-    Thread-safe via a lock.
-    """
-
-    def __init__(self, registry_path: str) -> None:
-        self._path = Path(registry_path)
-        self._lock = threading.Lock()
-        self._entries: list[dict[str, Any]] = []
-        self._mtime: float = 0.0
-
-    def _reload_if_stale(self) -> None:
-        """Reload from disk if the YAML has changed."""
-        if not self._path.exists():
-            return
-        current_mtime = self._path.stat().st_mtime
-        if current_mtime <= self._mtime:
-            return
-        with self._lock:
-            if current_mtime <= self._mtime:
-                return
-            try:
-                import yaml as _yaml
-                with open(self._path) as f:
-                    data = _yaml.safe_load(f)
-                self._entries = data if isinstance(data, list) else []
-            except Exception:
-                pass
-            self._mtime = current_mtime
+    def __init__(self, registry_path: str | None = None) -> None:
+        # Kept for the constructor call sites; the path is no longer a store.
+        self._path = registry_path
 
     def get_all_entries(self) -> list[dict[str, Any]]:
-        """Return all registry entries."""
-        self._reload_if_stale()
-        return list(self._entries)
+        rows = _rows(_BASE + " ORDER BY a.username, s.service_name, s.label")
+        emap = _endpoints([r["service_id"] for r in rows])
+        return [_entry(r, emap.get(str(r["service_id"]), [])) for r in rows]
 
     def get_entry(self, user_name: str, service_name: str, label: str) -> dict[str, Any] | None:
-        """Get a single registry entry by user/service/label."""
-        self._reload_if_stale()
-        for entry in self._entries:
-            if (
-                entry.get("user_name") == user_name
-                and entry.get("service_name") == service_name
-                and str(entry.get("label", "")) == str(label)
-            ):
-                return entry
-        return None
+        rows = _rows(
+            _BASE + " AND a.username=:u AND s.service_name=:s AND s.label=:l",
+            {"u": user_name, "s": service_name, "l": str(label)},
+        )
+        if not rows:
+            return None
+        emap = _endpoints([rows[0]["service_id"]])
+        return _entry(rows[0], emap.get(str(rows[0]["service_id"]), []))
+
+    def get_by_id(self, service_id: str) -> dict[str, Any] | None:
+        rows = _rows(_BASE + " AND s.id=:id", {"id": service_id})
+        if not rows:
+            return None
+        emap = _endpoints([rows[0]["service_id"]])
+        return _entry(rows[0], emap.get(str(rows[0]["service_id"]), []))

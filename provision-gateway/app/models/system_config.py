@@ -9,6 +9,7 @@ from ..database import Base
 
 class SystemConfig(Base):
     __tablename__ = "system_config"
+    __table_args__ = {"schema": "gateway"}
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     key = Column(String(255), nullable=False, unique=True, index=True)

@@ -13,11 +13,19 @@ ARG NO_PROXY
 ENV HTTP_PROXY=${HTTP_PROXY} \
     HTTPS_PROXY=${HTTPS_PROXY} \
     NO_PROXY=${NO_PROXY}
+# The build proxy's upstream links occasionally stall mid-transfer; without a
+# socket timeout npm waits forever on a dead keep-alive connection. Fail fast
+# and retry instead — the build then completes on the flaky link.
+ENV NPM_CONFIG_FETCH_TIMEOUT=120000 \
+    NPM_CONFIG_FETCH_RETRIES=5 \
+    NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=5000 \
+    NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT=20000 \
+    NPM_CONFIG_MAXSOCKETS=8
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 COPY tsconfig.json vite.config.ts index.html ./
 COPY src/ ./src/

@@ -1,36 +1,39 @@
-"""AuditLog ORM model."""
+"""Audit log — users.id actor and ID targets (T6)."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
-from sqlalchemy import Column, DateTime, Integer, String, Text
-from sqlalchemy.orm import relationship
+from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, Text
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 from ..database import Base
 
 
 class AuditLog(Base):
     __tablename__ = "audit_log"
+    __table_args__ = {"schema": "gateway"}
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    admin_id = Column(Integer, nullable=True)
-    action = Column(String(100), nullable=False)
-    target_user = Column(String(255), nullable=True)
-    target_service = Column(String(255), nullable=True)
-    target_label = Column(String(50), nullable=True)
-    detail_json = Column(Text, nullable=True)
-    status = Column(String(50), nullable=False, default="success")
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    actor_user_id = Column(UUID(as_uuid=True), ForeignKey("gateway.users.id"), nullable=True)
+    action = Column(Text, nullable=False)
+    target_api_user_id = Column(UUID(as_uuid=True), nullable=True)
+    target_service_id = Column(UUID(as_uuid=True), nullable=True)
+    target_user = Column(Text, nullable=True)
+    target_service = Column(Text, nullable=True)
+    target_label = Column(Text, nullable=True)
+    detail_json = Column(JSONB, nullable=True)
+    status = Column(Text, nullable=False, default="success")
     error_message = Column(Text, nullable=True)
-    ip_address = Column(String(45), nullable=True)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    ip_address = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=True)
 
-    def to_dict(self, admin_email: str | None = None) -> dict:
+    def to_dict(self, actor_username: str | None = None) -> dict:
         return {
             "id": self.id,
-            "admin_id": self.admin_id,
-            "admin_email": admin_email,
+            "actor_user_id": str(self.actor_user_id) if self.actor_user_id else None,
+            "actor_username": actor_username,
             "action": self.action,
+            "target_api_user_id": str(self.target_api_user_id) if self.target_api_user_id else None,
+            "target_service_id": str(self.target_service_id) if self.target_service_id else None,
             "target_user": self.target_user,
             "target_service": self.target_service,
             "target_label": self.target_label,

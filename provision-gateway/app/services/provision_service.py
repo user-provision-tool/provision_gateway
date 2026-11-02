@@ -51,6 +51,24 @@ class ProvisionService:
             return resp.json()
 
     @staticmethod
+    def as_task_error(exc: Exception) -> HTTPException:
+        """Preserve the -api's TASK-route statuses (404/409/410) at the gateway.
+
+        A task route's meaning is carried by its status: an unknown task is 404,
+        a terminal task is 409, a pruned task's log is 410. Folding those into
+        the generic 502 loses the distinction the dashboard and the operator rely
+        on (T5/T7). Deploy/rebuild/remove errors keep their own mapping.
+        """
+        resp = getattr(exc, "response", None)
+        if resp is not None and resp.status_code in (404, 409, 410):
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:  # noqa: BLE001 — the body is best-effort
+                detail = resp.text
+            return HTTPException(resp.status_code, detail)
+        return ProvisionService.as_http_error(exc)
+
+    @staticmethod
     def as_http_error(exc: Exception) -> HTTPException:
         """Map a provision-api failure to the gateway's own HTTP status.
 
@@ -84,6 +102,17 @@ class ProvisionService:
                         "capacity": body.get("capacity"),
                     },
                 )
+        # A card action on an unknown instance is a CLIENT error, not a
+        # gateway outage: the -api answers 404 ("No registration found") and
+        # folding it into 502 made a bogus/deleted id read as "the -api is
+        # broken" (surfaced by the §10 step-9a card-action trace, 2026-11-01).
+        # Keep the -api's detail so the dashboard can show the explicit state.
+        if resp is not None and resp.status_code == 404:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:  # noqa: BLE001 — the body is best-effort
+                detail = resp.text
+            return HTTPException(404, detail)
         return HTTPException(502, f"provision-api error: {exc}")
 
     # ---- Users ----
@@ -107,6 +136,36 @@ class ProvisionService:
 
     async def register_user(self, **kwargs) -> dict[str, Any]:
         return await self._request("POST", "/users", json_data=kwargs)
+
+    # ---- Canonical ID routes (R7.7) ----
+
+    async def get_instance(self, service_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/instances/{service_id}")
+
+    async def remove_instance(self, service_id: str, scope: str = "service") -> dict[str, Any]:
+        return await self._request(
+            "DELETE", f"/instances/{service_id}", params={"scope": scope}
+        )
+
+    async def rebuild_instance(self, service_id: str, **kwargs) -> dict[str, Any]:
+        return await self._request("POST", f"/instances/{service_id}/rebuild", json_data=kwargs)
+
+    async def start_instance(self, service_id: str) -> dict[str, Any]:
+        return await self._request("POST", f"/instances/{service_id}/start")
+
+    async def stop_instance(self, service_id: str) -> dict[str, Any]:
+        return await self._request("POST", f"/instances/{service_id}/stop")
+
+    async def change_instance_password(self, service_id: str, passwd: str) -> dict[str, Any]:
+        return await self._request(
+            "PUT", f"/instances/{service_id}/password", json_data={"passwd": passwd}
+        )
+
+    async def remove_instance_password(self, service_id: str) -> dict[str, Any]:
+        return await self._request("DELETE", f"/instances/{service_id}/password")
+
+    async def stop_api_user_services(self, api_user_id: str) -> dict[str, Any]:
+        return await self._request("POST", f"/api-users/{api_user_id}/stop-services")
 
     async def remove_user(self, user_name: str, service_name: str, label: str) -> dict[str, Any]:
         return await self._request(

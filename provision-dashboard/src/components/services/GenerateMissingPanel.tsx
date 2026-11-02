@@ -27,7 +27,7 @@ interface Props {
    * resumed (GRILLING G27: a pause is a terminal leg, and answering it starts
    * the next one).
    */
-  resumeJobId?: number | null
+  resumeJobId?: string | null
   onClose: () => void
   onChanged: () => void
 }
@@ -59,7 +59,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
   const [editorFromPicker, setEditorFromPicker] = useState(false)
   const [saving, setSaving] = useState(false)
   // The resume target already attached in THIS open (see the init effect).
-  const resumedRef = useRef<number | null>(null)
+  const resumedRef = useRef<string | null>(null)
 
   useEffect(() => {
     if (!open) { resumedRef.current = null; return }

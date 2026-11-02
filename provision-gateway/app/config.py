@@ -59,10 +59,17 @@ class Settings:
 
 
 
-        # ---- Database ----
+        # ---- Database (T1) ----
+        # PostgreSQL is the live store. `gateway_app` owns the gateway schema
+        # (authentication/account/task writes); `gateway_reader` is the
+        # per-request registry read path and has no gateway auth-table grant.
         self.DATABASE_URL: str = os.environ.get(
             "DATABASE_URL",
-            f"sqlite:///{self.GATEWAY_DATA_DIR / 'gateway.db'}",
+            "postgresql+psycopg://gateway_app:gateway_app_pw@subnet-acl-postgres:5432/subnet_acl",
+        )
+        self.GATEWAY_READER_DATABASE_URL: str = os.environ.get(
+            "GATEWAY_READER_DATABASE_URL",
+            "postgresql+psycopg://gateway_reader:gateway_reader_pw@subnet-acl-postgres:5432/subnet_acl",
         )
 
         # ---- Generation capacity (GRILLING G29) ----
@@ -97,8 +104,11 @@ class Settings:
         )
         self.JWT_ALGORITHM: str = "HS256"
 
-        # ---- ACL ----
-        self.ENABLE_ACL: bool = os.environ.get("ENABLE_ACL", "false").lower() == "true"
+        # ---- ACL (G80) ----
+        # Fullset is ACL-on. The switch is NOT read from the environment; the
+        # ACL-off branch stays in the edge/nginx source for future cleanup but
+        # is unreachable from this deployment.
+        self.ENABLE_ACL: bool = True
         self.REGISTRY_FILE: str = os.environ.get(
             "REGISTRY_FILE",
             str(self.PROVISION_DIR / "generated" / "user_registry.yml"),

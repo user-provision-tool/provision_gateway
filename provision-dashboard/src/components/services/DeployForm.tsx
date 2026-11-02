@@ -126,7 +126,7 @@ interface DeployFormProps {
   // (GRILLING G15/G24): the panel opens attached to the parked generation job,
   // which is what puts its pause popup on screen. Without this the button could
   // only open a blank panel — the duplicate of `Retry` it used to be.
-  resumeJobId?: number | null
+  resumeJobId?: string | null
   // `check` on an LLM-fix pause (GRILLING G26 row 5): the panel opens with the
   // ANALYSIS's fixing guide as the prompt, and the restart runs in fixing mode
   // so the generation emits `.fix` files rather than `.base` (G25).
@@ -192,6 +192,11 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   // the rotation rule honest (a repo-original selection is never rewritten by
   // an edit made in the panel). After saving the picker switches to the fork.
   const [editorFork, setEditorFork] = useState(false)
+
+  // The pre-deploy session's own identity, captured while polling it. The
+  // add-then-remove handoff sends these so the -api adopts the SAME service_id.
+  const sessionServiceIdRef = useRef<string | null>(null)
+  const sessionProcedureIdRef = useRef<string | null>(null)
 
   // GAP-003: Auto-computed next label state
   const [nextLabel, setNextLabel] = useState<string>('0')
@@ -831,7 +836,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     // creates, so reading it is what makes the auto-run survive an answer from
     // anywhere. A missing session (404 — cancelled, or already handed off) is
     // simply "no better information": keep polling what we have.
-    const sessionJobId = async (): Promise<number | null> => {
+    const sessionJobId = async (): Promise<string | null> => {
       const _u = snap.user_name || ''
       if (!_u) return null
       try {
@@ -839,7 +844,9 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           `/pre-deploy/${encodeURIComponent(_u)}/${encodeURIComponent(baseName)}`
           + `/${encodeURIComponent(snap.label || '0')}`,
           { params: { recipe_path: recipePath || '' } })
-        return data?.job_id == null ? null : Number(data.job_id)
+        sessionServiceIdRef.current = data?.service_id || null
+        sessionProcedureIdRef.current = data?.procedure_id || null
+        return data?.generation_task_id || null
       } catch {
         return null
       }
@@ -1197,11 +1204,26 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         })
       }
 
+      // The pre-deploy session carries the identity this deploy must adopt.
+      if (!sessionServiceIdRef.current) {
+        try {
+          const { data } = await client.get(
+            `/pre-deploy/${encodeURIComponent(snap.user_name || '')}`
+            + `/${encodeURIComponent(baseName)}/${encodeURIComponent(snap.label || '0')}`,
+            { params: { recipe_path: recipePath || '' } })
+          sessionServiceIdRef.current = data?.service_id || null
+          sessionProcedureIdRef.current = data?.procedure_id || null
+        } catch { /* no session: the gateway allocates */ }
+      }
+
       // Build deploy payload
       const payload: any = {
         user_name: snap.user_name,
         service_name: baseName,
         project_root: recipePath ? `${baseName}/${recipePath}` : baseName,
+        service_id: sessionServiceIdRef.current || undefined,
+        procedure_id: sessionProcedureIdRef.current || undefined,
+        recipe_path: recipePath || '',
         label: snap.label || '0',
         domain: snap.domain || 'localhost',
         passwd: snap.passwd || '',

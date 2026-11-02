@@ -21,6 +21,7 @@ from ..database import Base
 
 class LoopLease(Base):
     __tablename__ = "loop_leases"
+    __table_args__ = {"schema": "gateway"}
 
     name = Column(String(80), primary_key=True)
     locked_until = Column(Float, nullable=False, default=0.0)

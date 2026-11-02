@@ -22,7 +22,8 @@ WORKDIR /app
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 
 # Install system dependencies (apt honors *_PROXY env vars)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true; \
+    apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     && rm -rf /var/lib/apt/lists/* \
@@ -38,6 +39,8 @@ RUN mkdir -p /usr/local/lib/docker/cli-plugins && \
     chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
 # Install Python dependencies (pip honors *_PROXY env vars)
+COPY pip-constraints.txt /tmp/pip-constraints.txt
+ENV PIP_CONSTRAINT=/tmp/pip-constraints.txt
 RUN pip install --no-cache-dir \
     fastapi>=0.115.0 \
     uvicorn[standard]>=0.30.0 \
@@ -54,7 +57,8 @@ RUN pip install --no-cache-dir \
     pydantic>=2.0.0 \
     pydantic-settings>=2.0.0 \
     aiofiles>=24.0.0 \
-    python-multipart>=0.0.9
+    python-multipart>=0.0.9 \
+    "psycopg[binary]>=3.2"
 
 # Clear proxy settings — must NOT persist to runtime (internal Docker DNS would break)
 ENV HTTP_PROXY="" \

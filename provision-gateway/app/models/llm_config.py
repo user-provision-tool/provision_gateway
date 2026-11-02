@@ -11,6 +11,7 @@ from ..database import Base
 
 class LLMConfig(Base):
     __tablename__ = "llm_config"
+    __table_args__ = {"schema": "gateway"}
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     mode = Column(String(50), nullable=False, default="byok")  # 'byok' only; 'local_agent' is a future feature (GAP-2)

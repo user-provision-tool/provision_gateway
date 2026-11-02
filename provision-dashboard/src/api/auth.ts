@@ -6,7 +6,7 @@ export interface LoginParams {
 }
 
 export interface AdminUser {
-  id: number
+  id: string
   email: string
   role: string
   is_active?: boolean

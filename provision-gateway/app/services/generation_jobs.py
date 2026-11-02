@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -28,17 +29,17 @@ from typing import Any, Awaitable, Callable
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models.generation_job import (
-    JOB_ORIGIN_DEPLOY,
-    JOB_ORIGIN_STANDALONE,
-    JOB_STATUS_CANCELLED,
-    JOB_STATUS_AWAITING_INPUT,
-    JOB_STATUS_PAUSED,
-    JOB_STATUS_COMPLETED,
-    JOB_STATUS_FAILED,
-    JOB_STATUS_QUEUED,
-    JOB_STATUS_RUNNING,
-    GenerationJob,
+from ..models.gateway_task import (
+    GatewayTask as GenerationJob,
+    ORIGIN_DEPLOY as JOB_ORIGIN_DEPLOY,
+    ORIGIN_STANDALONE as JOB_ORIGIN_STANDALONE,
+    STATUS_AWAITING_INPUT as JOB_STATUS_AWAITING_INPUT,
+    STATUS_CANCELLED as JOB_STATUS_CANCELLED,
+    STATUS_COMPLETED as JOB_STATUS_COMPLETED,
+    STATUS_FAILED as JOB_STATUS_FAILED,
+    STATUS_PAUSED as JOB_STATUS_PAUSED,
+    STATUS_QUEUED as JOB_STATUS_QUEUED,
+    STATUS_RUNNING as JOB_STATUS_RUNNING,
     job_origin,
 )
 from .llm_service import llm_service
@@ -53,6 +54,33 @@ ProgressFn = Callable[[str], Awaitable[None]]
 # conf is derived from it in turn (GRILLING G37's "generated after compose and
 # before nginx").
 PHASE_ORDER = ("compose", "serving_ports", "validate_ports", "stream_conf", "nginx", "validate_conf", "env")
+
+_SECRET_KEYS = {"passwd", "passwd_plain", "password", "privkey", "api_key", "token",
+                "resume_values"}
+
+# In-memory credential handoff for a pause answer. Values live only on the
+# worker that received the answer; a lost handoff fails the new leg closed.
+_RESUME_HANDOFF: dict[str, dict] = {}
+
+
+def _redact_request(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _redact_request(v) for k, v in value.items() if k not in _SECRET_KEYS}
+    if isinstance(value, list):
+        return [_redact_request(v) for v in value]
+    return value
+
+
+def _as_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value or "{}")
+            return parsed if isinstance(parsed, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+    return {}
 
 
 def validation_conf_sources(
@@ -386,22 +414,70 @@ class GenerationJobManager:
             self._project_locks[key] = lock
         return lock
 
+    @staticmethod
+    def _service_id_for(db: Session, request: dict[str, Any]) -> uuid.UUID | None:
+        raw = request.get("service_id")
+        if raw:
+            try:
+                return uuid.UUID(str(raw))
+            except (ValueError, TypeError):
+                return None
+        user_name = request.get("user_name")
+        service_name = request.get("service_name")
+        label = request.get("label")
+        if not (user_name and service_name and label is not None):
+            return None
+        from sqlalchemy import text as _text
+        row = db.execute(
+            _text(
+                "SELECT s.id FROM registry.services s JOIN registry.api_users a "
+                "ON a.id=s.owner_api_user_id WHERE a.username=:u AND s.service_name=:s "
+                "AND s.label=:l AND s.deleted_at IS NULL"
+            ),
+            {"u": user_name, "s": service_name, "l": str(label)},
+        ).first()
+        return row[0] if row else None
+
     def create_job(
         self, db: Session, service_name: str, recipe_path: str,
         job_type: str, request: dict[str, Any],
+        resume_values: dict[str, str] | None = None,
     ) -> GenerationJob:
-        """Persist a queued job and schedule its execution."""
+        """Persist a queued gateway task and schedule its execution."""
         phases = self._compute_phases(job_type, request)
+        task_id = f"gt-{uuid.uuid4().hex[:12]}"
+        procedure_id = uuid.uuid4()
+        raw_proc = request.get("procedure_id")
+        if raw_proc:
+            try:
+                procedure_id = uuid.UUID(str(raw_proc))
+            except (ValueError, TypeError):
+                pass
+        snapshot = {
+            "service_name": service_name,
+            "recipe_path": recipe_path or "",
+            "user_name": request.get("user_name"),
+            "label": request.get("label"),
+        }
         job = GenerationJob(
-            service_name=service_name,
-            recipe_path=recipe_path or "",
-            job_type=job_type,
+            task_id=task_id,
+            collision_token=uuid.uuid4().hex[:12],
+            procedure_id=procedure_id,
+            service_id=self._service_id_for(db, request),
+            executor="gateway",
+            kind="analyze" if job_type == "fix" else "generate",
+            operation=job_type,
+            origin=job_origin(request, job_type),
             status=JOB_STATUS_QUEUED,
             phase=phases[0] if phases else "pending",
             phase_index=0,
             phase_total=len(phases) or 1,
             progress="queued",
-            request=json.dumps(request, ensure_ascii=False),
+            request=_redact_request(request),
+            target_snapshot=snapshot,
+            log_ref=str(self._log_path(task_id)),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
         )
         # THE COUNT CAP, ENFORCED ON SUBMIT (G30). The TTL sweep runs on reads
         # (`list_jobs` and the single-job GET); the cap runs here, which is the
@@ -422,7 +498,14 @@ class GenerationJobManager:
         # slot's work (G27 will make a pause TERMINAL, at which point it stops
         # counting — the two changes go together).
         from ..config import settings as _settings
+        from sqlalchemy import text as _text
         limit = _int_setting("GATEWAY_MAX_GENERATIONS", 4)
+        # Serialize admission ACROSS workers: a plain count-then-insert lets two
+        # uvicorn workers both see "N below the limit" and both insert. The
+        # transaction-scoped advisory lock makes the count and the insert one
+        # critical section, so the limit is the limit.
+        db.execute(_text("SELECT pg_advisory_xact_lock(:k)"),
+                   {"k": 7_412_003})
         in_flight = (
             db.query(GenerationJob)
             .filter(GenerationJob.status.in_([JOB_STATUS_QUEUED, JOB_STATUS_RUNNING,
@@ -436,8 +519,11 @@ class GenerationJobManager:
         db.add(job)
         db.commit()
         db.refresh(job)
+        # The credential handoff MUST exist before the runner can claim/read it.
+        if resume_values:
+            _RESUME_HANDOFF[job.task_id] = dict(resume_values)
         loop = asyncio.get_running_loop()
-        self._tasks[job.id] = loop.create_task(self._run_job(job.id))
+        self._tasks[job.task_id] = loop.create_task(self._run_job(job.task_id))
         return job
 
     def claim_job(self, job_id: int) -> bool:
@@ -700,8 +786,11 @@ class GenerationJobManager:
             pass
         return d
 
-    def _log_path(self, job_id: int) -> Path:
-        return self._log_dir() / f"gt-{job_id}.log"
+    def _log_path(self, job_id) -> Path:
+        name = str(job_id)
+        if not name.startswith("gt-"):
+            name = f"gt-{name}"
+        return self._log_dir() / f"{name}.log"
 
     def _log_append(self, job_id: int, entry: dict) -> None:
         """Append one JSON line. Best-effort — a log never fails a job."""
@@ -734,9 +823,7 @@ class GenerationJobManager:
         cutoff = datetime.now(timezone.utc) - timedelta(
             seconds=_int_setting("GATEWAY_JOB_TTL_SECONDS", 604800)
         )
-        return self._delete_finished(
-            db, GenerationJob.updated_at < cutoff
-        )
+        return self._delete_finished(db, GenerationJob.updated_at < cutoff)
 
     def prune_excess(self, db: Session) -> int:
         """Evict the OLDEST finished jobs beyond the count cap. Returns count.
@@ -755,43 +842,48 @@ class GenerationJobManager:
         cap = _int_setting("GATEWAY_MAX_JOBS", 1000)
         finished = (
             db.query(GenerationJob)
-            .filter(GenerationJob.status.in_(self._TERMINAL))
+            .filter(GenerationJob.status.in_(self._TERMINAL),
+                    GenerationJob.deleted_at.is_(None))
         )
         excess = finished.count() - cap
         if excess <= 0:
             return 0
         oldest = [
-            j.id for j in finished
-            .order_by(GenerationJob.created_at.asc(), GenerationJob.id.asc())
+            j.task_id for j in finished
+            .order_by(GenerationJob.created_at.asc(), GenerationJob.task_id.asc())
             .limit(excess)
             .all()
         ]
         if not oldest:
             return 0
-        return self._delete_finished(db, GenerationJob.id.in_(oldest))
+        return self._delete_finished(db, GenerationJob.task_id.in_(oldest))
 
     def _delete_finished(self, db: Session, criterion) -> int:
-        """Delete the finished rows matching `criterion`, logs first."""
+        """Soft-delete finished rows: keep the tombstone, drop the log (R4.4)."""
         doomed = [
-            j.id for j in db.query(GenerationJob)
-            .filter(GenerationJob.status.in_(self._TERMINAL), criterion)
+            j for j in db.query(GenerationJob)
+            .filter(GenerationJob.status.in_(self._TERMINAL),
+                    GenerationJob.deleted_at.is_(None), criterion)
             .all()
         ]
-        for jid in doomed:
-            self._log_delete(jid)
-        if not doomed:
-            return 0
-        rows = (
-            db.query(GenerationJob)
-            .filter(GenerationJob.id.in_(doomed))
-            .delete(synchronize_session=False)
-        )
-        db.commit()
-        return rows or 0
+        for job in doomed:
+            self._log_delete(job.task_id)
+            job.deleted_at = datetime.now(timezone.utc)
+            job.log_ref = None
+            job.events = None
+        if doomed:
+            db.commit()
+        return len(doomed)
 
     def list_jobs(self, db: Session, include_result: bool = False) -> list[dict]:
         self.prune_finished(db)
-        jobs = db.query(GenerationJob).order_by(GenerationJob.id.desc()).limit(200).all()
+        jobs = (
+            db.query(GenerationJob)
+            .filter(GenerationJob.deleted_at.is_(None))
+            .order_by(GenerationJob.created_at.desc(), GenerationJob.task_id.desc())
+            .limit(200)
+            .all()
+        )
         return [j.to_dict(include_result=include_result) for j in jobs]
 
     def list_fix_analyses(self, db: Session) -> list[dict[str, Any]]:
@@ -814,12 +906,9 @@ class GenerationJobManager:
         )
         out: list[dict[str, Any]] = []
         for j in rows:
-            try:
-                req = json.loads(j.request or "{}")
-            except ValueError:
-                req = {}
+            req = _as_dict(j.request)
             out.append({
-                "job_id": j.id,
+                "job_id": j.task_id,
                 "status": j.status,
                 "user_name": req.get("user_name") or "",
                 "service_name": j.service_name,
@@ -848,7 +937,7 @@ class GenerationJobManager:
 
         db = SessionLocal()
         try:
-            job = self.get_job(db, int(job_id))
+            job = self.get_job(db, job_id)
             return job.status if job is not None else None
         except Exception:
             return None
@@ -856,7 +945,14 @@ class GenerationJobManager:
             db.close()
 
     def cancel_job(self, db: Session, job_id: int) -> GenerationJob | None:
-        job = self.get_job(db, job_id)
+        # Row lock: the runner's terminal write and a second cancel both serialize
+        # on this row, so the cancel is exactly-once and cannot be overwritten.
+        job = (
+            db.query(GenerationJob)
+            .filter(GenerationJob.id == job_id)
+            .with_for_update()
+            .first()
+        )
         if not job:
             return None
         # `awaiting_input` MUST be cancellable. It is neither queued nor running,
@@ -891,15 +987,81 @@ class GenerationJobManager:
             _pdr.finish_leg(job_id, None)
         return job
 
+    def cancel_session_after_task_cancel(self, task_id: str) -> None:
+        """A cancelled generation leg removes its session unless operator-held."""
+        from ..services import pre_deploy_registry as _pdr
+        _pdr.finish_leg(task_id, None)
+
+    def answer_pause(self, task_id: str, body: dict) -> dict:
+        """Answer a paused task by creating the NEXT leg (R4.2).
+
+        The answered row becomes `cancelled` in the same operation, so no
+        answered pause lingers as a permanent paused leg. The new task shares
+        the procedure and the session's generation link is rewritten.
+        """
+        from ..database import SessionLocal
+        db = SessionLocal()
+        try:
+            job = self.get_job(db, task_id)
+            if job is None:
+                raise KeyError(task_id)
+            if job.status != JOB_STATUS_PAUSED:
+                raise ValueError(f"task is not paused: {job.status}")
+            pause = {}
+            if isinstance(job.result, dict):
+                pause = job.result.get("pause") or {}
+            if not pause and isinstance(job.pending_input, dict):
+                pause = job.pending_input
+            carried = _as_dict(pause.get("request") or job.request)
+            values = body.get("values") if isinstance(body.get("values"), dict) else body
+            values = {str(k): str(v) for k, v in (values or {}).items()}
+            kind = pause.get("kind")
+            if kind in ("compose_fix", "validate_ports_fix", "validate_conf_fix") and values.get("guidance"):
+                carried["prompt"] = values["guidance"]
+            if kind == "input" and values:
+                # Handed in memory only; never persisted (`_redact_request`
+                # strips it from the row).
+                carried["resume_values"] = values
+            carried.setdefault("service_name", job.service_name)
+            carried.setdefault("recipe_path", job.recipe_path)
+            carried["_answer_parent"] = job.task_id
+            new_job = self.create_job(
+                db, job.service_name, job.recipe_path, job.operation, carried,
+                resume_values=values if kind == "input" else None,
+            )
+            # Same procedure and service: one operator procedure, one identity.
+            new_job.procedure_id = job.procedure_id
+            new_job.service_id = job.service_id
+            db.commit()
+            job.status = JOB_STATUS_CANCELLED
+            job.updated_at = datetime.now(timezone.utc)
+            db.commit()
+            from ..services import pre_deploy_registry as _pdr
+            sess = _pdr.get_session(str(job.service_id)) if job.service_id else None
+            if sess is not None:
+                _pdr.create_or_replace(
+                    service_id=sess["service_id"], procedure_id=job.procedure_id,
+                    owner_api_user_id=sess["owner_api_user_id"],
+                    service_name=sess["service_name"], service_label=sess["label"],
+                    recipe_path=sess["recipe_path"], state="generating",
+                    generation_task_id=new_job.task_id,
+                    deploy_task_id=sess.get("deploy_task_id"),
+                    guide=sess.get("guide"), slot=sess.get("slot"),
+                    use_global_proxy=sess.get("use_global_proxy"),
+                )
+            return new_job.to_dict()
+        finally:
+            db.close()
+
     def recover_stale_jobs(self, db: Session) -> int:
-        """Mark queued/running jobs as failed after a restart. Returns count."""
+        """A restart leaves `unknown`; the recovery sweep terminalizes it (R4.2)."""
         rows = (
             db.query(GenerationJob)
             .filter(GenerationJob.status.in_([JOB_STATUS_QUEUED, JOB_STATUS_RUNNING]))
             .update(
                 {
-                    "status": JOB_STATUS_FAILED,
-                    "error": "interrupted by gateway restart",
+                    "status": "unknown",
+                    "error": "gateway restarted — runner lost",
                     "updated_at": datetime.now(timezone.utc),
                 },
                 synchronize_session=False,
@@ -910,6 +1072,20 @@ class GenerationJobManager:
         self._cancelled.clear()
         self._cancel_polled.clear()
         return rows or 0
+
+    def terminalize_unknown(self, db: Session) -> int:
+        """Recovery sweep: an `unknown` task with no survivor becomes `failed`."""
+        n = (
+            db.query(GenerationJob)
+            .filter(GenerationJob.status == "unknown",
+                    GenerationJob.deleted_at.is_(None))
+            .update({"status": JOB_STATUS_FAILED,
+                     "error": "restart recovery: no surviving runner",
+                     "updated_at": datetime.now(timezone.utc)},
+                    synchronize_session=False)
+        )
+        db.commit()
+        return n or 0
 
     # ------------------------------------------------------------------
     # Execution
@@ -924,7 +1100,15 @@ class GenerationJobManager:
 
         db = SessionLocal()
         try:
-            job = db.query(GenerationJob).filter(GenerationJob.id == job_id).first()
+            # Row lock with the cancel path: a cancel committed first makes this
+            # write see `cancelled` and honor the sticky rule instead of
+            # resurrecting the row (SELECT-then-UPDATE was not atomic).
+            job = (
+                db.query(GenerationJob)
+                .filter(GenerationJob.id == job_id)
+                .with_for_update()
+                .first()
+            )
             if not job:
                 return
             # CANCELLED is STICKY. A cancellation lands on whichever worker the
@@ -958,13 +1142,13 @@ class GenerationJobManager:
             if phase_index is not None:
                 job.phase_index = phase_index
             if result is not None:
-                job.result = json.dumps(result, ensure_ascii=False)
+                job.result = result
             if usage is not None:
-                job.usage = json.dumps(usage, ensure_ascii=False)
+                job.usage = usage
             if events is not None:
-                job.events = json.dumps(events, ensure_ascii=False)
+                job.events = events
             if pending_input is not None:
-                job.pending_input = json.dumps(pending_input, ensure_ascii=False)
+                job.pending_input = pending_input
             job.updated_at = datetime.now(timezone.utc)
             # §8b: the pre-deploy session mirrors the job's own state, so a card
             # can say `pre-deploy generating…` or `paused (<reason>)`. The three
@@ -1039,10 +1223,18 @@ class GenerationJobManager:
         # Load the job + request.
         db = SessionLocal()
         try:
-            job = db.query(GenerationJob).filter(GenerationJob.id == job_id).first()
+            # Row lock with the cancel path: a cancel committed first makes this
+            # write see `cancelled` and honor the sticky rule instead of
+            # resurrecting the row (SELECT-then-UPDATE was not atomic).
+            job = (
+                db.query(GenerationJob)
+                .filter(GenerationJob.id == job_id)
+                .with_for_update()
+                .first()
+            )
             if not job:
                 return
-            request = json.loads(job.request or "{}")
+            request = _as_dict(job.request)
             service_name = job.service_name
             recipe_path = job.recipe_path or ""
         finally:
@@ -1053,6 +1245,9 @@ class GenerationJobManager:
         # `claim_job` decides, and the loser returns quietly.
         if not self.claim_job(job_id):
             return
+        handoff = _RESUME_HANDOFF.pop(str(job_id), None)
+        if handoff:
+            request["resume_values"] = handoff
 
         try:
             self._check_cancelled(job_id)
@@ -2014,8 +2209,22 @@ class GenerationJobManager:
                                 f"phase '{phase}' produced no valid output: {'; '.join(errs) if errs else 'LLM unavailable?'}"
                             )
 
+                    # R4.4/R5.9 — the task row stores only file METADATA. The
+                    # content lives on disk (the phase writers already wrote it)
+                    # and `save-generated` reads it from there.
+                    import hashlib as _hashlib
+                    files_meta = {
+                        name: {
+                            "name": name,
+                            "sha256": _hashlib.sha256(
+                                str(content).encode("utf-8")
+                            ).hexdigest(),
+                            "size": len(str(content).encode("utf-8")),
+                        }
+                        for name, content in result_files.items()
+                    }
                     result = {
-                        "files": result_files,
+                        "files": files_meta,
                         "validations": validations,
                         "warnings": warnings,
                         "env_name": env_name,
@@ -2122,10 +2331,24 @@ class GenerationJobManager:
         if use_global_proxy is None:
             use_global_proxy = _instance_used_global_proxy(user, service, label)
 
-        pdr.add_session(
-            user=user, service=service, recipe_path=recipe_path, label=label,
-            state="paused", reason="llm_fix", job_id=job_id,
-            guide=guide, task_id=task_id, slot=slot,
+        from .registry import Registry
+
+        entry = Registry().get_entry(user, service, label)
+        if entry is None or not entry.get("service_id"):
+            return (
+                "the failed instance could not be found in the registry — "
+                "the fixing guide was not recorded on a pre-deploy session"
+            )
+        pdr.create_or_replace(
+            service_id=entry["service_id"],
+            procedure_id=entry.get("current_procedure_id") or uuid.uuid4(),
+            owner_api_user_id=entry["owner_api_user_id"],
+            service_name=service, service_label=label,
+            recipe_path=recipe_path or entry.get("recipe_path") or "",
+            state="paused", reason="llm_fix",
+            generation_task_id=str(job_id),
+            deploy_task_id=task_id or None,
+            guide=guide, slot=slot or None,
             use_global_proxy=use_global_proxy,
         )
         try:

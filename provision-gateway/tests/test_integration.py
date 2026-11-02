@@ -1,281 +1,197 @@
-"""Integration test script for provision-gateway.
+"""Live-gateway integration tests (current contracts, 2026-11-02).
 
-Tests the gateway API endpoints against the running provision-api stack.
+These tests drive a RUNNING gateway over HTTP and therefore are not unit
+tests. They run wherever a test gateway exists (the test environment); they do
+NOT create users, services or tasks and do NOT modify any existing row.
+
+Data rule (strict): the only writes are the side effects of the suite's own
+authentication — the login sets its own cookie jar and audit rows record the
+suite's own login/logout; everything else is a read, or a refusal on a
+deliberately nonexistent id. The test identity is provisioned outside the
+suite (bootstrap/operator) and passed in:
+
+    GATEWAY_TEST_USER=<username-or-email>
+    GATEWAY_TEST_PASSWORD=<password>
+    GATEWAY_URL=http://127.0.0.1:8870        # the gateway under test
+    PROVISION_API_URL=http://127.0.0.1:8875  # printed only
+
+The suite skips only when credentials are absent or the gateway is not
+answering /health; a live gateway plus credentials always runs it.
 """
 
-import subprocess
-import sys
 import json
-import time
 import os
-import tempfile
+import subprocess
+
+import pytest
 
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8870")
 PROVISION_API_URL = os.environ.get("PROVISION_API_URL", "http://127.0.0.1:8875")
+TEST_USER = os.environ.get("GATEWAY_TEST_USER", "")
+TEST_PASSWORD = os.environ.get("GATEWAY_TEST_PASSWORD", "")
 
-def run_curl(method, path, data=None, token=None):
-    """Make a curl request and return (status_code, response_body).
 
-    ``token`` is a v4 cookie-jar path. Login saves the HttpOnly provision_token
-    cookie with ``-c``; every request sends it with ``-b``.
+def run_curl(method, path, data=None, cookie_jar=None, max_time=None):
+    """Make a request and return (status_code, parsed_body).
+
+    ``cookie_jar`` is a v4 cookie-jar path. Login saves the HttpOnly
+    provision_token cookie with ``-c``; every request sends it with ``-b``.
     """
     url = f"{GATEWAY_URL}{path}"
     cmd = ["curl", "-s", "-w", "\n%{http_code}", "-X", method, url]
-    if data:
+    if data is not None:
         cmd.extend(["-H", "Content-Type: application/json", "-d", json.dumps(data)])
-    if token:
-        cmd.extend(["-c", token, "-b", token])
-    
+    if cookie_jar:
+        cmd.extend(["-c", cookie_jar, "-b", cookie_jar])
+    if max_time:
+        cmd.extend(["--max-time", str(max_time)])
     result = subprocess.run(cmd, capture_output=True, text=True)
     output = result.stdout.strip()
-    
-    # Split body and status code
     parts = output.rsplit("\n", 1)
     if len(parts) == 2:
-        body = parts[0]
+        body, raw_status = parts
         try:
-            status = int(parts[1])
+            status = int(raw_status)
         except ValueError:
-            body = output
-            status = 0
+            body, status = output, 0
     else:
-        body = output
-        status = 0
-    
+        body, status = output, 0
     try:
-        body_json = json.loads(body)
+        parsed = json.loads(body)
     except json.JSONDecodeError:
-        body_json = body
-    
-    return status, body_json
+        parsed = body
+    return status, parsed
+
+
+@pytest.fixture(scope="module")
+def client(tmp_path_factory):
+    """Log in once; the cookie jar lives in the test's own tmp dir."""
+    jar = str(tmp_path_factory.mktemp("it") / "cookies.txt")
+    status, body = run_curl(
+        "POST", "/api/auth/login",
+        {"email": TEST_USER, "password": TEST_PASSWORD}, cookie_jar=jar,
+    )
+    assert status == 200, f"login failed for {TEST_USER!r}: {status} {body}"
+    with open(jar) as fh:
+        assert "provision_token" in fh.read(), "no provision_token cookie saved"
+    return jar
 
 
 def test_health():
-    """Test health endpoint."""
-    print("Testing health endpoint...")
+    """Unauthenticated liveness: the gateway reports its database healthy."""
     status, body = run_curl("GET", "/health")
-    assert status == 200, f"Expected 200, got {status}: {body}"
-    assert body.get("status") == "ok"
-    print("  ✓ Health check passed")
+    assert status == 200, f"expected 200, got {status}: {body}"
+    assert body.get("status") == "ok", body
 
 
-def test_auth_flow(tmp_path):
-    """Test full auth flow: setup, login (cookie), me, logout (v4).
+def test_unauthenticated_denied():
+    """An admin surface without a cookie is refused, never silently served."""
+    status, body = run_curl("GET", "/api/tasks")
+    assert status == 401, (status, body)
 
-    Pytest supplies ``tmp_path`` (pathlib.Path); ``main()`` supplies a plain
-    cookie-jar path string. Both are accepted.
+
+def test_auth_login_me_logout(client):
+    """Login (cookie), me, logout — the current unified-user contract.
+
+    The response carries ``user`` (not the retired ``admin``); ``me`` exposes
+    id/username/role. No ``/setup`` or ``/register`` call is made: those routes
+    are retired (410) and user creation belongs to the admin API.
     """
-    print("\nTesting auth flow...")
+    status, me = run_curl("GET", "/api/auth/me", cookie_jar=client)
+    assert status == 200, me
+    assert me.get("id") and me.get("username"), me
+    assert me.get("role") in ("viewer", "admin"), me
 
-    if isinstance(tmp_path, str):
-        cookie_jar = tmp_path
-    else:
-        cookie_jar = str(tmp_path / "cookies.txt")
-    login_data = {"email": "gw-test@example.com", "password": "testpass123"}
-
-    # Try setup
-    status, body = run_curl("POST", "/api/auth/setup", login_data, token=cookie_jar)
-    if status == 409:
-        print("  Admin already exists, using existing credentials")
-        # Use the existing admin
-        login_data = {"email": "admin@subnet-acl.local", "password": "admin-pass-123"}
-    elif status == 201:
-        print("  Created test admin")
-    else:
-        print(f"  Setup response: {status} {body}")
-
-    # Login (v4: cookie auth, no access_token in body)
-    status, body = run_curl("POST", "/api/auth/login", login_data, token=cookie_jar)
-    assert status == 200, f"Login failed: {body}"
-    assert body.get("token_type") == "cookie", f"expected cookie auth, got: {body}"
-    assert body.get("admin") is not None
-    # HttpOnly provision_token cookie must be present in the jar
-    with open(cookie_jar) as f:
-        assert "provision_token" in f.read(), "no provision_token cookie saved"
-    print("  ✓ Login successful (provision_token cookie)")
-
-    # Get me
-    status, me = run_curl("GET", "/api/auth/me", token=cookie_jar)
-    assert status == 200
-    assert me.get("email") is not None
-    print("  ✓ GET /me works")
-
-    # Logout (v4 removed the refresh endpoint; logout clears the cookie)
-    status, logout_body = run_curl("POST", "/api/auth/logout", token=cookie_jar)
-    assert status == 200
-    print("  ✓ Logout works")
-
-    return cookie_jar
+    status, out = run_curl("POST", "/api/auth/logout", cookie_jar=client)
+    assert status == 200, out
+    # the suite logs back in for the remaining tests (its own cookie jar)
+    status, body = run_curl(
+        "POST", "/api/auth/login",
+        {"email": TEST_USER, "password": TEST_PASSWORD}, cookie_jar=client,
+    )
+    assert status == 200, body
 
 
-def test_users_proxy(token):
-    """Test users endpoints proxied to provision-api."""
-    print("\nTesting users proxy...")
-    
-    # List users
-    status, body = run_curl("GET", "/api/services", token=token)
-    assert status == 200, f"List users failed: {body}"
-    assert "users" in body or "user_status" in body
-    print(f"  ✓ GET /users works (count: {body.get('count', 'N/A')})")
-    
-    # Get non-existent user
-    status, body = run_curl("GET", "/api/services/nonexistent_user_xyz", token=token)
-    # May return 200 with empty or 404
-    print(f"  GET /users/nonexistent → {status}")
+def test_admin_users_list(client):
+    """GET /api/auth/users returns the unified user list (admin only)."""
+    status, body = run_curl("GET", "/api/auth/users", cookie_jar=client)
+    assert status == 200, body
+    assert isinstance(body.get("users"), list), body
+    names = {u.get("username") for u in body["users"]}
+    assert TEST_USER.split("@")[0] in names or TEST_USER in names, (
+        "the test identity must appear in the user list", names,
+    )
 
 
-def test_tasks_proxy(token):
-    """Test tasks endpoints."""
-    print("\nTesting tasks proxy...")
-    
-    status, body = run_curl("GET", "/api/tasks", token=token)
-    assert status == 200
-    assert "tasks" in body
-    print(f"  ✓ GET /tasks works (count: {body.get('count', 0)})")
+def test_services_cards_view(client):
+    """GET /api/services is the per-user cards view (users + count [+ orphans])."""
+    status, body = run_curl("GET", "/api/services", cookie_jar=client)
+    assert status == 200, body
+    assert isinstance(body.get("users"), list), body
+    assert body.get("count") == len(body["users"]), body
 
 
-def test_audit_logs(token):
-    """Test audit log endpoints."""
-    print("\nTesting audit logs...")
-    
-    status, body = run_curl("GET", "/api/audit", token=token)
-    assert status == 200
-    assert "entries" in body
-    print(f"  ✓ GET /audit works (total: {body.get('total', 0)})")
+def test_source_projects_list(client):
+    """GET /api/projects is the Source Projects recipe list."""
+    status, body = run_curl("GET", "/api/projects", cookie_jar=client)
+    assert status == 200, body
+    assert isinstance(body.get("services"), list), body
 
 
-def test_system_status(token):
-    """Test system status endpoint."""
-    print("\nTesting system status...")
-    
-    status, body = run_curl("GET", "/api/system/status", token=token)
-    assert status == 200
-    print(f"  ✓ GET /system/status works")
+def test_tasks_list(client):
+    """GET /api/tasks returns the unified gt-/api- read model."""
+    status, body = run_curl("GET", "/api/tasks", cookie_jar=client)
+    assert status == 200, body
+    assert isinstance(body.get("tasks"), list), body
+    assert body.get("count") == len(body["tasks"]), body
 
 
-def test_container_logs_endpoint(token):
-    """Test container logs endpoint (proxied to provision-api)."""
-    print("\nTesting container logs endpoint...")
-    
-    # Test with non-existent user/service — should get error from provision-api
+def test_audit_logs(client):
+    """GET /api/audit returns the audit page shape."""
+    status, body = run_curl("GET", "/api/audit?limit=5", cookie_jar=client)
+    assert status == 200, body
+    assert isinstance(body.get("entries"), list), body
+    assert "total" in body, body
+
+
+def test_system_status(client):
+    """GET /api/system/status answers with the aggregate status."""
+    status, body = run_curl("GET", "/api/system/status", cookie_jar=client)
+    assert status == 200, body
+
+
+def test_container_logs_unknown_service(client):
+    """The container-logs route exists and proxies; an unknown target is an
+    explicit error (404 from the -api or 502 from the proxy), never a 500."""
     status, body = run_curl(
         "GET",
-        "/api/services/nonexistent_user/nonexistent_svc/0/containers/web/logs?tail=10",
-        token=token,
+        "/api/services/it_nonexistent_user/it_nonexistent_svc/0/containers/web/logs?tail=10",
+        cookie_jar=client,
     )
-    # Should get a response (may be 404 or 502 depending on provision-api state)
-    print(f"  GET /users/.../containers/.../logs → {status}")
-    # Even a 404/502 is acceptable — we just need the endpoint to exist and proxy
-    assert status in (200, 404, 502), f"Unexpected status: {status}"
+    assert status in (404, 502), (status, body)
 
 
-def test_tasks_log_sse_endpoint(token):
-    """Test SSE task log streaming endpoint (proxied to provision-api)."""
-    print("\nTesting SSE task log endpoint...")
-    
-    # Test with non-existent task_id — should get error from provision-api
-    url = f"{GATEWAY_URL}/api/tasks/nonexistent_task_id_12345/log?tail=5&follow=false"
-    cmd = [
-        "curl", "-s", "-w", "\n%{http_code}",
-        "-c", token, "-b", token,
-        "--max-time", "5",
-        url,
+def test_task_log_unknown_task(client):
+    """An unknown task's log is 404 (the task-route status passthrough)."""
+    status, body = run_curl(
+        "GET", "/api/tasks/it-nonexistent-task/log?follow=false", cookie_jar=client,
+    )
+    assert status == 404, (status, body)
+
+
+def test_instance_actions_on_bogus_id_are_404(client):
+    """Card actions on a nonexistent instance are 404, not 502.
+
+    This is the only lifecycle surface the suite touches, and it targets an id
+    that never exists — no row is created, read or modified.
+    """
+    bogus = "00000000-0000-0000-0000-000000000000"
+    cases = [
+        ("POST", f"/api/services/instances/{bogus}/stop"),
+        ("POST", f"/api/services/instances/{bogus}/start"),
+        ("POST", f"/api/services/instances/{bogus}/rebuild"),
+        ("DELETE", f"/api/services/instances/{bogus}?scope=service"),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    output = result.stdout.strip()
-    
-    parts = output.rsplit("\n", 1)
-    if len(parts) == 2:
-        body = parts[0]
-        try:
-            status = int(parts[1])
-        except ValueError:
-            body = output
-            status = 0
-    else:
-        body = output
-        status = 0
-    
-    print(f"  GET /tasks/.../log (SSE) → {status}")
-    # Should get some response — even an error is acceptable as long as the
-    # endpoint exists and is proxying correctly
-    assert status in (200, 404, 502, 500), f"Unexpected status: {status}"
-
-
-def test_new_endpoints_exist(token):
-    """Verify all new endpoints from user_provision changes are reachable via gateway."""
-    print("\nTesting new proxied endpoints...")
-    
-    new_endpoints = [
-        # Docker / host monitoring
-        ("GET", "/api/system/status"),  # internally uses docker_ps, docker_stats, docker_info, host_stats
-        # Task management
-        ("GET", "/api/tasks"),
-        # Reconciliation
-        ("GET", "/api/system/status"),  # internally uses reconciliation
-    ]
-    
-    for method, path in new_endpoints:
-        status, body = run_curl(method, path, token=token)
-        print(f"  {method} {path} → {status}")
-        # All should be reachable
-        assert status < 500, f"Server error on {method} {path}: {body}"
-
-
-def main():
-    print("=" * 60)
-    print("Provision Gateway Integration Tests")
-    print(f"Gateway: {GATEWAY_URL}")
-    print(f"Provision API: {PROVISION_API_URL}")
-    print("=" * 60)
-    
-    tests = [
-        test_health,
-        test_auth_flow,
-    ]
-    
-    token = None
-    for test_fn in tests:
-        try:
-            if test_fn is test_auth_flow:
-                # tmp_path is a pytest fixture; main() supplies a temp dir.
-                tmp = tempfile.mkdtemp(prefix="gw-int-")
-                result = test_auth_flow(os.path.join(tmp, "cookies.txt"))
-            else:
-                result = test_fn()
-            if result:
-                token = result
-        except AssertionError as e:
-            print(f"\n  ✗ FAILED: {e}")
-            sys.exit(1)
-        except Exception as e:
-            print(f"\n  ✗ ERROR: {e}")
-            sys.exit(1)
-    
-    # Tests that need a token
-    if token:
-        for test_fn in [
-            test_users_proxy,
-            test_tasks_proxy,
-            test_audit_logs,
-            test_system_status,
-            test_container_logs_endpoint,
-            test_tasks_log_sse_endpoint,
-            test_new_endpoints_exist,
-        ]:
-            try:
-                test_fn(token)
-            except AssertionError as e:
-                print(f"\n  ✗ FAILED: {e}")
-                sys.exit(1)
-            except Exception as e:
-                print(f"\n  ✗ ERROR: {e}")
-                sys.exit(1)
-    
-    print("\n" + "=" * 60)
-    print("All integration tests passed! ✓")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    main()
+    for method, path in cases:
+        status, body = run_curl(method, path, cookie_jar=client)
+        assert status == 404, (method, path, status, body)

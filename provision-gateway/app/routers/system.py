@@ -10,7 +10,6 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..database import get_db
 from ..middleware import require_gateway_token, require_admin
-from ..models.admin import AdminUser
 from ..models.system_config import SystemConfig
 from ..services.provision_service import provision_service
 

@@ -206,7 +206,7 @@ export default function ServicesPage() {
   //
   // `resumeJobId` is the row's `Check`: the panel attaches to that paused leg,
   // whose popup comes back to be answered and resumed.
-  const [genPanel, setGenPanel] = useState<{ name: string; recipePath: string; resumeJobId?: number | null } | null>(null)
+  const [genPanel, setGenPanel] = useState<{ name: string; recipePath: string; resumeJobId?: string | null } | null>(null)
 
   // The non-terminal gateway generation jobs — the ROW's button slot is derived
   // from these (task doc §4b). The list is polled silently: the slot changes on
@@ -369,7 +369,7 @@ export default function ServicesPage() {
             {paused ? (
               <Tooltip title="Paused — open the panel to answer and resume">
                 <Button size="small" type="primary" icon={<CheckOutlined/>}
-                  onClick={()=>setGenPanel({ name: r.name, recipePath: r.recipePath, resumeJobId: job.id })}/>
+                  onClick={()=>setGenPanel({ name: r.name, recipePath: r.recipePath, resumeJobId: job.task_id })}/>
               </Tooltip>
             ) : (
               <Tooltip title={`gt-${job.id} is ${job.status} — the robot returns when it ends`}>

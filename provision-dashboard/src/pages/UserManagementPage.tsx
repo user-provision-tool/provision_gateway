@@ -8,6 +8,7 @@ import {
   SettingOutlined, KeyOutlined,
 } from '@ant-design/icons'
 import client from '../api/client'
+import { useAuth } from '../store/authStore'
 
 const { Title, Text } = Typography
 
@@ -38,6 +39,22 @@ export default function UserManagementPage() {
   const [addLoading, setAddLoading] = useState(false)
   const [form] = Form.useForm()
   const roleValue = Form.useWatch('role', form)
+  const { admin: currentUser } = useAuth()
+  const currentUserId = (currentUser as any)?.id
+
+  // Typed-confirmation state for the two destructive account actions — the
+  // same random-token pattern as the "Delete service — confirm" popup.
+  const [roleTarget, setRoleTarget] = useState<any>(null)
+  const [roleNext, setRoleNext] = useState<'viewer' | 'admin'>('admin')
+  const [roleToken, setRoleToken] = useState('')
+  const [roleInput, setRoleInput] = useState('')
+  const [roleLoading, setRoleLoading] = useState(false)
+  const [delTarget, setDelTarget] = useState<any>(null)
+  const [delToken, setDelToken] = useState('')
+  const [delInput, setDelInput] = useState('')
+  const [delLoading, setDelLoading] = useState(false)
+  const newToken = () => Math.random().toString(36).slice(2, 8)
+  const isSelf = (user: any) => String(user?.id) === String(currentUserId)
 
   const [specialUsersModalOpen, setSpecialUsersModalOpen] = useState(false)
   const [specialUsersTarget, setSpecialUsersTarget] = useState<any>(null)
@@ -54,6 +71,18 @@ export default function UserManagementPage() {
     } catch (err: any) {
       message.error('Failed to load users')
     } finally { setLoading(false) }
+  }
+
+  // Silent refresh after a mutation: update the table in place — no spinner,
+  // no flash, no page reload. A failed silent refresh keeps the current table.
+  const refreshUsersSilently = async () => {
+    try {
+      const { data } = await client.get('/auth/users')
+      setUsers(data.users || [])
+      setCandidates(data.candidates || [])
+    } catch (err) {
+      console.warn('silent user refresh failed', err)
+    }
   }
 
   const errorText = (err: any): string => {
@@ -74,21 +103,60 @@ export default function UserManagementPage() {
   const handleAdd = async (values: any) => {
     setAddLoading(true)
     try {
-      const payload = {
-        ...values,
-        is_public_shared: values.role === 'special' ? !!values.is_public_shared : false,
+      if (values.role === 'special') {
+        await client.post('/auth/users/register-special', {
+          username: values.username,
+          password: values.password,
+          is_public_shared: !!values.is_public_shared,
+        })
+      } else {
+        // Public signup is viewer-only and closed until the bootstrap admin.
+        await client.post('/auth/users/register', {
+          username: values.username,
+          password: values.password,
+        })
       }
-      await client.post('/auth/users/register', payload)
       message.success('User registered')
       setAddOpen(false)
       form.resetFields()
-      loadUsers()
+      refreshUsersSilently()
     } catch (err: any) { message.error(errorText(err)) }
     finally { setAddLoading(false) }
   }
 
-  const handleApprove = async (id: number) => {
-    try { await client.put(`/auth/users/${id}/approve`); message.success('Approved'); loadUsers() }
+  const openRoleChange = (user: any) => {
+    if (isSelf(user)) {
+      message.error('You cannot change your own role')
+      return
+    }
+    setRoleNext(user.role === 'admin' ? 'viewer' : 'admin')
+    setRoleToken(newToken())
+    setRoleInput('')
+    setRoleTarget(user)
+  }
+
+  const confirmRoleChange = async () => {
+    if (!roleTarget || roleInput !== roleToken) return
+    setRoleLoading(true)
+    try {
+      await client.put(`/auth/users/${roleTarget.id}`, { role: roleNext })
+      message.success(`${roleTarget.username} is now ${roleNext}`)
+      setUsers(prev => prev.map(u =>
+        u.id === roleTarget.id ? { ...u, role: roleNext } : u))
+      setRoleTarget(null)
+      setRoleInput('')
+      refreshUsersSilently()
+    } catch (err: any) { message.error(errorText(err)) }
+    finally { setRoleLoading(false) }
+  }
+
+  const handleApprove = async (id: string) => {
+    try {
+      await client.put(`/auth/users/${id}/approve`)
+      message.success('Approved')
+      setUsers(prev => prev.map(u => u.id === id ? { ...u, is_approved: true } : u))
+      refreshUsersSilently()
+    }
     catch (err: any) { message.error(errorText(err)) }
   }
 
@@ -98,39 +166,36 @@ export default function UserManagementPage() {
       message.success(checked
         ? `${user.username} activated — grants stay inactive until re-approved`
         : `${user.username} deactivated — all related grants are now inactive`)
-      loadUsers()
+      setUsers(prev => prev.map(u =>
+        u.id === user.id ? { ...u, is_active: checked } : u))
+      refreshUsersSilently()
     } catch (err: any) { message.error(errorText(err)) }
   }
 
-  const handleDelete = (user: any) => {
-    Modal.confirm({
-      title: `Delete ${user.username}?`,
-      content: (
-        <div>
-          <p>
-            Every service of this account is stopped first. If any stop fails,
-            the account is NOT deleted and the failure is shown.
-          </p>
-          <p>
-            On success the account is soft-deleted: the username stays reserved,
-            grants/keys/sessions/exposures are revoked, and the stopped services
-            remain as orphans for you to delete separately.
-          </p>
-        </div>
-      ),
-      okText: 'Delete',
-      okType: 'danger',
-      onOk: async () => {
-        try {
-          await client.delete(`/auth/users/${user.id}`)
-          message.success('Account deleted; its services are stopped and orphaned')
-          loadUsers()
-        } catch (err: any) {
-          Modal.error({ title: 'Deletion aborted', content: errorText(err) })
-          throw err
-        }
-      },
-    })
+  const openDelete = (user: any) => {
+    if (isSelf(user)) {
+      message.error('You cannot delete your own account')
+      return
+    }
+    setDelToken(newToken())
+    setDelInput('')
+    setDelTarget(user)
+  }
+
+  const confirmDelete = async () => {
+    if (!delTarget || delInput !== delToken) return
+    setDelLoading(true)
+    try {
+      await client.delete(`/auth/users/${delTarget.id}`)
+      message.success('Account deleted; its services are stopped and orphaned')
+      setUsers(prev => prev.map(u =>
+        u.id === delTarget.id ? { ...u, is_deleted: true, is_active: false } : u))
+      setDelTarget(null)
+      setDelInput('')
+      refreshUsersSilently()
+    } catch (err: any) {
+      Modal.error({ title: 'Deletion aborted', content: errorText(err) })
+    } finally { setDelLoading(false) }
   }
 
   const [pwdTarget, setPwdTarget] = useState<any>(null)
@@ -154,7 +219,7 @@ export default function UserManagementPage() {
     setSpecialUsersModalOpen(true)
   }
 
-  const replaceTargetGrants = (targetId: number, nextGrants: any[]) => {
+  const replaceTargetGrants = (targetId: string, nextGrants: any[]) => {
     setSpecialUsersTarget((prev: any) =>
       prev && prev.id === targetId ? { ...prev, grants: nextGrants } : prev)
     setUsers((prev) => prev.map((u) =>
@@ -185,7 +250,7 @@ export default function UserManagementPage() {
     finally { setGrantLoading(false) }
   }
 
-  const grantState = (sharedId: number): string | undefined =>
+  const grantState = (sharedId: string): string | undefined =>
     (specialUsersTarget?.grants || []).find((g: any) => g.shared_user_id === sharedId)?.state
 
   const modalTags = (() => {
@@ -279,11 +344,20 @@ export default function UserManagementPage() {
             <Button size="small" type="primary" icon={<CheckOutlined />}
               onClick={() => handleApprove(r.id)}>Approve</Button>
           )}
+          {r.role !== 'special' && !r.is_deleted && (
+            <Button size="small" onClick={() => openRoleChange(r)}
+              disabled={isSelf(r)}
+              title={isSelf(r) ? 'You cannot change your own role'
+                : (r.role === 'admin' ? 'Demote to viewer' : 'Promote to admin')}>
+              {r.role === 'admin' ? 'Viewer' : 'Admin'}
+            </Button>
+          )}
           <Button size="small" icon={<KeyOutlined />} disabled={r.is_deleted}
             onClick={() => { pwdForm.resetFields(); setPwdTarget(r) }}
             title="Reset password">Pwd</Button>
-          <Button size="small" danger icon={<CloseOutlined />} disabled={r.is_deleted}
-            onClick={() => handleDelete(r)} title="Soft-delete the account" />
+          <Button size="small" danger icon={<CloseOutlined />} disabled={r.is_deleted || isSelf(r)}
+            onClick={() => openDelete(r)}
+            title={isSelf(r) ? 'You cannot delete your own account' : 'Soft-delete the account'} />
         </Space>
       ),
     },
@@ -334,7 +408,8 @@ export default function UserManagementPage() {
         <Form form={form} layout="vertical" onFinish={handleAdd}>
           <Form.Item name="username" label="Username" rules={[{ required: true }]}><Input placeholder="alice" /></Form.Item>
           <Form.Item name="password" label="Password" rules={[{ required: true, min: 4 }]}><Input.Password placeholder="****" /></Form.Item>
-          <Form.Item name="role" label="Role" initialValue="viewer">
+          <Form.Item name="role" label="Role" initialValue="viewer"
+            extra="Viewer self-registration needs approval. Special is created approved/active by this admin route.">
             <Select options={[{ value: 'viewer', label: 'Viewer' }, { value: 'special', label: 'Special' }]} />
           </Form.Item>
           {roleValue === 'special' && (
@@ -405,6 +480,53 @@ export default function UserManagementPage() {
             an account is not undone by reactivating it — each tag is re-approved here.
           </Text>
         </div>
+      </Modal>
+
+      {/* Role change — typed confirmation (same pattern as Delete service). */}
+      <Modal
+        title={roleNext === 'admin'
+          ? `Promote ${roleTarget?.username || ''} to admin — confirm`
+          : `Demote ${roleTarget?.username || ''} to viewer — confirm`}
+        open={!!roleTarget}
+        onCancel={() => { setRoleTarget(null); setRoleInput('') }}
+        okText={roleNext === 'admin' ? 'Promote' : 'Demote'}
+        okButtonProps={{ danger: roleNext === 'viewer', disabled: roleInput !== roleToken }}
+        confirmLoading={roleLoading}
+        onOk={confirmRoleChange}
+      >
+        <p>
+          {roleNext === 'admin'
+            ? 'This grants the account every admin capability: service operations, user management and API-key administration.'
+            : 'This removes every admin capability; the account keeps its own services and stream exposures.'}{' '}
+          An admin cannot change its own role.
+        </p>
+        <p>Type <Text code>{roleToken}</Text> to confirm:</p>
+        <Input value={roleInput} onChange={(e) => setRoleInput(e.target.value)}
+          placeholder="confirm string" />
+      </Modal>
+
+      {/* Account delete — typed confirmation (same pattern as Delete service). */}
+      <Modal
+        title={`Delete ${delTarget?.username || ''} — confirm`}
+        open={!!delTarget}
+        onCancel={() => { setDelTarget(null); setDelInput('') }}
+        okText="Delete"
+        okButtonProps={{ danger: true, disabled: delInput !== delToken }}
+        confirmLoading={delLoading}
+        onOk={confirmDelete}
+      >
+        <p>
+          Every service of this account is stopped first. If any stop fails,
+          the account is NOT deleted and the failure is shown.
+        </p>
+        <p>
+          On success the account is soft-deleted: the username stays reserved,
+          grants/keys/sessions/exposures are revoked, and the stopped services
+          remain as orphans for you to delete separately.
+        </p>
+        <p>Type <Text code>{delToken}</Text> to confirm:</p>
+        <Input value={delInput} onChange={(e) => setDelInput(e.target.value)}
+          placeholder="confirm string" />
       </Modal>
     </div>
   )

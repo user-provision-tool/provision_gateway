@@ -1,113 +1,169 @@
-"""Tasks router — /api/tasks/* endpoints."""
+"""Unified task read model — one list, both families (T7/R4.5)."""
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ..database import get_db
+from ..database import SessionLocal, get_db
 from ..middleware import require_admin
-from ..services.auth_service import decode_gateway_token, get_admin_by_id
 from ..services.provision_service import provision_service
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
+TERMINAL = ("completed", "failed", "cancelled")
+
+
+def _row(db: Session, task_id: str) -> dict | None:
+    row = db.execute(
+        text("SELECT * FROM gateway.task_view WHERE task_id=:id"), {"id": task_id}
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def _clean(row: dict) -> dict:
+    row = dict(row)
+    for key in ("procedure_id", "service_id"):
+        if row.get(key) is not None:
+            row[key] = str(row[key])
+    return row
+
 
 @router.get("")
-async def list_tasks(
-    current_admin: dict = Depends(require_admin),
-):
-    """List all tasks from provision-api.
-
-    Each task is annotated with ``is_record``: a *record* is bookkeeping for work
-    an external process performs (the gateway's generation session) and occupies
-    no pool worker — so the Tasks page must not present it as running work.
-    """
+async def list_tasks(current_admin: dict = Depends(require_admin)):
+    db = SessionLocal()
     try:
-        result = await provision_service.list_tasks()
-    except Exception as e:
-        raise HTTPException(502, f"provision-api error: {e}")
-    for t in (result.get("tasks") or []):
-        t["is_record"] = (t.get("target") or {}).get("kind") == "record"
-    return result
+        rows = db.execute(
+            text(
+                "SELECT * FROM gateway.task_view WHERE deleted_at IS NULL "
+                "ORDER BY created_at DESC, task_id DESC"
+            )
+        ).mappings().all()
+    finally:
+        db.close()
+    tasks = [_clean(dict(r)) for r in rows]
+    for t in tasks:
+        t["is_record"] = False
+    return {"count": len(tasks), "tasks": tasks}
 
 
 @router.get("/{task_id}")
-async def get_task(
-    task_id: str,
-    current_admin: dict = Depends(require_admin),
-):
-    """Get a single task's status from provision-api."""
+async def get_task(task_id: str, current_admin: dict = Depends(require_admin)):
+    db = SessionLocal()
     try:
-        result = await provision_service.get_task(task_id)
-    except Exception as e:
-        raise HTTPException(502, f"provision-api error: {e}")
-    return result
+        row = _row(db, task_id)
+    finally:
+        db.close()
+    if row is None:
+        raise HTTPException(404, "Task not found")
+    return _clean(row)
 
 
 @router.delete("/{task_id}")
-async def cancel_task(
-    task_id: str,
-    current_admin: dict = Depends(require_admin),
-):
-    """Cancel a pending/running task."""
+async def cancel_task(task_id: str, current_admin: dict = Depends(require_admin)):
+    """Prefix dispatch: `gt-` gateway cancel, `api-` proxied to the -api."""
+    if task_id.startswith("api-"):
+        try:
+            return await provision_service.cancel_task(task_id)
+        except Exception as e:  # noqa: BLE001
+            raise provision_service.as_task_error(e)
+    db = SessionLocal()
     try:
-        result = await provision_service.cancel_task(task_id)
-    except Exception as e:
-        raise HTTPException(502, f"provision-api error: {e}")
-    return result
+        row = db.execute(
+            text("SELECT status, operation FROM gateway.tasks WHERE task_id=:id"),
+            {"id": task_id},
+        ).mappings().first()
+        if row is None:
+            raise HTTPException(404, "Task not found")
+        if row["operation"] == "fix_remove":
+            raise HTTPException(409, "fix_remove is not cancellable")
+        if row["status"] in TERMINAL or row["status"] == "unknown":
+            raise HTTPException(409, f"Task is already terminal: {row['status']}")
+        if row["status"] not in ("queued", "running", "paused", "awaiting_input"):
+            raise HTTPException(409, f"Task cannot be cancelled: {row['status']}")
+        db.execute(
+            text("UPDATE gateway.tasks SET status='cancelled', updated_at=now() "
+                 "WHERE task_id=:id AND status IN ('queued','running','paused','awaiting_input')"),
+            {"id": task_id},
+        )
+        db.commit()
+    finally:
+        db.close()
+    # Session rules: a live generation cancel removes its session; an
+    # operator-held paused/refused session is kept.
+    from ..services import generation_jobs as _gj
+    _gj.generation_jobs.cancel_session_after_task_cancel(task_id)
+    return {"task_id": task_id, "status": "cancelled"}
+
+
+@router.post("/{task_id}/answer")
+async def answer_task(task_id: str, body: dict,
+                      current_admin: dict = Depends(require_admin)):
+    from ..services.generation_jobs import generation_jobs
+    try:
+        return generation_jobs.answer_pause(task_id, body or {})
+    except KeyError:
+        raise HTTPException(404, "Task not found")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
 
 
 @router.get("/{task_id}/log")
-async def stream_task_log(
-    task_id: str,
-    request: Request,
-    tail: int = Query(200, description="Number of recent lines to send first"),
-    follow: bool = Query(True, description="Whether to keep streaming new lines"),
-    token: str = Query("", description="JWT token for EventSource (query param fallback)"),
-    db: Session = Depends(get_db),
-):
-    """Stream task build log via Server-Sent Events (proxied to provision-api).
-
-    Authentication: accepts the ``provision_token`` cookie (v4 §11.2 / N5) or
-    the ``X-Provision-Token`` API-key header, OR the ``?token=`` query parameter
-    (EventSource fallback). Legacy ``gateway_token`` cookie / ``Bearer`` are
-    REMOVED (G5) — ``decode_gateway_token`` accepts only ``type='provision'``.
-    """
-    admin = None
-    actual_token = (
-        request.cookies.get("provision_token", "")
-        or request.headers.get("X-Provision-Token", "")
-    )
-    if not actual_token and token:
-        actual_token = token
-
-    if actual_token:
+async def stream_task_log(task_id: str, request: Request,
+                          tail: int = Query(200), follow: bool = Query(True),
+                          token: str = Query("")):
+    require_admin(request)
+    if task_id.startswith("api-"):
         try:
-            payload = decode_gateway_token(actual_token)
-            admin_id = int(payload.get("sub", 0))
-            admin = get_admin_by_id(db, admin_id)
-        except Exception:
-            pass
+            task = await provision_service.get_task(task_id)
+        except Exception as e:  # noqa: BLE001
+            raise provision_service.as_task_error(e)
+        if task.get("deleted_at"):
+            raise HTTPException(410, "Task was pruned; its log is gone")
+        async def proxy():
+            try:
+                async for line in provision_service.stream_task_log(task_id, tail, follow):
+                    yield line
+            except Exception as exc:  # noqa: BLE001
+                import json as _json
+                yield f"event: error\ndata: {_json.dumps({'error': str(exc)})}\n\n"
+        return StreamingResponse(proxy(), media_type="text/event-stream")
 
-    if admin is None or not admin.is_active:
-        raise HTTPException(status_code=401, detail="Invalid or missing authentication token")
+    db = SessionLocal()
+    try:
+        row = db.execute(
+            text("SELECT log_ref, deleted_at FROM gateway.tasks WHERE task_id=:id"),
+            {"id": task_id},
+        ).mappings().first()
+    finally:
+        db.close()
+    if row is None:
+        raise HTTPException(404, "Task not found")
+    if row["deleted_at"] is not None:
+        raise HTTPException(410, "Task was pruned; its log is gone")
+    if not row["log_ref"] or not Path(row["log_ref"]).exists():
+        raise HTTPException(404, "Task log is gone")
+    log_file = Path(row["log_ref"])
 
-    async def sse_generator():
-        try:
-            async for line in provision_service.stream_task_log(task_id, tail, follow):
-                yield line
-        except Exception as e:
-            import json as _json
-            yield f"event: error\ndata: {_json.dumps({'error': str(e)})}\n\n"
-
-    return StreamingResponse(
-        sse_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    async def file_sse():
+        lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        for line in lines[-tail:]:
+            yield f"data: {line}\n\n"
+        if not follow:
+            yield "event: done\ndata: {}\n\n"
+            return
+        pos = log_file.stat().st_size
+        while True:
+            await asyncio.sleep(1)
+            if log_file.exists() and log_file.stat().st_size > pos:
+                with log_file.open("r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(pos)
+                    for line in fh.read().splitlines():
+                        yield f"data: {line}\n\n"
+                    pos = fh.tell()
+    return StreamingResponse(file_sse(), media_type="text/event-stream")

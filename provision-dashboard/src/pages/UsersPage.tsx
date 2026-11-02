@@ -15,6 +15,13 @@ const { Title, Text } = Typography
 const baseName = (p?: string) => (p ? p.split('/').pop() || '' : '')
 
 interface ServiceInstance {
+  service_id: string;
+  owner_api_user_id?: string;
+  owner_username?: string;
+  owner_role?: string | null;
+  owner_has_gateway_user?: boolean;
+  owner_is_public_shared?: boolean;
+  owner_was_public?: boolean;
   user_name: string; service_name: string; label: string;
   // R6.1: the sub-services this instance exposes a STREAM endpoint for, as the
   // canonical names the -api recorded when it rendered the stream conf. Empty or
@@ -239,7 +246,7 @@ export default function UsersPage() {
   // `check` on a `paused` session re-enters the paused path IN PLACE: the deploy
   // panel opens attached to the parked job (so its pause popup is there) or, for
   // an LLM-fix pause, pre-filled with the analysis's guide.
-  const [resumeJobId, setResumeJobId] = useState<number|null>(null)
+  const [resumeJobId, setResumeJobId] = useState<string|null>(null)
   const [fixingGuide, setFixingGuide] = useState<{guide:string; slot:string}|null>(null)
   // §8b pre-deploy sessions: work that is NOT an instance yet, so it is stored
   // by the GATEWAY, not the -api registry — a session rendered from the instance
@@ -264,8 +271,7 @@ export default function UsersPage() {
       : canonical.split('.')[0]
     try {
       const { data } = await client.post('/stream/exposures', {
-        service_name: svc.service_name, user_name: svc.user_name,
-        label: String(svc.label), sub_service: sub,
+        service_id: svc.service_id, sub_service: sub,
       })
       // `data.address` — the NAME and the stream PORT, and nothing else.
       //
@@ -345,7 +351,7 @@ export default function UsersPage() {
   const [editorContent, setEditorContent] = useState('')
   const [editorOriginal, setEditorOriginal] = useState('')
   const [delOpen, setDelOpen] = useState(false)
-  const [delTarget, setDelTarget] = useState<{user_name:string;service_name:string;label:string}|null>(null)
+  const [delTarget, setDelTarget] = useState<{service_id:string;user_name:string;service_name:string;label:string}|null>(null)
   const [delToken, setDelToken] = useState('')
   const [delInput, setDelInput] = useState('')
   // Batch (multi-select) delete also uses the typed-confirm modal (feature 2 —
@@ -409,6 +415,10 @@ export default function UsersPage() {
     return `/go/${servedName}`
   }, [])
 
+  const serviceIdFor = (user: string, service: string, label: string): string | undefined =>
+    services.find(s => s.user_name === user && s.service_name === service
+      && String(s.label) === String(label))?.service_id
+
   // Parse "user-service-label" key (service may contain hyphens like "example-mcp")
   const parseServiceKey = (key: string) => {
     const parts = key.split('-')
@@ -426,10 +436,14 @@ export default function UsersPage() {
       // A session's panel key is namespaced and belongs to no instance — it has
       // no fix files of its own to show.
       if (!key.startsWith('session:')) {
-        const { user, service, label } = parseServiceKey(key)
-        const svc = servicesRef.current.find(s =>
-          s.user_name === user && s.service_name === service && String(s.label) === String(label))
-        loadFixFiles(service, svc?.recipe_path || '')
+        const svc = key.startsWith('svc:')
+          ? servicesRef.current.find(s => s.service_id === key.slice(4))
+          : (() => {
+              const { user, service, label } = parseServiceKey(key)
+              return servicesRef.current.find(s =>
+                s.user_name === user && s.service_name === service && String(s.label) === String(label))
+            })()
+        loadFixFiles(svc?.service_name || '', svc?.recipe_path || '')
       }
       if (timers[key]) continue
       timers[key] = setInterval(() => {
@@ -646,7 +660,7 @@ export default function UsersPage() {
 
   // Toggle select all for a user group
   const toggleSelectAll = (userName: string) => {
-    const userKeys = services.filter(s => s.user_name === userName).map(s => `${s.user_name}-${s.service_name}-${s.label}`)
+    const userKeys = services.filter(s => s.user_name === userName).map(s => `svc:${s.service_id}`)
     const allSelected = userKeys.every(k => selectedKeys.has(k))
     setSelectedKeys(prev => {
       const next = new Set(prev)
@@ -662,11 +676,11 @@ export default function UsersPage() {
     const keys = Array.from(selectedKeys)
     try {
       for (const key of keys) {
-        const {user, service, label} = parseServiceKey(key)
+        const sid = key.startsWith('svc:') ? key.slice(4) : key
         switch (action) {
-          case 'stop': await client.post(`/services/${user}/${service}/${label}/down`); break
-          case 'start': await client.post(`/services/${user}/${service}/${label}/up`); break
-          case 'rebuild': await client.post(`/services/${user}/${service}/${label}/rebuild`, {no_cache: true}); break
+          case 'stop': await client.post(`/services/instances/${sid}/stop`); break
+          case 'start': await client.post(`/services/instances/${sid}/start`); break
+          case 'rebuild': await client.post(`/services/instances/${sid}/rebuild`, {no_cache: true}); break
         }
       }
       message.success(`Batch ${action}: ${keys.length} service(s) processed`)
@@ -765,7 +779,9 @@ export default function UsersPage() {
       ensure(un)
       if (matches(un, s.service_name)) svcsByUser[un].push(s)
     }
-    for (const sess of sessions) {
+    // A pre-deploy/generation card is admin-only: a viewer sees only deployed
+    // services it owns or is granted (decision 15).
+    for (const sess of (isAdmin ? sessions : [])) {
       const un = sess.user_name || 'unknown'
       ensure(un)
       if (matches(un, sess.service_name)) sessByUser[un].push(sess)
@@ -773,7 +789,7 @@ export default function UsersPage() {
     return order
       .map(un => ({ userName: un, svcs: svcsByUser[un], sessions: sessByUser[un] }))
       .filter(g => g.svcs.length > 0 || g.sessions.length > 0)
-  }, [services, sessions, search])
+  }, [services, sessions, search, isAdmin])
 
   const getBadge = (s: ServiceInstance, key?: string, analyzing = false) => {
     // Failed: its own state, read from the registry — never an ordinary
@@ -839,7 +855,9 @@ export default function UsersPage() {
     if (!pwdTarget || !newPassword) { message.warning('Enter a new password'); return }
     setPwdLoading(true)
     try {
-      await client.put(`/services/${pwdTarget.user}/${pwdTarget.service}/${pwdTarget.label}/password`, { passwd: newPassword })
+      const sid = serviceIdFor(pwdTarget.user, pwdTarget.service, pwdTarget.label)
+      if (!sid) throw new Error('service not found')
+      await client.put(`/services/instances/${sid}/password`, { passwd: newPassword })
       message.success('Password changed')
       setPwdModalOpen(false)
     } catch (err: any) { message.error(err.response?.data?.detail || 'Failed') }
@@ -851,7 +869,9 @@ export default function UsersPage() {
   // can never satisfy that auth_basic again, so the layer has to come off.
   const handleRemovePwd = async (user: string, service: string, label: string) => {
     try {
-      await client.delete(`/services/${user}/${service}/${label}/password`)
+      const sid = serviceIdFor(user, service, label)
+      if (!sid) throw new Error('service not found')
+      await client.delete(`/services/instances/${sid}/password`)
       message.success('Service password removed — auth_basic is off, the ACL gate still applies')
       refreshServices()
     } catch (err: any) { message.error(err.response?.data?.detail || 'Failed to remove the service password') }
@@ -880,7 +900,9 @@ export default function UsersPage() {
       const payload: any = {}
       if (noCache) payload.no_cache = true
       if (rebuildProxy) payload.use_global_proxy = true
-      const r = await client.post(`/services/${user}/${service}/${label}/rebuild`, payload)
+      const sid = serviceIdFor(user, service, label)
+      if (!sid) throw new Error('service not found')
+      const r = await client.post(`/services/instances/${sid}/rebuild`, payload)
       const taskId = r.data?.task_id || r.data?.id
       message.success({content:<span>{noCache ? 'Redeploying' : 'Rebuilding'}... {taskId && <Button type="link" size="small" icon={<UnorderedListOutlined/>} onClick={()=>navigate('/tasks')}>View Task</Button>}</span>,duration:5})
       if (noCache) setNeedsRedeploy(prev => ({...prev, [key]: false}))
@@ -1008,8 +1030,8 @@ export default function UsersPage() {
               // already run — and open the panel in fixing mode.
               if (sess.state === 'paused' && sess.reason === 'llm_fix') {
                 setFixingGuide({ guide: sess.guide || '', slot: sess.slot || 'compose' })
-              } else if (sess.job_id != null) {
-                setResumeJobId(sess.job_id)
+              } else if (sess.generation_task_id != null) {
+                setResumeJobId(sess.generation_task_id)
               }
               setDeployOpen(true)
             }}>Check</Button>
@@ -1022,11 +1044,11 @@ export default function UsersPage() {
           {isJobLive && (
             <Button size="small" danger onClick={async () => {
               try {
-                if (sess.job_id == null) {
+                if (sess.generation_task_id == null) {
                   message.warning('This session has no running job to cancel')
                   return
                 }
-                const r = await client.delete(`/llm/jobs/${sess.job_id}`)
+                const r = await client.delete(`/llm/jobs/${sess.generation_task_id}`)
                 // The endpoint answers 200 for ANY existing job: it
                 // no-ops when the job has already stopped and still
                 // returns the row. Reporting success off the response
@@ -1094,7 +1116,7 @@ export default function UsersPage() {
                 </Space>
               : <Text type="secondary">none recorded yet</Text>}
           </div>
-          {sess.job_id != null && (
+          {sess.generation_task_id != null && (
             <div>
               <Text strong>Job: </Text>
               {/* The Tasks page reads `?job=` and shows THIS gateway
@@ -1104,7 +1126,7 @@ export default function UsersPage() {
                   tasks that page lists — so it could not have resolved
                   even if it had. */}
               <Button type="link" size="small" style={{ padding: 0 }}
-                onClick={() => navigate(`/tasks?job=${sess.job_id}`)}>#{sess.job_id}</Button>
+                onClick={() => navigate(`/tasks?task=${sess.generation_task_id}`)}>#{sess.generation_task_id}</Button>
             </div>
           )}
           {sess.task_id && (
@@ -1188,6 +1210,9 @@ export default function UsersPage() {
           // The group itself is marked public, with the same inline-tag style
           // as the owner-gone tag; every card in it carries its own Public badge.
           const publicGroup = userSvcs.some(s => s.is_public || s.was_public)
+          const ownerRole = userSvcs[0]?.owner_role
+          const serviceOnly = userSvcs.length > 0
+            && userSvcs.every(s => s.owner_has_gateway_user === false)
           const unhealthyCount = userSvcs.length - healthyCount - buildingCount - failedCount
           // The group tag counts INSTANCES (it is a health summary, and a session
           // has no containers to be healthy about); a user holding only sessions
@@ -1207,15 +1232,17 @@ export default function UsersPage() {
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
               <Space>
                 {isAdmin && <Checkbox
-                  checked={userSvcs.length>0 && userSvcs.every(s => selectedKeys.has(`${s.user_name}-${s.service_name}-${s.label}`))}
-                  indeterminate={userSvcs.some(s => selectedKeys.has(`${s.user_name}-${s.service_name}-${s.label}`)) && !userSvcs.every(s => selectedKeys.has(`${s.user_name}-${s.service_name}-${s.label}`))}
+                  checked={userSvcs.length>0 && userSvcs.every(s => selectedKeys.has(`svc:${s.service_id}`))}
+                  indeterminate={userSvcs.some(s => selectedKeys.has(`svc:${s.service_id}`)) && !userSvcs.every(s => selectedKeys.has(`svc:${s.service_id}`))}
                   onChange={() => toggleSelectAll(userName)}
                 />}
                 <Title level={4} style={{margin:0, color: ownerGone ? '#cf1322' : undefined}}>
                   {highlight(userName, search)}
                 </Title>
                 {ownerGone && <Tag color="red">owner gone</Tag>}
+                {ownerRole === 'special' && <Tag color="purple">Functional</Tag>}
                 {publicGroup && <Tag color="green">Public</Tag>}
+                {serviceOnly && <Tag>Service-only</Tag>}
                 <Tag color={failedCount > 0 ? 'red' : (userSvcs.length === 0 ? 'blue' : (allHealthy?'green':'orange'))}>{groupTag}</Tag>
               </Space>
               <Space>
@@ -1234,7 +1261,7 @@ export default function UsersPage() {
                   operator's attention is on the work in flight. */}
               {userSessions.map((sess) => renderSessionCard(sess))}
               {userSvcs.map((svc) => {
-                const key = `${svc.user_name}-${svc.service_name}-${svc.label}`
+                const key = `svc:${svc.service_id}`
                 const isDeleting = svc.status === 'deleting' || deletingKeys.has(key)
                 const containers = {...svc.healthy_containers, ...svc.unhealthy_containers, ...svc.missing_containers}
                 const pwdVisible = visiblePwds[key] || false
@@ -1337,7 +1364,7 @@ export default function UsersPage() {
                               }}>Retry</Button>
                             <Button size="small" danger icon={<DeleteOutlined/>}
                               onClick={()=>{
-                                setDelTarget({user_name:svc.user_name, service_name:svc.service_name, label:svc.label})
+                                setDelTarget({service_id:svc.service_id, user_name:svc.user_name, service_name:svc.service_name, label:svc.label})
                                 setDelToken(Math.random().toString(36).slice(2,8))
                                 setDelInput(''); setDelOpen(true)
                               }}>Delete</Button>
@@ -1358,9 +1385,9 @@ export default function UsersPage() {
                               type={Object.keys(svc.healthy_containers||{}).length > 0 ? 'default' : 'primary'}
                               onClick={()=>{
                                 const isRunning = Object.keys(svc.healthy_containers||{}).length > 0
-                                const action = isRunning ? 'down' : 'up'
+                                const action = isRunning ? 'stop' : 'start'
                                 const label = isRunning ? 'Stopping...' : 'Starting...'
-                                client.post(`/services/${svc.user_name}/${svc.service_name}/${svc.label}/${action}`)
+                                client.post(`/services/instances/${svc.service_id}/${action}`)
                                   .then(()=>{message.success(label); refreshServices()})
                                   .catch(e=>message.error(e.response?.data?.detail||'Failed'))
                               }}
@@ -1400,7 +1427,7 @@ export default function UsersPage() {
                             }}>Dup</Button>
                           </Tooltip>
                           <Button size="small" danger icon={<DeleteOutlined/>} disabled={isDeleting} onClick={()=>{
-                            setDelTarget({user_name:svc.user_name, service_name:svc.service_name, label:svc.label})
+                            setDelTarget({service_id:svc.service_id, user_name:svc.user_name, service_name:svc.service_name, label:svc.label})
                             setDelToken(Math.random().toString(36).slice(2,8))
                             setDelInput(''); setDelOpen(true)
                           }}/>
@@ -1669,7 +1696,7 @@ export default function UsersPage() {
         setDeployOpen(false); setPreselectedDeploy(undefined); if(deployParam) setSearchParams({});
         // Optimistic update: immediately show the new service as "building"
         const optimisticEntry: ServiceInstance = {
-          user_name: user, service_name: service, label: label,
+          service_id: '', user_name: user, service_name: service, label: label,
           healthy_containers: {}, unhealthy_containers: {}, missing_containers: {},
           status: 'building',
         }
@@ -1694,7 +1721,7 @@ export default function UsersPage() {
           // teardown is an async -api task, so we don't wait for the round-trip.
           const keys: string[] = delBatch
             ? Array.from(selectedKeys)
-            : (delTarget ? [`${delTarget.user_name}-${delTarget.service_name}-${delTarget.label}`] : [])
+            : (delTarget ? [`svc:${delTarget.service_id}`] : [])
           setDelOpen(false); setDelBatch(false); setDelInput('')
           if (keys.length === 0) return
           // Optimistic "Deleting..." until the next poll (the -api also persists
@@ -1702,16 +1729,17 @@ export default function UsersPage() {
           setDeletingKeys(prev => new Set([...prev, ...keys]))
           if (delBatch) setSelectedKeys(new Set())
           for (const key of keys) {
-            const {user, service, label} = parseServiceKey(key)
-            client.delete(`/services/${user}/${service}/${label}`)
-              .then(() => { message.success(`Deleting ${service}/${label}…`); refreshServices() })
+            const sid = key.startsWith('svc:') ? key.slice(4) : key
+            if (!sid) continue
+            client.delete(`/services/instances/${sid}`, { params: { scope: 'service' } })
+              .then(() => { message.success('Deleting service…'); refreshServices() })
               .catch(() => {
                 setDeletingKeys(prev => { const n = new Set(prev); n.delete(key); return n })
                 message.error('Failed to delete')
               })
           }
         }}>
-        <p>This <b>permanently deletes</b> {delBatch ? 'the selected instances' : 'the instance'}: its containers, generated files <b>and data volumes</b> (decision #2 — nothing is kept). This cannot be undone.</p>
+        <p>This deletes {delBatch ? 'the selected services' : 'the service'}: containers are stopped, the service identity is tombstoned and the card disappears. <b>Generated files, user data and volumes are preserved</b> by the no-auto-delete rule; only the per-instance stream conf is removed. The tombstone cannot be undone.</p>
         <p>Type <Text code>{delToken}</Text> to confirm:</p>
         <Input value={delInput} onChange={(e)=>setDelInput(e.target.value)} placeholder="confirm string" />
       </Modal>

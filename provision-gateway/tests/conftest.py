@@ -1,8 +1,21 @@
 """Pytest fixtures for provision-gateway tests."""
 
 import os
+import sys
+from pathlib import Path
+
 import pytest
 import subprocess
+
+# tests/ helper for the real PostgreSQL test database (T12/R8.5).
+sys.path.insert(0, str(Path(__file__).parent))
+import pg_test_db  # noqa: E402 — path set above
+
+# Point the application at the dedicated TEST database BEFORE any app module is
+# imported: app.config reads these at import time. The fixture refuses any
+# database whose name lacks "test", so a bad override cannot reach the live store.
+os.environ["DATABASE_URL"] = pg_test_db.gateway_sqlalchemy_url()
+os.environ["GATEWAY_READER_DATABASE_URL"] = pg_test_db.reader_sqlalchemy_url()
 
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8870")
 
@@ -28,15 +41,27 @@ def _is_gateway_running() -> bool:
     return _gateway_running
 
 
-@pytest.fixture(autouse=True)
-def _skip_if_no_gateway(request):
-    """Auto-skip integration tests if the gateway is not running.
+@pytest.fixture(autouse=True, scope="module")
+def _integration_tests_need_gateway_and_credentials(request):
+    """Skip the live-gateway file only when it cannot meaningfully run.
 
     Only applies to tests in test_integration.py — unit tests are unaffected.
+
+    The file drives a running gateway with a pre-provisioned test identity, so
+    it needs (a) credentials in ``GATEWAY_TEST_USER``/``GATEWAY_TEST_PASSWORD``
+    and (b) a gateway answering ``/health`` at ``GATEWAY_URL``. With both it
+    always runs; the suite itself creates no users, services or tasks (see the
+    module docstring — it only reads and targets nonexistent ids).
     """
     if "test_integration" in request.node.fspath.strpath:
+        if not (os.environ.get("GATEWAY_TEST_USER")
+                and os.environ.get("GATEWAY_TEST_PASSWORD")):
+            pytest.skip(
+                "integration tests need GATEWAY_TEST_USER/GATEWAY_TEST_PASSWORD "
+                "(a pre-provisioned test identity)"
+            )
         if not _is_gateway_running():
-            pytest.skip("Gateway is not running — skipping integration test")
+            pytest.skip("integration tests need a gateway answering /health at GATEWAY_URL")
 
 
 @pytest.fixture(scope="session")
@@ -77,58 +102,64 @@ def token(tmp_path_factory):
     return ""  # unreachable but satisfies type checker
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _pg_test_database():
+    """Provision the real PostgreSQL test database once per session (T12).
+
+    The -api's registry migrations run first (the gateway has cross-schema FKs
+    into that schema); then the gateway's own migrations.
+    """
+    pg_test_db.provision()
+    import app.database as database
+
+    database.init_db()
+    yield
+    database.engine.dispose()
+    database.reader_engine.dispose()
+
+
 @pytest.fixture(autouse=True)
 def _isolated_gateway_db(tmp_path_factory, monkeypatch):
-    """Point every test at its OWN throwaway SQLite database (GRILLING G31).
+    """Per-test truncation on the PostgreSQL test database + a temp data dir.
 
-    Two reasons this is autouse rather than opt-in:
-
-    1. **Safety.** The gateway's real store is `gateway_data/gateway.db`, shared
-       with the live container. Any test that reaches `SessionLocal` without an
-       override writes into the running system's data.
-    2. **The store is a table now.** `pre_deploy_registry` used to be a JSON file
-       under `GATEWAY_DATA_DIR`, so setting that env var to `tmp_path` was enough
-       isolation. The sessions moved into SQLite, so a temp *directory* no longer
-       isolates anything — a temp *engine* does.
-
-    `database.SessionLocal` is resolved at call time by every service (the
-    codebase's convention), so patching it here reaches all of them.
+    Safety: the application's engines point at ``subnet_acl_test_gw`` only (set
+    at conftest import). The live ``gateway_data`` directory is never touched
+    because both the env var and the resolved setting are redirected here.
     """
-    import app.database as database
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
+    pg_test_db.truncate()
 
-    import app.models  # noqa: F401 — registers every model on Base.metadata
-    from app.database import Base
-
-    # A SEPARATE directory, not the test's own `tmp_path`: a test that
-    # fingerprints `tmp_path` would otherwise see this file (`gateway-test.db`)
-    # as one of its own entries.
-    data_dir = tmp_path_factory.mktemp("gateway-data")
-    engine = create_engine(f"sqlite:///{data_dir}/gateway.db")
-    Base.metadata.create_all(engine)
-    monkeypatch.setattr(
-        database, "SessionLocal",
-        sessionmaker(bind=engine, expire_on_commit=False),
-    )
-    monkeypatch.setenv("GATEWAY_DATA_DIR", str(data_dir))
-    # ...and the RESOLVED setting, not only the environment variable. `settings`
-    # is built at import time, so a later `setenv` cannot reach it — which left
-    # every per-task LOG path pointing at the live `/srv/provision/gateway_data`
-    # for the whole suite. Anything that unlinks a log (`prune_finished` does)
-    # would then have deleted a real deployment's log file.
     from app.config import settings
+
+    data_dir = tmp_path_factory.mktemp("gateway-data")
+    monkeypatch.setenv("GATEWAY_DATA_DIR", str(data_dir))
+
+    # A per-test PROVISION_DIR with a fresh gateway-read keyring: refusal
+    # options encrypt the deploy credential (R3.6) and must never touch the
+    # live key file.
+    import base64
+    import json
+    import secrets
+
+    provision = tmp_path_factory.mktemp("provision")
+    keys_dir = provision / "keys"
+    keys_dir.mkdir(mode=0o700)
+    (keys_dir / "service_basic.key").write_text(json.dumps({
+        "current": "v1",
+        "keys": {"v1": base64.b64encode(secrets.token_bytes(32)).decode()},
+    }))
+    monkeypatch.setenv("PROVISION_DIR", str(provision))
+    monkeypatch.setattr(settings, "PROVISION_DIR", provision, raising=False)
+    # ...and the RESOLVED setting, not only the environment variable. `settings`
+    # is built at import time, so a later `setenv` cannot reach it — which would
+    # leave every per-task LOG path pointing at the live gateway_data directory.
     monkeypatch.setattr(settings, "GATEWAY_DATA_DIR", data_dir, raising=False)
 
-    # The manager is a module-level SINGLETON and every test gets a FRESH
-    # database whose job ids restart at 1. Its id-keyed bookkeeping would
-    # therefore outlive the rows it describes: a cancel booked in one test
-    # (or a `_cancel_polled` throttle timestamp) would silently apply to a
-    # later test's job that reused the id. Same stale-id hazard `_set_status`
-    # guards against with its `discard`. Reset it with the database.
+    # The manager is a module-level SINGLETON whose id-keyed bookkeeping
+    # (in-flight asyncio tasks, cancels, throttle stamps) would otherwise
+    # outlive the rows it describes between tests.
     from app.services.generation_jobs import generation_jobs
     generation_jobs._tasks.clear()
     generation_jobs._cancelled.clear()
     generation_jobs._cancel_polled.clear()
 
-    return engine
+    return data_dir

@@ -9,7 +9,10 @@ services:
     ports:
       - "127.0.0.1:${GATEWAY_PORT:-8870}:8770"
     volumes:
+      # The parent stays rw (SOURCE_PROJECTS_DIR generation/fix/save-generated
+      # and gateway_data); ONLY the keyring subtree is read-only (R8.6).
       - ${PROVISION_DIR:-/srv/provision_subnet_acl}:${PROVISION_DIR:-/srv/provision_subnet_acl}
+      - ${PROVISION_DIR:-/srv/provision_subnet_acl}/keys:${PROVISION_DIR:-/srv/provision_subnet_acl}/keys:ro
     environment:
       - PROVISION_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}
       - GATEWAY_DATA_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/gateway_data
@@ -21,8 +24,13 @@ services:
       # the edge's published port in fullset. The minimal shape has no gateway.
       - STREAM_PORT=${STREAM_PORT:-17687}
       - DOCKER_OPS_LOG=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/docker_ops.log
-      - ENABLE_ACL=${ENABLE_ACL:-false}
+      # G80 — fullset is ACL-on; the switch is gone from the deployment and the
+      # gateway forces it true internally.
       - REGISTRY_FILE=${PROVISION_DIR:-/srv/provision_subnet_acl}/generated/user_registry.yml
+      # T1 — the gateway schema is the live store; the registry schema is read
+      # on demand by the gateway_reader role over the same connection.
+      - DATABASE_URL=postgresql+psycopg://gateway_app:${GATEWAY_DB_PASSWORD:-gateway_app_pw}@subnet-acl-postgres:5432/${POSTGRES_DB:-subnet_acl}
+      - GATEWAY_READER_DATABASE_URL=postgresql+psycopg://gateway_reader:${GATEWAY_READER_DB_PASSWORD:-gateway_reader_pw}@subnet-acl-postgres:5432/${POSTGRES_DB:-subnet_acl}
       - PROVISION_COOKIE_TTL=${PROVISION_COOKIE_TTL:-604800}
     networks:
       # Static IP pin: the edge (subnet-acl-nginx-acl) resolves the DNS name
@@ -99,7 +107,8 @@ services:
       - PORTAL_SCHEME=${PORTAL_SCHEME:-http}
       - PORTAL_REDIRECT_PORT=${PORTAL_REDIRECT_PORT:-}
       - HTTPS_REDIRECT_PORT=${HTTPS_REDIRECT_PORT:-}
-      - ENABLE_ACL=${ENABLE_ACL:-false}
+      # G80 — no ENABLE_ACL: the edge renders ACL-on by default. The ACL-off
+      # branch remains in edge.conf.template/entrypoint.sh, unreachable.
     command: /bin/sh /etc/nginx/acl/entrypoint.sh
     user: nginx  # non-root (decision 17)
     networks:

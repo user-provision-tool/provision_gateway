@@ -32,14 +32,14 @@ export const isPaused = (js: any) =>
  * and the completed result (files + validations) for the review gate.
  */
 export function useGenerationJob() {
-  const [jobId, setJobId] = useState<number | null>(null)
+  const [jobId, setJobId] = useState<string | null>(null)
   // G27: answering a pause creates a NEW job, and callers that WAIT on a job
   // (the deploy auto-run) must follow that hand-off. React state is stale inside
   // such a loop, so the current id is mirrored in a ref that every assignment
   // updates — a loop that polls `jobIdRef.current` follows the resume, while one
   // that captured the id at entry would poll a row that is terminal forever.
-  const jobIdRef = useRef<number | null>(null)
-  const setJob = (id: number | null) => { jobIdRef.current = id; setJobId(id) }
+  const jobIdRef = useRef<string | null>(null)
+  const setJob = (id: string | null) => { jobIdRef.current = id; setJobId(id) }
   const [jobState, setJobState] = useState<any>(null)
   const [polling, setPolling] = useState(false)
   const timerRef = useRef<number | null>(null)
@@ -52,7 +52,7 @@ export function useGenerationJob() {
     }
   }
 
-  const poll = (id: number) => {
+  const poll = (id: string) => {
     setPolling(true)
     const tick = async () => {
       try {
@@ -108,13 +108,13 @@ export function useGenerationJob() {
     }
   }
 
-  const startJob = async (body: any): Promise<number | null> => {
+  const startJob = async (body: any): Promise<string | null> => {
     try {
       const { data } = await client.post('/llm/jobs', body)
       setJob(data.job_id)
       setJobState({ status: 'queued', progress: 'queued', phase: '', phase_index: 0, phase_total: 1 })
       poll(data.job_id)
-      return data.job_id as number
+      return data.job_id as string
     } catch (err: any) {
       stopPolling()
       // R3-F48 — never let an API ERROR BODY reach a render.
@@ -177,7 +177,7 @@ export function useGenerationJob() {
    * cancel it, because TasksPage lists only the -api's tasks. Re-attaching from a
    * persisted id is what makes such a job reachable again.
    */
-  const resumeJob = (id: number) => {
+  const resumeJob = (id: string) => {
     setJob(id)
     setJobState({ status: 'queued', progress: 'resuming…', phase: '', phase_index: 0, phase_total: 1 })
     poll(id)

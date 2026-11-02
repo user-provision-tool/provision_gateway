@@ -435,12 +435,21 @@ def save_generated_files(
     rename_map: dict[str, str] = {}
     saved = []
     for filename, content in files.items():
-        if not isinstance(filename, str) or not isinstance(content, str):
-            raise HTTPException(400, "files must map filename -> string content")
+        if not isinstance(filename, str):
+            raise HTTPException(400, "files must map filename -> content")
         try:
             filename = _validate_paths(project_dir, recipe_path, [filename])[0]
         except FileSetError as e:
             raise HTTPException(400, str(e))
+        if isinstance(content, dict):
+            # A task result carries {name, sha256, size} metadata only. The
+            # content is read from the on-disk generated file it names.
+            try:
+                content = (target / filename).read_text(encoding="utf-8")
+            except OSError as e:
+                raise HTTPException(409, f"generated file is not on disk: {filename}: {e}")
+        if not isinstance(content, str):
+            raise HTTPException(400, "files must map filename -> string content")
         filepath = target / filename
         marker = target / f"{filename}.generated"
         if filepath.exists() and not marker.is_file():

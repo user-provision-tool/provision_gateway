@@ -1,148 +1,143 @@
-"""Pre-deploy session endpoints (doc §8b).
-
-Closing the deploy panel must keep the session alive and give it a way back —
-explicitly NOT `close = cancel`. The job already survives (it is a server-side
-gateway task); these endpoints are what make it reachable again, service-scoped,
-instead of only on the Tasks page.
-
-Sessions describe work that is NOT an instance yet, which is why they live in the
-gateway's own store rather than the -api's registry (G10 restated, not bent).
-"""
+"""Pre-deploy session endpoints, keyed by service_id (T8)."""
 
 from __future__ import annotations
 
-from typing import Any
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import text
 
-from fastapi import APIRouter, Depends, HTTPException
-
+from ..database import SessionLocal
 from ..middleware import require_admin
 from ..services import pre_deploy_registry as pdr
 
 router = APIRouter(prefix="/api/pre-deploy", tags=["pre-deploy"])
 
+LIVE_TASK = ("queued", "running", "unknown")
+
+
+def _task_status(task_id: str | None) -> str | None:
+    if not task_id:
+        return None
+    db = SessionLocal()
+    try:
+        row = db.execute(
+            text("SELECT status FROM gateway.tasks WHERE task_id=:id"), {"id": task_id}
+        ).first()
+        return row[0] if row else None
+    finally:
+        db.close()
+
+
+def _services_row(service_id: str):
+    db = SessionLocal()
+    try:
+        return db.execute(
+            text("SELECT id, deleted_at FROM registry.services WHERE id=:id"),
+            {"id": service_id},
+        ).mappings().first()
+    finally:
+        db.close()
+
 
 @router.get("")
 async def list_pre_deploy(current_admin: dict = Depends(require_admin)):
-    """Every live pre-deploy session, plus the fix analyses in flight.
-
-    `analyses` is what makes a `failed` instance render as **`failed +
-    analyzing`** (GRILLING G26 row 2). While an analysis runs the -api entry is
-    deliberately untouched and NO session exists yet — the session is written
-    only when the analysis succeeds, as the first half of add-then-delete — so
-    neither store can express that state alone. It is computed gateway-side,
-    from the gateway's own job, and costs no `-api → gateway` interaction.
-    """
-    from ..database import SessionLocal
     from ..services.generation_jobs import generation_jobs
-
     sessions = pdr.list_sessions()
     db = SessionLocal()
     try:
         analyses = generation_jobs.list_fix_analyses(db)
-        # `job_live` is what tells the card whether `cancel` belongs on it. The
-        # job's STATUS is authoritative and only the gateway knows it — a
-        # session's `job_id` alone cannot distinguish "parked, cancellable" from
-        # "finished hours ago", and the card must not guess (G24 rule 4: cancel
-        # follows the job, and disappears when the job stops).
         for row in sessions:
-            jid = row.get("job_id")
-            if jid is None:
-                row["job_live"] = False
-                continue
-            try:
-                job = generation_jobs.get_job(db, int(jid))
-                st = (job.status if job is not None else None)
-            except Exception:
-                st = None
-            row["job_live"] = st in ("queued", "running", "awaiting_input")
+            st = _task_status(row.get("generation_task_id"))
+            row["job_live"] = st in LIVE_TASK
     except Exception:
         analyses = []
-        for row in sessions:
-            row.setdefault("job_live", False)
     finally:
         db.close()
     return {"sessions": sessions, "analyses": analyses, "count": len(sessions)}
 
 
+@router.get("/{service_id}")
+async def get_pre_deploy(service_id: str,
+                         current_admin: dict = Depends(require_admin)):
+    return pdr.get_session(service_id) or {}
+
+
 @router.get("/{user}/{service}/{label}")
-async def get_pre_deploy(
-    user: str, service: str, label: str, recipe_path: str = "",
-    current_admin: dict = Depends(require_admin),
-):
-    """The session for this combination, or `{}` — an absence is NOT an error.
+async def get_pre_deploy_by_names(user: str, service: str, label: str,
+                                  current_admin: dict = Depends(require_admin)):
+    db = SessionLocal()
+    try:
+        row = db.execute(
+            text("SELECT id FROM registry.api_users WHERE username=:u"), {"u": user}
+        ).first()
+        owner = str(row[0]) if row else None
+    finally:
+        db.close()
+    if owner is None:
+        return {}
+    return pdr.find_by_tuple(owner, service, str(label)) or {}
 
-    This answered `404 no pre-deploy session for that combination`, and its only
-    caller is the deploy panel's auto-run, which asks it once a SECOND to keep
-    track of which leg the deployment is on. So an ordinary state — no record for
-    this combination — printed ~60 red "Failed to load resource: 404" lines in
-    the browser console on every deploy, measured 2026-10-14.
 
-    Nothing broke on it: the caller reads `data?.job_id == null` and treats that
-    as "no better information", by design. But an error status for an expected
-    answer is a lie, and a console full of false alarms is how a REAL failure
-    hides — which is exactly what it did, to the person writing this.
+@router.delete("/{service_id}")
+async def delete_pre_deploy(service_id: str,
+                            current_admin: dict = Depends(require_admin)):
+    """Record-only delete; 409 while a live services row exists.
 
-    `{}` is what the caller already means by this, so it is what the endpoint
-    answers. Note the reader must test a FIELD on it (`data?.job_id`), never the
-    mere presence of a body.
+    A paused fix card is a full service delete (`DELETE
+    /api/services/instances/{id}?scope=service`) followed by session removal.
     """
-    return pdr.get_session(user, service, recipe_path, label) or {}
-
-
-# A `POST /{user}/{service}/{label}/retry` endpoint lived here until 2026-09-26: it
-# replayed a refused deployment's stored options straight to the -api, with no
-# generation. It was DELETED because nothing called it — the dashboard's `Retry`
-# opens the Deploy panel with `initialOptions`, so the operator confirms what is
-# replayed (G20's revised ruling 4) — nothing tested it, and no API reference
-# listed it. Two mechanisms for one action is how a reader ends up implementing
-# against the dead one.
-
-
-@router.delete("/{user}/{service}/{label}")
-async def delete_pre_deploy(
-    user: str, service: str, label: str, recipe_path: str = "",
-    current_admin: dict = Depends(require_admin),
-):
-    """Delete the record — **implicitly cancelling a live job first**.
-
-    User ruling (2026-09-23): *"the delete implicitly forcing a cancel first"*.
-    The record used to refuse with a 409 while its job was live, telling the
-    operator to cancel first — which turned `delete` into a dead end whenever no
-    cancel was on screen, and made the button's meaning depend on a second
-    button. Deleting IS the operator saying "stop this and forget it", so the
-    two steps are one action: cancel the job (never orphan it — the reason the
-    guard existed), then drop the record.
-
-    Cancelling rather than killing is deliberate: it goes through the same path
-    the `cancel` button uses, so the job's own bookkeeping (the in-process
-    discard flag, the in-flight LLM call it is awaiting) is unwound the one way
-    the system knows. **A `paused` job included** (GRILLING G34): its leg has
-    stopped, but the object still exists, and dropping the card without
-    cancelling it is exactly the orphan this rule forbids.
-    """
-    row = pdr.get_session(user, service, recipe_path, label)
+    row = pdr.get_session(service_id)
     if row is None:
-        raise HTTPException(404, "no pre-deploy session for that combination")
-    job_id = row.get("job_id")
+        raise HTTPException(404, "no pre-deploy session for that service")
+    svc = _services_row(service_id)
+    if svc is not None and svc["deleted_at"] is None:
+        raise HTTPException(409, "a live service exists; delete the service, not the record")
     cancelled = False
-    if job_id is not None:
+    task_id = row.get("generation_task_id")
+    if task_id and _task_status(task_id) in ("queued", "running", "paused", "awaiting_input"):
         from ..services.generation_jobs import generation_jobs
-        # `job_status` (not `get_job`) — it owns its session, so it cannot be
-        # called without one. This guard read `get_job(int(job_id))` with no
-        # `db` and swallowed the TypeError, so it never fired either way.
-        #
-        # The cancellable set is the manager's own `CANCELLABLE_STATUSES`, not a
-        # copy of it. It includes `paused`: that leg has STOPPED but its job
-        # still EXISTS, so skipping it would drop the record and leave the object
-        # paused forever — the state G34 forbids, and how the five orphaned
-        # paused jobs (gt-315/316/325/328/332) arose.
-        if generation_jobs.job_status(int(job_id)) in generation_jobs.CANCELLABLE_STATUSES:
-            from ..database import SessionLocal
-            db = SessionLocal()
-            try:
-                generation_jobs.cancel_job(db, int(job_id))
-                cancelled = True
-            finally:
-                db.close()
-    pdr.remove_session(user, service, recipe_path, label)
+        db = SessionLocal()
+        try:
+            generation_jobs.cancel_job(db, task_id)
+            cancelled = True
+        finally:
+            db.close()
+    pdr.remove_session(service_id)
     return {"deleted": True, "cancelled_job": cancelled}
+
+
+@router.post("/{service_id}/retry")
+async def retry_pre_deploy(service_id: str,
+                           current_admin: dict = Depends(require_admin)):
+    """Retry a refusal: generation-capacity re-runs generation, deploy-capacity
+    replays the stored deployment (R3.2)."""
+    row = pdr.get_session(service_id)
+    if row is None:
+        raise HTTPException(404, "no pre-deploy session for that service")
+    if row.get("state") not in ("refused", "paused", "generated"):
+        raise HTTPException(409, f"session is {row.get('state')}; not retryable")
+    reason = row.get("reason") or ""
+    if reason == "at_capacity":
+        from ..services.provision_service import provision_service
+        options = dict(pdr.replay_options(service_id) or {})
+        options.update({"service_id": service_id,
+                        "owner_api_user_id": row.get("owner_api_user_id"),
+                        "service_name": row.get("service_name"),
+                        "label": row.get("label"),
+                        "recipe_path": row.get("recipe_path")})
+        try:
+            result = await provision_service.register_user(**options)
+        except Exception as exc:  # noqa: BLE001
+            raise provision_service.as_http_error(exc)
+        pdr.set_deploying(service_id, deploy_task_id=result.get("task_id"))
+        return {"action": "deploy", **result}
+    pdr.create_or_replace(
+        service_id=service_id, procedure_id=row["procedure_id"],
+        owner_api_user_id=row["owner_api_user_id"], service_name=row["service_name"],
+        service_label=row["label"], recipe_path=row["recipe_path"],
+        state="generating", generation_task_id=row.get("generation_task_id"),
+        deploy_task_id=row.get("deploy_task_id"), reason=None, detail=None,
+        guide=row.get("guide"), slot=row.get("slot"),
+        use_global_proxy=row.get("use_global_proxy"), options=row.get("options"),
+    )
+    return {"action": "generate", "service_id": service_id,
+            "message": "re-run generation for this session"}

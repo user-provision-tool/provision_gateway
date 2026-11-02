@@ -1,228 +1,85 @@
-"""JWT authentication middleware / dependency."""
+"""Auth dependencies — unified users, current-role authority (T9).
+
+Every authorization loads the current `users` row; a token claim alone never
+grants access. The liveness rule is `User.account_live` (active + approved +
+not deleted + deletion saga complete).
+"""
 
 from __future__ import annotations
 
-from fastapi import Depends, HTTPException, Request
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import HTTPException, Request
+from fastapi.security import HTTPBearer
 from jose import JWTError
 
 from .. import database
-from ..models.admin import AdminUser
-from ..models.end_user import EndUser
-from ..services.auth_service import decode_access_token, decode_gateway_token, get_admin_by_id, get_end_user_by_id
+from ..services import auth_service
 
-
-# `SessionLocal` is resolved through the MODULE (``database.SessionLocal()``) and
-# never bound here: this module is imported once, so a binding made at import
-# time pins whichever engine existed then. Every service resolves it per call
-# (the codebase's convention, stated in tests/conftest.py's isolation fixture) —
-# and this is the AUTH path, where a stale engine means "user not found".
 security_scheme = HTTPBearer(auto_error=False)
 
 
 def _extract_gateway_token(request: Request) -> str | None:
-    """Extract the auth token from the provision_token cookie or API-key header.
-
-    v4 §6.1 (three-credential model): the provision_token cookie (browser) and
-    the ``X-Provision-Token`` header (API keys are long-lived provision tokens)
-    are the ONLY credentials. The legacy ``gateway_token`` cookie and
-    ``Authorization: Bearer`` fallbacks are REMOVED (G5) so an old client or an
-    attacker holding a legacy access/gateway token cannot authenticate against
-    the management API.
-    """
     cookie = request.cookies.get("provision_token")
     if cookie:
         return cookie
     return request.headers.get("X-Provision-Token") or None
 
 
-def require_gateway_token(
-    request: Request,
-) -> dict:
-    """FastAPI dependency: validates the provision_token cookie or Bearer token.
+def require_gateway_token(request: Request) -> dict:
+    """Validate a provision token and return the current user.
 
-    Synchronous dependency: FastAPI runs it in a worker thread, so a DB pool
-    checkout that blocks (e.g. the pool is momentarily exhausted) can never
-    freeze the event loop — which would otherwise wedge every in-flight request
-    awaiting an external call. The auth query uses a short-lived session that is
-    closed before the request proceeds, so its connection is NOT held across the
-    endpoint's slow external awaits.
-
-    Returns a user dict with keys: id, email, role, user_type.
-    Blocks special users entirely (403).
-    Raises 401 if token is missing, invalid, or user not found.
+    Returns ``{id, username, role, api_user_id}``; special users are blocked
+    from the dashboard (403). No connection is held past this dependency.
     """
     token = _extract_gateway_token(request)
     if token is None:
-        raise HTTPException(status_code=401, detail="Missing provision token (cookie or Authorization header)")
+        raise HTTPException(401, "Missing provision token (cookie or header)")
 
-    try:
-        payload = decode_gateway_token(token)
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired provision token")
-
-    user_id_str: str | None = payload.get("sub")
-    if user_id_str is None:
-        raise HTTPException(status_code=401, detail="Token missing subject claim")
-
-    try:
-        user_id = int(user_id_str)
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid token subject")
-
-    user_type = payload.get("user_type", "admin")
-    role = payload.get("role", "viewer")
-    email = payload.get("email", "")
-
-    # Block special users entirely
-    if role == "special":
-        raise HTTPException(status_code=403, detail="Special users are not permitted to access the dashboard")
-
-    db = database.SessionLocal()
-    try:
-        if user_type == "admin":
-            admin = get_admin_by_id(db, user_id)
-            if admin is None or not admin.is_active:
-                raise HTTPException(status_code=401, detail="Admin not found or inactive")
-            return {"id": admin.id, "email": admin.email, "role": admin.role, "user_type": "admin"}
-        else:
-            end_user = get_end_user_by_id(db, user_id)
-            if (end_user is None or not end_user.is_active
-                    or end_user.deleted_at is not None):
-                raise HTTPException(status_code=401, detail="User not found or inactive")
-            if not end_user.is_approved:
-                raise HTTPException(status_code=401, detail="User not yet approved")
-            return {"id": end_user.id, "email": end_user.username,
-                    "role": end_user.role, "user_type": "end_user"}
-    finally:
-        db.close()
-
-
-def require_admin(
-    request: Request,
-) -> dict:
-    """FastAPI dependency: requires gateway_token AND admin role.
-
-    Returns the user dict from require_gateway_token.
-    Raises 403 if user does not have admin role.
-    """
-    user = require_gateway_token(request=request)
-    if user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
-    return user
-
-
-def get_current_admin(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials | None = Depends(security_scheme),
-) -> AdminUser:
-    """FastAPI dependency: extracts and validates JWT, returns the AdminUser.
-
-    Synchronous dependency (see require_gateway_token docstring for why).
-    Raises 401 if the token is missing, invalid, or the admin doesn't exist.
-    """
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Missing authorization header")
-
-    token = credentials.credentials
-
-    try:
-        payload = decode_access_token(token)
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-    admin_id_str: str | None = payload.get("sub")
-    if admin_id_str is None:
-        raise HTTPException(status_code=401, detail="Token missing subject claim")
-
-    try:
-        admin_id = int(admin_id_str)
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid token subject")
-
-    db = database.SessionLocal()
-    try:
-        admin = get_admin_by_id(db, admin_id)
-        if admin is None or not admin.is_active:
-            raise HTTPException(status_code=401, detail="Admin not found or inactive")
-        return admin
-    finally:
-        db.close()
-
-
-def get_current_user(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials | None = Depends(security_scheme),
-) -> dict:
-    """FastAPI dependency: extracts JWT, returns user dict for both admin and end-user.
-
-    Synchronous dependency (see require_gateway_token docstring for why).
-    Returns dict with keys: id, email, role, user_type
-    Raises 401 if token is missing, invalid, or user not found.
-    """
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Missing authorization header")
-
-    token = credentials.credentials
-
-    try:
-        payload = decode_access_token(token)
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-    user_id_str: str | None = payload.get("sub")
-    if user_id_str is None:
-        raise HTTPException(status_code=401, detail="Token missing subject claim")
-
-    try:
-        user_id = int(user_id_str)
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid token subject")
-
-    user_type = payload.get("user_type", "admin")
-    role = payload.get("role", "viewer")
-    email = payload.get("email", "")
-
-    db = database.SessionLocal()
-    try:
-        if user_type == "admin":
-            admin = get_admin_by_id(db, user_id)
-            if admin is None or not admin.is_active:
-                raise HTTPException(status_code=401, detail="Admin not found or inactive")
-            return {"id": admin.id, "email": admin.email, "role": admin.role, "user_type": "admin"}
-        else:
-            end_user = get_end_user_by_id(db, user_id)
-            if (end_user is None or not end_user.is_active
-                    or end_user.deleted_at is not None):
-                raise HTTPException(status_code=401, detail="User not found or inactive")
-            if not end_user.is_approved:
-                raise HTTPException(status_code=401, detail="User not yet approved")
-            return {"id": end_user.id, "email": end_user.username, "role": end_user.role, "user_type": "end_user"}
-    finally:
-        db.close()
-
-
-def get_current_admin_optional(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials | None = Depends(security_scheme),
-) -> AdminUser | None:
-    """Like get_current_admin but returns None instead of raising 401."""
-    if credentials is None:
-        return None
     db = database.SessionLocal()
     try:
         try:
-            payload = decode_access_token(credentials.credentials)
-            admin_id = int(payload.get("sub", 0))
-            return get_admin_by_id(db, admin_id)
-        except (JWTError, ValueError):
-            return None
+            payload = auth_service.verify_provision_token(db, token)
+        except JWTError:
+            raise HTTPException(401, "Invalid or expired provision token")
+        except Exception:  # noqa: BLE001 — a store failure denies, never 500
+            raise HTTPException(401, "Authentication temporarily unavailable")
+        user = auth_service.get_user_by_id(db, payload.get("sub"))
+        if user is None:
+            raise HTTPException(401, "User not found")
+        if user.role == "special":
+            raise HTTPException(403, "Special users are not permitted to access the dashboard")
+        if not user.account_live:
+            raise HTTPException(401, "User is inactive, unapproved or deleted")
+        username = auth_service.username_for(db, user.id)
+        return {
+            "id": str(user.id),
+            "username": username,
+            "role": user.role,
+            "api_user_id": str(user.api_user_id),
+        }
     finally:
         db.close()
 
 
-def require_admin_role(admin: AdminUser = Depends(get_current_admin)) -> AdminUser:
-    """Dependency: requires the authenticated admin to have 'admin' role."""
-    if admin.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
-    return admin
+def require_admin(request: Request) -> dict:
+    user = require_gateway_token(request)
+    if user["role"] != "admin":
+        raise HTTPException(403, "Admin role required")
+    return user
+
+
+def require_owner_or_admin(request: Request) -> dict:
+    """Owner of the target service or an admin; the target is checked by the route."""
+    user = require_gateway_token(request)
+    if user["role"] not in ("viewer", "admin"):
+        raise HTTPException(403, "Owner or admin role required")
+    return user
+
+
+# Compatibility names for any older import; authority is unchanged.
+def get_current_admin(request: Request):
+    user = require_admin(request)
+    return user
+
+
+def get_current_user(request: Request) -> dict:
+    return require_gateway_token(request)

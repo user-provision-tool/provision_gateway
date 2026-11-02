@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -32,6 +33,7 @@ _start_time = time.time()
 _reconcile_task: asyncio.Task | None = None
 _docker_events_task: asyncio.Task | None = None
 _project_monitor_task: asyncio.Task | None = None
+_account_repair_task: asyncio.Task | None = None
 
 
 def _get_reconcile_interval_min() -> int:
@@ -143,6 +145,25 @@ async def _docker_events_monitor():
     await loop.run_in_executor(None, _blocking_event_loop)
 
 
+async def _account_repair_loop():
+    """Claim pending api_users and retry/finalize pending account deletions."""
+    interval = int(os.environ.get("ACCOUNT_REPAIR_INTERVAL", "60"))
+    while True:
+        await asyncio.sleep(max(10, interval))
+        try:
+            from .services.loop_lease import acquire_lease
+            if not acquire_lease("account_repair", max(120, interval * 3)):
+                continue
+            from .services import account_service
+            db = SessionLocal()
+            try:
+                account_service.repair_accounts(db)
+            finally:
+                db.close()
+        except Exception:
+            continue
+
+
 async def _project_monitor_loop():
     """Background loop: periodically scan source_projects for new directories.
 
@@ -171,7 +192,7 @@ async def _project_monitor_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
-    global _reconcile_task, _docker_events_task, _project_monitor_task
+    global _reconcile_task, _docker_events_task, _project_monitor_task, _account_repair_task
     # Startup
     init_db()
     print(f"[gateway] Database initialized at {settings.DATABASE_URL}")
@@ -210,7 +231,10 @@ async def lifespan(app: FastAPI):
         from .services.generation_jobs import generation_jobs
         stale = generation_jobs.recover_stale_jobs(SessionLocal())
         if stale:
-            print(f"[gateway] Marked {stale} stale generation job(s) as failed (restart recovery)")
+            print(f"[gateway] Marked {stale} stale generation task(s) unknown (restart recovery)")
+        terminal = generation_jobs.terminalize_unknown(SessionLocal())
+        if terminal:
+            print(f"[gateway] Terminalized {terminal} unknown task(s) as failed")
     except Exception as exc:
         print(f"[gateway] WARNING: generation-job recovery failed: {exc}")
 
@@ -221,7 +245,7 @@ async def lifespan(app: FastAPI):
     # the operator's hands — `paused`, `refused`, and `generated`.
     try:
         from .services import pre_deploy_registry as _pdr
-        rep = _pdr.reconcile(live_job_ids=set())
+        rep = _pdr.reconcile(live_task_ids=set())
         if rep["dropped_stale"]:
             print(f"[gateway] pre-deploy reconcile: dropped "
                   f"{len(rep['dropped_stale'])} stale session(s)")
@@ -234,6 +258,8 @@ async def lifespan(app: FastAPI):
     print("[gateway] Docker events monitor started (watching subnet-acl-nginx)")
     _project_monitor_task = asyncio.create_task(_project_monitor_loop())
     print("[gateway] Project directory monitor started (polling source_projects every 10s)")
+    _account_repair_task = asyncio.create_task(_account_repair_loop())
+    print("[gateway] Account repair loop started")
     yield
     # Shutdown
     if _reconcile_task:
@@ -242,6 +268,8 @@ async def lifespan(app: FastAPI):
         _docker_events_task.cancel()
     if _project_monitor_task:
         _project_monitor_task.cancel()
+    if _account_repair_task:
+        _account_repair_task.cancel()
     print("[gateway] Shutting down")
 
 
@@ -296,11 +324,35 @@ app.include_router(stream_router)
 
 @app.get("/health")
 def health():
-    """Liveness/readiness probe."""
+    """Readiness probe: the gateway DB and the registry read path (T1).
+
+    Reporting "connected" unconditionally was one of the inspected defects
+    (B23): a gateway whose store is down must not look healthy. The registry
+    probe uses the same gateway_reader role as the per-request read path.
+    """
+    from sqlalchemy import text as _text
+    from .database import engine as _engine, reader_engine as _reader
     uptime_sec = int(time.time() - _start_time)
+    db_state = "connected"
+    try:
+        with _engine.connect() as conn:
+            conn.execute(_text("SELECT 1"))
+        with _reader.connect() as conn:
+            conn.execute(_text("SELECT count(*) FROM registry.services"))
+    except Exception as exc:  # noqa: BLE001 — readiness must fail closed
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "db": "unavailable",
+                "error": str(exc),
+                "uptime_sec": uptime_sec,
+            },
+        )
     return {
         "status": "ok",
-        "db": "connected",
+        "db": db_state,
+        "registry": "readable",
         "provision_api": "unknown",  # Will be checked by system status endpoint
         "uptime_sec": uptime_sec,
     }

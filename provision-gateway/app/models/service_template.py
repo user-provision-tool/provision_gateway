@@ -11,6 +11,7 @@ from ..database import Base
 
 class ServiceTemplate(Base):
     __tablename__ = "service_templates"
+    __table_args__ = {"schema": "gateway"}
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(255), nullable=False, unique=True)

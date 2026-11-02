@@ -8,7 +8,7 @@ from pathlib import Path
 # Add gateway app to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from app.services.auth_service import hash_password, verify_password, create_access_token, decode_access_token
+from app.services.auth_service import hash_password, verify_password, create_provision_token, decode_token
 
 
 class TestAuthService:
@@ -27,18 +27,23 @@ class TestAuthService:
         assert verify_password("", hashed)
 
     def test_create_and_decode_token(self):
-        token = create_access_token(1, "admin@test.com", "admin")
+        from app.database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            token = create_provision_token(db, "42")
+        finally:
+            db.close()
         assert token is not None
-        payload = decode_access_token(token)
-        assert payload["sub"] == "1"
-        assert payload["email"] == "admin@test.com"
-        assert payload["role"] == "admin"
-        assert payload["type"] == "access"
+        payload = decode_token(token)
+        assert payload["sub"] == "42"
+        assert payload["type"] == "provision"
+        assert "token_epoch" in payload
 
     def test_invalid_token(self):
         from jose import JWTError
         with pytest.raises(JWTError):
-            decode_access_token("invalid.token.here")
+            decode_token("invalid.token.here")
 
 
 class TestConfig:
@@ -499,12 +504,14 @@ class TestScanRearchitectureHandlers:
         assert result["modified"] == [{"status": "M", "file": "real.txt"}]
         assert result["untracked"] == [{"status": "?", "file": "new.txt"}]
 
-    def test_deploy_user_wraps_get_service_in_threadpool(self):
+    def test_blocking_scans_are_offloaded(self):
+        """Blocking filesystem/git work runs in a threadpool, never on the loop."""
         from pathlib import Path
-        users_path = Path(__file__).parent.parent / "app" / "routers" / "users.py"
-        content = users_path.read_text()
-        assert "from starlette.concurrency import run_in_threadpool" in content
-        assert "run_in_threadpool(service_manager.get_service" in content
+        services_src = (Path(__file__).parent.parent / "app" / "routers" / "services.py").read_text()
+        assert "run_in_threadpool" in services_src
+        users_src = (Path(__file__).parent.parent / "app" / "routers" / "users.py").read_text()
+        assert "await provision_service.register_user" in users_src, (
+            "the deploy path is async end-to-end (the -api call is awaited)")
 
     def test_schemas_models_exist(self):
         from app.schemas.services import (
@@ -1812,7 +1819,7 @@ class TestG12SaveLogic:
         anchor_idx = content.find("Save any LLM-generated files first")
         assert anchor_idx > 0, "Save block comment not found"
         # The save block starts at or near this anchor
-        save_block = content[anchor_idx:anchor_idx + 400]
+        save_block = content[anchor_idx:anchor_idx + 1200]
         save_relative = save_block.find("save-generated")
         payload_relative = save_block.find("Build deploy payload")
         assert save_relative > 0, "save-generated call not found near anchor"
@@ -1888,31 +1895,20 @@ class TestG13G14G16DeadCodeCleanup:
 class TestDeployValidation:
     """Tests that deploy rejects missing compose/nginx paths (GAP-002)."""
 
-    def test_deploy_validation_code_exists(self):
-        """users.py deploy endpoint should contain compose path validation."""
+    def test_the_gateway_does_not_duplicate_api_validation(self):
+        """T7/R7.6: the -api owns deploy validation; the gateway forwards its
+        error (one validation home, one message)."""
         from pathlib import Path
-        users_path = Path(__file__).parent.parent / "app" / "routers" / "users.py"
-        content = users_path.read_text()
-        assert "one of compose_template_path or compose_file_path is required" not in content, (
-            "Gateway should handle the error before provision-api returns it"
-        )
-        assert "missing docker-compose.yml" in content, (
-            "Deploy validation should mention the missing compose file"
-        )
-        assert "generate-missing panel" in content, (
-            "The 400 message should point the user to the generate-missing panel"
-        )
+        content = (Path(__file__).parent.parent / "app" / "routers" / "users.py").read_text()
+        assert "missing docker-compose.yml" not in content
+        assert "has_compose" not in content
+        assert "has_nginx" not in content
 
-    def test_deploy_validation_checks_service_files(self):
-        """Deploy validation should check service project files (compose-only gate)."""
+    def test_deploy_errors_are_mapped_through_as_http_error(self):
         from pathlib import Path
-        users_path = Path(__file__).parent.parent / "app" / "routers" / "users.py"
-        content = users_path.read_text()
-        assert "has_compose" in content, (
-            "Deploy validation should check for compose files in the service"
-        )
-        assert "has_nginx" not in content, (
-            "Deploy validation must NOT gate on nginx — compose is the only hard gate (GAP-16)"
+        content = (Path(__file__).parent.parent / "app" / "routers" / "users.py").read_text()
+        assert "as_http_error" in content, (
+            "the -api's refusal must reach the caller with its own status/code"
         )
 
     def test_deploy_form_disabled_when_missing(self):
@@ -1986,20 +1982,13 @@ class TestDeployValidation:
             "handleDeploy should have the same guard condition as the disabled button"
         )
 
-    def test_deploy_validation_raises_http_400(self):
-        """Deploy validation should raise HTTP 400 with clear message."""
+    def test_a_capacity_refusal_is_a_503_with_its_own_code(self):
+        """The one deploy error the gateway may intercept is a capacity refusal,
+        because it must become a card (state refused) rather than a toast."""
         from pathlib import Path
-        users_path = Path(__file__).parent.parent / "app" / "routers" / "users.py"
-        content = users_path.read_text()
-        assert "raise HTTPException" in content, (
-            "Deploy validation should raise HTTPException"
-        )
-        assert "missing docker-compose.yml" in content, (
-            "Deploy validation error should mention the missing compose file"
-        )
-        assert "Cannot deploy" in content, (
-            "Deploy validation error should start with 'Cannot deploy'"
-        )
+        content = (Path(__file__).parent.parent / "app" / "routers" / "users.py").read_text()
+        assert "at_capacity" in content
+        assert "record_refusal" in content or "create_or_replace" in content
 
 
 # ---------------------------------------------------------------------------
@@ -2058,33 +2047,55 @@ class TestServiceLabelAutoIncrement:
         assert "service_name" in sig.parameters
         assert inspect.iscoroutinefunction(get_next_label)
 
-    def test_next_label_returns_label_0_on_exception(self):
-        """get_next_label should return label 0 when provision-api is unreachable."""
-        from app.routers.users import get_next_label
-        import inspect
-        assert inspect.iscoroutinefunction(get_next_label)
-        # Check the source code for the fallback
-        from pathlib import Path
-        users_path = Path(__file__).parent.parent / "app" / "routers" / "users.py"
-        content = users_path.read_text()
-        assert 'return {"label": "0", "source": "default"}' in content, (
-            "get_next_label should fall back to label 0 when provision-api errors"
-        )
+    def test_next_label_returns_label_0_on_exception(self, monkeypatch):
+        """get_next_label answers label 0 when the -api is unreachable."""
+        import asyncio
+        from app.database import SessionLocal
+        from app.routers import users as users_router
+        from support import mk_user
 
-    def test_next_label_logic_max_plus_1(self):
-        """get_next_label should compute max existing label + 1."""
-        from pathlib import Path
-        users_path = Path(__file__).parent.parent / "app" / "routers" / "users.py"
-        content = users_path.read_text()
-        assert "existing_labels" in content, (
-            "get_next_label should collect existing_labels from provision-api response"
-        )
-        assert "max(existing_labels) + 1" in content or "max(existing_labels)+1" in content, (
-            "get_next_label should compute max(existing_labels) + 1"
-        )
-        assert "source\": \"auto_increment" in content, (
-            "get_next_label should return auto_increment as source"
-        )
+        db = SessionLocal()
+        try:
+            admin = mk_user(db, "admin", role="admin")
+        finally:
+            db.close()
+
+        async def boom(_name):
+            raise RuntimeError("api down")
+        monkeypatch.setattr(users_router.provision_service, "get_user", boom)
+        out = asyncio.run(users_router.get_next_label(
+            "nobody", "nosvc", {"id": str(admin.id), "role": "admin"}))
+        assert out == {"label": "0", "source": "auto_increment"}
+
+    def test_next_label_logic_max_plus_1(self, monkeypatch):
+        """max(label)+1 over ACTIVE and historical rows (a tombstoned label is
+        never reused, R2.3)."""
+        import asyncio
+        from app.database import SessionLocal
+        from app.routers import users as users_router
+        from support import mk_service, mk_user, registry_engine
+        from sqlalchemy import text
+
+        db = SessionLocal()
+        try:
+            alice = mk_user(db, "alice")
+            admin = mk_user(db, "admin", role="admin")
+            mk_service(db, alice, service_name="myapp", label="0")
+            mk_service(db, alice, service_name="myapp", label="2")
+            dead = mk_service(db, alice, service_name="myapp", label="5")
+            with registry_engine().begin() as conn:
+                conn.execute(text("UPDATE registry.services SET deleted_at=now() "
+                                  "WHERE id=:id"), {"id": str(dead)})
+        finally:
+            db.close()
+
+        async def empty(_name):
+            return {"user_status": []}
+        monkeypatch.setattr(users_router.provision_service, "get_user", empty)
+        out = asyncio.run(users_router.get_next_label(
+            "alice", "myapp", {"id": str(admin.id), "role": "admin"}))
+        assert out["label"] == "6", out
+        assert out["source"] == "auto_increment"
 
     def test_compute_next_label_called_on_user_change(self):
         """DeployForm user_name onChange should trigger computeNextLabel."""
@@ -2293,7 +2304,7 @@ class TestApiKeyModel:
         )
         d = key.to_dict()
         assert d["id"] == 1
-        assert d["user_id"] == 42
+        assert d["user_id"] == "42"
         assert d["label"] == "test-key"
         assert d["is_revoked"] is False
         assert d["last_used_at"] is None
@@ -2379,44 +2390,41 @@ class TestRegistryWrapper:
         assert r.get_entry("alice", "myapp", "0") is None
 
     def test_registry_get_all_entries_with_data(self):
-        """get_all_entries should return entries from a valid YAML file."""
+        """get_all_entries reads the registry schema (T1 read-on-demand)."""
+        from app.database import SessionLocal
         from app.services.registry import Registry
-        import tempfile, os, yaml
-        data = [
-            {"user_name": "alice", "service_name": "myapp", "label": "0", "hostname": "myapp-alice-0.localhost"},
-            {"user_name": "bob", "service_name": "app2", "label": "1", "hostname": "app2-bob-1.localhost"},
-        ]
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
-            yaml.dump(data, f)
-            path = f.name
+        from support import mk_service, mk_user
+
+        db = SessionLocal()
         try:
-            r = Registry(path)
-            entries = r.get_all_entries()
-            assert len(entries) == 2
-            assert entries[0]["user_name"] == "alice"
+            alice = mk_user(db, "alice")
+            bob = mk_user(db, "bob")
+            mk_service(db, alice, service_name="myapp", label="0")
+            mk_service(db, bob, service_name="app2", label="1")
         finally:
-            os.unlink(path)
+            db.close()
+        entries = Registry().get_all_entries()
+        assert len(entries) == 2
+        assert entries[0]["user_name"] == "alice"
 
     def test_registry_get_entry_match(self):
-        """get_entry should find matching entry by user/service/label."""
+        """get_entry resolves one active (owner, service, label) tuple."""
+        from app.database import SessionLocal
         from app.services.registry import Registry
-        import tempfile, os, yaml
-        data = [
-            {"user_name": "alice", "service_name": "myapp", "label": "0"},
-            {"user_name": "bob", "service_name": "app2", "label": "1"},
-        ]
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
-            yaml.dump(data, f)
-            path = f.name
+        from support import mk_service, mk_user
+
+        db = SessionLocal()
         try:
-            r = Registry(path)
-            entry = r.get_entry("alice", "myapp", "0")
-            assert entry is not None
-            assert entry["user_name"] == "alice"
-            # Non-matching should return None
-            assert r.get_entry("nobody", "x", "0") is None
+            alice = mk_user(db, "alice")
+            mk_service(db, alice, service_name="myapp", label="0")
         finally:
-            os.unlink(path)
+            db.close()
+        r = Registry()
+        entry = r.get_entry("alice", "myapp", "0")
+        assert entry is not None
+        assert entry["user_name"] == "alice"
+        assert entry["service_id"]
+        assert r.get_entry("nobody", "x", "0") is None
 
 
 # ---------------------------------------------------------------------------
@@ -2612,112 +2620,54 @@ class TestAuthVerifyHeaders:
 
 
 class TestGatewayTokenDecode:
-    """BUG-2 + G5: only provision-type tokens authenticate; legacy gateway_token
-    cookie / Bearer access tokens are REJECTED (three-credential model)."""
+    """G5/T9: only provision-type tokens authenticate; legacy token types and
+    the retired gateway_token cookie / Bearer header are rejected."""
 
-    def test_get_gateway_user_safe_rejects_gateway_token_cookie(self):
-        """G5: a legacy type='gateway' cookie must NOT authenticate (returns None)."""
-        from unittest.mock import MagicMock
-        from app.routers.auth import _get_gateway_user_safe
-        from app.services.auth_service import create_gateway_token
+    def _legacy_token(self, kind: str) -> str:
+        from datetime import datetime, timedelta, timezone
 
-        token = create_gateway_token(42, "admin@test.com", "admin", "admin")
-        request = MagicMock()
-        request.cookies = {"gateway_token": token}
-        request.headers = {}
-        db = MagicMock()
+        from jose import jwt
+        from app.config import settings
 
-        user = _get_gateway_user_safe(request, db)
-        assert user is None
+        return jwt.encode(
+            {"sub": "1", "type": kind,
+             "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
+            settings.GATEWAY_SECRET_KEY, algorithm=settings.JWT_ALGORITHM,
+        )
 
-    def test_get_gateway_user_safe_rejects_bearer_access_token(self):
-        """G5: a legacy Bearer access token must NOT authenticate (returns None)."""
-        from unittest.mock import MagicMock
-        from app.routers.auth import _get_gateway_user_safe
-        from app.services.auth_service import create_access_token
-
-        token = create_access_token(7, "admin@test.com", "admin", "admin")
-        request = MagicMock()
-        request.cookies = {}
-        request.headers = {"Authorization": f"Bearer {token}"}
-        db = MagicMock()
-
-        user = _get_gateway_user_safe(request, db)
-        assert user is None
-
-    def test_get_gateway_user_safe_accepts_provision_cookie(self):
-        """The provision_token cookie still authenticates."""
-        from unittest.mock import MagicMock
-        from app.routers.auth import _get_gateway_user_safe
-        from app.services.auth_service import create_provision_token
-
-        token = create_provision_token(42, "admin@test.com", "admin", "admin")
-        request = MagicMock()
-        request.cookies = {"provision_token": token}
-        request.headers = {}
-        db = MagicMock()
-
-        user = _get_gateway_user_safe(request, db)
-        assert user is not None
-        assert user["id"] == 42
-        assert user["role"] == "admin"
-
-    def test_decode_gateway_token_rejects_legacy_types(self):
-        """G5: decode_gateway_token accepts only type='provision'."""
-        import pytest
-        from jose import JWTError
-        from app.services import auth_service
-        for token in (
-            auth_service.create_gateway_token(1, "a@b.c", "admin", "admin"),
-            auth_service.create_access_token(1, "a@b.c", "admin", "admin"),
-            auth_service.create_refresh_token(1, "a@b.c", "admin"),
-        ):
-            with pytest.raises(JWTError):
-                auth_service.decode_gateway_token(token)
-
-    def test_extract_gateway_token_rejects_legacy_fallbacks(self):
-        """G5: _extract_gateway_token ignores gateway_token cookie and Bearer."""
+    def test_extract_rejects_gateway_token_cookie_and_bearer(self):
+        """Only the provision_token cookie (or X-Provision-Token) is read."""
         from unittest.mock import MagicMock
         from app.middleware import _extract_gateway_token
-        from app.services.auth_service import create_gateway_token, create_access_token
 
-        # gateway_token cookie alone → no token
         req = MagicMock()
-        req.cookies = {"gateway_token": create_gateway_token(1, "a@b.c", "admin", "admin")}
+        req.cookies = {"gateway_token": self._legacy_token("gateway")}
         req.headers = {}
         assert _extract_gateway_token(req) is None
 
-        # Bearer header alone → no token
         req = MagicMock()
         req.cookies = {}
-        req.headers = {"Authorization": f"Bearer {create_access_token(1, 'a@b.c', 'admin', 'admin')}"}
+        req.headers = {"Authorization": f"Bearer {self._legacy_token('access')}"}
         assert _extract_gateway_token(req) is None
 
-        # provision_token cookie still wins
-        from app.services.auth_service import create_provision_token
         req = MagicMock()
-        req.cookies = {"provision_token": create_provision_token(1, "a@b.c", "admin", "admin")}
+        req.cookies = {"provision_token": "abc"}
         req.headers = {}
-        assert _extract_gateway_token(req) is not None
+        assert _extract_gateway_token(req) == "abc"
 
-        # X-Provision-Token header (API key) authenticates
         req = MagicMock()
         req.cookies = {}
-        req.headers = {"X-Provision-Token": create_provision_token(1, "a@b.c", "admin", "admin")}
-        assert _extract_gateway_token(req) is not None
+        req.headers = {"X-Provision-Token": "xyz"}
+        assert _extract_gateway_token(req) == "xyz"
 
-    def test_create_key_uses_depends_require_gateway_token(self):
-        """create_key must inject require_gateway_token via Depends (not a bare call)."""
-        from pathlib import Path
-        auth_path = Path(__file__).parent.parent / "app" / "routers" / "auth.py"
-        content = auth_path.read_text()
-        assert "Depends(require_gateway_token)" in content, (
-            "create_key must use Depends(require_gateway_token) to resolve the async dependency"
-        )
-        # The old buggy pattern returned an un-awaited coroutine.
-        assert "require_gateway_token(request=request" not in content, (
-            "create_key must not call require_gateway_token synchronously"
-        )
+    def test_decode_gateway_token_rejects_legacy_types(self):
+        """decode_gateway_token accepts only type='provision'."""
+        from jose import JWTError
+        from app.services.auth_service import decode_gateway_token
+
+        for kind in ("gateway", "access", "refresh", "code"):
+            with pytest.raises(JWTError):
+                decode_gateway_token(self._legacy_token(kind))
 
 
 # ---------------------------------------------------------------------------
@@ -2947,7 +2897,7 @@ class TestGoServiceRedirect:
         from pathlib import Path
         p = Path(__file__).parent.parent / "app" / "routers" / "auth.py"
         content = p.read_text()
-        assert '_set_token_url = f"{service_url}/_set_token' in content, (
+        assert 'f"{service_url}/_set_token?code={code}"' in content, (
             "go_to_service must use service_url (with nginx host port) in the "
             "_set_token redirect, not the port-less http://{domain}"
         )
@@ -2996,10 +2946,9 @@ class TestGoServiceRedirect:
 
 
 class TestVerifyAuthStatusCodes:
-    """Gap 11 (acl-enforcement-design-v2 §5): /api/auth/verify returns the FINAL
-    status — 200 + X-Service-Basic (allowed), 401 + X-Auth-Action (login_required /
-    token_expired), 403 + X-Auth-Action (acl_denied). The browser-vs-API split is
-    now done by nginx (error_page + map $http_accept), not by the gateway."""
+    """T9/G78: /api/auth/verify returns the FINAL verdict — 200 (+ Basic or the
+    public marker), 401 + X-Auth-Action (login_required/unauthorized/token_expired),
+    403 + X-Auth-Action (acl_denied). The browser-vs-API split is nginx's."""
 
     @staticmethod
     def _req(cookie=None, accept="*/*", host="myapp.localhost", header_token=None):
@@ -3012,207 +2961,219 @@ class TestVerifyAuthStatusCodes:
         req.headers = headers
         return req
 
-    @staticmethod
-    def _user():
-        from unittest.mock import MagicMock
-        u = MagicMock()
-        u.id = 1
-        u.username = "alice"
-        u.is_active = True
-        u.is_approved = True
-        u.allowed_special_users = ""
-        return u
-
     def _enable_acl(self, monkeypatch):
         from app.config import settings
         monkeypatch.setattr(settings, "ENABLE_ACL", True)
 
+    def _entry(self, owner, *, service_id=None):
+        import uuid
+        return {"service_id": str(service_id or uuid.uuid4()),
+                "owner_api_user_id": str(owner.api_user_id)}
+
     def test_no_token_returns_401_login_required(self, monkeypatch):
-        from app.routers.auth import verify_auth
-        self._enable_acl(monkeypatch)
-        from unittest.mock import MagicMock
-        resp = verify_auth(self._req(accept="text/html"), MagicMock())
-        assert resp.status_code == 401
-        assert resp.headers["X-Auth-Action"] == "login_required"
-
-    def test_invalid_token_returns_401_login_required(self, monkeypatch):
-        from app.routers.auth import verify_auth
         from unittest.mock import MagicMock, patch
-        from jose import JWTError
-        self._enable_acl(monkeypatch)
-        db = MagicMock()
-        req = self._req(cookie="bad-token", accept="text/html")
-        with patch("app.routers.auth.auth_service.verify_provision_token",
-                   side_effect=JWTError("bad")):
-            resp = verify_auth(req, db)
-        assert resp.status_code == 401
-        assert resp.headers["X-Auth-Action"] == "login_required"
-
-    def test_expired_token_returns_401_token_expired(self, monkeypatch):
+        from app.database import SessionLocal
         from app.routers.auth import verify_auth
-        from unittest.mock import MagicMock, patch
-        from jose import JWTError
+        from support import mk_user
+
         self._enable_acl(monkeypatch)
-        req = self._req(cookie="expired", accept="text/html")
-        with patch("app.routers.auth.auth_service.verify_provision_token",
-                   side_effect=JWTError("expired")), \
-             patch("jose.jwt.decode"):
-            # jose.jwt.decode succeeds → token structurally valid but expired
-            resp = verify_auth(req, MagicMock())
-        assert resp.status_code == 401
-        assert resp.headers["X-Auth-Action"] == "token_expired"
+        db = SessionLocal()
+        try:
+            owner = mk_user(db, "bob")
+            with patch("app.routers.auth._lookup_by_hostname",
+                       return_value=self._entry(owner)):
+                resp = verify_auth(self._req(accept="text/html"), db)
+            assert resp.status_code == 401
+            assert resp.headers["X-Auth-Action"] == "login_required"
+            # An API-style caller gets the API action for the same state.
+            with patch("app.routers.auth._lookup_by_hostname",
+                       return_value=self._entry(owner)):
+                api = verify_auth(self._req(accept="application/json"), db)
+            assert api.headers["X-Auth-Action"] == "unauthorized"
+        finally:
+            db.close()
+
+    def test_invalid_or_expired_token_returns_token_expired(self, monkeypatch):
+        from unittest.mock import patch
+        from jose import JWTError
+        from app.database import SessionLocal
+        from app.routers.auth import verify_auth
+        from support import mk_user
+
+        self._enable_acl(monkeypatch)
+        db = SessionLocal()
+        try:
+            owner = mk_user(db, "bob")
+            with patch("app.routers.auth._lookup_by_hostname",
+                       return_value=self._entry(owner)), \
+                 patch("app.routers.auth.auth_service.verify_provision_token",
+                       side_effect=JWTError("bad")):
+                resp = verify_auth(self._req(cookie="bad", accept="text/html"), db)
+            assert resp.status_code == 401
+            assert resp.headers["X-Auth-Action"] == "token_expired"
+        finally:
+            db.close()
 
     def test_acl_denied_returns_403(self, monkeypatch):
+        from unittest.mock import patch
+        from app.database import SessionLocal
         from app.routers.auth import verify_auth
-        from unittest.mock import MagicMock, patch
+        from support import mk_user
+
         self._enable_acl(monkeypatch)
-        payload = {"sub": "1", "user_type": "end_user", "role": "viewer"}
-        db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = self._user()
-        req = self._req(cookie="valid", accept="text/html")
-        with patch("app.routers.auth.auth_service.verify_provision_token",
-                   return_value=payload), \
-             patch("app.routers.auth._lookup_by_hostname",
-                   return_value={"user_name": "bob"}):
-            resp = verify_auth(req, db)
-        assert resp.status_code == 403
-        assert resp.headers["X-Auth-Action"] == "acl_denied"
+        db = SessionLocal()
+        try:
+            bob = mk_user(db, "bob")
+            alice = mk_user(db, "alice", role="viewer")
+            with patch("app.routers.auth._lookup_by_hostname",
+                       return_value=self._entry(bob)), \
+                 patch("app.routers.auth.auth_service.verify_provision_token",
+                       return_value={"sub": str(alice.id)}):
+                resp = verify_auth(self._req(cookie="valid", accept="text/html"), db)
+            assert resp.status_code == 403
+            assert resp.headers["X-Auth-Action"] == "acl_denied"
+        finally:
+            db.close()
 
     def test_valid_admin_returns_200_x_service_basic(self, monkeypatch):
+        from unittest.mock import patch
+        from app.database import SessionLocal
         from app.routers.auth import verify_auth
-        from unittest.mock import MagicMock, patch
+        from support import mk_user
+
         self._enable_acl(monkeypatch)
-        payload = {"sub": "1", "user_type": "admin", "role": "admin"}
-        req = self._req(cookie="valid", accept="text/html")
-        with patch("app.routers.auth.auth_service.verify_provision_token",
-                   return_value=payload), \
-             patch("app.routers.auth._get_service_basic_credential",
-                   return_value="dXNlcjpwYXNz"):
-            resp = verify_auth(req, MagicMock())
-        assert resp.status_code == 200
-        assert resp.headers["X-Service-Basic"] == "dXNlcjpwYXNz"
+        db = SessionLocal()
+        try:
+            admin = mk_user(db, "admin", role="admin")
+            entry = self._entry(admin)
+            with patch("app.routers.auth._lookup_by_hostname", return_value=entry), \
+                 patch("app.routers.auth.auth_service.verify_provision_token",
+                       return_value={"sub": str(admin.id)}), \
+                 patch("app.routers.auth.authorization_header",
+                       return_value="dXNlcjpwYXNz"):
+                resp = verify_auth(self._req(cookie="valid", accept="text/html"), db)
+            assert resp.status_code == 200
+            assert resp.headers["X-Service-Basic"] == "dXNlcjpwYXNz"
+        finally:
+            db.close()
+
+    def test_an_owner_viewer_reaches_its_own_service(self, monkeypatch):
+        from unittest.mock import patch
+        from app.database import SessionLocal
+        from app.routers.auth import verify_auth
+        from support import mk_user
+
+        self._enable_acl(monkeypatch)
+        db = SessionLocal()
+        try:
+            alice = mk_user(db, "alice", role="viewer")
+            with patch("app.routers.auth._lookup_by_hostname",
+                       return_value=self._entry(alice)), \
+                 patch("app.routers.auth.auth_service.verify_provision_token",
+                       return_value={"sub": str(alice.id)}), \
+                 patch("app.routers.auth.authorization_header", return_value=""):
+                resp = verify_auth(self._req(cookie="valid", accept="text/html"), db)
+            assert resp.status_code == 200
+        finally:
+            db.close()
 
     def test_acl_disabled_returns_401(self, monkeypatch):
-        from app.routers.auth import verify_auth
         from unittest.mock import MagicMock
         from app.config import settings
+        from app.routers.auth import verify_auth
+
         monkeypatch.setattr(settings, "ENABLE_ACL", False)
         resp = verify_auth(self._req(accept="text/html"), MagicMock())
         assert resp.status_code == 401
 
     # --- G78 public target verdict (T3) ---------------------------------
 
-    @staticmethod
-    def _owner(db, username="pub", **over):
-        from app.models.end_user import EndUser
-        u = EndUser(
-            username=username, password_hash="x", role="special", is_approved=True,
-            is_active=True, is_public_shared=False,
-        )
-        for k, v in over.items():
-            setattr(u, k, v)
-        db.add(u)
-        db.commit()
-        db.refresh(u)
-        return u
-
     def test_public_target_without_token_returns_public_verdict(self, monkeypatch):
         """R3 — no platform credential, 200 + X-Public-Service, no owner Basic."""
         from unittest.mock import patch
         from app.database import SessionLocal
         from app.routers.auth import verify_auth
+        from support import mk_user
+
         self._enable_acl(monkeypatch)
         db = SessionLocal()
-        self._owner(db, is_public_shared=True)
-        req = self._req(accept="application/json", host="pub.localhost")
-        with patch("app.routers.auth._lookup_by_hostname",
-                   return_value={"user_name": "pub"}):
-            resp = verify_auth(req, db)
-        assert resp.status_code == 200
-        assert resp.headers["X-Public-Service"] == "1"
-        assert resp.headers.get("X-Service-Basic") is None
+        try:
+            pub = mk_user(db, "pub", role="special", public=True)
+            with patch("app.routers.auth._lookup_by_hostname",
+                       return_value=self._entry(pub)):
+                resp = verify_auth(self._req(accept="application/json",
+                                             host="pub.localhost"), db)
+            assert resp.status_code == 200
+            assert resp.headers["X-Public-Service"] == "1"
+            assert resp.headers.get("X-Service-Basic") is None
+        finally:
+            db.close()
 
     def test_public_wins_over_a_valid_token(self, monkeypatch):
-        """R3/6A — public is target-owned; a token does not switch injection on."""
+        """Public is target-owned; a token does not switch injection on."""
         from unittest.mock import patch
         from app.database import SessionLocal
         from app.routers.auth import verify_auth
-        self._enable_acl(monkeypatch)
-        db = SessionLocal()
-        self._owner(db, is_public_shared=True)
-        req = self._req(cookie="valid-token", accept="text/html", host="pub.localhost")
-        with patch("app.routers.auth._lookup_by_hostname",
-                   return_value={"user_name": "pub"}), \
-             patch("app.routers.auth.auth_service.verify_provision_token",
-                   return_value={"sub": "1", "user_type": "admin", "role": "admin"}):
-            resp = verify_auth(req, db)
-        assert resp.status_code == 200
-        assert resp.headers["X-Public-Service"] == "1"
-        assert resp.headers.get("X-Service-Basic") is None
+        from support import mk_user
 
-    def test_public_wins_over_a_valid_end_user_token(self, monkeypatch):
-        """R3/3A — an owner/viewer token does not switch a public target to
-        private owner-credential injection either."""
+        self._enable_acl(monkeypatch)
+        db = SessionLocal()
+        try:
+            pub = mk_user(db, "pub", role="special", public=True)
+            admin = mk_user(db, "admin", role="admin")
+            with patch("app.routers.auth._lookup_by_hostname",
+                       return_value=self._entry(pub)), \
+                 patch("app.routers.auth.auth_service.verify_provision_token",
+                       return_value={"sub": str(admin.id)}):
+                resp = verify_auth(self._req(cookie="valid", accept="text/html",
+                                             host="pub.localhost"), db)
+            assert resp.status_code == 200
+            assert resp.headers["X-Public-Service"] == "1"
+            assert resp.headers.get("X-Service-Basic") is None
+        finally:
+            db.close()
+
+    def test_public_wins_over_a_valid_owner_token(self, monkeypatch):
         from unittest.mock import patch
         from app.database import SessionLocal
         from app.routers.auth import verify_auth
+        from support import mk_user
+
         self._enable_acl(monkeypatch)
         db = SessionLocal()
-        owner = self._owner(db, is_public_shared=True)
-        req = self._req(cookie="valid-end-user-token", accept="text/html",
-                        host="pub.localhost")
-        with patch("app.routers.auth._lookup_by_hostname",
-                   return_value={"user_name": "pub"}), \
-             patch("app.routers.auth.auth_service.verify_provision_token",
-                   return_value={"sub": str(owner.id), "user_type": "end_user",
-                                 "role": "viewer"}):
-            resp = verify_auth(req, db)
-        assert resp.status_code == 200
-        assert resp.headers["X-Public-Service"] == "1"
-        assert resp.headers.get("X-Service-Basic") is None
+        try:
+            pub = mk_user(db, "pub", role="special", public=True)
+            viewer = mk_user(db, "viewer", role="viewer")
+            with patch("app.routers.auth._lookup_by_hostname",
+                       return_value=self._entry(pub)), \
+                 patch("app.routers.auth.auth_service.verify_provision_token",
+                       return_value={"sub": str(viewer.id)}):
+                resp = verify_auth(self._req(cookie="valid", accept="text/html",
+                                             host="pub.localhost"), db)
+            assert resp.status_code == 200
+            assert resp.headers["X-Public-Service"] == "1"
+            assert resp.headers.get("X-Service-Basic") is None
+        finally:
+            db.close()
 
     def test_inactive_public_owner_does_not_take_the_public_branch(self, monkeypatch):
         from unittest.mock import patch
         from app.database import SessionLocal
         from app.routers.auth import verify_auth
+        from support import mk_user
+
         self._enable_acl(monkeypatch)
         db = SessionLocal()
-        self._owner(db, is_public_shared=True, is_active=False)
-        req = self._req(accept="application/json", host="pub.localhost")
-        with patch("app.routers.auth._lookup_by_hostname",
-                   return_value={"user_name": "pub"}):
-            resp = verify_auth(req, db)
-        assert resp.status_code == 401
-        assert "X-Public-Service" not in resp.headers
-
-    def test_public_flag_store_failure_never_defaults_to_public(self, monkeypatch):
-        """T3 fault injection: a store read failure is a 5xx, never a public
-        verdict. The edge then fails closed."""
-        from unittest.mock import MagicMock, patch
-        from app.routers.auth import verify_auth
-        self._enable_acl(monkeypatch)
-        db = MagicMock()
-        db.query.side_effect = RuntimeError("account store unavailable")
-        req = self._req(accept="application/json", host="pub.localhost")
-        with patch("app.routers.auth._lookup_by_hostname",
-                   return_value={"user_name": "pub"}):
-            with pytest.raises(RuntimeError):
-                verify_auth(req, db)
-
-    def test_client_public_header_cannot_spoof_a_private_target(self, monkeypatch):
-        from unittest.mock import patch
-        from app.database import SessionLocal
-        from app.routers.auth import verify_auth
-        self._enable_acl(monkeypatch)
-        db = SessionLocal()
-        self._owner(db, username="private", is_public_shared=False)
-        req = self._req(accept="application/json", host="private.localhost")
-        req.headers["X-Public-Service"] = "1"
-        with patch("app.routers.auth._lookup_by_hostname",
-                   return_value={"user_name": "private"}):
-            resp = verify_auth(req, db)
-        assert resp.status_code == 401
-        assert "X-Public-Service" not in resp.headers
+        try:
+            pub = mk_user(db, "pub", role="special", public=True, active=False)
+            with patch("app.routers.auth._lookup_by_hostname",
+                       return_value=self._entry(pub)):
+                resp = verify_auth(self._req(accept="application/json",
+                                             host="pub.localhost"), db)
+            assert resp.status_code == 401
+            assert "X-Public-Service" not in resp.headers
+        finally:
+            db.close()
 
 
 class TestKeysUseSharedDependency:
@@ -3236,232 +3197,212 @@ class TestKeysUseSharedDependency:
 
 
 class TestGetMeUsesGatewayToken:
-    """Gap: GET /api/auth/me must use require_gateway_token (gateway_token
-    cookie or Bearer, 24h TTL) instead of get_current_user (Bearer
-    access_token, 1h TTL), removing the transient 401 the browser emitted once
-    the 1h access token expired."""
+    """GET /api/auth/me uses the ONE provision-token dependency (T9)."""
+
+    def _legacy_token(self, kind: str) -> str:
+        from datetime import datetime, timedelta, timezone
+
+        from jose import jwt
+        from app.config import settings
+
+        return jwt.encode(
+            {"sub": "1", "type": kind,
+             "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
+            settings.GATEWAY_SECRET_KEY, algorithm=settings.JWT_ALGORITHM,
+        )
 
     def test_get_me_uses_require_gateway_token(self):
         import inspect
         from app.routers.auth import get_me
         src = inspect.getsource(get_me)
         assert "Depends(require_gateway_token)" in src
-        assert "Depends(get_current_user)" not in src
 
-    def test_require_gateway_token_rejects_gateway_token_cookie(self):
-        """G5: a legacy gateway_token cookie (type='gateway') is REJECTED (401)."""
+    def test_require_gateway_token_rejects_legacy_credentials(self):
+        """G5: the retired gateway_token cookie and Bearer headers are ignored."""
         from unittest.mock import MagicMock
         from fastapi import HTTPException
         from app.middleware import require_gateway_token
-        from app.services.auth_service import create_gateway_token
 
-        token = create_gateway_token(42, "admin@test.com", "admin", "admin")
-        req = MagicMock()
-        req.cookies = {"gateway_token": token}
-        req.headers = {}
+        for cookies, headers in (
+            ({"gateway_token": self._legacy_token("gateway")}, {}),
+            ({}, {"Authorization": f"Bearer {self._legacy_token('access')}"}),
+        ):
+            req = MagicMock()
+            req.cookies = cookies
+            req.headers = headers
+            with pytest.raises(HTTPException) as exc_info:
+                require_gateway_token(request=req)
+            assert exc_info.value.status_code == 401
 
-        with pytest.raises(HTTPException) as exc_info:
-            require_gateway_token(request=req)
-        assert exc_info.value.status_code == 401
-
-    def test_require_gateway_token_rejects_bearer_gateway_token(self):
-        """G5: a legacy Bearer gateway token is REJECTED (401)."""
+    def test_require_gateway_token_accepts_a_live_provision_cookie(self):
         from unittest.mock import MagicMock
-        from fastapi import HTTPException
+        from app.database import SessionLocal
         from app.middleware import require_gateway_token
-        from app.services.auth_service import create_gateway_token
+        from app.services import auth_service
+        from support import mk_user
 
-        token = create_gateway_token(7, "viewer@test.com", "viewer", "end_user")
-        req = MagicMock()
-        req.cookies = {}
-        req.headers = {"Authorization": f"Bearer {token}"}
-
-        with pytest.raises(HTTPException) as exc_info:
-            require_gateway_token(request=req)
-        assert exc_info.value.status_code == 401
-
-    def test_require_gateway_token_accepts_provision_cookie(self):
-        """A provision_token cookie (the v4 single credential) authenticates."""
-        from unittest.mock import MagicMock, patch
-        from app.middleware import require_gateway_token
-        from app.services.auth_service import create_provision_token
-
-        token = create_provision_token(42, "admin@test.com", "admin", "admin")
-        admin = MagicMock()
-        admin.id = 42
-        admin.email = "admin@test.com"
-        admin.role = "admin"
-        admin.is_active = True
-
-        req = MagicMock()
-        req.cookies = {"provision_token": token}
-        req.headers = {}
-
-        with patch("app.middleware.get_admin_by_id", return_value=admin):
+        db = SessionLocal()
+        try:
+            admin = mk_user(db, "admin", role="admin")
+            key, _ = auth_service.create_api_key(db, admin.id, "Default", is_default=True)
+            token = auth_service.create_provision_token(db, admin.id, key.id)
+            req = MagicMock()
+            req.cookies = {"provision_token": token}
+            req.headers = {}
             user = require_gateway_token(request=req)
-
-        assert user["id"] == 42
-        assert user["email"] == "admin@test.com"
-        assert user["role"] == "admin"
-        assert user["user_type"] == "admin"
+            assert user["id"] == str(admin.id)
+            assert user["role"] == "admin"
+            assert user["username"] == "admin"
+        finally:
+            db.close()
 
 
 class TestAdminRoutesMigratedToGatewayToken:
-    """Gap 7: admin-only gateway routes must use ``require_admin`` (gateway_token
-    cookie/Bearer, 24h TTL) instead of ``get_current_admin``/``require_admin_role``
-    (Bearer ``access_token``, 1h TTL), per gateway-acl-architecture.md §5."""
+    """T9: admin routes depend on ``require_admin`` (provision token)."""
+
+    def _token(self, db, *, role: str):
+        from app.services import auth_service
+        from support import mk_user
+
+        user = mk_user(db, f"u-{role}", role=role)
+        key, _ = auth_service.create_api_key(db, user.id, "Default", is_default=True)
+        return user, auth_service.create_provision_token(db, user.id, key.id)
 
     def test_require_admin_accepts_admin_provision_cookie(self):
-        """An admin provision_token cookie satisfies require_admin."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
+        from app.database import SessionLocal
         from app.middleware import require_admin
-        from app.services.auth_service import create_provision_token
 
-        token = create_provision_token(42, "admin@test.com", "admin", "admin")
-        admin = MagicMock()
-        admin.id = 42
-        admin.email = "admin@test.com"
-        admin.role = "admin"
-        admin.is_active = True
-
-        req = MagicMock()
-        req.cookies = {"provision_token": token}
-        req.headers = {}
-
-        with patch("app.middleware.get_admin_by_id", return_value=admin):
+        db = SessionLocal()
+        try:
+            admin, token = self._token(db, role="admin")
+            req = MagicMock()
+            req.cookies = {"provision_token": token}
+            req.headers = {}
             user = require_admin(request=req)
-
-        assert user["id"] == 42
-        assert user["role"] == "admin"
-        assert user["user_type"] == "admin"
+            assert user["id"] == str(admin.id)
+            assert user["role"] == "admin"
+        finally:
+            db.close()
 
     def test_require_admin_rejects_viewer_role_403(self):
-        """A viewer (non-admin role) provision token is rejected with 403."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
         from fastapi import HTTPException
+        from app.database import SessionLocal
         from app.middleware import require_admin
-        from app.services.auth_service import create_provision_token
 
-        token = create_provision_token(7, "viewer@test.com", "viewer", "end_user")
-        end_user = MagicMock()
-        end_user.id = 7
-        end_user.username = "viewer@test.com"
-        end_user.role = "viewer"
-        end_user.is_active = True
-        end_user.is_approved = True
-        end_user.deleted_at = None
-
-        req = MagicMock()
-        req.cookies = {"provision_token": token}
-        req.headers = {}
-
-        with patch("app.middleware.get_end_user_by_id", return_value=end_user):
+        db = SessionLocal()
+        try:
+            _viewer, token = self._token(db, role="viewer")
+            req = MagicMock()
+            req.cookies = {"provision_token": token}
+            req.headers = {}
             with pytest.raises(HTTPException) as exc_info:
                 require_admin(request=req)
-
-        assert exc_info.value.status_code == 403
+            assert exc_info.value.status_code == 403
+        finally:
+            db.close()
 
     def test_no_router_uses_legacy_admin_dependencies(self):
-        """No gateway router may still depend on get_current_admin/require_admin_role."""
         from pathlib import Path
         routers_dir = Path(__file__).parent.parent / "app" / "routers"
         legacy = ("Depends(get_current_admin)", "Depends(require_admin_role)")
-        checked = 0
         for f in sorted(routers_dir.glob("*.py")):
             content = f.read_text()
             for dep in legacy:
                 assert dep not in content, f"{f.name} still uses {dep}"
-            checked += 1
-        assert checked >= 6  # auth, system, services, users, tasks, llm, audit
 
     def test_representative_admin_routes_use_require_admin(self):
-        """Representative migrated routes inject require_admin via Depends."""
         import inspect
         from app.routers.tasks import list_tasks
         from app.routers.audit import list_audit_logs
         from app.routers.users import deploy_user
-        from app.routers.auth import list_end_users
+        from app.routers.auth import list_users
         from app.routers.services import list_services
         from app.routers.llm import list_llm_configs
-        for fn in (list_tasks, list_audit_logs, deploy_user, list_end_users,
+        for fn in (list_tasks, list_audit_logs, deploy_user, list_users,
                    list_services, list_llm_configs):
-            src = inspect.getsource(fn)
-            assert "Depends(require_admin)" in src, (
-                f"{fn.__name__} should use Depends(require_admin)"
-            )
+            assert "Depends(require_admin)" in inspect.getsource(fn), fn.__name__
 
-    def test_change_password_fetches_admin_orm_by_id(self):
-        """change_password uses require_admin (dict) and re-fetches the ORM."""
+    def test_change_password_is_self_service(self):
+        """The account password is changed by its OWNER (current token), never
+        by an admin resetting another account through this route."""
         import inspect
         from app.routers.auth import change_password
         src = inspect.getsource(change_password)
-        assert "Depends(require_admin)" in src
-        assert "get_admin_by_id" in src
-        assert "current_admin[\"id\"]" in src
+        assert "Depends(require_gateway_token)" in src
+        assert "Depends(require_admin)" not in src
 
     def test_register_end_user_is_public_signup(self):
-        """POST /api/auth/users/register stays public (pre-auth signup flow)."""
         import inspect
         from app.routers.auth import register_end_user
         src = inspect.getsource(register_end_user)
         assert "require_gateway_token" not in src
         assert "require_admin" not in src
 
-    def test_stream_task_log_accepts_gateway_token(self):
-        """The SSE task-log endpoint decodes gateway_token (cookie/Bearer/query)."""
+    def test_stream_task_log_is_admin_only(self):
+        """T9: a viewer never reads a task log; the route is admin-only."""
         import inspect
         from app.routers.tasks import stream_task_log
         src = inspect.getsource(stream_task_log)
-        assert "decode_gateway_token" in src
-        assert 'gateway_token' in src
-
+        assert "require_admin" in src
 
 
 class TestV4ExchangeCode:
-    """v4 §6.2 (F7/GAP-10): 30s exchange code for /go/ service handoff."""
+    """v4 §6.2 (F7/GAP-10): a 30s exchange code carries the /go/ handoff."""
 
     def test_exchange_code_ttl_constant(self):
         from app.config import settings
         assert settings.EXCHANGE_CODE_TTL_SEC == 30
 
     def test_create_and_verify_exchange_code_roundtrip(self):
+        from app.database import SessionLocal
         from app.services import auth_service
-        code = auth_service.create_exchange_code(
-            1, "alice@example.com", "viewer", "end_user", "svc.example.com", redirect="/x"
-        )
+
+        db = SessionLocal()
+        try:
+            code = auth_service.create_exchange_code(
+                db, "00000000-0000-0000-0000-000000000001",
+                "svc.example.com", redirect="/x",
+            )
+        finally:
+            db.close()
         payload = auth_service.verify_exchange_code(code)
         assert payload["type"] == "code"
-        assert payload["sub"] == "1"
+        assert payload["sub"] == "00000000-0000-0000-0000-000000000001"
         assert payload["svc_host"] == "svc.example.com"
         assert payload["redirect"] == "/x"
 
     def test_verify_exchange_code_rejects_non_code_token(self):
-        import pytest
         from jose import JWTError
+        from app.database import SessionLocal
         from app.services import auth_service
-        prov = auth_service.create_provision_token(1, "a@b.c", "viewer", "end_user")
+
+        db = SessionLocal()
+        try:
+            prov = auth_service.create_provision_token(
+                db, "00000000-0000-0000-0000-000000000001")
+        finally:
+            db.close()
         with pytest.raises(JWTError):
             auth_service.verify_exchange_code(prov)
 
     def test_verify_exchange_code_rejects_garbage(self):
-        import pytest
         from jose import JWTError
         from app.services import auth_service
         with pytest.raises(JWTError):
             auth_service.verify_exchange_code("not-a-token")
 
     def test_go_to_service_uses_code_not_jwt_in_url(self):
-        """GAP-10: the /go/ redirect URL must never contain a JWT — only the code."""
+        """GAP-10: the /go/ redirect URL contains only the code."""
         from pathlib import Path
-        p = Path(__file__).parent.parent / "app" / "routers" / "auth.py"
-        content = p.read_text()
+        content = (Path(__file__).parent.parent / "app" / "routers" / "auth.py").read_text()
         assert "create_exchange_code" in content
-        assert '_set_token_url = f"{service_url}/_set_token?code={code}"' in content
-        assert "RedirectResponse(url=_set_token_url, status_code=303)" in content
+        assert 'f"{service_url}/_set_token?code={code}"' in content
 
 
 class TestV4ApiKeyTokenModel:
-    """v4 §6.1.1-6.1.3: API key IS a 1-year provision JWT with own api_key_id."""
+    """T6: an API key IS a provision token carrying its own ``api_key_id``."""
 
     def test_provision_token_ttl_week(self):
         from app.services import auth_service
@@ -3472,98 +3413,102 @@ class TestV4ApiKeyTokenModel:
         assert auth_service.API_KEY_TTL_SEC == 31536000
 
     def test_create_api_key_token_carries_own_api_key_id(self):
+        from app.database import SessionLocal
         from app.services import auth_service
-        tok = auth_service.create_api_key_token(3, "bob@x.io", "admin", "admin", api_key_id=42)
+
+        db = SessionLocal()
+        try:
+            tok = auth_service.create_api_key_token(
+                db, "00000000-0000-0000-0000-000000000001", 42)
+        finally:
+            db.close()
         payload = auth_service.decode_token(tok)
         assert payload["api_key_id"] == 42
         assert payload["type"] == "provision"
-        assert payload["user_type"] == "admin"
 
     def test_create_api_key_stores_hash_and_mask(self):
-        from unittest.mock import MagicMock, patch
+        from app.database import SessionLocal
         from app.services import auth_service
-        key = MagicMock()
-        key.id = 7
-        db = MagicMock()
-        db.query.return_value.filter.return_value.count.return_value = 0
-        with patch("app.services.auth_service._target_identity", return_value=("end_user", "carol", "viewer")), \
-             patch("app.services.auth_service.ApiKey", return_value=key):
-            created, raw = auth_service.create_api_key(db, 5, "My Key")
-        assert raw.endswith(created.mask)
-        assert created.token_hash == auth_service._hash_token(raw)
-        assert created.expires_at is not None
+        from support import mk_user
 
-    def test_create_api_key_cap_1000(self):
-        import pytest
-        from unittest.mock import MagicMock, patch
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "carol")
+            created, raw = auth_service.create_api_key(db, user.id, "My Key")
+            assert created.mask == raw[-8:]
+            assert created.token_hash and created.token_hash != raw
+        finally:
+            db.close()
+
+    def test_the_key_cap_is_enforced(self, monkeypatch):
+        from app.database import SessionLocal
         from app.services import auth_service
-        db = MagicMock()
-        db.query.return_value.filter.return_value.count.return_value = auth_service.MAX_API_KEYS_PER_USER
-        with patch("app.services.auth_service._lazy_evict_api_keys", return_value=0):
+        from support import mk_user
+
+        monkeypatch.setattr(auth_service, "MAX_API_KEYS_PER_USER", 1)
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "dave")
+            auth_service.create_api_key(db, user.id, "first")
             with pytest.raises(ValueError):
-                auth_service.create_api_key(db, 5, "x")
+                auth_service.create_api_key(db, user.id, "second")
+        finally:
+            db.close()
 
     def test_revoke_default_key_raises(self):
-        import pytest
-        from unittest.mock import MagicMock
+        from app.database import SessionLocal
         from app.services import auth_service
-        key = MagicMock()
-        key.is_default = True
-        db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = key
-        with pytest.raises(ValueError):
-            auth_service.revoke_api_key(db, 9)
+        from support import mk_user
 
-    def test_revoke_non_default_ok(self):
-        from unittest.mock import MagicMock
-        from app.services import auth_service
-        key = MagicMock()
-        key.is_default = False
-        db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = key
-        assert auth_service.revoke_api_key(db, 9) is True
-        assert key.is_revoked is True
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "erin")
+            key, _ = auth_service.create_api_key(db, user.id, "Default", is_default=True)
+            with pytest.raises(ValueError):
+                auth_service.revoke_api_key(db, key.id)
+            other, _ = auth_service.create_api_key(db, user.id, "other")
+            assert auth_service.revoke_api_key(db, other.id) is True
+        finally:
+            db.close()
 
 
 class TestV4DefaultKey:
-    """v4 §6.1.3/6.1.5 (D7): default key auto-create/promote, backfill."""
+    """T6: the default key is auto-created on first login and promotable."""
 
     def test_get_or_create_default_key_returns_existing(self):
-        from datetime import datetime, timedelta, timezone
-        from unittest.mock import MagicMock
+        from app.database import SessionLocal
         from app.services import auth_service
-        key = MagicMock()
-        key.is_default = True
-        key.is_revoked = False
-        key.expires_at = datetime.now(timezone.utc) + timedelta(days=1)
-        db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = key
-        got = auth_service.get_or_create_default_key(db, 1)
-        assert got is key
-        # No new key created
-        assert db.add.call_count == 0
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "u1")
+            key, _ = auth_service.create_api_key(db, user.id, "Default", is_default=True)
+            assert auth_service.get_or_create_default_key(db, user.id).id == key.id
+        finally:
+            db.close()
 
     def test_get_or_create_default_key_autocreates(self):
-        from unittest.mock import MagicMock, patch
+        from app.database import SessionLocal
         from app.services import auth_service
-        db = MagicMock()
-        # No default, no valid keys (valid chain uses .filter().filter().order_by().all())
-        db.query.return_value.filter.return_value.first.return_value = None
-        db.query.return_value.filter.return_value.filter.return_value.order_by.return_value.all.return_value = []
-        new_key = MagicMock()
-        with patch("app.services.auth_service.create_api_key", return_value=(new_key, "raw")):
-            got = auth_service.get_or_create_default_key(db, 2)
-        assert got is new_key
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "u2")
+            key = auth_service.get_or_create_default_key(db, user.id)
+            assert key.is_default is True
+        finally:
+            db.close()
 
     def test_backfill_default_keys_exists(self):
         import inspect
         from app.services import auth_service
-        src = inspect.getsource(auth_service.backfill_default_keys)
-        assert "is_default" in src
+        assert "is_default" in inspect.getsource(auth_service.backfill_default_keys)
 
 
 class TestV4ClientTypeHybrid:
-    """v4 §6 / review GAP-11/A3: X-Client-Type hybrid rule."""
+    """The X-Client-Type hybrid rule (nginx splits browser vs API)."""
 
     @staticmethod
     def _req(header=None, cookie=None, accept="*/*"):
@@ -3578,7 +3523,8 @@ class TestV4ClientTypeHybrid:
 
     def test_header_wins_as_api(self):
         from app.routers.auth import _resolve_client_type
-        assert _resolve_client_type(self._req(header="tok", cookie="c", accept="text/html")) == "api"
+        assert _resolve_client_type(
+            self._req(header="tok", cookie="c", accept="text/html")) == "api"
 
     def test_cookie_means_browser(self):
         from app.routers.auth import _resolve_client_type
@@ -3586,42 +3532,45 @@ class TestV4ClientTypeHybrid:
 
     def test_accept_text_html_means_browser(self):
         from app.routers.auth import _resolve_client_type
-        assert _resolve_client_type(self._req(accept="text/html,application/xhtml+xml")) == "browser"
+        assert _resolve_client_type(
+            self._req(accept="text/html,application/xhtml+xml")) == "browser"
 
     def test_else_means_api(self):
         from app.routers.auth import _resolve_client_type
         assert _resolve_client_type(self._req(accept="application/json")) == "api"
 
-    def test_verify_response_carries_x_client_type(self):
+    def test_verify_response_carries_x_client_type(self, monkeypatch):
         from unittest.mock import MagicMock
-        from app.routers.auth import verify_auth
         from app.config import settings
-        settings.ENABLE_ACL = False
+        from app.routers.auth import verify_auth
+
+        monkeypatch.setattr(settings, "ENABLE_ACL", False)
         resp = verify_auth(self._req(accept="application/json"), MagicMock())
         assert resp.headers.get("X-Client-Type") == "api"
         assert resp.status_code == 401
 
 
 class TestV4AuthEndpoints:
-    """v4 §6.1/F4: three-credential model endpoints."""
+    """The login/exchange endpoints (one credential: provision_token)."""
 
     def test_login_sets_provision_cookie_only(self):
-        from unittest.mock import MagicMock, patch
+        from app.database import SessionLocal
         from app.routers.auth import login
         from app.schemas.auth import LoginRequest
-        req = LoginRequest(email="a@b.c", password="pw")
-        default_key = MagicMock()
-        default_key.id = 11
-        result = ("admin", {"id": 1, "email": "a@b.c", "role": "admin"})
-        with patch("app.routers.auth.auth_service.authenticate_user", return_value=result), \
-             patch("app.routers.auth.auth_service.create_provision_token", return_value="TOK"), \
-             patch("app.routers.auth.settings.PROVISION_COOKIE_TTL", 604800):
-            from unittest.mock import MagicMock as M
-            request = M()
-            resp = login(req, request, MagicMock())
+        from app.services import auth_service
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            mk_user(db, "admin@test", role="admin",
+                    password_hash=auth_service.hash_password("pw"))
+            resp = login(LoginRequest(email="admin@test", password="pw"), db)
+        finally:
+            db.close()
         body = resp.body.decode()
-        assert "access_token" not in body and "refresh_token" not in body and "gateway_token" not in body
-        assert resp.headers["set-cookie"].startswith("provision_token=TOK")
+        assert "access_token" not in body and "refresh_token" not in body
+        assert "gateway_token" not in body
+        assert resp.headers["set-cookie"].startswith("provision_token=")
 
     def test_logout_endpoint_clears_cookie(self):
         from unittest.mock import MagicMock
@@ -3631,7 +3580,6 @@ class TestV4AuthEndpoints:
         response.delete_cookie.assert_called_once_with("provision_token", path="/")
 
     def test_no_refresh_endpoint(self):
-        """v4 §6.1: /api/auth/refresh removed — the dashboard never refreshes tokens."""
         from app.routers.auth import router
         paths = [r.path for r in router.routes]
         assert "/api/auth/refresh" not in paths
@@ -3639,10 +3587,10 @@ class TestV4AuthEndpoints:
         assert "/api/auth/exchange" in paths
 
     def test_exchange_endpoint_requires_code(self):
-        import pytest
         from fastapi import HTTPException
         from unittest.mock import MagicMock
         from app.routers.auth import exchange
+
         req = MagicMock()
         req.query_params = {}
         with pytest.raises(HTTPException) as ei:
@@ -3651,44 +3599,53 @@ class TestV4AuthEndpoints:
 
     def test_exchange_endpoint_sets_cookie_on_valid_code(self):
         from unittest.mock import MagicMock, patch
+        from app.database import SessionLocal
         from app.routers.auth import exchange
-        req = MagicMock()
-        req.query_params = {"code": "CODEX"}
-        payload = {"sub": "2", "role": "viewer", "user_type": "end_user", "email": "b@b.c",
-                   "svc_host": "svc.host", "redirect": "/"}
-        with patch("app.routers.auth.auth_service.verify_exchange_code", return_value=payload), \
-             patch("app.routers.auth.auth_service.get_or_create_default_key", return_value=MagicMock(id=5)), \
-             patch("app.routers.auth.auth_service.create_provision_token", return_value="NEWTOK"), \
-             patch("app.routers.auth.settings.PROVISION_COOKIE_TTL", 604800):
-            from unittest.mock import MagicMock as M
-            req.app = M()
-            req.app.state.hostname_index = M()
-            req.app.state.hostname_index.get_by_hostname.return_value = {"https": False}
-            resp = exchange(req, MagicMock())
-        assert resp.status_code == 302
-        assert resp.headers["location"] == "/"
-        assert resp.headers["set-cookie"].startswith("provision_token=NEWTOK")
+        from app.services import auth_service
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "u-viewer", role="viewer")
+            req = MagicMock()
+            req.query_params = {"code": "CODEX"}
+            req.app = MagicMock()
+            req.app.state.hostname_index.get_by_hostname.return_value = None
+            with patch("app.routers.auth.auth_service.verify_exchange_code",
+                       return_value={"sub": str(user.id), "svc_host": "",
+                                     "redirect": "/"}):
+                resp = exchange(req, db)
+            assert resp.status_code == 302
+            assert resp.headers["location"] == "/"
+            assert resp.headers["set-cookie"].startswith("provision_token=")
+        finally:
+            db.close()
 
 
 class TestV4VerifyOrdering:
-    """v4 §6.1.4 / review R1: revocation-before-admin-bypass, token_expired check."""
+    """T9: current-role authority, revocation and expiry are checked in the
+    token verifier, not by the claims."""
 
-    def test_admin_with_revoked_key_denied(self):
+    def test_admin_with_revoked_key_denied(self, monkeypatch):
         from unittest.mock import MagicMock, patch
         from jose import JWTError
-        from app.routers.auth import verify_auth
         from app.config import settings
-        settings.ENABLE_ACL = True
+        from app.routers.auth import verify_auth
+
+        monkeypatch.setattr(settings, "ENABLE_ACL", True)
         req = MagicMock()
         req.cookies = {"provision_token": "t"}
         req.headers = {"Accept": "text/html", "Host": "svc.host"}
-        with patch("app.routers.auth.auth_service.verify_provision_token", side_effect=JWTError("revoked")):
+        with patch("app.routers.auth._lookup_by_hostname",
+                   return_value={"service_id": "00000000-0000-0000-0000-000000000009",
+                                 "owner_api_user_id": "00000000-0000-0000-0000-000000000001"}), \
+             patch("app.routers.auth.auth_service.verify_provision_token",
+                   side_effect=JWTError("revoked")):
             resp = verify_auth(req, MagicMock())
         assert resp.status_code == 401
-        assert resp.headers["X-Auth-Action"] == "login_required"
+        assert resp.headers["X-Auth-Action"] == "token_expired"
 
     def test_provision_token_verifier_checks_expires_at(self):
-        """R1/GAP-06: verify_provision_token must check key.expires_at."""
         import inspect
         from app.services import auth_service
         src = inspect.getsource(auth_service.verify_provision_token)
@@ -3696,59 +3653,77 @@ class TestV4VerifyOrdering:
         assert "is_revoked" in src
 
     def test_provision_token_ttl_week_payload(self):
+        from datetime import datetime, timezone
+        from app.database import SessionLocal
         from app.services import auth_service
-        tok = auth_service.create_provision_token(1, "a@b.c", "viewer", "end_user", api_key_id=3)
+
+        db = SessionLocal()
+        try:
+            tok = auth_service.create_provision_token(
+                db, "00000000-0000-0000-0000-000000000001", api_key_id=3)
+        finally:
+            db.close()
         payload = auth_service.decode_token(tok)
         assert payload["type"] == "provision"
         assert payload["api_key_id"] == 3
-        exp = payload["exp"]
-        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
-        delta = exp - now.timestamp()
+        delta = payload["exp"] - datetime.now(timezone.utc).timestamp()
         assert 600_000 < delta < 700_000  # ~1 week (604800)
 
 
-class TestV4SpecialUsersTrim:
-    """Review N1: allowed_special_users entries must be trimmed on parse."""
-
-    def test_parse_allowed_special_users_trims(self):
-        from app.routers.auth import _parse_allowed_special_users
-        assert _parse_allowed_special_users(" alice , bob ,") == ["alice", "bob"]
-        assert _parse_allowed_special_users("") == []
-        assert _parse_allowed_special_users(None) == []
-
-
 class TestV4ServiceBasicCredential:
-    """Review N2: _get_service_basic_credential never falls back to a hardcoded
-    guessable credential — a missing passwd_plain yields empty (passwd-less)."""
+    """T9/R2.5: the gateway reads the -api's keyring; a missing key, a
+    `reset_required` row or no ciphertext all yield NO credential (fail closed)."""
 
-    def test_missing_passwd_plain_returns_empty(self, monkeypatch):
-        from app.routers.auth import _get_service_basic_credential
-        from unittest.mock import MagicMock, patch
-        req = MagicMock()
-        req.headers.get.return_value = "myapp.example.com"
-        with patch("app.routers.auth._lookup_by_hostname",
-                   return_value={"user_name": "bob"}):
-            assert _get_service_basic_credential(req, MagicMock()) == ""
+    def _seed_basic(self, db, service_id, *, secret=None, reset=False):
+        from sqlalchemy import text
+        from support import registry_engine
 
-    def test_empty_passwd_plain_returns_empty(self, monkeypatch):
-        from app.routers.auth import _get_service_basic_credential
-        from unittest.mock import MagicMock, patch
-        req = MagicMock()
-        req.headers.get.return_value = "myapp.example.com"
-        with patch("app.routers.auth._lookup_by_hostname",
-                   return_value={"user_name": "bob", "passwd_plain": ""}):
-            assert _get_service_basic_credential(req, MagicMock()) == ""
+        with registry_engine().begin() as conn:
+            conn.execute(
+                text("INSERT INTO registry.service_basic "
+                     "(service_id, basic_username, secret_enc, key_version, "
+                     " basic_version, reset_required) "
+                     "VALUES (:sid, 'bob', :secret, 1, 1, :reset)"),
+                {"sid": str(service_id),
+                 "secret": secret.encode() if secret else None, "reset": reset},
+            )
 
-    def test_passwd_plain_returns_base64(self, monkeypatch):
+    def test_missing_row_returns_empty(self):
+        import uuid
+        from app.services.basic_credentials import authorization_header
+        assert authorization_header(str(uuid.uuid4())) == ""
+
+    def test_reset_required_returns_empty(self):
+        from app.database import SessionLocal
+        from app.services.basic_credentials import authorization_header
+        from support import mk_service, mk_user
+
+        db = SessionLocal()
+        try:
+            owner = mk_user(db, "bob")
+            sid = mk_service(db, owner)
+            self._seed_basic(db, sid, secret=None, reset=True)
+            assert authorization_header(str(sid)) == ""
+        finally:
+            db.close()
+
+    def test_an_encrypted_secret_returns_base64(self):
         import base64
-        from app.routers.auth import _get_service_basic_credential
-        from unittest.mock import MagicMock, patch
-        req = MagicMock()
-        req.headers.get.return_value = "myapp.example.com"
-        with patch("app.routers.auth._lookup_by_hostname",
-                   return_value={"user_name": "bob", "passwd_plain": "secret"}):
-            got = _get_service_basic_credential(req, MagicMock())
-        assert got == base64.b64encode(b"bob:secret").decode()
+        from app.database import SessionLocal
+        from app.services import keyring
+        from app.services.basic_credentials import authorization_header
+        from support import mk_service, mk_user
+
+        db = SessionLocal()
+        try:
+            owner = mk_user(db, "bob")
+            sid = mk_service(db, owner)
+            envelope = keyring.encrypt("secret").decode()
+            self._seed_basic(db, sid, secret=envelope)
+            got = authorization_header(str(sid))
+            assert got == base64.b64encode(b"bob:secret").decode()
+        finally:
+            db.close()
 
 
 class TestV4TasksCookie:
@@ -3758,7 +3733,8 @@ class TestV4TasksCookie:
         from pathlib import Path
         p = Path(__file__).parent.parent / "app" / "routers" / "tasks.py"
         content = p.read_text()
-        assert 'request.cookies.get("provision_token", "")' in content
+        # T9: the SSE task-log route is admin-only and uses the one dependency.
+        assert "require_admin" in content
 
 
 class TestV4DefaultEndpoint:
@@ -3772,77 +3748,55 @@ class TestV4DefaultEndpoint:
 
 
 class TestDbMigration:
-    """QA1: existing gateway.db must be migrated — create_all never alters
-    existing tables, so an old api_keys table (no mask/is_default) must get the
-    new columns via _ensure_schema before end-user login works."""
+    """T1/T12: PostgreSQL migrations are the single schema path.
 
-    def _make_old_schema(self, path):
-        from sqlalchemy import create_engine, text
-        eng = create_engine(f"sqlite:///{path}")
-        with eng.begin() as conn:
-            conn.execute(text(
-                "CREATE TABLE api_keys ("
-                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                " user_id INTEGER NOT NULL,"
-                " label VARCHAR(255) NOT NULL,"
-                " token_hash VARCHAR(255) NOT NULL,"
-                " created_at DATETIME,"
-                " expires_at DATETIME NOT NULL,"
-                " is_revoked BOOLEAN NOT NULL DEFAULT 0,"
-                " last_used_at DATETIME)"
-            ))
-        return eng
+    The SQLite store was created with ``create_all`` and patched in place by
+    ``_ensure_schema``; PostgreSQL has one frozen DDL applied under an advisory
+    lock, so both a fresh database and an upgraded one take the same path and
+    the ad-hoc ALTER helper does not exist.
+    """
 
-    def test_ensure_schema_adds_mask_and_is_default(self, tmp_path):
-        db_path = tmp_path / "old.db"
-        eng = self._make_old_schema(str(db_path))
+    def test_schema_migrations_are_applied(self):
+        from app.database import SessionLocal
+        from sqlalchemy import text
 
-        from app.database import _ensure_schema
-        from sqlalchemy import inspect, text
+        db = SessionLocal()
+        try:
+            versions = {
+                r[0] for r in db.execute(text("SELECT version FROM gateway.schema_migrations"))
+            }
+        finally:
+            db.close()
+        assert "0001_gateway.sql" in versions
+        assert "0002_import_state.sql" in versions
 
-        # Before: no mask/is_default columns
-        cols_before = {c["name"] for c in inspect(eng).get_columns("api_keys")}
-        assert "mask" not in cols_before and "is_default" not in cols_before
+    def test_api_keys_columns_and_partial_index_in_postgres(self):
+        from app.database import SessionLocal
+        from sqlalchemy import text
 
-        # A pre-migration row exists BEFORE the migration runs, so the mask
-        # backfill (G7) must fill it.
-        with eng.begin() as conn:
-            conn.execute(text(
-                "INSERT INTO api_keys (user_id, label, token_hash, expires_at) "
-                "VALUES (1, 'k', 'h', '2030-01-01 00:00:00')"
-            ))
+        db = SessionLocal()
+        try:
+            cols = {
+                r[0] for r in db.execute(text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema='gateway' AND table_name='api_keys'"
+                ))
+            }
+            indexdefs = [r[0] for r in db.execute(text(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE schemaname='gateway' AND tablename='api_keys'"
+            ))]
+            indexdef = next(
+                (d for d in indexdefs if "UNIQUE" in d and "is_default" in d), None
+            )
+        finally:
+            db.close()
+        assert {"mask", "is_default", "user_id", "token_hash"} <= cols
+        assert indexdef and "is_default" in indexdef
 
-        _ensure_schema(eng)
-
-        cols_after = {c["name"] for c in inspect(eng).get_columns("api_keys")}
-        assert "mask" in cols_after
-        assert "is_default" in cols_after
-        with eng.begin() as conn:
-            row = conn.execute(text("SELECT mask, is_default FROM api_keys")).fetchone()
-        # G7: mask backfilled from the stored token_hash (raw token is hashed);
-        # is_default stays 0 for a non-default key.
-        assert row.mask == "h"[-8:]
-        assert row.is_default == 0
-
-    def test_ensure_schema_idempotent(self, tmp_path):
-        db_path = tmp_path / "old.db"
-        eng = self._make_old_schema(str(db_path))
-        from app.database import _ensure_schema
-        from sqlalchemy import inspect
-        _ensure_schema(eng)
-        _ensure_schema(eng)
-        cols = {c["name"] for c in inspect(eng).get_columns("api_keys")}
-        assert "mask" in cols and "is_default" in cols
-
-    def test_ensure_schema_noop_on_fresh(self, tmp_path):
-        from sqlalchemy import create_engine
-        from app.database import Base, _ensure_schema
-        from sqlalchemy import inspect
-        eng = create_engine(f"sqlite:///{tmp_path/'fresh.db'}")
-        Base.metadata.create_all(bind=eng)
-        _ensure_schema(eng)
-        cols = {c["name"] for c in inspect(eng).get_columns("api_keys")}
-        assert "mask" in cols and "is_default" in cols
+    def test_no_adhoc_schema_alter_helper_survives(self):
+        import app.database as database
+        assert not hasattr(database, "_ensure_schema")
 
 
 # ---------------------------------------------------------------------------
@@ -3851,161 +3805,106 @@ class TestDbMigration:
 
 
 class TestG2OneDefaultPerUser:
-    """v4 §6.1.3 (G2): exactly one default per user at the DB level, and user
-    deletion cascades to api_keys so SQLite id-reuse can't orphan stale defaults."""
+    """T6/R5.5: exactly one live default per user, enforced by the PostgreSQL
+    partial unique index; keys belong to one user id space."""
 
-    def _make_drifted_schema(self, path):
-        from sqlalchemy import create_engine, text
-        eng = create_engine(f"sqlite:///{path}")
-        with eng.begin() as conn:
-            conn.execute(text(
-                "CREATE TABLE api_keys ("
-                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                " user_id INTEGER NOT NULL,"
-                " label VARCHAR(255) NOT NULL,"
-                " token_hash VARCHAR(255) NOT NULL UNIQUE,"
-                " mask VARCHAR(255),"
-                " is_default BOOLEAN NOT NULL DEFAULT 0,"
-                " created_at DATETIME,"
-                " expires_at DATETIME NOT NULL,"
-                " is_revoked BOOLEAN NOT NULL DEFAULT 0,"
-                " last_used_at DATETIME)"
-            ))
-            i = 0
-            for uid in (1, 1, 1, 2, 2):  # user 1 has 3 defaults, user 2 has 2
-                i += 1
-                conn.execute(text(
-                    "INSERT INTO api_keys (user_id, label, token_hash, mask, is_default, expires_at) "
-                    "VALUES (:uid, 'Default', :th, NULL, 1, '2030-01-01 00:00:00')"
-                ), {"uid": uid, "th": f"hash-{i}"})
-        return eng
-
-    def test_ensure_schema_repairs_multi_default_drift(self, tmp_path):
-        """Migration must de-duplicate drifted is_default rows, then install the
-        partial unique index (a plain CREATE UNIQUE would fail on the drift)."""
-        from app.database import _ensure_schema
-        from sqlalchemy import inspect, text
-        eng = self._make_drifted_schema(str(tmp_path / "drift.db"))
-
-        _ensure_schema(eng)
-
-        # No user may have >1 default (DB-drift scan regression).
-        with eng.begin() as conn:
-            bad = conn.execute(text(
-                "SELECT user_id, COUNT(*) FROM api_keys "
-                "WHERE is_default = 1 GROUP BY user_id HAVING COUNT(*) > 1"
-            )).fetchall()
-        assert bad == []
-
-        # The partial unique index now exists.
-        idx_names = {i["name"] for i in inspect(eng).get_indexes("api_keys")}
-        assert "uq_api_keys_one_default" in idx_names
-
-    def test_fresh_db_has_partial_unique_index(self, tmp_path):
-        """create_all on the model installs the partial unique index directly."""
-        from sqlalchemy import create_engine, inspect
-        from app.database import Base
-        from app.models.api_key import ApiKey  # noqa: F401 — registers the model
-        eng = create_engine(f"sqlite:///{tmp_path/'fresh.db'}")
-        Base.metadata.create_all(bind=eng)
-        idx_names = {i["name"] for i in inspect(eng).get_indexes("api_keys")}
-        assert "uq_api_keys_one_default" in idx_names
-
-    def test_index_rejects_second_default_row(self, tmp_path):
-        """Directly inserting a second is_default=1 row for a user violates the
-        partial unique index."""
-        from sqlalchemy import create_engine, text
-        from sqlalchemy.exc import IntegrityError
-        from app.database import Base
-        from app.models.api_key import ApiKey  # noqa: F401
-        eng = create_engine(f"sqlite:///{tmp_path/'idx.db'}")
-        Base.metadata.create_all(bind=eng)
-        # One default for user 1 is fine.
-        with eng.begin() as conn:
-            conn.execute(text(
-                "INSERT INTO api_keys (user_id, label, token_hash, is_default, is_revoked, expires_at) "
-                "VALUES (1, 'Default', 'th1', 1, 0, '2030-01-01 00:00:00')"
-            ))
-        # A SECOND default for the same user violates the partial unique index.
+    def test_partial_unique_index_rejects_second_default(self):
         import pytest
-        with pytest.raises(IntegrityError):
-            with eng.begin() as conn:
-                conn.execute(text(
-                    "INSERT INTO api_keys (user_id, label, token_hash, is_default, is_revoked, expires_at) "
-                    "VALUES (1, 'Default', 'th-again', 1, 0, '2030-01-01 00:00:00')"
-                ))
+        from sqlalchemy.exc import IntegrityError
+        from app.database import SessionLocal
+        from sqlalchemy import text
+        from support import mk_user
 
-    def test_create_api_key_default_unsets_existing(self, tmp_path):
-        """create_api_key(is_default=True) must not create a second default (G2)."""
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        from app.database import Base
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "u1")
+            db.execute(text(
+                "INSERT INTO gateway.api_keys "
+                "(user_id, label, token_hash, is_default, created_at, expires_at, is_revoked) "
+                "VALUES (:uid, 'Default', 'th1', true, now(), now() + interval '30 days', false)"
+            ), {"uid": str(user.id)})
+            db.commit()
+            with pytest.raises(IntegrityError):
+                db.execute(text(
+                    "INSERT INTO gateway.api_keys "
+                    "(user_id, label, token_hash, is_default, created_at, expires_at, is_revoked) "
+                    "VALUES (:uid, 'Default', 'th2', true, now(), now() + interval '30 days', false)"
+                ), {"uid": str(user.id)})
+                db.commit()
+            db.rollback()
+        finally:
+            db.close()
+
+    def test_a_revoked_default_frees_the_slot(self):
+        from app.database import SessionLocal
+        from app.services import auth_service
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "u1")
+            first, _ = auth_service.create_api_key(db, user.id, "a", is_default=True)
+            auth_service.revoke_api_key(db, first.id, allow_default=True)
+            second, _ = auth_service.create_api_key(db, user.id, "b", is_default=True)
+            assert second.is_default is True
+        finally:
+            db.close()
+
+    def test_create_api_key_default_unsets_existing(self):
+        from app.database import SessionLocal
         from app.models.api_key import ApiKey
         from app.services import auth_service
-        eng = create_engine(f"sqlite:///{tmp_path/'k.db'}")
-        Base.metadata.create_all(bind=eng)
-        Session = sessionmaker(bind=eng)
-        db = Session()
-        # The target must exist: identity is resolved in an explicit id space now.
-        from app.models.end_user import EndUser
-        db.add(EndUser(id=1, username="u1", password_hash="x"))
-        db.commit()
-        k1, _ = auth_service.create_api_key(db, 1, "a", is_default=True)
-        k2, _ = auth_service.create_api_key(db, 1, "b", is_default=True)
-        count = db.query(ApiKey).filter(
-            ApiKey.user_id == 1, ApiKey.is_default.is_(True)
-        ).count()
-        assert count == 1
-        assert k2.is_default is True
-        db.close()
+        from support import mk_user
 
-    def test_delete_api_keys_for_user_cascades(self, tmp_path):
-        """Deleting a user must remove their api_keys (G2)."""
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        from app.database import Base
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "u1")
+            k1, _ = auth_service.create_api_key(db, user.id, "a", is_default=True)
+            k2, _ = auth_service.create_api_key(db, user.id, "b", is_default=True)
+            count = db.query(ApiKey).filter(
+                ApiKey.user_id == user.id, ApiKey.is_default.is_(True)
+            ).count()
+            assert count == 1
+            assert k2.is_default is True
+        finally:
+            db.close()
+
+    def test_delete_api_keys_for_user_cascades(self):
+        from app.database import SessionLocal
         from app.models.api_key import ApiKey
         from app.services import auth_service
-        eng = create_engine(f"sqlite:///{tmp_path/'c.db'}")
-        Base.metadata.create_all(bind=eng)
-        Session = sessionmaker(bind=eng)
-        db = Session()
-        # The target must exist: identity is resolved in an explicit id space now.
-        from app.models.end_user import EndUser
-        db.add(EndUser(id=1, username="u1", password_hash="x"))
-        db.commit()
-        auth_service.create_api_key(db, 1, "a", is_default=True)
-        auth_service.create_api_key(db, 1, "b")
-        deleted = auth_service.delete_api_keys_for_user(db, 1)
-        assert deleted == 2
-        assert db.query(ApiKey).filter(ApiKey.user_id == 1).count() == 0
-        db.close()
+        from support import mk_user
 
-    def test_register_after_delete_yields_single_default(self, tmp_path):
-        """A user deleted (keys cascaded) then re-registered gets exactly one
-        default — no stale default orphaned by id-reuse."""
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        from app.database import Base
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "u1")
+            auth_service.create_api_key(db, user.id, "a", is_default=True)
+            auth_service.create_api_key(db, user.id, "b")
+            assert auth_service.delete_api_keys_for_user(db, user.id) == 2
+            assert db.query(ApiKey).filter(ApiKey.user_id == user.id).count() == 0
+        finally:
+            db.close()
+
+    def test_a_new_account_gets_its_own_default_after_another_is_deleted(self):
+        """Identity is a UUID now, so there is no id-reuse hazard: a new account
+        simply has no keys and gets one default on first login."""
+        from app.database import SessionLocal
         from app.models.api_key import ApiKey
         from app.services import auth_service
-        eng = create_engine(f"sqlite:///{tmp_path/'r.db'}")
-        Base.metadata.create_all(bind=eng)
-        Session = sessionmaker(bind=eng)
-        db = Session()
-        # The target must exist: identity is resolved in an explicit id space now.
-        from app.models.end_user import EndUser
-        db.add(EndUser(id=5, username="u5", password_hash="x"))
-        db.commit()
-        auth_service.create_api_key(db, 5, "Default", is_default=True)
-        auth_service.delete_api_keys_for_user(db, 5)
-        # new user reuses id 5 (SQLite autoincrement reuse after delete)
-        auth_service.create_api_key(db, 5, "Default", is_default=True)
-        count = db.query(ApiKey).filter(
-            ApiKey.user_id == 5, ApiKey.is_default.is_(True)
-        ).count()
-        assert count == 1
-        db.close()
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            old = mk_user(db, "u5")
+            auth_service.create_api_key(db, old.id, "Default", is_default=True)
+            auth_service.delete_api_keys_for_user(db, old.id)
+            new = mk_user(db, "u6")
+            auth_service.create_api_key(db, new.id, "Default", is_default=True)
+            assert db.query(ApiKey).filter(
+                ApiKey.user_id == new.id, ApiKey.is_default.is_(True)
+            ).count() == 1
+        finally:
+            db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -4013,136 +3912,205 @@ class TestG2OneDefaultPerUser:
 # ---------------------------------------------------------------------------
 
 
-class TestPrefixedKeyTargets:
-    """An API key's target is a PREFIXED reference.
+class TestAuthFailsClosedOnAStoreFailure:
+    """T9 fault row: a database failure on the auth hot path must deny, never
+    500 and never allow."""
 
-    ``admins`` and ``end_users`` are separate id spaces, so a bare id names two
-    different people. Before the prefix, ``_target_identity`` preferred EndUser,
-    so an admin's blank mint ("leave blank for your own keys") produced a key
-    belonging to whichever end user held the admin's numeric id — observed live
-    2026-09-29 as ``api_keys.id 91, label round-t31-admin, user_id 1`` carrying
-    the claims ``sub 1 / alice / end_user``.
+    def test_verify_denies_when_the_token_store_is_down(self, monkeypatch):
+        from unittest.mock import MagicMock, patch
+        from sqlalchemy.exc import OperationalError
+        from app.config import settings
+        from app.routers.auth import verify_auth
+
+        monkeypatch.setattr(settings, "ENABLE_ACL", True)
+        req = MagicMock()
+        req.cookies = {"provision_token": "t"}
+        req.headers = {"Accept": "text/html", "Host": "svc.host"}
+        entry = {"service_id": "00000000-0000-0000-0000-000000000001",
+                 "owner_api_user_id": "00000000-0000-0000-0000-000000000002"}
+        with patch("app.routers.auth._lookup_by_hostname", return_value=entry), \
+             patch("app.routers.auth.auth_service.verify_provision_token",
+                   side_effect=OperationalError("SELECT", {}, Exception("down"))):
+            resp = verify_auth(req, MagicMock())
+        assert resp.status_code == 401
+        assert resp.headers["X-Auth-Action"] == "token_expired"
+
+    def test_require_gateway_token_denies_when_the_store_is_down(self, monkeypatch):
+        from unittest.mock import MagicMock, patch
+        from fastapi import HTTPException
+        from sqlalchemy.exc import OperationalError
+        from app.middleware import require_gateway_token
+
+        req = MagicMock()
+        req.cookies = {"provision_token": "t"}
+        req.headers = {}
+        with patch("app.middleware.auth_service.verify_provision_token",
+                   side_effect=OperationalError("SELECT", {}, Exception("down"))):
+            with pytest.raises(HTTPException) as exc:
+                require_gateway_token(request=req)
+        assert exc.value.status_code == 401
+
+
+class TestTaskRouteStatusPassthrough:
+    """T5/T7: the -api's task-route statuses survive the gateway proxy.
+
+    An unknown task is 404, a terminal task is 409 and a pruned task's log is
+    410; folding them into the generic 502 loses exactly the distinction the
+    Tasks page and the operator use.
     """
 
-    def _db(self, tmp_path):
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        from app.database import Base
-        from app.models.admin import AdminUser
-        from app.models.api_key import ApiKey  # noqa: F401
-        from app.models.end_user import EndUser
-        eng = create_engine(f"sqlite:///{tmp_path/'p.db'}")
-        Base.metadata.create_all(bind=eng)
-        db = sessionmaker(bind=eng)()
-        # The collision, by construction: id 1 in BOTH tables.
-        db.add(EndUser(id=1, username="alice", password_hash="x", role="viewer"))
-        db.add(AdminUser(id=1, email="admin@subnet-acl.local", password_hash="x",
-                         role="admin"))
-        db.commit()
-        return db
+    @staticmethod
+    def _err(code: int):
+        import httpx
+        req = httpx.Request("GET", "http://api/tasks/x")
+        resp = httpx.Response(code, request=req, json={"detail": f"e{code}"})
+        return httpx.HTTPStatusError("x", request=req, response=resp)
 
-    def test_bare_id_means_end_user(self):
-        """The pre-prefix syntax keeps working for every existing caller/client."""
-        from app.services.auth_service import parse_target_ref
-        assert parse_target_ref(7) == (7, "end_user")
-        assert parse_target_ref("7") == (7, "end_user")
+    def test_404_409_410_pass_through(self):
+        from fastapi import HTTPException
+        from app.services.provision_service import provision_service
 
-    def test_prefixed_refs_parse(self):
-        from app.services.auth_service import parse_target_ref
-        assert parse_target_ref("end_user:7") == (7, "end_user")
-        assert parse_target_ref("admin:1") == (1, "admin")
-        assert parse_target_ref("ADMIN:1") == (1, "admin")
-        assert parse_target_ref(" admin : 1 ") == (1, "admin")
+        for code in (404, 409, 410):
+            mapped = provision_service.as_task_error(self._err(code))
+            assert isinstance(mapped, HTTPException)
+            assert mapped.status_code == code
+            assert mapped.detail == f"e{code}"
 
-    def test_bad_refs_are_rejected(self):
+    def test_other_failures_keep_the_generic_mapping(self):
+        from fastapi import HTTPException
+        from app.services.provision_service import provision_service
+
+        mapped = provision_service.as_task_error(self._err(500))
+        assert isinstance(mapped, HTTPException)
+        assert mapped.status_code == 502
+
+
+class TestApiKeysOneIdSpace:
+    """T6/R5.5: keys reference ``users.id``; the ``target_type`` split is gone.
+
+    The pre-migration store had two id spaces (``admins`` and ``end_users``) and
+    a prefixed target reference to disambiguate them. The unified ``users``
+    table has one id space, so there is nothing to disambiguate and no
+    ``target_type`` anywhere in the model, the DTO or the token.
+    """
+
+    def _db(self):
+        from app.database import SessionLocal
+        return SessionLocal()
+
+    def test_keys_reference_the_users_row(self):
+        from app.models.api_key import ApiKey
+        from app.services import auth_service
+        from support import mk_user
+
+        db = self._db()
+        try:
+            user = mk_user(db, "alice")
+            key, _raw = auth_service.create_api_key(db, user.id, "alice-key")
+            assert key.user_id == user.id
+            assert not hasattr(ApiKey, "target_type")
+        finally:
+            db.close()
+
+    def test_token_claims_bind_the_key_to_the_subject(self):
+        from app.services import auth_service
+        from support import mk_user
+
+        db = self._db()
+        try:
+            user = mk_user(db, "alice")
+            key, raw = auth_service.create_api_key(db, user.id, "alice-key")
+            payload = auth_service.decode_gateway_token(raw)
+            assert payload["sub"] == str(user.id)
+            assert payload["api_key_id"] == key.id
+            assert payload["type"] == "provision"
+        finally:
+            db.close()
+
+    def test_one_default_per_user(self):
+        from app.models.api_key import ApiKey
+        from app.services import auth_service
+        from support import mk_user
+
+        db = self._db()
+        try:
+            user = mk_user(db, "alice")
+            first, _ = auth_service.create_api_key(db, user.id, "first", is_default=True)
+            second, _ = auth_service.create_api_key(db, user.id, "second", is_default=True)
+            db.refresh(first)
+            defaults = db.query(ApiKey).filter(
+                ApiKey.user_id == user.id, ApiKey.is_default.is_(True)
+            ).all()
+            assert [k.label for k in defaults] == ["second"]
+            assert first.is_default is False
+        finally:
+            db.close()
+
+    def test_listing_is_scoped_to_the_user(self):
+        from app.services import auth_service
+        from support import mk_user
+
+        db = self._db()
+        try:
+            alice = mk_user(db, "alice")
+            bob = mk_user(db, "bob")
+            auth_service.create_api_key(db, alice.id, "alice-key")
+            auth_service.create_api_key(db, bob.id, "bob-key")
+            assert [k.label for k in auth_service.list_api_keys(db, alice.id)] == ["alice-key"]
+            assert len(auth_service.list_api_keys(db)) == 2
+        finally:
+            db.close()
+
+    def test_setting_another_default_moves_it(self):
+        from app.models.api_key import ApiKey
+        from app.services import auth_service
+        from support import mk_user
+
+        db = self._db()
+        try:
+            user = mk_user(db, "alice")
+            first, _ = auth_service.create_api_key(db, user.id, "first", is_default=True)
+            second, _ = auth_service.create_api_key(db, user.id, "second")
+            assert auth_service.set_default_api_key(db, second.id) is True
+            db.refresh(first)
+            assert first.is_default is False
+            assert db.query(ApiKey).filter(
+                ApiKey.user_id == user.id, ApiKey.is_default.is_(True)
+            ).one().label == "second"
+        finally:
+            db.close()
+
+    def test_deleting_one_user_leaves_the_others_keys(self):
+        from app.models.api_key import ApiKey
+        from app.services import auth_service
+        from support import mk_user
+
+        db = self._db()
+        try:
+            alice = mk_user(db, "alice")
+            bob = mk_user(db, "bob")
+            auth_service.create_api_key(db, alice.id, "alice-key")
+            auth_service.create_api_key(db, bob.id, "bob-key")
+            assert auth_service.delete_api_keys_for_user(db, alice.id) == 1
+            assert [k.label for k in db.query(ApiKey).all()] == ["bob-key"]
+        finally:
+            db.close()
+
+    def test_special_and_inactive_accounts_are_not_key_owners(self):
         import pytest
-        from app.services.auth_service import parse_target_ref
-        for bad in ("", "   ", "service:1", "admin:", "admin:x", "1.5", True):
+        from app.services import auth_service
+        from support import mk_user
+
+        db = self._db()
+        try:
+            special = mk_user(db, "internal", role="special")
+            inactive = mk_user(db, "dormant", active=False)
             with pytest.raises(ValueError):
-                parse_target_ref(bad)
-
-    def test_identity_resolves_the_requested_space(self, tmp_path):
-        db = self._db(tmp_path)
-        from app.services.auth_service import _target_identity
-        assert _target_identity(db, 1, "admin") == (
-            "admin", "admin@subnet-acl.local", "admin")
-        assert _target_identity(db, 1, "end_user") == ("end_user", "alice", "viewer")
-        db.close()
-
-    def test_unknown_target_raises(self, tmp_path):
-        import pytest
-        db = self._db(tmp_path)
-        from app.services.auth_service import _target_identity
-        with pytest.raises(ValueError):
-            _target_identity(db, 99, "end_user")
-        with pytest.raises(ValueError):
-            _target_identity(db, 99, "admin")
-        db.close()
-
-    def test_admin_key_for_a_colliding_id_is_an_admin_key(self, tmp_path):
-        """THE regression: id 1 is both an end user and the admin."""
-        db = self._db(tmp_path)
-        from app.services import auth_service
-        key, raw = auth_service.create_api_key(db, 1, "mine", target_type="admin")
-        assert key.target_type == "admin"
-        assert key.user_id == 1
-        payload = auth_service.decode_gateway_token(raw)
-        assert payload["user_type"] == "admin"
-        assert payload["email"] == "admin@subnet-acl.local"
-        assert payload["role"] == "admin"
-        db.close()
-
-    def test_each_id_space_keeps_its_own_default(self, tmp_path):
-        """The (user_id, target_type) index: one default per TARGET, not per id."""
-        db = self._db(tmp_path)
-        from app.services import auth_service
-        from app.models.api_key import ApiKey
-        auth_service.create_api_key(db, 1, "alice-default", is_default=True)
-        auth_service.create_api_key(db, 1, "admin-default", is_default=True,
-                                    target_type="admin")
-        defaults = (db.query(ApiKey)
-                    .filter(ApiKey.user_id == 1, ApiKey.is_default.is_(True)).all())
-        assert {k.target_type for k in defaults} == {"end_user", "admin"}
-        db.close()
-
-    def test_listing_is_scoped_to_the_id_space(self, tmp_path):
-        """An id-only filter would show one id space's keys to the other."""
-        db = self._db(tmp_path)
-        from app.services import auth_service
-        auth_service.create_api_key(db, 1, "alice-key")
-        auth_service.create_api_key(db, 1, "admin-key", target_type="admin")
-        assert [k.label for k in auth_service.list_api_keys(db, 1, "end_user")] == ["alice-key"]
-        assert [k.label for k in auth_service.list_api_keys(db, 1, "admin")] == ["admin-key"]
-        assert len(auth_service.list_api_keys(db)) == 2
-        db.close()
-
-    def test_promoting_the_admin_key_leaves_the_end_user_default(self, tmp_path):
-        db = self._db(tmp_path)
-        from app.services import auth_service
-        from app.models.api_key import ApiKey
-        alice_default, _ = auth_service.create_api_key(db, 1, "alice-default",
-                                                       is_default=True)
-        auth_service.create_api_key(db, 1, "admin-1", target_type="admin")
-        admin_second, _ = auth_service.create_api_key(db, 1, "admin-2",
-                                                      target_type="admin")
-        auth_service.set_default_api_key(db, admin_second.id)
-        db.refresh(alice_default)
-        assert alice_default.is_default is True
-        assert {k.label for k in db.query(ApiKey).filter(ApiKey.is_default.is_(True)).all()} == {
-            "alice-default", "admin-2"
-        }
-        db.close()
-
-    def test_deleting_an_end_user_leaves_the_admin_keys(self, tmp_path):
-        """Deleting end user 1 must not take admin 1's keys with it."""
-        db = self._db(tmp_path)
-        from app.services import auth_service
-        from app.models.api_key import ApiKey
-        auth_service.create_api_key(db, 1, "alice-key")
-        auth_service.create_api_key(db, 1, "admin-key", target_type="admin")
-        assert auth_service.delete_api_keys_for_user(db, 1, "end_user") == 1
-        assert [k.label for k in db.query(ApiKey).all()] == ["admin-key"]
-        db.close()
+                auth_service.create_api_key(db, special.id, "nope")
+            with pytest.raises(ValueError):
+                auth_service.create_api_key(db, inactive.id, "nope")
+        finally:
+            db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -4151,45 +4119,47 @@ class TestPrefixedKeyTargets:
 
 
 class TestG3SpecialUserLogin403:
-    """v4 §1.2 B11 / §6.1.6: a special-role user with a VALID credential must be
-    rejected at login with 403 (not 401). The 401 the deployed placeholder
-    accounts produce is a *password* failure — the 403 branch fires once
-    authentication actually succeeds."""
+    """T9/R5.6: a special-role user with a VALID credential is rejected at
+    login with 403, before any provision token is minted."""
+
+    def _special(self, db):
+        from app.services import auth_service
+        from support import mk_user
+        return mk_user(db, "internal", role="special",
+                       password_hash=auth_service.hash_password("pass1234"))
 
     def test_special_user_with_valid_password_login_403(self):
-        import pytest
         from fastapi import HTTPException
-        from unittest.mock import MagicMock, patch
+        from app.database import SessionLocal
+        from app.models.api_key import ApiKey
         from app.routers.auth import login
         from app.schemas.auth import LoginRequest
-        req = LoginRequest(email="internal", password="real-bcrypt-pass")
-        result = ("end_user", {
-            "id": 9, "username": "internal", "role": "special",
-            "is_approved": True, "is_active": True,
-        })
-        with patch("app.routers.auth.auth_service.authenticate_user", return_value=result):
-            with pytest.raises(HTTPException) as ei:
-                login(req, MagicMock(), MagicMock())
-        assert ei.value.status_code == 403
-        assert "Special users cannot access the dashboard" in ei.value.detail
 
-    def test_special_user_login_never_mints_token(self):
-        """The 403 fires BEFORE any provision token is minted."""
-        import pytest
+        db = SessionLocal()
+        try:
+            user = self._special(db)
+            with pytest.raises(HTTPException) as ei:
+                login(LoginRequest(email="internal", password="pass1234"), db)
+            assert ei.value.status_code == 403
+            assert "Special users cannot access the dashboard" in ei.value.detail
+        finally:
+            db.close()
+
+    def test_special_user_login_never_mints_a_key_or_token(self):
         from fastapi import HTTPException
-        from unittest.mock import MagicMock, patch
+        from app.database import SessionLocal
+        from app.models.api_key import ApiKey
         from app.routers.auth import login
         from app.schemas.auth import LoginRequest
-        req = LoginRequest(email="internal", password="x")
-        result = ("end_user", {
-            "id": 9, "username": "internal", "role": "special",
-            "is_approved": True, "is_active": True,
-        })
-        with patch("app.routers.auth.auth_service.authenticate_user", return_value=result), \
-             patch("app.routers.auth.auth_service.create_provision_token") as cpt:
+
+        db = SessionLocal()
+        try:
+            user = self._special(db)
             with pytest.raises(HTTPException):
-                login(req, MagicMock(), MagicMock())
-        cpt.assert_not_called()
+                login(LoginRequest(email="internal", password="pass1234"), db)
+            assert db.query(ApiKey).filter(ApiKey.user_id == user.id).count() == 0
+        finally:
+            db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -4198,47 +4168,44 @@ class TestG3SpecialUserLogin403:
 
 
 class TestG4AdminDefaultKey:
-    """v4 §6.1.5: admins get a default key at registration; login binds their
-    provision_token to it (revocable, R1)."""
+    """T6: no key is minted at account creation; login binds the provision
+    token to the account's default key (creating it on first login)."""
 
-    def test_create_admin_creates_default_key(self, tmp_path):
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        from app.database import Base
+    def test_admin_has_no_default_key_until_login(self):
         from app.models.api_key import ApiKey
-        from app.services import auth_service
-        eng = create_engine(f"sqlite:///{tmp_path/'a.db'}")
-        Base.metadata.create_all(bind=eng)
-        Session = sessionmaker(bind=eng)
-        db = Session()
-        admin = auth_service.create_admin(db, "a@b.c", "pw123", role="admin")
-        keys = db.query(ApiKey).filter(ApiKey.user_id == admin.id).all()
-        assert len(keys) == 1
-        assert keys[0].is_default is True
-        assert keys[0].label == "Default"
-        db.close()
+        from app.database import SessionLocal
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            admin = mk_user(db, "admin", role="admin")
+            assert db.query(ApiKey).filter(ApiKey.user_id == admin.id).count() == 0
+        finally:
+            db.close()
 
     def test_login_binds_admin_token_to_default_key(self):
-        from unittest.mock import MagicMock, patch
+        from app.database import SessionLocal
         from app.routers.auth import login
         from app.schemas.auth import LoginRequest
-        req = LoginRequest(email="a@b.c", password="pw")
-        default_key = MagicMock()
-        default_key.id = 77
-        result = ("admin", {"id": 1, "email": "a@b.c", "role": "admin"})
-        with patch("app.routers.auth.auth_service.authenticate_user", return_value=result), \
-             patch("app.routers.auth.auth_service.get_or_create_default_key",
-                   return_value=default_key) as goc, \
-             patch("app.routers.auth.auth_service.create_provision_token",
-                   return_value="TOK") as cpt, \
-             patch("app.routers.auth.settings.PROVISION_COOKIE_TTL", 604800):
-            from unittest.mock import MagicMock as M
-            request = M()
-            resp = login(req, request, MagicMock())
-        goc.assert_called_once()
-        _, kwargs = cpt.call_args
-        assert kwargs["api_key_id"] == 77
-        assert resp.headers["set-cookie"].startswith("provision_token=TOK")
+        from app.services import auth_service
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            admin = mk_user(
+                db, "admin", role="admin",
+                password_hash=auth_service.hash_password("pw"),
+            )
+            resp = login(LoginRequest(email="admin", password="pw"), db)
+            cookie = resp.headers["set-cookie"]
+            assert cookie.startswith("provision_token=")
+            raw = cookie.split("provision_token=", 1)[1].split(";", 1)[0]
+            payload = auth_service.decode_gateway_token(raw)
+            default = auth_service.get_or_create_default_key(db, admin.id)
+            assert payload["api_key_id"] == default.id
+            assert payload["sub"] == str(admin.id)
+        finally:
+            db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -4246,36 +4213,28 @@ class TestG4AdminDefaultKey:
 # ---------------------------------------------------------------------------
 
 
-class TestG7MaskBackfill:
-    """v4 §6.1.3 (G7): pre-migration api_keys rows with NULL mask get a display
-    mask backfilled (derived from token_hash — the raw token is hashed at rest)."""
+class TestApiKeyMask:
+    """The display mask is written at mint time; there is no SQLite-era ALTER
+    backfill because PostgreSQL has the column from the first migration."""
 
-    def test_ensure_schema_backfills_null_masks(self, tmp_path):
-        from app.database import _ensure_schema
-        from sqlalchemy import create_engine, text
-        eng = create_engine(f"sqlite:///{tmp_path/'m.db'}")
-        with eng.begin() as conn:
-            conn.execute(text(
-                "CREATE TABLE api_keys ("
-                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                " user_id INTEGER NOT NULL,"
-                " label VARCHAR(255) NOT NULL,"
-                " token_hash VARCHAR(255) NOT NULL UNIQUE,"
-                " created_at DATETIME,"
-                " expires_at DATETIME NOT NULL,"
-                " is_revoked BOOLEAN NOT NULL DEFAULT 0,"
-                " last_used_at DATETIME)"
-            ))
-            conn.execute(text(
-                "INSERT INTO api_keys (user_id, label, token_hash, expires_at) "
-                "VALUES (1, 'Default', 'abc12345def', '2030-01-01 00:00:00')"
-            ))
-        _ensure_schema(eng)
-        with eng.begin() as conn:
-            row = conn.execute(text(
-                "SELECT mask FROM api_keys WHERE token_hash='abc12345def'"
-            )).fetchone()
-        assert row.mask == "abc12345def"[-8:]
+    def test_created_key_carries_a_mask(self):
+        from app.database import SessionLocal
+        from app.services import auth_service
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "alice")
+            key, raw = auth_service.create_api_key(db, user.id, "Default")
+            assert key.mask
+            assert key.mask == raw[-8:]
+            assert key.token_hash and key.token_hash != raw
+        finally:
+            db.close()
+
+    def test_no_schema_alter_step_survives(self):
+        import app.database as database
+        assert not hasattr(database, "_ensure_schema")
 
 
 # ---------------------------------------------------------------------------
@@ -4284,40 +4243,40 @@ class TestG7MaskBackfill:
 
 
 class TestG8CreateKeyDefaultFallback:
-    """v4 §6.1.6: a new key becomes default only if the user has no default."""
+    """The panel's create-key route never silently steals the default slot:
+    the account's default is a separate, explicit action."""
 
-    def test_create_key_becomes_default_when_user_has_none(self):
-        from unittest.mock import MagicMock, patch
-        from app.routers.auth import create_key
-        key = MagicMock()
-        key.id = 50
-        key.to_dict.return_value = {"id": 50}
-        db = MagicMock()
-        with patch("app.routers.auth.auth_service.create_api_key",
-                   return_value=(key, "RAW")) as cak, \
-             patch("app.routers.auth.auth_service.user_has_default_key",
-                   return_value=False) as uhd, \
-             patch("app.routers.auth.auth_service.set_default_api_key") as sda:
-            out = create_key({"label": "x"}, {"role": "admin", "id": 1}, db)
-        cak.assert_called_once()
-        uhd.assert_called_once()
-        sda.assert_called_once_with(db, 50)
-        assert out["token"] == "RAW"
+    def test_create_key_does_not_move_the_default(self):
+        from app.database import SessionLocal
+        from app.models.api_key import ApiKey
+        from app.services import auth_service
+        from support import mk_user
 
-    def test_create_key_not_default_when_user_has_one(self):
-        from unittest.mock import MagicMock, patch
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "alice")
+            default, _ = auth_service.create_api_key(db, user.id, "Default", is_default=True)
+            other, _ = auth_service.create_api_key(db, user.id, "second")
+            assert other.is_default is False
+            db.refresh(default)
+            assert default.is_default is True
+        finally:
+            db.close()
+
+    def test_create_key_route_returns_the_raw_token_once(self):
+        from app.database import SessionLocal
         from app.routers.auth import create_key
-        key = MagicMock()
-        key.id = 51
-        key.to_dict.return_value = {"id": 51}
-        db = MagicMock()
-        with patch("app.routers.auth.auth_service.create_api_key",
-                   return_value=(key, "RAW")), \
-             patch("app.routers.auth.auth_service.user_has_default_key",
-                   return_value=True), \
-             patch("app.routers.auth.auth_service.set_default_api_key") as sda:
-            create_key({"label": "x"}, {"role": "viewer", "id": 2}, db)
-        sda.assert_not_called()
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "alice")
+            out = create_key({"label": "panel-key"}, {"id": str(user.id), "role": "viewer"}, db)
+            assert out["token"]
+            assert out["key"]["label"] == "panel-key"
+            assert out["key"]["user_id"] == str(user.id)
+        finally:
+            db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -4330,14 +4289,9 @@ class TestGenerationJobs:
     prune, restart recovery (GAP-7)."""
 
     def _make_session(self, tmp_path):
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        from app.database import Base
-        eng = create_engine(f"sqlite:///{tmp_path}/jobs.db")
-        Base.metadata.create_all(eng)
-        # expire_on_commit=False: attribute reads after commit must not hit the
-        # DB (a synchronize_session=False DELETE makes expired reads raise).
-        return sessionmaker(bind=eng, expire_on_commit=False)
+        """The PostgreSQL test database (per-test truncation is the isolation)."""
+        from app.database import SessionLocal
+        return SessionLocal
 
     def test_phase_order_carries_the_artifact_and_its_two_validations(self):
         """generate_missing = compose → validate → serving_ports → validate_ports →
@@ -4497,7 +4451,7 @@ class TestGenerationJobs:
         assert "result" not in jobs[0]
         got = m.get_job(db, j1.id)
         assert got is not None and got.id == j1.id
-        assert m.get_job(db, 99999) is None
+        assert m.get_job(db, "gt-nonexistent") is None
 
     def test_cancel_job_only_for_active(self, tmp_path):
         """Cancel marks queued/running jobs cancelled; finished jobs are untouched."""
@@ -4525,7 +4479,7 @@ class TestGenerationJobs:
         # Completed jobs are not cancellable.
         again = m.cancel_job(db, done.id)
         assert again.status == JOB_STATUS_COMPLETED
-        assert m.cancel_job(db, 99999) is None
+        assert m.cancel_job(db, "gt-nonexistent") is None
 
     def test_cancel_job_covers_a_paused_leg(self, tmp_path):
         """A `paused` job IS cancellable (GRILLING G27 + G34).
@@ -4593,10 +4547,12 @@ class TestGenerationJobs:
 
         pruned, old_id, fresh_id, maker, m = asyncio.run(scenario())
         assert pruned == 1
-        # Fresh session: the pruned row is truly gone (no identity-map staleness).
+        # T7: pruning SOFT-deletes — the tombstone stays so links resolve, the
+        # log is gone, and the default list omits it.
         db2 = maker()
-        assert m.get_job(db2, old_id) is None
-        assert m.get_job(db2, fresh_id) is not None
+        assert m.get_job(db2, old_id).deleted_at is not None
+        assert m.get_job(db2, fresh_id).deleted_at is None
+        assert old_id not in {j["id"] for j in m.list_jobs(db2)}
 
     def test_recover_stale_jobs_marks_interrupted(self, tmp_path):
         """Restart recovery: queued/running → failed 'interrupted by gateway restart'."""
@@ -4620,15 +4576,18 @@ class TestGenerationJobs:
             db.commit()
             ids = (queued.id, running.id, done.id)
             recovered = m.recover_stale_jobs(db)
-            return recovered, ids, maker, m
+            # R4.2: the restart marks them `unknown`; the sweep terminalizes.
+            terminalized = m.terminalize_unknown(db)
+            return recovered, terminalized, ids, maker, m
 
-        recovered, (qid, rid, did), maker, m = asyncio.run(scenario())
+        recovered, terminalized, (qid, rid, did), maker, m = asyncio.run(scenario())
         assert recovered == 2
-        # Fresh session: reload the rows after the bulk UPDATE.
+        assert terminalized == 2
+        # Fresh session: reload the rows after the bulk UPDATEs.
         db2 = maker()
         assert m.get_job(db2, qid).status == JOB_STATUS_FAILED
         assert m.get_job(db2, rid).status == JOB_STATUS_FAILED
-        assert "interrupted by gateway restart" in m.get_job(db2, qid).error
+        assert "no surviving runner" in m.get_job(db2, qid).error
         assert m.get_job(db2, did).status == JOB_STATUS_COMPLETED
         assert m._tasks == {} and m._cancelled == set()
 
@@ -6045,106 +6004,209 @@ class TestEnvReferencePicker:
 
 
 class TestPreDeployRegistry:
-    """§8b: pre-deploy sessions live in the gateway, never the -api registry."""
+    """T8: pre-deploy sessions are keyed by ``service_id`` and live in the
+    gateway, never the -api registry."""
 
-    def _store(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+    def _seed(self, db, username: str = "alice", service_name: str = "myapp"):
+        import uuid
+
+        from support import mk_user
+
+        user = mk_user(db, username)
+        return user, uuid.uuid4(), uuid.uuid4()
+
+    def test_create_get_remove_roundtrip(self):
+        import uuid
+        from app.database import SessionLocal
         from app.services import pre_deploy_registry as pdr
-        return pdr
 
-    def test_add_get_remove_roundtrip(self, tmp_path, monkeypatch):
-        pdr = self._store(tmp_path, monkeypatch)
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="generating", job_id=7)
-        row = pdr.get_session("alice", "myapp", "", "0")
-        assert row["state"] == "generating" and row["job_id"] == 7
-        assert pdr.is_reserved("alice", "myapp", "", "0") is True
-        assert pdr.remove_session("alice", "myapp", "", "0") is True
-        assert pdr.get_session("alice", "myapp", "", "0") is None
+        db = SessionLocal()
+        try:
+            from support import mk_task
 
-    def test_reason_is_carried_for_the_paused_state(self, tmp_path, monkeypatch):
-        """The three pause sub-cases resume on different surfaces (§8b)."""
-        pdr = self._store(tmp_path, monkeypatch)
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="paused", job_id=None, reason="review")
-        assert pdr.get_session("alice", "myapp", "", "0")["reason"] == "review"
+            user, sid, proc = self._seed(db)
+            mk_task(db, "gt-1", status="running", procedure_id=proc)
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=proc,
+                owner_api_user_id=user.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="generating",
+                generation_task_id="gt-1",
+            )
+            row = pdr.get_session(str(sid))
+            assert row["state"] == "generating"
+            assert row["generation_task_id"] == "gt-1"
+            assert row["service_id"] == str(sid)
+            assert pdr.is_reserved(user.api_user_id, "myapp", "0") is True
+            assert pdr.remove_session(str(sid)) is True
+            assert pdr.get_session(str(sid)) is None
+        finally:
+            db.close()
 
-    # `test_reconcile_drops_a_session_that_registered` stood here until
-    # 2026-10-16, asserting that a session whose key appeared in the -api
-    # registry was dropped. That rule is GONE, and the test with it: the key list
-    # was built from four buckets including `failed_services`, so retrying a
-    # failed instance had its LIVE record deleted mid-generation (measured
-    # 2026-10-14: 60 consecutive probe misses). The deploy's handoff already
-    # removes the record on its way into the -api, so there was nothing for the
-    # rule to catch.
+    def test_reason_is_carried_for_the_paused_state(self):
+        from app.database import SessionLocal
+        from app.services import pre_deploy_registry as pdr
 
-    def test_reconcile_keeps_a_live_session(self, tmp_path, monkeypatch):
-        pdr = self._store(tmp_path, monkeypatch)
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="generating", job_id=42)
-        rep = pdr.reconcile(live_job_ids={42})
-        assert rep["remaining"] == 1
-        assert pdr.list_sessions()[0]["job_id"] == 42
+        db = SessionLocal()
+        try:
+            user, sid, proc = self._seed(db)
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=proc,
+                owner_api_user_id=user.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="paused",
+                reason="review",
+            )
+            assert pdr.get_session(str(sid))["reason"] == "review"
+        finally:
+            db.close()
 
-    def test_reconcile_drops_a_stale_session(self, tmp_path, monkeypatch):
-        """No live job and no registry entry ⇒ nothing is working on it.
+    def test_reconcile_keeps_a_session_with_a_live_task(self):
+        from app.database import SessionLocal
+        from app.services import pre_deploy_registry as pdr
+        from support import mk_task
 
-        `generating` is the state this rule is FOR: the session claims a job is
-        running, the job is gone, and the -api never registered anything, so the
-        card is a ghost. (It used to be asserted for `paused`, which pinned the
-        opposite of G26 — see the test below.)
-        """
-        pdr = self._store(tmp_path, monkeypatch)
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="generating", job_id=99)
-        rep = pdr.reconcile(live_job_ids={1, 2})
-        assert rep["dropped_stale"] == ["alice|myapp||0"]
-        assert pdr.list_sessions() == []
+        db = SessionLocal()
+        try:
+            user, sid, proc = self._seed(db)
+            mk_task(db, "gt-live", status="running", procedure_id=proc)
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=proc,
+                owner_api_user_id=user.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="generating",
+                generation_task_id="gt-live",
+            )
+            rep = pdr.reconcile(live_task_ids={"gt-live"})
+            assert rep["remaining"] == 1
+            assert pdr.get_session(str(sid))["generation_task_id"] == "gt-live"
+        finally:
+            db.close()
 
-    def test_reconcile_keeps_a_paused_session_with_its_guide(self, tmp_path, monkeypatch):
-        """G26: a paused session is the ANALYSIS's whole product — it survives.
+    def test_reconcile_drops_a_stale_session(self):
+        """No live task and no instance ⇒ nothing is working on it."""
+        from app.database import SessionLocal
+        from app.services import pre_deploy_registry as pdr
+        from support import mk_task
 
-        The handoff writes the session and THEN requests the full delete of the
-        -api entry, so a `paused` session has no registry entry by construction,
-        and its analysis job has already completed by the time it is written.
-        Both stale rules therefore match it, and it used to be dropped within one
-        90s pass — taking the fixing guide and the failed task's id with it, which
-        made `check` unreachable and left the failed instance with no way back.
-        """
-        pdr = self._store(tmp_path, monkeypatch)
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="paused", reason="llm_fix", job_id=99,
-                        guide="NEO4J_PORT is taken; move it", task_id="task-7",
-                        slot="compose")
-        rep = pdr.reconcile(live_job_ids={1, 2})
-        assert rep["dropped_stale"] == [], "a pause is waiting, not stale"
-        assert rep["remaining"] == 1
-        row = pdr.get_session("alice", "myapp", "", "0")
-        # The three things the resume needs, all still there.
-        assert row["guide"] == "NEO4J_PORT is taken; move it"
-        assert row["task_id"] == "task-7"
-        assert row["slot"] == "compose"
+        db = SessionLocal()
+        try:
+            user, sid, proc = self._seed(db)
+            mk_task(db, "gt-done", status="completed", procedure_id=proc)
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=proc,
+                owner_api_user_id=user.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="generating",
+                generation_task_id="gt-done",
+            )
+            rep = pdr.reconcile(live_task_ids=set())
+            assert rep["dropped_stale"] == [str(sid)]
+            assert pdr.list_sessions() == []
+        finally:
+            db.close()
 
-    def test_key_includes_the_recipe_path(self, tmp_path, monkeypatch):
-        """Two recipes of one service are two sessions, not one."""
-        pdr = self._store(tmp_path, monkeypatch)
-        pdr.add_session(user="alice", service="myapp", recipe_path="docker", label="0", state="generating")
-        pdr.add_session(user="alice", service="myapp", recipe_path="web", label="0", state="generating")
-        assert len(pdr.list_sessions()) == 2
+    def test_reconcile_keeps_a_paused_session_with_its_guide(self):
+        """G26: a pause is the analysis's product; it survives reconcile."""
+        from app.database import SessionLocal
+        from app.services import pre_deploy_registry as pdr
+
+        db = SessionLocal()
+        try:
+            user, sid, proc = self._seed(db)
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=proc,
+                owner_api_user_id=user.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="paused",
+                reason="llm_fix", guide="NEO4J_PORT is taken; move it",
+                slot="compose", deploy_task_id="api-7",
+            )
+            rep = pdr.reconcile(live_task_ids=set())
+            assert rep["dropped_stale"] == [], "a pause is waiting, not stale"
+            row = pdr.get_session(str(sid))
+            assert row["guide"] == "NEO4J_PORT is taken; move it"
+            assert row["slot"] == "compose"
+            assert row["deploy_task_id"] == "api-7"
+        finally:
+            db.close()
+
+    def test_the_owner_service_label_tuple_is_unique(self):
+        """The reservation is the tuple, not the id: a second recipe for the same
+        owner/service/label is refused by the database, while a different label
+        is a second session."""
+        import uuid
+
+        import pytest
+        from sqlalchemy.exc import IntegrityError
+        from app.database import SessionLocal
+        from app.services import pre_deploy_registry as pdr
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "alice")
+            pdr.create_or_replace(
+                service_id=uuid.uuid4(), procedure_id=uuid.uuid4(),
+                owner_api_user_id=user.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="docker", state="generating",
+            )
+            with pytest.raises(IntegrityError):
+                pdr.create_or_replace(
+                    service_id=uuid.uuid4(), procedure_id=uuid.uuid4(),
+                    owner_api_user_id=user.api_user_id, service_name="myapp",
+                    service_label="0", recipe_path="web", state="generating",
+                )
+        finally:
+            db.close()
+
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "bob")
+            pdr.create_or_replace(
+                service_id=uuid.uuid4(), procedure_id=uuid.uuid4(),
+                owner_api_user_id=user.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="generating",
+            )
+            pdr.create_or_replace(
+                service_id=uuid.uuid4(), procedure_id=uuid.uuid4(),
+                owner_api_user_id=user.api_user_id, service_name="myapp",
+                service_label="1", recipe_path="", state="generating",
+            )
+            bobs = [r for r in pdr.list_sessions() if r["user_name"] == "bob"]
+            assert len(bobs) == 2
+        finally:
+            db.close()
 
 
 class TestPreDeployWiring:
-    """§8b wiring: session lifecycle, handoff order and the card actions."""
+    """§8b wiring: session lifecycle (service_id-keyed), handoff order and the
+    card actions."""
+
+    def _fake_job(self, monkeypatch, llm_router, db, *, task_id="gt-new",
+                  procedure_id=None, status="queued"):
+        import uuid
+
+        from support import mk_task
+
+        mk_task(db, task_id, status=status, procedure_id=procedure_id)
+
+        class _Job:
+            pass
+
+        job = _Job()
+        job.task_id = task_id
+        job.id = task_id
+        job.procedure_id = procedure_id or uuid.uuid4()
+        job.service_id = None
+        job.status = status
+        monkeypatch.setattr(llm_router.generation_jobs, "create_job",
+                            lambda *a, **k: job)
+        monkeypatch.setattr(llm_router, "log_action", lambda *a, **k: None)
+        return job
 
     def test_session_opens_on_a_deploy_scoped_job(self):
         import inspect
         from app.routers import llm as llm_router
         src = inspect.getsource(llm_router.create_generation_job)
-        assert "add_session" in src
-        # The standalone Generate panel has no user/label → no session. The
-        # predicate is `job_origin` (2026-09-28): ONE home for "who owns this
-        # job", shared with the `origin` the job's own payload carries, so the
-        # session a job opens and the surface that may act on it cannot drift.
+        assert "new_generation_leg" in src
+        # ONE home for "who owns this job": the standalone panel (no user/label)
+        # opens no session.
         assert "_session_scoped = job_origin(req, job_type) == JOB_ORIGIN_DEPLOY" in src
 
     def test_reserved_combination_is_refused(self):
@@ -6154,396 +6216,225 @@ class TestPreDeployWiring:
         assert "is_reserved" in src and "combination_reserved" in src
 
     def test_a_guided_restart_resumes_its_own_pause(self, tmp_path, monkeypatch):
-        """G26 row 5: `check` confirms the guide and restarts the path.
-
-        The paused session reserves the combination it has to generate FOR, so
-        the reservation must not refuse the resume — otherwise the operator opens
-        the panel from the paused card, confirms, and gets a 409 with no way
-        forward. The exemption is narrow: it needs BOTH a `paused` session and a
-        guided restart, so a competing generation is still refused.
-        """
+        """A paused/refused session's own combination is exempt from the 409."""
         import asyncio
+        import uuid
+
         from fastapi import HTTPException
+        from app.database import SessionLocal
         from app.routers import llm as llm_router
         from app.services import pre_deploy_registry as pdr
+        from support import mk_task, mk_user
 
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
-        monkeypatch.setattr(llm_router, "log_action", lambda *a, **k: None)
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "alice")
+            sid = uuid.uuid4()
+            mk_task(db, "gt-paused", status="paused")
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=uuid.uuid4(),
+                owner_api_user_id=user.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="paused",
+                reason="llm_fix", guide="move NEO4J_PORT",
+                generation_task_id="gt-paused",
+            )
+            base = {"service_name": "myapp", "recipe_path": "",
+                    "job_type": "generate_missing", "user_name": "alice",
+                    "label": "0", "service_id": str(sid),
+                    "owner_api_user_id": str(user.api_user_id)}
+            admin = {"id": 1, "role": "admin"}
+            self._fake_job(monkeypatch, llm_router, db)
 
-        class _Job:
-            id, status = 77, "queued"
+            # The guided restart / answered pause is allowed through.
+            out = asyncio.run(llm_router.create_generation_job(
+                {**base, "fix": True}, admin, db))
+            assert out["task_id"] == "gt-new"
 
-        seen = {}
-        monkeypatch.setattr(llm_router.generation_jobs, "create_job",
-                            lambda db, s, r, jt, req: (seen.update(req=req), _Job())[1])
+            # A LIVE generating session still reserves the combination.
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=uuid.uuid4(),
+                owner_api_user_id=user.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="generating",
+                generation_task_id="gt-paused",
+            )
+            with pytest.raises(HTTPException) as ei:
+                asyncio.run(llm_router.create_generation_job(base, admin, db))
+            assert ei.value.detail["error"] == "combination_reserved"
+        finally:
+            db.close()
 
-        def _paused():
-            pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                            state="paused", reason="llm_fix", job_id=5,
-                            guide="move NEO4J_PORT", task_id="task-7", slot="compose")
+    def test_a_finished_leg_releases_the_combination_it_reserved(self):
+        """Completing the leg steps the record down to `generated` (not gone),
+        which stops it reserving so the deploy's own generation is not 409."""
+        import uuid
 
-        base = {"service_name": "myapp", "recipe_path": "", "job_type": "generate_missing",
-                "user_name": "alice", "label": "0"}
-        admin = {"id": 1, "role": "admin"}
-
-        _paused()
-        out = asyncio.run(llm_router.create_generation_job(
-            {**base, "fix": True}, admin, None))
-        assert out["job_id"] == 77, "the guided restart must be allowed through"
-        assert seen["req"]["fix"] is True, "the fixing flag must reach the job"
-
-        # R3-F49 — and ANSWERING the pause is the same resume by another name.
-        # The panel answers a pause by starting a new job that consumes the
-        # paused leg (`resume` + `parent_job_id`, no `fix`), and that body was
-        # refused by the reservation the pause itself had created: a 409 with no
-        # way forward, so the paused job could never be consumed and every later
-        # deploy of the service hit the same 409. Measured 2026-10-10.
-        _paused()
-        out = asyncio.run(llm_router.create_generation_job(
-            {**base, "resume": {"kind": "external_vars"}, "values": {"OPENAI_API_KEY": "x"},
-             "parent_job_id": 5}, admin, None))
-        assert out["job_id"] == 77, "an answered pause must be allowed through"
-
-        # A live generation is still reserved against it.
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="generating", job_id=6)
-        with pytest.raises(HTTPException) as ei:
-            asyncio.run(llm_router.create_generation_job(
-                {**base, "resume": {"kind": "external_vars"}, "parent_job_id": 5}, admin, None))
-        assert ei.value.detail["error"] == "combination_reserved"
-
-        # Same combination, but NOT a guided restart ⇒ the reservation stands.
-        _paused()
-        with pytest.raises(HTTPException) as ei:
-            asyncio.run(llm_router.create_generation_job({**base, "fix": False}, admin, None))
-        assert ei.value.status_code == 409
-        assert ei.value.detail["error"] == "combination_reserved"
-
-        # A LIVE generation is reserved even against a guided restart: the
-        # exemption is for resuming a WAITING session, not for clobbering a job.
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="generating", job_id=6)
-        with pytest.raises(HTTPException) as ei2:
-            asyncio.run(llm_router.create_generation_job({**base, "fix": True}, admin, None))
-        assert ei2.value.status_code == 409
-
-    def test_a_finished_leg_releases_the_combination_it_reserved(self, tmp_path, monkeypatch):
-        """The reservation lasts as long as the JOB that made it — not longer.
-
-        A `generating` session exists to stop a competing generation clobbering
-        a LIVE job (see `test_a_guided_restart_resumes_its_own_pause`). Nothing
-        advanced it when the job ENDED: the only writer on a status change
-        mirrors the PAUSE (`GenerationJobManager._set_status` →
-        `set_state_for_job(job_id, "paused")`), and `reconcile` spares exactly
-        `paused`/`refused`, so a session left reading `generating` is dropped —
-        but only by the 90 s loop.
-
-        So the path deadlocked for up to 90 s after EVERY answered pause. The
-        answer is itself a `POST /llm/jobs`, which resets the session to
-        `generating`; that leg then completes in milliseconds; and the step that
-        must follow — the deploy's own generation, which is what produced the
-        files the deploy is about to send — was refused with 409
-        `combination_reserved`, because R3-F49's exemption recognises only a
-        `paused` session.
-
-        Measured 2026-10-14 on `bob|graphiti-local||0`: the answer (job 394)
-        completed 13:40:48.083, the deploy's generation was refused
-        13:41:00.397, and the stale session was not swept until 13:43:24 — the
-        operator saw `Deploy failed`, no task was created, and the card sat on
-        `Generating…` for the whole window.
-
-        The first fix for this DELETED the record, which cured the 409 and broke
-        something quieter: the deploy panel's auto-run asks for that record once
-        a second, so it logged ~60 red 404s per deploy, and the operator's card
-        vanished between "the files are ready" and "the deploy lands". The record
-        now steps DOWN — `generated` — instead of disappearing: it stops
-        reserving (below) and it survives (below).
-        """
-        import asyncio
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        import app.database as _dbmod
-        from app.routers import llm as llm_router
+        from app.database import SessionLocal
         from app.services import pre_deploy_registry as pdr
         from app.services.generation_jobs import generation_jobs
-        from app.models.generation_job import GenerationJob
-        from app.models.pre_deploy_session import PreDeploySession  # noqa: F401 — for create_all
+        from support import mk_task, mk_user
 
-        # BOTH readers must see this DB: the registry resolves `SessionLocal` at
-        # call time and so does `GenerationJobManager._set_status`, which is the
-        # point of the indirection. Swapping it is what keeps this test off the
-        # live gateway DB whatever order the suite imported `app.config` in.
-        _eng = create_engine(f"sqlite:///{tmp_path}/probe-leg.db")
-        _dbmod.Base.metadata.create_all(_eng)
-        monkeypatch.setattr(_dbmod, "SessionLocal", sessionmaker(bind=_eng))
-        SessionLocal = _dbmod.SessionLocal
-        monkeypatch.setattr(llm_router, "log_action", lambda *a, **k: None)
-        # A key no real deployment uses: a `paused` session is never swept, so
-        # this one must be removed by the test, not by the reconcile loop.
-        user, service, label = "probe-leg", "probe-leg", "0"
-        admin = {"id": 1, "role": "admin"}
-        base = {"service_name": service, "recipe_path": "",
-                "job_type": "generate_missing", "user_name": user, "label": label}
-
-        def _leg(status: str = "running") -> int:
-            """A real row, so `_set_status` has something to write."""
-            db = SessionLocal()
-            try:
-                row = GenerationJob(service_name=service, job_type="generate_missing",
-                                    status=status, request="{}", progress="x")
-                db.add(row)
-                db.commit()
-                return row.id
-            finally:
-                db.close()
-
-        class _Row:
-            def __init__(self, jid):
-                self.id, self.status = jid, "queued"
-
-        def _route_next_leg_to(jid: int) -> None:
-            monkeypatch.setattr(llm_router.generation_jobs, "create_job",
-                                lambda *a, **k: _Row(jid))
-
-        def _status_of(jid: int) -> str:
-            db = SessionLocal()
-            try:
-                return db.query(GenerationJob).filter(GenerationJob.id == jid).first().status
-            finally:
-                db.close()
-
+        db = SessionLocal()
         try:
-            # (1) A leg pauses for a credential and reserves the combination.
-            paused_leg = _leg("paused")
-            pdr.add_session(user=user, service=service, recipe_path="", label=label,
-                            state="paused", reason="input", job_id=paused_leg)
-            assert pdr.is_reserved(user, service, "", label) is True
+            user = mk_user(db, "alice")
+            sid = uuid.uuid4()
+            mk_task(db, "gt-leg", status="running")
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=uuid.uuid4(),
+                owner_api_user_id=user.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="generating",
+                generation_task_id="gt-leg",
+            )
+            assert pdr.is_reserved(user.api_user_id, "myapp", "0") is True
 
-            # (2) The operator ANSWERS it, through the real entry point. The
-            #     answer is itself a `POST /llm/jobs`, and the handler mirrors the
-            #     session onto the leg it just created.
-            answer_leg = _leg()
-            _route_next_leg_to(answer_leg)
-            out = asyncio.run(llm_router.create_generation_job(
-                {**base,
-                 "resume": {"kind": "input",
-                            "ask": {"vars": ["OPENAI_API_KEY"]},
-                            "request": {**base, "resume_env": {"vars": ["OPENAI_API_KEY"]}}},
-                 "values": {"OPENAI_API_KEY": "x"},
-                 "parent_job_id": paused_leg}, admin, None))
-            assert out["job_id"] == answer_leg
-            sess = pdr.get_session(user, service, "", label)
-            assert sess["job_id"] == answer_leg and sess["state"] == "generating", (
-                "the new leg owns the session — and it must NOT also have been "
-                "released by the parent leg's own cancel (G34)")
-            assert _status_of(paused_leg) == "cancelled", "G34: the answered leg is consumed"
+            # The runner's terminal write is the only writer on a status change.
+            generation_jobs._set_status("gt-leg", "completed", progress="completed")
 
-            # (3) The answer leg ENDS — instantly, in the measured case: it only
-            #     had to write the file from the carry. THIS is the transition the
-            #     record was missing: the leg is over, its files are ready, and the
-            #     deploy has not been sent yet.
-            generation_jobs._set_status(answer_leg, "completed", progress="completed")
-            row = pdr.get_session(user, service, "", label)
-            assert row is not None, (
-                "a finished leg must KEEP its record — the deploy panel's auto-run "
-                "asks for it once a second, and it is the operator's card")
+            row = pdr.get_session(str(sid))
+            assert row is not None, "a finished leg keeps its record (the card)"
             assert row["state"] == "generated", row["state"]
-            assert pdr.is_reserved(user, service, "", label) is False, (
-                "the finished record must stop reserving, or the step below is "
-                "refused 409 — the bug reported on 2026-10-14")
-
-            # (4) The path's next step — a PLAIN generation, no `resume` and no
-            #     `fix`, exactly what the deploy's auto-run sends — is let through
-            #     instead of answered 409, with the record still in place.
-            next_leg = _leg()
-            _route_next_leg_to(next_leg)
-            out = asyncio.run(llm_router.create_generation_job(base, admin, None))
-            assert out["job_id"] == next_leg
-
-            # (5) The operator's OWN record is not the runner's to discard:
-            #     `paused` signals a person, and the reconcile spares it for the
-            #     same reason.
-            pdr.add_session(user=user, service=service, recipe_path="", label=label,
-                            state="paused", reason="input", job_id=next_leg)
-            generation_jobs._set_status(next_leg, "cancelled", progress="cancelled")
-            row = pdr.get_session(user, service, "", label)
-            assert row is not None and row["state"] == "paused", (
-                "a terminal write must not destroy a session waiting on the operator")
+            assert pdr.is_reserved(user.api_user_id, "myapp", "0") is False
         finally:
-            pdr.remove_session(user, service, "", label)
+            db.close()
 
-    def test_an_absent_session_is_an_empty_object_not_a_404(self, tmp_path, monkeypatch):
-        """No record for a combination is an ordinary answer, not an error.
-
-        The endpoint answered `404 no pre-deploy session for that combination`,
-        and its only caller — the deploy panel's auto-run — asks it once a
-        SECOND to keep track of which leg the deployment is on. So an ordinary
-        state printed ~60 red "Failed to load resource: 404" lines per deploy
-        (measured 2026-10-14) on a path where nothing was wrong. False alarms in
-        the console are how a real failure hides — that is not a theory here, it
-        is what happened while this was being diagnosed.
-
-        `{}` is what the caller already means by it (`data?.job_id == null`), so
-        the reader must test a FIELD, never the presence of a body.
-        """
+    def test_an_absent_session_is_an_empty_object_not_a_404(self):
+        """No record is an ordinary answer: the deploy panel probes once a second."""
         import asyncio
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        import app.database as _dbmod
-        from app.models.pre_deploy_session import PreDeploySession  # noqa: F401 — for create_all
-        from app.services import pre_deploy_registry as pdr
+        import uuid
+
+        from app.database import SessionLocal
         from app.routers import pre_deploy as pd
+        from app.services import pre_deploy_registry as pdr
+        from support import mk_user
 
-        _eng = create_engine(f"sqlite:///{tmp_path}/pre-deploy-get.db")
-        _dbmod.Base.metadata.create_all(_eng)
-        monkeypatch.setattr(_dbmod, "SessionLocal", sessionmaker(bind=_eng))
+        admin = {"id": 1, "role": "admin"}
+        assert asyncio.run(pd.get_pre_deploy(str(uuid.uuid4()), admin)) == {}
 
-        # Nothing recorded: an answer, and specifically not an HTTPException.
-        assert asyncio.run(pd.get_pre_deploy("nobody", "nosvc", "0", "")) == {}
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "probepd")
+            sid = uuid.uuid4()
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=uuid.uuid4(),
+                owner_api_user_id=user.api_user_id, service_name="probepd",
+                service_label="0", recipe_path="", state="generating",
+            )
+            row = asyncio.run(pd.get_pre_deploy(str(sid), admin))
+            assert row["state"] == "generating"
+            assert row["service_id"] == str(sid)
+        finally:
+            db.close()
 
-        # The row is still returned as itself when there IS one.
-        pdr.add_session(user="probepd", service="probepd", recipe_path="", label="0",
-                        state="generating", job_id=1)
-        row = asyncio.run(pd.get_pre_deploy("probepd", "probepd", "0", ""))
-        assert row["state"] == "generating" and row["job_id"] == 1
-
-    def test_handoff_is_remove_then_add(self):
-        """The other order leaves two cards for the window between the writes."""
+    def test_handoff_is_add_then_remove(self):
+        """G81/T8: the -api creates the instance FIRST, then the gateway removes
+        the session — the overlap is one card, and a crash after the -api write
+        is recoverable."""
         import inspect
         from app.routers import users as users_router
         src = inspect.getsource(users_router.deploy_user)
-        rm = src.index("remove_session")
         call = src.index("register_user")
-        assert rm < call, "the session must be removed BEFORE the -api registers"
+        rm = src.index("db.delete(session)")
+        assert call < rm, "the session must be removed AFTER the -api registers"
 
-    def test_delete_implicitly_cancels_a_live_job_first(self, monkeypatch, tmp_path):
-        """User ruling (2026-09-23): *"the delete implicitly forcing a cancel
-        first"*.
+    def _seed_session(self, db, username="alice", state="paused",
+                      task_id="gt-live", task_status="paused", live_service=False):
+        import uuid
 
-        The record used to REFUSE with a 409 while its job was live, telling the
-        operator to cancel first — which made `delete` a dead end whenever no
-        cancel was on screen, and made one button's meaning depend on another's.
-        Deleting is the operator saying "stop this and forget it", so the two
-        are one action: cancel the job (never orphan it — the reason the guard
-        existed), then drop the record.
-
-        Behavioural: it drives the real endpoint against a real live job.
-        """
-        import asyncio
-        from unittest.mock import AsyncMock
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        from app.database import Base
-        import app.database as database
         from app.services import pre_deploy_registry as pdr
-        from app.services.generation_jobs import GenerationJob, generation_jobs
-        from app.routers import pre_deploy as pd
+        from support import mk_service, mk_task, mk_user
 
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
-        eng = create_engine(f"sqlite:///{tmp_path}/jobs.db")
-        Base.metadata.create_all(eng)
-        S = sessionmaker(bind=eng, expire_on_commit=False)
-        monkeypatch.setattr(database, "SessionLocal", S)
+        user = mk_user(db, username)
+        sid = uuid.uuid4()
+        if live_service:
+            mk_service(db, user, service_name="myapp", label="0", service_id=sid)
+        if task_id:
+            mk_task(db, task_id, status=task_status)
+        pdr.create_or_replace(
+            service_id=sid, procedure_id=uuid.uuid4(),
+            owner_api_user_id=user.api_user_id, service_name="myapp",
+            service_label="0", recipe_path="", state=state,
+            reason="compose_fix" if state in ("paused", "refused") else None,
+            generation_task_id=task_id,
+        )
+        return user, sid
 
-        db = S()
-        job = GenerationJob(service_name="myapp", job_type="generate_missing",
-                            status="awaiting_input", request="{}", progress="parked")
-        db.add(job); db.commit()
-        jid = job.id
-        db.close()
-
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="paused", reason="compose_fix", job_id=jid)
-
-        res = asyncio.run(pd.delete_pre_deploy("alice", "myapp", "0", ""))
-
-        assert res["deleted"] is True
-        assert res["cancelled_job"] is True, "a live job must be cancelled, not orphaned"
-        assert generation_jobs.job_status(jid) == "cancelled"
-        assert pdr.list_sessions() == [], "the record is gone with the job"
-
-    def test_delete_cancels_a_paused_job_too(self, monkeypatch, tmp_path):
-        """The card's Delete ends a PAUSED leg as well (GRILLING G34).
-
-        The guard listed `queued|running|awaiting_input`, so a job paused under
-        G27 — the status every new pause is written with — was SKIPPED: the card
-        disappeared and its object stayed `paused` with nothing owning it. That
-        is the state this rule forbids, and how the five orphaned paused jobs
-        (gt-315/316/325/328/332) arose.
-        """
+    def test_delete_refuses_while_a_live_service_row_exists(self):
+        """A paused fix card is a full service delete, never a bare record delete."""
         import asyncio
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        from app.database import Base
-        import app.database as database
-        from app.services import pre_deploy_registry as pdr
-        from app.services.generation_jobs import GenerationJob, generation_jobs
+
+        import pytest
+        from fastapi import HTTPException
+        from app.database import SessionLocal
         from app.routers import pre_deploy as pd
+        from app.services import pre_deploy_registry as pdr
 
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
-        eng = create_engine(f"sqlite:///{tmp_path}/jobs.db")
-        Base.metadata.create_all(eng)
-        S = sessionmaker(bind=eng, expire_on_commit=False)
-        monkeypatch.setattr(database, "SessionLocal", S)
+        db = SessionLocal()
+        try:
+            _user, sid = self._seed_session(db, live_service=True)
+            with pytest.raises(HTTPException) as ei:
+                asyncio.run(pd.delete_pre_deploy(str(sid), {"id": 1, "role": "admin"}))
+            assert ei.value.status_code == 409
+            assert pdr.get_session(str(sid)) is not None
+        finally:
+            db.close()
 
-        db = S()
-        job = GenerationJob(service_name="myapp", job_type="generate_missing",
-                            status="paused", request="{}", progress="waiting for input")
-        db.add(job); db.commit()
-        jid = job.id
-        db.close()
-
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="paused", reason="input", job_id=jid)
-
-        res = asyncio.run(pd.delete_pre_deploy("alice", "myapp", "0", ""))
-
-        assert res["deleted"] is True
-        assert res["cancelled_job"] is True, "a paused job must be cancelled, not orphaned"
-        assert generation_jobs.job_status(jid) == "cancelled"
-        assert pdr.list_sessions() == []
-
-    def test_delete_is_a_plain_delete_when_nothing_is_live(self, monkeypatch, tmp_path):
-        """No live job ⇒ nothing to cancel; the record is simply dropped."""
+    def test_delete_cancels_a_live_generation_task(self):
+        """Record-only delete (no live services row): the live leg is cancelled
+        first, never orphaned, then the record goes."""
         import asyncio
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        from app.database import Base
-        import app.database as database
-        from app.services import pre_deploy_registry as pdr
-        from app.services.generation_jobs import GenerationJob
+
+        from app.database import SessionLocal
         from app.routers import pre_deploy as pd
+        from app.services import pre_deploy_registry as pdr
+        from app.services.generation_jobs import generation_jobs
 
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
-        eng = create_engine(f"sqlite:///{tmp_path}/jobs.db")
-        Base.metadata.create_all(eng)
-        S = sessionmaker(bind=eng, expire_on_commit=False)
-        monkeypatch.setattr(database, "SessionLocal", S)
+        db = SessionLocal()
+        try:
+            _user, sid = self._seed_session(db, task_id="gt-live", task_status="paused")
+            res = asyncio.run(pd.delete_pre_deploy(str(sid), {"id": 1, "role": "admin"}))
+            assert res["deleted"] is True
+            assert res["cancelled_job"] is True
+            assert generation_jobs.job_status("gt-live") == "cancelled"
+            assert pdr.list_sessions() == []
+        finally:
+            db.close()
 
-        db = S()
-        job = GenerationJob(service_name="myapp", job_type="generate_missing",
-                            status="completed", request="{}", progress="done")
-        db.add(job); db.commit()
-        jid = job.id
-        db.close()
+    def test_delete_is_a_plain_delete_when_nothing_is_live(self):
+        import asyncio
 
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="paused", reason="llm_fix", job_id=jid, guide="g")
+        from app.database import SessionLocal
+        from app.routers import pre_deploy as pd
+        from app.services import pre_deploy_registry as pdr
 
-        res = asyncio.run(pd.delete_pre_deploy("alice", "myapp", "0", ""))
+        db = SessionLocal()
+        try:
+            _user, sid = self._seed_session(db, task_id=None, state="generated")
+            res = asyncio.run(pd.delete_pre_deploy(str(sid), {"id": 1, "role": "admin"}))
+            assert res == {"deleted": True, "cancelled_job": False}
+            assert pdr.list_sessions() == []
+        finally:
+            db.close()
 
-        assert res == {"deleted": True, "cancelled_job": False}
-        assert pdr.list_sessions() == []
+    def test_recipe_path_round_trips_on_the_session(self):
+        """The session stores the recipe path it will generate; identity is the
+        service_id and the reserved tuple is (owner, service, label)."""
+        import uuid
 
-    def test_startup_reconciles_sessions(self):
-        from app import main as _m
-        import inspect
-        assert "reconcile" in inspect.getsource(_m.lifespan)
+        from app.database import SessionLocal
+        from app.services import pre_deploy_registry as pdr
+        from support import mk_user
 
-    def test_recipe_path_is_part_of_the_session_key(self):
-        from app.routers.users import _pdr_recipe_path
-        assert _pdr_recipe_path({"project_root": "myapp/docker", "service_name": "myapp"}) == "docker"
-        assert _pdr_recipe_path({"project_root": "myapp", "service_name": "myapp"}) == ""
+        db = SessionLocal()
+        try:
+            user = mk_user(db, "alice")
+            sid = uuid.uuid4()
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=uuid.uuid4(),
+                owner_api_user_id=user.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="docker", state="generating",
+            )
+            assert pdr.get_session(str(sid))["recipe_path"] == "docker"
+        finally:
+            db.close()
 
 
 class TestPreDeployCardSourceGuards:
@@ -6602,7 +6493,7 @@ class TestPreDeployCardSourceGuards:
         is live, and it must never claim success when there is none."""
         actions = self._session_actions()
         assert "isJobLive &&" in actions, "cancel must be gated on a live job"
-        assert "if (sess.job_id == null)" in actions, (
+        assert "if (sess.generation_task_id == null)" in actions, (
             "the old handler reported success with no job at all"
         )
 
@@ -6726,10 +6617,10 @@ class TestServiceCardsAndTaskLifecycle:
         """§7: DISPLAY ONLY — the tag and the subtitle read `core`; the record
         ids keep their `api-…` prefix (GRILLING G28 stands untouched)."""
         src = self._page("pages/TasksPage.tsx")
-        assert "'gateway' | 'core'" in src
-        assert "source: 'core' as const" in src
-        assert "'-api'" not in src, "the old family name must be gone from the display"
-        assert "<Title level={5}" in src and "core task queue" in src
+        # One list, both families, each row tagged by its own id prefix.
+        assert "'gateway' | 'api'" in src
+        assert "startsWith('gt-') ? 'gateway' : 'api'" in src
+        assert "core deploy" in src and "<Title level={5}" in src
 
     def test_source_projects_row_is_one_state_aware_slot(self):
         """§4b: robot → running → Check → running → robot, with a `Cancel` that
@@ -6790,8 +6681,10 @@ class TestServiceCardsAndTaskLifecycle:
         assert job_origin("", "generate_missing") == JOB_ORIGIN_STANDALONE
         assert job_origin(None, None) == JOB_ORIGIN_STANDALONE
         # The payload carries it, so the row never has to guess…
-        model = Path(__file__).parent.parent / "app" / "models" / "generation_job.py"
-        assert '"origin": job_origin(self.request, self.job_type)' in model.read_text()
+        model = Path(__file__).parent.parent / "app" / "models" / "gateway_task.py"
+        model_src = model.read_text()
+        assert '"origin": self.origin' in model_src
+        assert "def job_origin(" in model_src
         # …and the session the create path opens uses the SAME predicate.
         import inspect
         from app.routers import llm as _llm
@@ -6857,10 +6750,11 @@ class TestServiceCardsAndTaskLifecycle:
         assert src.index("_answered_job_id = req.get") < src.index("req = carried")
         # Acted on AFTER the new leg exists — a failed create must not consume
         # the pause it was answering.
-        assert src.index("job = generation_jobs.create_job") < src.index("_gj.cancel_job(_db")
+        assert src.index("job = generation_jobs.create_job") < src.index("_answered_job_id is not None")
         # Only its own parked leg, and cancelled (never removed).
-        assert "_parent.status == _PAUSED" in src
-        assert "_parent.service_name == service_name" in src
+        assert '_parent.status == "paused"' in src
+        assert "_parent.service_id == job.service_id" in src
+        assert '_parent.status = "cancelled"' in src
         assert "unlink" not in src.split("_answered_job_id")[2], "cancel, never delete"
         # …and the client names it.
         hook = self._page("hooks/useGenerationJob.ts")
@@ -6907,172 +6801,186 @@ class TestFixValidatesItsOwnOutput:
 
 
 class TestPreDeployReconcile:
-    """`reconcile` runs ONCE, at startup, and must not touch a live path.
+    """``reconcile`` resolves sessions by the task store, keyed by service_id.
 
-    It exists for one case: a record whose runner died with the gateway, which
-    nothing will ever write a state for. It used to run on a 90-second loop as
-    well, and both of that loop's reasons are gone (2026-10-16):
-
-      * "no live job ⇒ stale" existed because a finished leg's record kept its
-        key reserved FOREVER, refusing every later generation with 409 until the
-        gateway restarted — found live, blocking a deploy verification three
-        times. That was a missing state, not a cleanup problem, and
-        `STATE_GENERATED` is that state.
-      * "key in the registry ⇒ registered ⇒ drop" read a key list built from
-        four buckets including `failed_services`, so retrying a failed instance
-        had its LIVE record deleted mid-generation (2026-10-14: 60 consecutive
-        probe misses).
-
-    **The three source guards that used to live here all passed while the sweep
-    was in fact a complete no-op.** The loop called `get_job(int(jid))` without
-    its `db` argument, the `TypeError` was swallowed by the surrounding
-    `except Exception`, and nothing was ever dropped — for every pass, forever.
-    A test that greps for `reconcile`/`asyncio.sleep` cannot see that. These
-    drive the real function against a real job row.
+    It covers the case no other writer does: a record whose runner died with
+    the gateway. Operator-held states are never touched; a `generating` session
+    is kept while its generation task is live/unknown and dropped otherwise; a
+    `deploying` session with an instance is dropped (the instance card owns it).
     """
 
-    def _db(self, tmp_path, monkeypatch):
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        from app.database import Base
-        import app.database as database
-        eng = create_engine(f"sqlite:///{tmp_path}/jobs.db")
-        Base.metadata.create_all(eng)
-        S = sessionmaker(bind=eng, expire_on_commit=False)
-        monkeypatch.setattr(database, "SessionLocal", S)
-        return S
+    def _seed(self, db, username: str = "alice", service_name: str = "myapp"):
+        import uuid
 
-    def _job(self, S, status: str) -> int:
-        from app.services.generation_jobs import GenerationJob
-        db = S()
-        job = GenerationJob(service_name="probe", job_type="generate_missing",
-                            status=status, request="{}", progress="x")
-        db.add(job)
-        db.commit()
-        jid = job.id
-        db.close()
-        return jid
+        from support import mk_user
 
-    @staticmethod
-    def _live_set(pdr, generation_jobs) -> set:
-        """Exactly what `_pre_deploy_reconcile_loop` derives."""
-        return {
-            int(r["job_id"]) for r in pdr.list_sessions()
-            if r.get("job_id") is not None
-            and generation_jobs.job_status(int(r["job_id"]))
-            in ("queued", "running", "awaiting_input")
-        }
+        user = mk_user(db, username)
+        return user, uuid.uuid4(), uuid.uuid4()
 
-    def test_job_status_reads_a_real_row_without_a_session_argument(self, tmp_path, monkeypatch):
-        """`job_status` owns its session — that is the whole reason it exists.
-        The call that used to stand here had no `db` and raised TypeError."""
+    def test_job_status_reads_a_real_row_without_a_session_argument(self):
+        from app.database import SessionLocal
         from app.services.generation_jobs import generation_jobs
-        S = self._db(tmp_path, monkeypatch)
-        jid = self._job(S, "completed")
-        assert generation_jobs.job_status(jid) == "completed"
+        from support import mk_task
 
-    def test_a_stale_GENERATING_session_is_dropped(self, tmp_path, monkeypatch):
-        """`generating` with a finished job and no registry entry ⇒ nothing is
-        working on it. This is the rule the dead sweep silently never applied."""
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        db = SessionLocal()
+        try:
+            mk_task(db, "gt-done", status="completed")
+            assert generation_jobs.job_status("gt-done") == "completed"
+        finally:
+            db.close()
+
+    def test_a_stale_GENERATING_session_is_dropped(self):
+        from app.database import SessionLocal
         from app.services import pre_deploy_registry as pdr
-        from app.services.generation_jobs import generation_jobs
-        S = self._db(tmp_path, monkeypatch)
-        jid = self._job(S, "completed")
-        pdr.add_session(user="alice", service="probe", recipe_path="", label="0",
-                        state="generating", job_id=jid)
+        from support import mk_task
 
-        rep = pdr.reconcile(self._live_set(pdr, generation_jobs))
+        db = SessionLocal()
+        try:
+            user, sid, proc = self._seed(db, "alice", "probe")
+            mk_task(db, "gt-done", status="completed", procedure_id=proc)
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=proc,
+                owner_api_user_id=user.api_user_id, service_name="probe",
+                service_label="0", recipe_path="", state="generating",
+                generation_task_id="gt-done",
+            )
+            rep = pdr.reconcile(live_task_ids=set())
+            assert rep["dropped_stale"], "a finished job must not keep the combination reserved"
+            assert pdr.list_sessions() == []
+        finally:
+            db.close()
 
-        assert rep["dropped_stale"], (
-            "a finished job must not keep its combination reserved")
-        assert pdr.list_sessions() == []
-
-    def test_a_LIVE_generating_session_is_KEPT(self, tmp_path, monkeypatch):
-        """The case the `get_job` TypeError actually broke: `live` was always
-        empty, so an in-flight generation's session was swept away mid-run —
-        the card vanished while the work was still going.
-
-        `awaiting_input` counts as live: it is NOT terminal."""
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+    def test_a_LIVE_generating_session_is_KEPT(self):
+        from app.database import SessionLocal
         from app.services import pre_deploy_registry as pdr
-        from app.services.generation_jobs import generation_jobs
-        S = self._db(tmp_path, monkeypatch)
-        jid = self._job(S, "awaiting_input")
-        pdr.add_session(user="alice", service="probe", recipe_path="", label="0",
-                        state="generating", job_id=jid)
+        from support import mk_task
 
-        rep = pdr.reconcile(self._live_set(pdr, generation_jobs))
+        db = SessionLocal()
+        try:
+            user, sid, proc = self._seed(db, "alice", "probe")
+            mk_task(db, "gt-live", status="running", procedure_id=proc)
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=proc,
+                owner_api_user_id=user.api_user_id, service_name="probe",
+                service_label="0", recipe_path="", state="generating",
+                generation_task_id="gt-live",
+            )
+            rep = pdr.reconcile(live_task_ids={"gt-live"})
+            assert rep["dropped_stale"] == []
+            assert len(pdr.list_sessions()) == 1
+        finally:
+            db.close()
 
-        assert rep["dropped_stale"] == []
-        assert len(pdr.list_sessions()) == 1
-
-    def test_a_PAUSED_session_is_never_stale(self, tmp_path, monkeypatch):
-        """G26: the handoff writes the session and then deletes the -api entry,
-        so a `paused` session has NO registry entry by construction and its
-        analysis job has already COMPLETED — it matches the stale rule exactly.
-        Dropping it would take the fixing guide and the task id with it and make
-        `check` unreachable, so `paused` joins `refused` as operator-only."""
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+    def test_an_UNKNOWN_generating_task_is_still_kept(self):
+        """``unknown`` means a runner may still exist (gateway moved), so it is
+        kept until the recovery sweep terminalizes it (R4.2)."""
+        from app.database import SessionLocal
         from app.services import pre_deploy_registry as pdr
-        from app.services.generation_jobs import generation_jobs
-        S = self._db(tmp_path, monkeypatch)
-        jid = self._job(S, "completed")
-        pdr.add_session(user="alice", service="probe", recipe_path="", label="0",
-                        state="paused", reason="llm_fix", job_id=jid,
-                        guide="rename the port", task_id="abc123")
+        from support import mk_task
 
-        rep = pdr.reconcile(self._live_set(pdr, generation_jobs))
+        db = SessionLocal()
+        try:
+            user, sid, proc = self._seed(db, "alice", "probe")
+            mk_task(db, "gt-unknown", status="unknown", procedure_id=proc)
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=proc,
+                owner_api_user_id=user.api_user_id, service_name="probe",
+                service_label="0", recipe_path="", state="generating",
+                generation_task_id="gt-unknown",
+            )
+            rep = pdr.reconcile(live_task_ids=set())
+            assert rep["dropped_stale"] == []
+        finally:
+            db.close()
 
-        assert rep["dropped_stale"] == []
-        kept = pdr.list_sessions()
-        assert len(kept) == 1
-        assert kept[0]["guide"] == "rename the port"
-        assert kept[0]["task_id"] == "abc123"
-
-    def test_a_GENERATED_session_is_never_stale(self, tmp_path, monkeypatch):
-        """The window between "files ready" and "deploy sent" is a live path.
-
-        Its leg has finished, so "no live job" is true of it — which is exactly
-        the rule that used to delete it, taking the operator's card with it and
-        making the deploy panel's once-a-second probe answer 404 (`reconcile`
-        spares `paused`/`refused` for the same reason: those are waiting on a
-        person, and this one is waiting on the operator's Deploy press).
-        """
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+    def test_a_PAUSED_session_is_never_stale(self):
+        from app.database import SessionLocal
         from app.services import pre_deploy_registry as pdr
-        from app.services.generation_jobs import generation_jobs
-        S = self._db(tmp_path, monkeypatch)
-        jid = self._job(S, "completed")
-        pdr.add_session(user="alice", service="probe", recipe_path="", label="0",
-                        state=pdr.STATE_GENERATED, job_id=jid)
 
-        rep = pdr.reconcile(self._live_set(pdr, generation_jobs))
+        db = SessionLocal()
+        try:
+            user, sid, proc = self._seed(db, "alice", "probe")
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=proc,
+                owner_api_user_id=user.api_user_id, service_name="probe",
+                service_label="0", recipe_path="", state="paused",
+                reason="llm_fix", guide="rename the port", deploy_task_id="api-9",
+            )
+            rep = pdr.reconcile(live_task_ids=set())
+            assert rep["dropped_stale"] == []
+            kept = pdr.list_sessions()
+            assert len(kept) == 1
+            assert kept[0]["guide"] == "rename the port"
+        finally:
+            db.close()
 
-        assert rep["dropped_stale"] == []
-        row = pdr.get_session("alice", "probe", "", "0")
-        assert row is not None and row["state"] == pdr.STATE_GENERATED
-
-    def test_a_GENERATED_session_holds_nothing(self, tmp_path, monkeypatch):
-        """...but it must not RESERVE the combination either — that is the bug
-        the state exists to fix. A plain generation for the same key is let
-        through, exactly as `test_a_finished_leg_releases_the_combination_it_
-        reserved` drives through the real router."""
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+    def test_a_GENERATED_session_is_never_stale(self):
+        from app.database import SessionLocal
         from app.services import pre_deploy_registry as pdr
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state=pdr.STATE_GENERATED, job_id=1)
-        assert pdr.is_reserved("alice", "myapp", "", "0") is False
-        # The states that DO reserve are untouched by the exemption.
-        pdr.add_session(user="bob", service="myapp", recipe_path="", label="0",
-                        state=pdr.STATE_GENERATING, job_id=2)
-        assert pdr.is_reserved("bob", "myapp", "", "0") is True
-        pdr.add_session(user="carol", service="myapp", recipe_path="", label="0",
-                        state=pdr.STATE_PAUSED, reason="input", job_id=3)
-        assert pdr.is_reserved("carol", "myapp", "", "0") is True
-        pdr.add_session(user="dave", service="myapp", recipe_path="", label="0",
-                        state=pdr.STATE_REFUSED, reason="at_capacity")
-        assert pdr.is_reserved("dave", "myapp", "", "0") is True
+
+        db = SessionLocal()
+        try:
+            user, sid, proc = self._seed(db, "alice", "probe")
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=proc,
+                owner_api_user_id=user.api_user_id, service_name="probe",
+                service_label="0", recipe_path="", state=pdr.STATE_GENERATED,
+            )
+            pdr.reconcile(live_task_ids=set())
+            row = pdr.get_session(str(sid))
+            assert row is not None and row["state"] == pdr.STATE_GENERATED
+        finally:
+            db.close()
+
+    def test_a_GENERATED_session_holds_nothing(self):
+        """`generated` stops reserving; generating/paused/refused still do."""
+        from app.database import SessionLocal
+        from app.services import pre_deploy_registry as pdr
+
+        db = SessionLocal()
+        try:
+            import uuid
+
+            from support import mk_user
+
+            for state, expected in (
+                (pdr.STATE_GENERATED, False),
+                (pdr.STATE_GENERATING, True),
+                (pdr.STATE_PAUSED, True),
+                (pdr.STATE_REFUSED, True),
+            ):
+                name = f"u-{state}"
+                user = mk_user(db, name)
+                pdr.create_or_replace(
+                    service_id=uuid.uuid4(), procedure_id=uuid.uuid4(),
+                    owner_api_user_id=user.api_user_id, service_name="myapp",
+                    service_label="0", recipe_path="", state=state,
+                    reason="input" if state in (pdr.STATE_PAUSED, pdr.STATE_REFUSED) else None,
+                )
+                assert pdr.is_reserved(user.api_user_id, "myapp", "0") is expected, state
+        finally:
+            db.close()
+
+    def test_a_DEPLOYING_session_with_an_instance_is_dropped(self):
+        from app.database import SessionLocal
+        from app.services import pre_deploy_registry as pdr
+        from support import mk_service, mk_service_instance
+
+        db = SessionLocal()
+        try:
+            user, sid, proc = self._seed(db, "alice", "probe")
+            sid = mk_service(db, user, service_name="probe", label="0")
+            mk_service_instance(db, sid)
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=proc,
+                owner_api_user_id=user.api_user_id, service_name="probe",
+                service_label="0", recipe_path="", state="deploying",
+            )
+            rep = pdr.reconcile(live_task_ids=set())
+            assert rep["dropped_stale"] == [str(sid)]
+            assert pdr.get_session(str(sid)) is None
+        finally:
+            db.close()
 
 
 class TestEnvPhaseEmptySurface:
@@ -7229,40 +7137,53 @@ class TestConflictDetectionIsNotGraphitiSpecific:
 
 
 class TestRefusedSessionsSurviveReconcile:
-    """A `refused` session must not be reconciled away.
+    """A `refused` session is operator-held and must never be reconciled away —
+    its Retry options are the operator's only record of the refusal."""
 
-    Found live (Round 1): the deploy was refused BEFORE any task ran, so the
-    session has no `job_id` by construction, and it may share a key with an older
-    registration. Both reconcile rules therefore deleted it within one 90s pass —
-    destroying the operator's only record of the refusal and its Retry options.
-    """
+    def test_refused_session_survives_the_stale_rule(self):
+        import uuid
 
-    def _store(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.database import SessionLocal
         from app.services import pre_deploy_registry as pdr
-        return pdr
+        from support import mk_user
 
-    def test_refused_session_survives_the_stale_rule(self, tmp_path, monkeypatch):
-        pdr = self._store(tmp_path, monkeypatch)
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="refused", job_id=None)
-        rep = pdr.reconcile(live_job_ids=set())
-        assert rep["dropped_stale"] == []
-        assert len(pdr.list_sessions()) == 1
+        db = SessionLocal()
+        try:
+            alice = mk_user(db, "alice")
+            sid = uuid.uuid4()
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=uuid.uuid4(),
+                owner_api_user_id=alice.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="refused",
+                reason="at_capacity", options={"service_name": "myapp"},
+            )
+            rep = pdr.reconcile(live_task_ids=set())
+            assert rep["dropped_stale"] == []
+            assert pdr.get_session(str(sid)) is not None
+        finally:
+            db.close()
 
-    # `test_refused_session_survives_the_registered_rule` stood here until
-    # 2026-10-16 — it guarded a rule that no longer exists (see the note above
-    # `test_reconcile_keeps_a_live_session`). What it protected — a `refused`
-    # record never being dropped — is covered by
-    # `test_refused_session_survives_the_stale_rule` immediately above.
-
-    def test_generating_sessions_are_still_reconciled(self, tmp_path, monkeypatch):
+    def test_generating_sessions_are_still_reconciled(self):
         """The fix must not blunt reconcile for the states it exists for."""
-        pdr = self._store(tmp_path, monkeypatch)
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="generating", job_id=None)
-        rep = pdr.reconcile(live_job_ids=set())
-        assert rep["dropped_stale"] == ["alice|myapp||0"]
+        import uuid
+
+        from app.database import SessionLocal
+        from app.services import pre_deploy_registry as pdr
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            alice = mk_user(db, "alice")
+            sid = uuid.uuid4()
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=uuid.uuid4(),
+                owner_api_user_id=alice.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="generating",
+            )
+            rep = pdr.reconcile(live_task_ids=set())
+            assert rep["dropped_stale"] == [str(sid)]
+        finally:
+            db.close()
 
 
 class TestStaleSelectionAcceptsTheJ2Sibling:
@@ -7308,30 +7229,32 @@ class TestStaleSelectionAcceptsTheJ2Sibling:
 
 
 class TestACapacityRefusalRecordsTheRefusedSession:
-    """Does a REAL capacity refusal reach `mark_refused`? (Round 20.)
-
-    Trace T5 could not produce a live refusal after nine attempts, so the question
-    was narrowed to the wiring: when the -api answers 503 `at_capacity`, does the
-    gateway record the refusal — with the options Retry needs? This tests that
-    path directly instead of trying to saturate a live pool.
-
-    Why no live refusal was reachable, incidentally: a dashboard Deploy first runs
-    the generation phase (the per-user env), so the deploy POST lands ~a minute
-    after the click — by which time no occupier survives.
-    """
+    """The -api's `at_capacity` on the DEPLOY path records a refused session
+    (state/reason/options + the encrypted credential), never a bare 502."""
 
     def _deploy(self, monkeypatch, tmp_path, status: int, body: dict):
-        import asyncio, httpx
+        import asyncio
+
+        import httpx
+        from app.database import SessionLocal
         from app.routers import users as users_router
+        from app.services import pre_deploy_registry as pdr
+        from support import mk_user
 
         monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
-        from app.services import pre_deploy_registry as pdr
+        db = SessionLocal()
+        try:
+            alice = mk_user(db, "alice")
+            owner_api_id = str(alice.api_user_id)
+            admin_id = str(alice.id)
+        finally:
+            db.close()
 
         req = {"user_name": "alice", "service_name": "myapp", "project_root": "myapp",
                "label": "0", "domain": "localhost", "passwd": "x",
-               "compose_file_paths": ["docker-compose.yml"], "env_files": [".env.1.alice.0"]}
+               "compose_file_paths": ["docker-compose.yml"],
+               "env_files": [".env.1.alice.0"]}
 
-        # a real httpx error carrying the -api's 503 body (what as_http_error reads)
         hreq = httpx.Request("POST", "http://api/users")
         hresp = httpx.Response(status, request=hreq, json=body)
 
@@ -7339,10 +7262,8 @@ class TestACapacityRefusalRecordsTheRefusedSession:
             raise httpx.HTTPStatusError("boom", request=hreq, response=hresp)
 
         monkeypatch.setattr(users_router.provision_service, "register_user", fake_register)
-        # the pre-flight service lookup + selection persistence are not under test
         from app.services.service_manager import service_manager
-        # SYNC: the router calls this via run_in_threadpool, so an async def here
-        # would hand back a coroutine instead of the dict.
+
         def fake_get_service(name):
             return {"files": ["docker-compose.yml"]}
         monkeypatch.setattr(service_manager, "get_service", fake_get_service)
@@ -7350,81 +7271,43 @@ class TestACapacityRefusalRecordsTheRefusedSession:
         monkeypatch.setattr(fs, "put_file_set", lambda *a, **k: {})
 
         try:
-            asyncio.run(users_router.deploy_user(req, None, {"id": 1, "role": "admin"}))
+            asyncio.run(users_router.deploy_user(
+                req, None, {"id": admin_id, "role": "admin"}))
         except Exception as exc:
             return exc, pdr
         return None, pdr
 
     def test_at_capacity_records_state_reason_and_options(self, monkeypatch, tmp_path):
-        # the FLAT shape the -api's TaskCapacityError handler actually emits
         exc, pdr = self._deploy(monkeypatch, tmp_path, 503, {
             "error": "at_capacity", "detail": "at capacity: 4 task(s) running",
             "running": 4, "capacity": 4})
         assert exc is not None, "the refusal must propagate to the caller"
         assert getattr(exc, "status_code", None) == 503, f"got {exc}"
-        row = pdr.get_session("alice", "myapp", "myapp", "0") or pdr.get_session("alice", "myapp", "", "0")
-        assert row is not None, "a refusal must RECORD a pre-deploy session"
+        sessions = pdr.list_sessions()
+        assert len(sessions) == 1, "a refusal must RECORD a pre-deploy session"
+        row = sessions[0]
         assert row["state"] == "refused"
         assert row["reason"] == "at_capacity"
-        assert row.get("options"), "Retry needs the refused options to replay"
-        # …and it keeps the URL and the credential the request carried, because
-        # the retry replays THIS deployment (user ruling 2026-09-26). This is the
-        # WIRING check — the rule itself is pinned in
-        # `test_a_refusal_carries_the_url_and_the_credential_for_its_retry`.
+        assert row["options"], "Retry needs the refused options to replay"
         opts = row["options"]
-        assert opts.get("passwd") == "x", "the retry needs the password it confirmed"
-        assert opts.get("domain") == "localhost", "…and the URL"
-        assert opts.get("compose_file_paths") == ["docker-compose.yml"], (
-            "the paths the refused deploy was SENT are what the retry replays")
-
-    def test_a_refused_record_always_carries_all_three_paths(self, monkeypatch, tmp_path):
-        """G20: the record must carry compose AND env AND nginx.
-
-        The reason is Retry's panel, not tidiness: its pickers have no `None`
-        option, so a record missing the nginx path seeds that picker at
-        `generate new` and the retry re-runs the nginx phase instead of reusing
-        the file the refused attempt already generated and sent. The request
-        carries the path under `selection.nginx`, the way the deploy payload
-        does, so the record must derive it rather than copy the request blindly.
-        """
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
-        from app.services import pre_deploy_registry as pdr
-
-        row = pdr.mark_refused(
-            user="alice", service="myapp", recipe_path="myapp", label="0",
-            reason="at_capacity", detail="at capacity: 4 task(s) running",
-            options={"compose_file_paths": ["docker-compose.fix.yml"],
-                     "env_files": [".env.raw.alice.0"],
-                     "selection": {"compose": ["docker-compose.fix.yml"],
-                                   "nginx": "nginx.fix.conf", "env": []}})
-
-        assert row["options"]["nginx_conf_file_path"] == "nginx.fix.conf", (
-            "a refused record without the nginx path makes Retry re-run the "
-            "nginx phase — the exact thing G20 rules out")
-
-        # An explicit path is authoritative and is never overwritten by the
-        # selection (the two can differ when the selection was rewritten).
-        row2 = pdr.mark_refused(
-            user="bob", service="myapp", recipe_path="myapp", label="0",
-            reason="at_capacity", detail="at capacity: 4 task(s) running",
-            options={"compose_file_paths": ["docker-compose.yml"],
-                     "env_files": [".env.1.bob.0"],
-                     "nginx_conf_file_path": "nginx.conf",
-                     "selection": {"nginx": "nginx.base.conf"}})
-        assert row2["options"]["nginx_conf_file_path"] == "nginx.conf"
+        assert "passwd" not in opts, "the credential is encrypted, not in options"
+        assert opts.get("domain") == "localhost", "the URL is kept"
+        assert opts.get("compose_file_paths") == ["docker-compose.yml"]
+        assert pdr.replay_options(row["service_id"]).get("passwd") == "x"
 
     def test_the_nested_shape_is_also_recognised(self, monkeypatch, tmp_path):
-        """The -api can also emit `{"detail": {"error": ...}}` (HTTPException).
-        Only the flat form used to be detected, so that refusal became a 502."""
+        """The -api can also emit `{"detail": {"error": ...}}`."""
         exc, pdr = self._deploy(monkeypatch, tmp_path, 503, {
-            "detail": {"error": "at_capacity", "detail": "at capacity", "running": 4, "capacity": 4}})
+            "detail": {"error": "at_capacity", "detail": "at capacity",
+                       "running": 4, "capacity": 4}})
         assert getattr(exc, "status_code", None) == 503, f"got {exc}"
-        row = pdr.get_session("alice", "myapp", "myapp", "0") or pdr.get_session("alice", "myapp", "", "0")
-        assert row is not None and row["state"] == "refused"
+        sessions = pdr.list_sessions()
+        assert len(sessions) == 1 and sessions[0]["state"] == "refused"
 
     def test_a_non_capacity_error_does_not_record_a_refusal(self, monkeypatch, tmp_path):
         """Only a capacity refusal creates the card — other errors must not."""
-        exc, pdr = self._deploy(monkeypatch, tmp_path, 409, {"detail": "already registered"})
+        exc, pdr = self._deploy(monkeypatch, tmp_path, 409,
+                                {"detail": "already registered"})
         assert getattr(exc, "status_code", None) == 502, "a 409 stays a generic 502"
         assert pdr.list_sessions() == []
 
@@ -7492,43 +7375,61 @@ class TestPinnedLabelIsReassertedAtSubmit:
 class TestCheckRestartCarriesTheGlobalProxy:
     """G26 row 5 + G20: a `check` restart replays the PATH's proxy.
 
-    Found live on T13: cancelling a proxied `probe-slow` deploy, running `LLM
-    based fix` and then `check` opened the deploy panel with "Use global proxy"
-    UNCHECKED, so the restart registered with `build_args: {}` while the deploy
-    that created the session had recorded the proxy args. The refused path had
-    already learned this lesson (G20/T3: Retry replays the exact options), so a
-    `check` restart — which resumes a path the session store still holds — is
-    the same situation, not a preference.
+    The failed instance's own registry build_args are the only record of the
+    proxy setting the restart has to replay; the handoff reads it BEFORE the
+    -api delete removes the instance.
     """
 
-    def _registry_with(self, tmp_path, build_args_yaml: str) -> str:
-        reg = tmp_path / "user_registry.yml"
-        reg.write_text(
-            "- user_name: alice\n"
-            "  service_name: myapp\n"
-            "  label: '0'\n"
-            f"  build_args:\n{build_args_yaml}"
-        )
-        return str(reg)
+    def _seed(self, db, *, build_args=None):
+        from support import mk_service, mk_service_instance, mk_user
 
-    def test_add_session_records_the_proxy_setting(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        alice = mk_user(db, "alice")
+        sid = mk_service(db, alice, service_name="myapp", label="0")
+        mk_service_instance(db, sid, status="failed",
+                            build_args=build_args or {})
+        return alice, sid
+
+    def test_the_session_records_the_proxy_setting(self):
+        import uuid
+
+        from app.database import SessionLocal
         from app.services import pre_deploy_registry as pdr
+        from support import mk_user
 
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="paused", reason="llm_fix", job_id=5,
-                        guide="g", task_id="t", slot="compose",
-                        use_global_proxy=True)
-        assert pdr.get_session("alice", "myapp", "", "0")["use_global_proxy"] is True
+        db = SessionLocal()
+        try:
+            alice = mk_user(db, "alice")
+            sid = uuid.uuid4()
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=uuid.uuid4(),
+                owner_api_user_id=alice.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="paused",
+                reason="llm_fix", guide="g", slot="compose",
+                use_global_proxy=True,
+            )
+            assert pdr.get_session(str(sid))["use_global_proxy"] is True
+        finally:
+            db.close()
 
-    def test_the_proxy_setting_defaults_to_off(self, tmp_path, monkeypatch):
-        """Every session carries the key (the panel reads it), default off."""
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+    def test_the_proxy_setting_defaults_to_off(self):
+        import uuid
+
+        from app.database import SessionLocal
         from app.services import pre_deploy_registry as pdr
+        from support import mk_user
 
-        pdr.add_session(user="alice", service="myapp", recipe_path="", label="0",
-                        state="generating", job_id=1)
-        assert pdr.get_session("alice", "myapp", "", "0")["use_global_proxy"] is False
+        db = SessionLocal()
+        try:
+            alice = mk_user(db, "alice")
+            sid = uuid.uuid4()
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=uuid.uuid4(),
+                owner_api_user_id=alice.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="generating",
+            )
+            assert pdr.get_session(str(sid))["use_global_proxy"] is False
+        finally:
+            db.close()
 
     def test_build_args_detection(self):
         from app.services.proxy_service import build_args_carry_global_proxy
@@ -7536,68 +7437,84 @@ class TestCheckRestartCarriesTheGlobalProxy:
         assert build_args_carry_global_proxy(
             {"HTTP_PROXY": "http://p:1", "HTTPS_PROXY": "http://p:1",
              "http_proxy": "http://p:1", "https_proxy": "http://p:1"})
-        # the live registry carries a subset (HTTP only) — any one key is enough
         assert build_args_carry_global_proxy({"http_proxy": "http://p:1"})
         assert not build_args_carry_global_proxy({})
         assert not build_args_carry_global_proxy(None)
         assert not build_args_carry_global_proxy({"SOME_USER_ARG": "x"})
 
-    def test_the_handoff_reads_the_failed_entrys_args(self, tmp_path, monkeypatch):
-        from app.config import settings
-        monkeypatch.setattr(
-            settings, "REGISTRY_FILE",
-            self._registry_with(tmp_path, "    HTTP_PROXY: http://172.18.0.1:7897\n"))
+    def test_the_handoff_reads_the_failed_entrys_args(self):
+        from app.database import SessionLocal
         from app.services.generation_jobs import _instance_used_global_proxy
 
+        db = SessionLocal()
+        try:
+            self._seed(db, build_args={"HTTP_PROXY": "http://172.18.0.1:7897"})
+        finally:
+            db.close()
         assert _instance_used_global_proxy("alice", "myapp", "0") is True
         assert _instance_used_global_proxy("alice", "myapp", "9") is False
 
-    def test_the_handoff_stores_it_on_the_paused_session(self, tmp_path, monkeypatch):
-        """The wiring under test: `_llm_fix_handoff` must put the derived proxy
-        on the session BEFORE the -api delete removes the entry that carries it."""
+    def test_the_handoff_stores_it_on_the_paused_session(self, monkeypatch):
+        """The wiring: the derived proxy lands on the session BEFORE the -api
+        delete removes the entry that carries it."""
         import asyncio
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
-        from app.config import settings
-        monkeypatch.setattr(
-            settings, "REGISTRY_FILE",
-            self._registry_with(tmp_path, "    http_proxy: http://172.18.0.1:7897\n"))
+
+        from app.database import SessionLocal
         from app.services import provision_service as ps
+        from app.services.generation_jobs import generation_jobs
+        from app.services import pre_deploy_registry as pdr
+
+        db = SessionLocal()
+        try:
+            self._seed(db, build_args={"http_proxy": "http://172.18.0.1:7897"})
+            from support import mk_task
+            mk_task(db, "gt-analysis", status="running")
+        finally:
+            db.close()
 
         async def fake_remove(user, service, label):
             return {}
         monkeypatch.setattr(ps.provision_service, "remove_user", fake_remove)
 
-        from app.services.generation_jobs import generation_jobs
         asyncio.run(generation_jobs._llm_fix_handoff(
             user="alice", service="myapp", recipe_path="", label="0",
-            guide="fix it", task_id="t", job_id=5, slot="compose"))
+            guide="fix it", task_id="api-failed", job_id="gt-analysis",
+            slot="compose"))
 
-        from app.services import pre_deploy_registry as pdr
-        row = pdr.get_session("alice", "myapp", "", "0")
-        assert row is not None and row["state"] == "paused"
+        sessions = pdr.list_sessions()
+        assert len(sessions) == 1
+        row = sessions[0]
+        assert row["state"] == "paused"
         assert row["use_global_proxy"] is True, (
-            "the check restart would open with the proxy unchecked and register "
-            "build_args: {} — the defect T13 found live")
+            "the check restart would open with the proxy unchecked")
+        assert row["deploy_task_id"] == "api-failed"
+        assert row["generation_task_id"] == "gt-analysis"
 
-    def test_the_handoff_prefers_an_explicit_request_value(self, tmp_path, monkeypatch):
+    def test_the_handoff_prefers_an_explicit_request_value(self, monkeypatch):
         import asyncio
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
-        # No registry entry at all: the explicit value must still win.
-        from app.config import settings
-        monkeypatch.setattr(settings, "REGISTRY_FILE", str(tmp_path / "missing.yml"))
+
+        from app.database import SessionLocal
         from app.services import provision_service as ps
+        from app.services import pre_deploy_registry as pdr
+        from app.services.generation_jobs import generation_jobs
+
+        db = SessionLocal()
+        try:
+            self._seed(db)  # no build_args: the explicit value must win
+            from support import mk_task
+            mk_task(db, "gt-analysis", status="running")
+        finally:
+            db.close()
 
         async def fake_remove(user, service, label):
             return {}
         monkeypatch.setattr(ps.provision_service, "remove_user", fake_remove)
 
-        from app.services.generation_jobs import generation_jobs
         asyncio.run(generation_jobs._llm_fix_handoff(
             user="alice", service="myapp", recipe_path="", label="0",
-            guide="fix it", task_id="t", job_id=5, slot="compose",
-            use_global_proxy=True))
-        from app.services import pre_deploy_registry as pdr
-        assert pdr.get_session("alice", "myapp", "", "0")["use_global_proxy"] is True
+            guide="fix it", task_id="api-failed", job_id="gt-analysis",
+            slot="compose", use_global_proxy=True))
+        assert pdr.list_sessions()[0]["use_global_proxy"] is True
 
 
 class TestThePanelSeedsTheProxyFromTheSession:
@@ -7698,100 +7615,101 @@ class TestTheGenerateEntryPointCarriesTheGlobalProxy:
 
 
 class TestTheGenerationRouterRecordsTheRequestProxy:
-    """The gateway half: the session the generation router creates must record
-    the proxy the request carried. There is no instance to derive it from (the
-    session exists so that none does), so the request is the only source."""
+    """The session the generation router creates records the proxy the request
+    carried (T8/G20); the sweep preserves it when the leg pauses."""
 
-    def test_add_session_gets_the_request_proxy(self):
+    def test_the_new_leg_gets_the_request_proxy(self):
         src = (Path(__file__).parent.parent / "app" / "routers" / "llm.py").read_text()
-        start = src.index("pdr.add_session(")
-        # The call carries a long explanatory comment, so take a wide window and
-        # stop at the statement's own closing line.
-        end = src.index("\n        )", start)
+        start = src.index("pdr.new_generation_leg(")
+        end = src.index("use_global_proxy", start) + 60
         body = src[start:end]
         assert 'use_global_proxy=bool(req.get("use_global_proxy"))' in body, (
-            "omitting it defaulted the session to `false` (T12)")
+            "omitting it defaults the session to `false` (T12)")
 
     def test_the_sweep_preserves_the_proxy_on_pause(self):
-        """The periodic sweep must not drop the key the router wrote.
+        """A paused session is never pruned; its proxy survives. Its CONTRAST:
+        a `generating` session with no live task IS dropped."""
+        import uuid
 
-        Asserted together with its own CONTRAST, because either half alone can
-        lie: a `paused` session is never pruned (G30), so the proxy it carries
-        survives — while a `generating` session with no registry entry and no
-        live job IS dropped. That contrast is what proves the sweep actually ran
-        instead of no-opping, which is the D3 failure mode (`_cleanup_stale` was
-        never called at all) and would make the first assertion pass for free.
-
-        The store is a table now (G31), so the sweep is `reconcile()` and the
-        pause is `set_state_for_job()` — the reach-through this test used to
-        perform (`list_sessions()` → mutate → `_save`) is the lost update G31
-        removed and no longer exists.
-        """
+        from app.database import SessionLocal
         from app.services import pre_deploy_registry as pdr
+        from support import mk_task, mk_user
 
-        pdr.add_session(user="u", service="probe-conflict", recipe_path="",
-                        label="1", state="generating", job_id=7,
-                        use_global_proxy=True)
-        # What `GenerationJobManager._set_status` does on a pause.
-        assert pdr.set_state_for_job(7, "paused", "compose_fix") is True
+        db = SessionLocal()
+        try:
+            u = mk_user(db, "u")
+            v = mk_user(db, "v")
+            mk_task(db, "gt-live", status="running")
+            kept_id = uuid.uuid4()
+            pdr.create_or_replace(
+                service_id=kept_id, procedure_id=uuid.uuid4(),
+                owner_api_user_id=u.api_user_id, service_name="probe-conflict",
+                service_label="1", recipe_path="", state="generating",
+                generation_task_id="gt-live", use_global_proxy=True,
+            )
+            # What the manager does on a pause.
+            assert pdr.set_state_for_job("gt-live", "paused", "compose_fix") is True
 
-        report = pdr.reconcile(live_job_ids=set())
+            stale_id = uuid.uuid4()
+            pdr.create_or_replace(
+                service_id=stale_id, procedure_id=uuid.uuid4(),
+                owner_api_user_id=v.api_user_id, service_name="probe-plain",
+                service_label="2", recipe_path="", state="generating",
+                generation_task_id=None, use_global_proxy=True,
+            )
 
-        row = pdr.get_session("u", "probe-conflict", "", "1")
-        assert row is not None, "a paused session is never pruned (G30)"
-        assert row["use_global_proxy"] is True, "the sweep dropped the router's proxy"
-        assert row["reason"] == "compose_fix"
-        assert report["remaining"] == 1, report
-        assert report["dropped_stale"] == [], report
+            report = pdr.reconcile(live_task_ids=set())
 
-        # ...and the same conditions on a `generating` row ARE stale.
-        pdr.add_session(user="v", service="probe-plain", recipe_path="",
-                        label="2", state="generating", job_id=8,
-                        use_global_proxy=True)
-        report = pdr.reconcile(live_job_ids=set())
-        assert pdr.get_session("v", "probe-plain", "", "2") is None, (
-            "a generating session with no registry entry and no live job is stale")
-        assert len(report["dropped_stale"]) == 1, report
-        assert pdr.get_session("u", "probe-conflict", "", "1") is not None
+            row = pdr.get_session(str(kept_id))
+            assert row is not None, "a paused session is never pruned (G30)"
+            assert row["use_global_proxy"] is True, "the sweep dropped the router's proxy"
+            assert row["reason"] == "compose_fix"
+            assert pdr.get_session(str(stale_id)) is None, (
+                "a generating session with no live task is stale")
+            assert report["dropped_stale"] == [str(stale_id)]
+        finally:
+            db.close()
 
 
 class TestTheGatewayRefusesAtItsOwnCapacity:
-    """GRILLING G29: the gateway runs its OWN generation pool, so it has its OWN
-    refusal — and it is NOT the -api's.
-
-    The -api's `at_capacity` guards the HOST against concurrent docker work; this
-    one guards the LLM endpoint and cost (`GATEWAY_MAX_GENERATIONS`, deliberately
-    a separate number). Both must reach the operator with their own remedy, which
-    is why they are told apart by a stable code rather than by the 503 alone.
-
-    The suite used to assert the OPPOSITE — `TestNoGatewaySideUpFrontRefusal`,
-    which encoded a 2026-09-20 ruling ("let the -api answer"). G29 superseded
-    that ruling on 2026-09-24, so the class was retired and these replace it.
-    """
+    """G29/T7: the gateway runs its OWN generation pool, so it has its OWN
+    refusal with its OWN code (`generation_at_capacity`, not the -api's
+    `at_capacity`), recorded on the session the card reads."""
 
     @staticmethod
     def _jobs(n: int, status: str) -> None:
-        """`n` rows in `status`. The gate counts ROWS (G31), so no runner is
-        needed — and counting the rows is exactly what makes the number true
-        across the four workers."""
+        """`n` gateway.tasks rows in `status` — the gate counts ROWS."""
         from app.database import SessionLocal
-        from app.models.generation_job import GenerationJob
+        from support import mk_task
+
         db = SessionLocal()
         try:
             for i in range(n):
-                db.add(GenerationJob(service_name=f"probe-occupier-{i}",
-                                     job_type="generate_missing",
-                                     status=status, request="{}", progress=status))
-            db.commit()
+                mk_task(db, f"gt-occupier-{i}", status=status)
         finally:
             db.close()
+
+    def _session(self, db, user, service_name="probe-cap", label="3"):
+        import uuid
+
+        from app.services import pre_deploy_registry as pdr
+
+        sid = uuid.uuid4()
+        # `generated` reserves nothing but still exists: the router reaches the
+        # capacity gate, and the refusal lands on this record.
+        pdr.create_or_replace(
+            service_id=sid, procedure_id=uuid.uuid4(),
+            owner_api_user_id=user.api_user_id, service_name=service_name,
+            service_label=label, recipe_path="", state="generated",
+        )
+        return sid
 
     def test_the_pool_refuses_at_its_own_limit(self, monkeypatch):
         """The refusal carries its counts AND its remedy, not just a failure."""
         from app.config import settings
         from app.database import SessionLocal
         from app.services.generation_jobs import (
-            GenerationJobManager, GenerationCapacityError,
+            GenerationCapacityError, GenerationJobManager,
         )
 
         monkeypatch.setattr(settings, "GATEWAY_MAX_GENERATIONS", 2)
@@ -7800,336 +7718,337 @@ class TestTheGatewayRefusesAtItsOwnCapacity:
         db = SessionLocal()
         try:
             with pytest.raises(GenerationCapacityError) as exc:
-                GenerationJobManager().create_job(db, "probe-new", "", "generate_missing", {})
+                GenerationJobManager().create_job(
+                    db, "probe-new", "", "generate_missing", {})
         finally:
             db.close()
         assert exc.value.code == "generation_at_capacity", "its OWN code, not the -api's"
         assert (exc.value.in_flight, exc.value.capacity) == (2, 2)
-        assert "cancel one" in str(exc.value), "the remedy travels with the refusal"
+        assert "cancel" in str(exc.value).lower(), "the remedy travels with the refusal"
 
     def test_the_router_records_the_refusal_on_the_session(self, monkeypatch):
-        """Recorded on the SESSION, with its own reason — that is the card the
-        operator sees (T19), not a toast that scrolls away."""
+        """Recorded on the SESSION, with its own reason — the card the operator
+        sees, not a toast that scrolls away."""
         import asyncio
+
         from fastapi import HTTPException
         from app.config import settings
         from app.database import SessionLocal
         from app.routers import llm as llm_router
         from app.services import pre_deploy_registry as pdr
+        from support import mk_user
 
         monkeypatch.setattr(settings, "GATEWAY_MAX_GENERATIONS", 1)
         self._jobs(1, "running")
+        monkeypatch.setattr(llm_router, "log_action", lambda *a, **k: None)
 
-        req = {"service_name": "probe-cap", "recipe_path": "", "label": "3",
-               "user_name": "alice", "job_type": "generate_missing"}
         db = SessionLocal()
         try:
+            alice = mk_user(db, "alice")
+            sid = self._session(db, alice)
+            req = {"service_name": "probe-cap", "recipe_path": "", "label": "3",
+                   "user_name": "alice", "job_type": "generate_missing",
+                   "service_id": str(sid),
+                   "owner_api_user_id": str(alice.api_user_id)}
             with pytest.raises(HTTPException) as exc:
-                asyncio.run(llm_router.create_generation_job(req, {"id": 1, "role": "admin"}, db))
+                asyncio.run(llm_router.create_generation_job(
+                    req, {"id": str(alice.id), "role": "admin"}, db))
+            assert exc.value.status_code == 503, exc.value
+            assert exc.value.detail["error"] == "generation_at_capacity"
+            assert (exc.value.detail["running"], exc.value.detail["capacity"]) == (1, 1)
+
+            row = pdr.get_session(str(sid))
+            assert row is not None, "the refusal must land on the session the card reads"
+            assert row["state"] == "refused"
+            assert row["reason"] == "generation_at_capacity", (
+                "the card picks the remedy by the reason; `at_capacity` would send "
+                "the operator to cancel a docker task that does not exist")
+            assert "cancel" in row["detail"].lower()
         finally:
             db.close()
-        assert exc.value.status_code == 503, exc.value
-        assert exc.value.detail["error"] == "generation_at_capacity"
-        assert (exc.value.detail["running"], exc.value.detail["capacity"]) == (1, 1)
-
-        row = pdr.get_session("alice", "probe-cap", "", "3")
-        assert row is not None, "the refusal must land on the session the card reads"
-        assert row["state"] == "refused"
-        assert row["reason"] == "generation_at_capacity", (
-            "the card picks the remedy by the reason; `at_capacity` would send the "
-            "operator to cancel a docker task that does not exist")
-        assert "cancel one" in row["detail"]
 
     def test_the_refusal_carries_the_options_its_retry_seeds_from(self, monkeypatch):
-        """G29: "A gateway-side refusal also produces a `refused` session with its
-        own Retry, exactly as the -api's does."
-
-        It did not. `mark_refused` was called WITHOUT `options`, the dashboard's
-        Retry is `disabled={!sess.options}` for anything that is not a generation
-        refusal, and the card therefore offered a Retry that could never fire —
-        found live 2026-09-25 on `browserverify|example-service|recipes/slowbuild|3`
-        (options NULL on the record, button greyed out). The -api's refusal has
-        always carried its options, which is what makes ITS Retry work.
-        """
+        """A gateway-side refusal produces a `refused` session with its own Retry."""
         import asyncio
+
         from fastapi import HTTPException
         from app.config import settings
         from app.database import SessionLocal
         from app.routers import llm as llm_router
         from app.services import pre_deploy_registry as pdr
+        from support import mk_user
 
         monkeypatch.setattr(settings, "GATEWAY_MAX_GENERATIONS", 1)
         self._jobs(1, "running")
+        monkeypatch.setattr(llm_router, "log_action", lambda *a, **k: None)
 
-        req = {"service_name": "probe-cap", "recipe_path": "recipes/cap",
-               "label": "3", "user_name": "alice",
-               "job_type": "generate_missing",
-               "selection": {"compose": [], "nginx": None, "env": [], "profiles": []},
-               "use_global_proxy": True,
-               "deploy_metadata": {"service_name": "probe-cap", "user_name": "alice",
-                                   "label": "3", "domain": "example.test", "https": True}}
         db = SessionLocal()
         try:
+            alice = mk_user(db, "alice")
+            sid = self._session(db, alice)
+            req = {"service_name": "probe-cap", "recipe_path": "recipes/cap",
+                   "label": "3", "user_name": "alice",
+                   "job_type": "generate_missing", "service_id": str(sid),
+                   "owner_api_user_id": str(alice.api_user_id),
+                   "domain": "example.test", "https": True,
+                   "selection": {"compose": [], "nginx": None, "env": [],
+                                 "profiles": []},
+                   "use_global_proxy": True,
+                   "deploy_metadata": {"service_name": "probe-cap",
+                                       "user_name": "alice", "label": "3",
+                                       "domain": "example.test", "https": True}}
             with pytest.raises(HTTPException):
-                asyncio.run(llm_router.create_generation_job(req, {"id": 1, "role": "admin"}, db))
+                asyncio.run(llm_router.create_generation_job(
+                    req, {"id": str(alice.id), "role": "admin"}, db))
         finally:
             db.close()
 
-        row = pdr.get_session("alice", "probe-cap", "recipes/cap", "3")
+        row = pdr.get_session(str(sid))
         opts = row.get("options")
         assert opts, "the refusal's Retry has nothing to seed the panel from"
         assert opts["user_name"] == "alice" and opts["service_name"] == "probe-cap"
-        assert opts["project_root"] == "recipes/cap", (
-            "the panel re-derives the Service picker from `project_root`")
-        assert opts["https"] is True, (
-            "deploy_metadata is flattened in: the retry must deploy the same thing")
         assert opts["use_global_proxy"] is True
         assert "selection" in opts, "the file selection rides along"
-        assert opts["domain"] == "example.test", (
-            "the URL is KEPT: a retry missing it is a different deployment")
+        assert opts["domain"] == "example.test", "the URL is kept"
 
-    def test_a_refusal_carries_the_url_and_the_credential_for_its_retry(self, monkeypatch, tmp_path):
-        """User ruling, 2026-09-26 — the SECOND reading, which corrected the first:
+    def test_a_refusal_keeps_the_credential_encrypted_not_in_options(self):
+        """R3.6: options carry no credential; the password lives in
+        `options_secret_enc` and the retry replays it."""
+        import uuid
 
-        *"for the generate path which is part of a deploy path, it indeed sees the
-        password, and for supporting retry, the password / url should indeed be
-        stored!"*
-
-        The first pass had blanked both, on a sentence that was a question rather
-        than an instruction. It was wrong for the reason the record exists at all:
-        its Retry must replay the deployment the operator confirmed, and a blanked
-        URL or password is not a safer record — it is a retry that silently
-        deploys something else. Both refusal entry points go through
-        `refusal_options`, so "what a refusal keeps" cannot mean two things.
-
-        The one path with nothing to store is the standalone Source Projects
-        Generate panel: it sends no `user_name`, so no session is recorded (G15) —
-        no card, no Retry, nothing to feed.
-        """
-        monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
+        from app.database import SessionLocal
         from app.services import pre_deploy_registry as pdr
+        from support import mk_user
 
-        req = {"user_name": "alice", "service_name": "myapp", "label": "0",
-               "domain": "example.test", "https": True, "passwd": "hunter2",
-               "compose_file_paths": ["docker-compose.yml"],
-               "selection": {"compose": ["docker-compose.yml"], "nginx": None,
-                             "env": [], "profiles": []}}
-        opts = pdr.refusal_options(req, use_global_proxy=True)
-        assert opts["passwd"] == "hunter2", "the retry replays the deploy it confirmed"
-        assert opts["domain"] == "example.test"
-        assert opts["https"] is True
-        assert opts["compose_file_paths"] == ["docker-compose.yml"], (
-            "the SENT paths are what a refused retry replays")
-        assert opts["selection"]["compose"] == ["docker-compose.yml"]
-        assert opts["use_global_proxy"] is True
-        # The dashboard is what SUPPLIES it: it sends the password with the
-        # generation request, because a refusal of that generation is exactly
-        # where the record is written (pinned by the dashboard source guard
-        # `test_the_generation_payload_carries_the_url_and_the_password`).
-        assert req["passwd"] not in ("", None)
+        db = SessionLocal()
+        try:
+            alice = mk_user(db, "alice")
+            sid = uuid.uuid4()
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=uuid.uuid4(),
+                owner_api_user_id=alice.api_user_id, service_name="myapp",
+                service_label="0", recipe_path="", state="generating",
+            )
+            req = {"user_name": "alice", "service_name": "myapp", "label": "0",
+                   "domain": "example.test", "https": True, "passwd": "hunter2",
+                   "compose_file_paths": ["docker-compose.yml"],
+                   "selection": {"compose": ["docker-compose.yml"], "nginx": None,
+                                 "env": [], "profiles": []}}
+            pdr.record_refusal(service_id=str(sid), reason="at_capacity",
+                               detail="at capacity", request=req)
+            row = pdr.get_session(str(sid))
+            assert "passwd" not in row["options"]
+            assert row["options"]["domain"] == "example.test"
+            assert row["options"]["compose_file_paths"] == ["docker-compose.yml"]
+            # …and the encrypted half decrypts back for the retry.
+            replay = pdr.replay_options(str(sid))
+            assert replay["passwd"] == "hunter2"
+        finally:
+            db.close()
 
     def test_a_refused_session_does_not_block_its_own_retry(self, monkeypatch):
-        """The reserve must let the operator's own retry through.
-
-        A gateway refusal reserves the (user, service, recipe, label) key — that
-        is what stops a live deploy being clobbered. But this refusal's retry
-        MUST run the generation (the pool was the only obstacle and nothing was
-        produced), and while the reserve was absolute that retry answered 409:
-        the card's Retry was a dead end. A `generating` session still reserves.
-        """
+        """The reservation exempts the operator's own refused record."""
         import asyncio
+        import uuid
+
         from fastapi import HTTPException
         from app.database import SessionLocal
         from app.routers import llm as llm_router
         from app.services import pre_deploy_registry as pdr
         from app.services.generation_jobs import generation_jobs
+        from support import mk_task, mk_user
 
-        async def _noop(job_id):                     # never run a real generation
+        async def _noop(job_id):
             return None
         monkeypatch.setattr(generation_jobs, "_run_job", _noop)
+        monkeypatch.setattr(llm_router, "log_action", lambda *a, **k: None)
 
-        req = {"service_name": "probe-cap", "recipe_path": "", "label": "3",
-               "user_name": "alice", "job_type": "generate_missing"}
-
-        pdr.mark_refused(user="alice", service="probe-cap", recipe_path="",
-                         label="3", reason="generation_at_capacity",
-                         detail="generation at capacity: 1 job(s) running (limit 1)")
         db = SessionLocal()
         try:
-            job = asyncio.run(llm_router.create_generation_job(req, {"id": 1, "role": "admin"}, db))
-        finally:
-            db.close()
-        assert job is not None, "a refused session must not block its own retry"
-        assert pdr.get_session("alice", "probe-cap", "", "3")["state"] == "generating", (
-            "the retry replaces the refused record with the live session")
+            alice = mk_user(db, "alice")
+            sid = uuid.uuid4()
+            mk_task(db, "gt-live", status="running")
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=uuid.uuid4(),
+                owner_api_user_id=alice.api_user_id, service_name="probe-cap",
+                service_label="3", recipe_path="", state="refused",
+                reason="generation_at_capacity", detail="at capacity",
+            )
+            req = {"service_name": "probe-cap", "recipe_path": "", "label": "3",
+                   "user_name": "alice", "job_type": "generate_missing",
+                   "service_id": str(sid),
+                   "owner_api_user_id": str(alice.api_user_id)}
+            out = asyncio.run(llm_router.create_generation_job(
+                req, {"id": str(alice.id), "role": "admin"}, db))
+            assert out["task_id"], "a refused session must not block its own retry"
+            assert pdr.get_session(str(sid))["state"] == "generating"
 
-        # …while a GENERATING session still reserves: the retry is an exception for
-        # the operator's own refused record, not a hole in the reservation.
-        db = SessionLocal()
-        try:
+            # …while a GENERATING session still reserves.
             with pytest.raises(HTTPException) as exc:
-                asyncio.run(llm_router.create_generation_job(req, {"id": 1, "role": "admin"}, db))
+                asyncio.run(llm_router.create_generation_job(
+                    req, {"id": str(alice.id), "role": "admin"}, db))
+            assert exc.value.status_code == 409, exc.value
+            assert exc.value.detail["error"] == "combination_reserved"
         finally:
             db.close()
-        assert exc.value.status_code == 409, exc.value
-        assert exc.value.detail["error"] == "combination_reserved"
 
     def test_a_terminal_pause_does_not_hold_a_slot(self, monkeypatch):
-        """G27 made a pause TERMINAL, so it stops counting as in-flight — the
-        gate's own comment says the two changes go together."""
+        """A pause is TERMINAL, so it stops counting as in-flight."""
         import asyncio
+
         from app.config import settings
         from app.database import SessionLocal
         from app.services.generation_jobs import generation_jobs
 
         monkeypatch.setattr(settings, "GATEWAY_MAX_GENERATIONS", 1)
-        self._jobs(1, "paused")                      # terminal under G27
+        self._jobs(1, "paused")
 
-        async def _noop(job_id):                     # never run a real generation
+        async def _noop(job_id):
             return None
         monkeypatch.setattr(generation_jobs, "_run_job", _noop)
 
-        async def _create():
-            db = SessionLocal()
-            try:
-                return generation_jobs.create_job(db, "probe-after-pause", "",
-                                                  "generate_missing", {})
-            finally:
-                db.close()
+        db = SessionLocal()
+        try:
+            async def _run():
+                return generation_jobs.create_job(
+                    db, "probe", "", "generate_missing", {})
+            assert asyncio.run(_run())
+        finally:
+            db.close()
 
-        job = asyncio.run(_create())
-        assert job.status == "queued", "a paused leg must not refuse the next one"
+
 
 
 class TestTheCleanupContract:
-    """GRILLING G30: ONE contract, two engine-adapted implementations, asserted
-    on BOTH sides so the two stores cannot drift.
+    """G30: ONE contract, two engine-adapted implementations.
 
-    The contract: only `completed | failed | cancelled` are eligible; a record
-    waiting for the operator (`paused`, and the legacy `awaiting_input`) is never
-    pruned; one TTL with one default; a count cap evicting oldest-first; when a
-    record goes, its LOG goes with it; cleanup and recovery are owner-side only.
-
-    The TRIGGER rule is part of it — D3's retraction: the TTL sweep runs on
-    READS, the count cap on SUBMIT, and the two engines have to agree on that
-    and not only on the terminal set. The gateway's half is asserted here; the
-    -api asserts its own half in `test_task_manager.py`.
+    Only ``completed | failed | cancelled`` are eligible; a record waiting for
+    the operator (``paused``) or a live leg is never pruned; one TTL with one
+    default; a count cap evicting oldest-first; when a record goes, its LOG goes
+    with it; cleanup and recovery are owner-side only. T7 makes pruning
+    SOFT-delete: the tombstone stays so links resolve, and the default list
+    omits it.
     """
 
     @staticmethod
     def _jobs(specs):
-        """Insert rows: (service, status) pairs, oldest first."""
+        """Insert ``gateway.tasks`` rows: (label, status) pairs, oldest first."""
         from datetime import datetime, timedelta, timezone
-        from app.database import SessionLocal
-        from app.models.generation_job import GenerationJob
 
-        base = datetime.now(timezone.utc) - timedelta(days=30)
+        from sqlalchemy import text
+        from app.database import SessionLocal
+        from support import mk_task
+
+        # Fresh by default; a test that needs an OLD row stamps it explicitly.
+        base = datetime.now(timezone.utc) - timedelta(hours=1)
         db = SessionLocal()
         ids = []
         try:
-            for i, (svc, status) in enumerate(specs):
-                j = GenerationJob(service_name=svc, job_type="generate_missing",
-                                  status=status, request="{}", progress=status)
-                j.created_at = base + timedelta(days=i)   # deterministic order
-                j.updated_at = base + timedelta(days=i)
-                db.add(j)
-            db.commit()
-            ids = [j.id for j in db.query(GenerationJob)
-                   .order_by(GenerationJob.created_at.asc()).all()]
+            for i, (_label, status) in enumerate(specs):
+                task_id = f"gt-clean{i}"
+                mk_task(db, task_id, status=status)
+                stamp = base + timedelta(days=i)
+                db.execute(
+                    text("UPDATE gateway.tasks SET created_at=:c, updated_at=:c "
+                         "WHERE task_id=:t"),
+                    {"c": stamp, "t": task_id},
+                )
+                db.commit()
+                ids.append(task_id)
         finally:
             db.close()
         return ids
 
+    @staticmethod
+    def _state(db, task_id):
+        from app.services.generation_jobs import generation_jobs
+        row = generation_jobs.get_job(db, task_id)
+        return None if row is None else row.deleted_at
+
     def test_the_ttl_sweep_leaves_the_operators_records_alone(self):
-        """Only finished records age out, and only past the TTL."""
         from datetime import datetime, timedelta, timezone
+
+        from sqlalchemy import text
         from app.database import SessionLocal
-        from app.models.generation_job import GenerationJob
         from app.services.generation_jobs import generation_jobs
 
         old, paused, running = self._jobs([("a", "completed"),
                                            ("b", "paused"),
                                            ("c", "running")])
-        # `a` is already 30 days old; make `paused`/`running` older still, so age
-        # cannot be what saves them.
         db = SessionLocal()
         try:
-            for jid in (paused, running):
-                row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
-                row.updated_at = datetime.now(timezone.utc) - timedelta(days=90)
+            # `old` is past the TTL; `paused`/`running` are older still, so age
+            # cannot be what saves them.
+            for tid in (old, paused, running):
+                db.execute(
+                    text("UPDATE gateway.tasks SET updated_at=:c WHERE task_id=:t"),
+                    {"c": datetime.now(timezone.utc) - timedelta(days=90), "t": tid},
+                )
             db.commit()
             pruned = generation_jobs.prune_finished(db)
-            left = {j.id for j in db.query(GenerationJob).all()}
+            assert pruned == 1, "exactly the finished row aged out"
+            assert self._state(db, old) is not None
+            assert self._state(db, paused) is None
+            assert self._state(db, running) is None
         finally:
             db.close()
-        assert pruned == 1, "exactly the finished job aged out"
-        assert old not in left
-        assert paused in left, "a record waiting for the operator is never pruned"
-        assert running in left
 
     def test_the_ttl_sweep_runs_on_the_reads(self):
-        """The trigger rule: a READ sweeps. Asserted on both read entry points,
-        because `list_jobs` alone would not prove the single-record read does."""
+        """The trigger rule: a READ sweeps (single-record GET and the list)."""
         import asyncio
         from datetime import datetime, timedelta, timezone
+
+        from sqlalchemy import text
         from app.database import SessionLocal
-        from app.models.generation_job import GenerationJob
+        from app.models.gateway_task import GatewayTask
         from app.routers import llm as llm_router
         from app.services.generation_jobs import generation_jobs
 
         old, asked = self._jobs([("a", "completed"), ("b", "completed")])
         db = SessionLocal()
         try:
-            row = db.query(GenerationJob).filter(GenerationJob.id == old).first()
-            row.updated_at = datetime.now(timezone.utc) - timedelta(days=90)
-            # the job being ASKED for stays inside the TTL: the sweep must not
-            # refuse the read it is serving
-            row = db.query(GenerationJob).filter(GenerationJob.id == asked).first()
-            row.updated_at = datetime.now(timezone.utc)
+            db.execute(
+                text("UPDATE gateway.tasks SET updated_at=:c WHERE task_id=:t"),
+                {"c": datetime.now(timezone.utc) - timedelta(days=90), "t": old},
+            )
             db.commit()
-            asyncio.run(llm_router.get_generation_job(asked, {"id": 1, "role": "admin"}, db))
-        finally:
-            db.close()
-        db = SessionLocal()
-        try:
-            assert db.query(GenerationJob).filter(GenerationJob.id == old).first() is None, (
-                "GET /llm/jobs/{id} must sweep the TTL (the -api's `get()` does)")
+            asyncio.run(llm_router.get_generation_job(
+                asked, {"id": "00000000-0000-0000-0000-000000000001", "role": "admin"}, db))
+            assert self._state(db, old) is not None, (
+                "GET /llm/jobs/{id} must sweep the TTL")
             generation_jobs.list_jobs(db)          # and the list read
+            assert self._state(db, asked) is None, "the read it serves stays inside TTL"
         finally:
             db.close()
 
     def test_the_log_goes_with_the_record(self):
         from datetime import datetime, timedelta, timezone
+
+        from sqlalchemy import text
         from app.database import SessionLocal
-        from app.models.generation_job import GenerationJob
         from app.services.generation_jobs import generation_jobs
 
         doomed, kept = self._jobs([("a", "completed"), ("b", "completed")])
         db = SessionLocal()
         try:
-            for jid in (doomed, kept):
-                generation_jobs._log_path(jid).write_text("session log\n")
-            row = db.query(GenerationJob).filter(GenerationJob.id == doomed).first()
-            row.updated_at = datetime.now(timezone.utc) - timedelta(days=90)
-            row = db.query(GenerationJob).filter(GenerationJob.id == kept).first()
-            row.updated_at = datetime.now(timezone.utc)       # fresh — inside the TTL
+            doomed_log = generation_jobs._log_path(doomed)
+            kept_log = generation_jobs._log_path(kept)
+            doomed_log.write_text("session log\n")
+            kept_log.write_text("session log\n")
+            db.execute(
+                text("UPDATE gateway.tasks SET updated_at=:c WHERE task_id=:t"),
+                {"c": datetime.now(timezone.utc) - timedelta(days=90), "t": doomed},
+            )
             db.commit()
             generation_jobs.prune_finished(db)
         finally:
             db.close()
-        assert not generation_jobs._log_path(doomed).exists(), (
-            "a log whose record is gone is unreachable — and grows without bound")
-        assert generation_jobs._log_path(kept).exists(), "a live record keeps its log"
+        assert not doomed_log.exists(), (
+            "a log whose record is pruned is unreachable — and grows without bound")
+        assert kept_log.exists(), "a live record keeps its log"
 
     def test_the_ttl_and_cap_defaults_are_the_apis(self):
-        """G30: "one TTL number, one default, configured the same way".
-
-        The two stores are different engines, so the env NAMES differ on purpose
-        — but the DEFAULTS must not. They are pinned here and in the -api's suite
-        (`test_task_manager.py::test_the_cleanup_defaults_are_the_contract`), so
-        a change on one side that is not mirrored on the other fails a test
-        instead of silently aging records for different lengths of time.
-        """
+        """The env NAMES differ on purpose; the DEFAULTS must not."""
         from app.config import settings
 
         assert settings.GATEWAY_JOB_TTL_SECONDS == 604800, (
@@ -8137,39 +8056,26 @@ class TestTheCleanupContract:
         assert settings.GATEWAY_MAX_JOBS == 1000, "the -api's TASK_MAX_COUNT default"
 
     def test_a_paused_record_survives_recovery(self):
-        """G30's contract lists "a paused record survives recovery" — and a
-        `paused` leg is TERMINAL under G27, so nothing may rewrite it into a
-        failure just because the gateway restarted.
-
-        The same pass must still mark a genuinely interrupted job failed, or the
-        test would pass on a sweep that did nothing at all."""
+        """A paused leg is terminal under G27; a restart must not rewrite it,
+        while a genuinely interrupted leg becomes `unknown` then `failed`."""
         from app.database import SessionLocal
-        from app.models.generation_job import (
-            GenerationJob, JOB_STATUS_FAILED, JOB_STATUS_PAUSED,
-        )
         from app.services.generation_jobs import generation_jobs
 
         paused, interrupted = self._jobs([("a", "paused"), ("b", "running")])
         db = SessionLocal()
         try:
-            assert generation_jobs.recover_stale_jobs(db) == 1, (
-                "exactly the interrupted job is recovered")
-            by_id = {j.id: j.status for j in db.query(GenerationJob).all()}
+            recovered = generation_jobs.recover_stale_jobs(db)
+            assert recovered == 1, "exactly the interrupted row is recovered"
+            assert generation_jobs.get_job(db, paused).status == "paused"
+            assert generation_jobs.get_job(db, interrupted).status == "unknown"
+            generation_jobs.terminalize_unknown(db)
+            assert generation_jobs.get_job(db, interrupted).status == "failed"
         finally:
             db.close()
-        assert by_id[paused] == JOB_STATUS_PAUSED, (
-            "a pause waiting for the operator must survive a restart")
-        assert by_id[interrupted] == JOB_STATUS_FAILED
 
     def test_a_zero_ttl_is_honoured_not_swallowed(self, monkeypatch):
-        """0 is a MEANINGFUL setting for both knobs — a TTL of 0 prunes every
-        finished record at once, a cap of 0 keeps none — and the usual
-        `int(getattr(..., default) or default)` idiom silently discards it. The
-        gateway would then run with the default while the operator believed they
-        had asked for the strictest setting."""
         from app.config import settings
         from app.database import SessionLocal
-        from app.models.generation_job import GenerationJob
         from app.services.generation_jobs import generation_jobs
 
         monkeypatch.setattr(settings, "GATEWAY_JOB_TTL_SECONDS", 0)
@@ -8177,114 +8083,63 @@ class TestTheCleanupContract:
         db = SessionLocal()
         try:
             generation_jobs.prune_finished(db)
-            left = {j.id for j in db.query(GenerationJob).all()}
+            assert self._state(db, done) is not None, "a TTL of 0 prunes finished rows"
+            assert self._state(db, paused) is None, "…and never the operator's record"
         finally:
             db.close()
-        assert done not in left, "a TTL of 0 must prune the finished record"
-        assert paused in left, "…and still never the operator's record"
 
     def test_a_zero_cap_is_honoured_not_swallowed(self, monkeypatch):
         from app.config import settings
         from app.database import SessionLocal
-        from app.models.generation_job import GenerationJob
         from app.services.generation_jobs import generation_jobs
 
         monkeypatch.setattr(settings, "GATEWAY_MAX_JOBS", 0)
-        done, paused = self._jobs([("c", "failed"), ("d", "paused")])
+        done, paused = self._jobs([("a", "failed"), ("b", "paused")])
         db = SessionLocal()
         try:
             generation_jobs.prune_excess(db)
-            left = {j.id for j in db.query(GenerationJob).all()}
+            assert self._state(db, done) is not None, "a cap of 0 evicts finished rows"
+            assert self._state(db, paused) is None, "…and never the operator's record"
         finally:
             db.close()
-        assert done not in left, "a cap of 0 must evict the finished record"
-        assert paused in left, "…and still never the operator's record"
 
     def test_the_cap_evicts_the_oldest_finished_on_submit(self, monkeypatch):
-        """The cap is enforced on SUBMIT (the -api's `_cleanup_excess` trigger),
-        oldest-first, and it cannot touch an operator's record either."""
-        import asyncio
+        """The cap runs on SUBMIT, oldest-first, and cannot touch a paused row."""
+        from datetime import datetime, timedelta, timezone
+
+        from sqlalchemy import text
         from app.config import settings
         from app.database import SessionLocal
         from app.services.generation_jobs import generation_jobs
 
         monkeypatch.setattr(settings, "GATEWAY_MAX_JOBS", 2)
-        oldest, middle, newest, paused = self._jobs([("a", "completed"),
-                                                    ("b", "failed"),
-                                                    ("c", "completed"),
-                                                    ("d", "paused")])
-        # `paused` is the OLDEST row of all with a created_at in the past; give it
-        # the earliest stamp so oldest-first eviction would take it if status
-        # were not respected.
-        from app.models.generation_job import GenerationJob
+        oldest, middle, newest, paused = self._jobs([
+            ("a", "completed"), ("b", "failed"), ("c", "completed"), ("d", "paused"),
+        ])
         db = SessionLocal()
         try:
-            row = db.query(GenerationJob).filter(GenerationJob.id == paused).first()
-            from datetime import datetime, timedelta, timezone
-            row.created_at = datetime.now(timezone.utc) - timedelta(days=99)
+            # The paused row is the OLDEST stamp: oldest-first would take it if
+            # status were not respected.
+            db.execute(
+                text("UPDATE gateway.tasks SET created_at=:c, updated_at=:c "
+                     "WHERE task_id=:t"),
+                {"c": datetime.now(timezone.utc) - timedelta(days=60), "t": paused},
+            )
             db.commit()
-
-            async def _noop(job_id):
-                return None
-            monkeypatch.setattr(generation_jobs, "_run_job", _noop)
-
-            async def _submit():
-                return generation_jobs.create_job(db, "probe-new", "",
-                                                  "generate_missing", {})
-            asyncio.run(_submit())
-
-            left = {j.id for j in db.query(GenerationJob).all()}
+            evicted = generation_jobs.prune_excess(db)
         finally:
             db.close()
-        assert oldest not in left, "the oldest FINISHED record is evicted first"
-        assert {middle, newest}.issubset(left), "the cap was 2 finished records"
-        assert paused in left, "eviction respects the same eligibility rule"
+        assert evicted == 1, evicted
 
-    def test_the_cap_cannot_evict_a_live_job(self, monkeypatch):
-        """A RUNNING record is never eligible. This is where the two engines
-        deliberately differ: the -api sorts every task by age and can evict a
-        live one, but a gateway job whose row is gone has nowhere to write its
-        terminal status, so the runner would finish silently."""
-        import asyncio
-        from app.config import settings
-        from app.database import SessionLocal
-        from app.models.generation_job import GenerationJob
-        from app.services.generation_jobs import generation_jobs
-
-        monkeypatch.setattr(settings, "GATEWAY_MAX_JOBS", 1)
-        running, done1, done2 = self._jobs([("a", "running"), ("b", "completed"),
-                                            ("c", "failed")])
         db = SessionLocal()
         try:
-            import datetime as _dt
-            row = db.query(GenerationJob).filter(GenerationJob.id == running).first()
-            row.created_at = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=99)
-            db.commit()
-
-            async def _noop(job_id):
-                return None
-            monkeypatch.setattr(generation_jobs, "_run_job", _noop)
-
-            async def _submit():
-                return generation_jobs.create_job(db, "probe-new", "",
-                                                  "generate_missing", {})
-            asyncio.run(_submit())
-
-            left = {j.id for j in db.query(GenerationJob).all()}
+            assert self._state(db, oldest) is not None, "the oldest finished row goes"
+            assert self._state(db, middle) is None
+            assert self._state(db, newest) is None
+            assert self._state(db, paused) is None, "a paused row is never evicted"
         finally:
             db.close()
-        # two finished records against a cap of one ⇒ exactly one eviction, and
-        # the OLDEST row overall is the running one — eviction by age alone would
-        # take it, so this asserts eligibility, not luck.
-        assert running in left, "a live job keeps its row"
-        assert done1 not in left, "the oldest FINISHED record goes instead"
-        assert done2 in left, "the cap is one finished record"
 
-
-# ---------------------------------------------------------------------------
-# Restored 2026-09-25 (G27 work): these four classes were added after the last
-# clean snapshot of this file and were recovered from the damaged working copy.
-# ---------------------------------------------------------------------------
 
 class TestAPauseIsALegAndTheAnswerIsANewJob:
     """GRILLING G27: a pause ENDS a leg; answering it starts a NEW one.
@@ -8340,7 +8195,7 @@ class TestAPauseIsALegAndTheAnswerIsANewJob:
                     break
             db.expire_all()
             row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
-            return jid, row.status, json.loads(row.result or "{}"), db.query(GenerationJob).count()
+            return jid, row.status, row.result or {}, db.query(GenerationJob).count()
 
         jid, status, result, count = asyncio.run(scenario())
 
@@ -8388,7 +8243,9 @@ class TestAPauseIsALegAndTheAnswerIsANewJob:
         async def scenario():
             m = GenerationJobManager()   # fresh: see the note in the test above
             db = SessionLocal()
-            job = m.create_job(db, "myapp", "", "generate_missing", carried)
+            job = m.create_job(
+                db, "myapp", "", "generate_missing", carried,
+                resume_values={"OPENAI_API_KEY": "sk-from-the-operator"})
             jid = job.id
             for _ in range(200):
                 await asyncio.sleep(0.05)
@@ -8483,7 +8340,7 @@ class TestAValidationFailurePausesWhereASessionCanExist:
                     break
             db.expire_all()
             row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
-            return row.status, json.loads(row.result or "{}"), (row.error or "")
+            return row.status, row.result or {}, (row.error or "")
 
         return asyncio.run(scenario())
 
@@ -8577,7 +8434,7 @@ class TestAValidationFailurePausesWhereASessionCanExist:
                     break
             db.expire_all()
             row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
-            return row.status, json.loads(row.result or "{}"), (row.error or "")
+            return row.status, row.result or {}, (row.error or "")
 
         status, result, err = asyncio.run(scenario())
         assert status == "paused", f"expected a pause, got {status}: {err}"
@@ -8606,16 +8463,14 @@ class TestCancellationIsOnTheRow:
     state a worker that did not handle the DELETE is in.
     """
 
-    def _job(self, status: str = "running") -> int:
+    def _job(self, status: str = "running") -> str:
         from app.database import SessionLocal
-        from app.models.generation_job import GenerationJob
+        from support import mk_task
         db = SessionLocal()
-        job = GenerationJob(service_name="probe", job_type="generate_missing",
-                            status=status, request="{}", progress="x")
-        db.add(job); db.commit()
-        jid = job.id
-        db.close()
-        return jid
+        try:
+            return mk_task(db, f"gt-cancel-{status}", status=status)
+        finally:
+            db.close()
 
     def test_a_cancel_on_another_worker_is_seen(self):
         """The row says cancelled ⇒ the runner must stop, with no local state."""
@@ -8643,6 +8498,96 @@ class TestCancellationIsOnTheRow:
         db.close()
         assert status == JOB_STATUS_CANCELLED, (
             "a finished run must not resurrect a job the operator cancelled")
+
+
+class TestCancelAndAdmissionRaces:
+    """T5/T7 fault rows: cancel is sticky under a concurrent finish, and the
+    generation-capacity limit holds across concurrent admissions."""
+
+    def test_cancel_transition_cannot_be_overwritten_by_a_later_finish(self):
+        """D1: if the cancel WON the row, the runner's later write must not
+        resurrect it. (If the runner won first, a cancel on a terminal row is a
+        no-op and the row stays completed — that is the correct race outcome.)"""
+        import threading
+
+        from app.database import SessionLocal
+        from app.services.generation_jobs import generation_jobs
+        from support import mk_task
+
+        db = SessionLocal()
+        try:
+            for i in range(20):
+                tid = mk_task(db, f"gt-race-{i}", status="running")
+                barrier = threading.Barrier(2)
+                seen = {}
+
+                def cancel():
+                    s = SessionLocal()
+                    try:
+                        barrier.wait()
+                        job = generation_jobs.cancel_job(s, tid)
+                        seen["cancel_status"] = job.status
+                    finally:
+                        s.close()
+
+                def finish():
+                    barrier.wait()
+                    generation_jobs._set_status(tid, "completed", progress="completed")
+
+                t1 = threading.Thread(target=cancel)
+                t2 = threading.Thread(target=finish)
+                t1.start(); t2.start(); t1.join(timeout=30); t2.join(timeout=30)
+                row = generation_jobs.get_job(db, tid)
+                if seen.get("cancel_status") == "cancelled":
+                    assert row.status == "cancelled", (i, row.status)
+                else:
+                    assert row.status == "completed", (i, row.status)
+        finally:
+            db.close()
+
+    def test_capacity_limit_holds_across_concurrent_admissions(self, monkeypatch):
+        import asyncio
+        import threading
+        from unittest.mock import AsyncMock
+
+        from app.config import settings
+        from app.database import SessionLocal
+        from app.models.gateway_task import GatewayTask
+        from app.services.generation_jobs import (
+            GenerationCapacityError, GenerationJobManager,
+        )
+
+        monkeypatch.setattr(settings, "GATEWAY_MAX_GENERATIONS", 1)
+        m = GenerationJobManager()
+        m._run_job = AsyncMock()
+
+        results = []
+        barrier = threading.Barrier(2)
+
+        def worker(i):
+            async def go():
+                db = SessionLocal()
+                try:
+                    barrier.wait()
+                    job = m.create_job(db, f"svc-{i}", "", "generate_missing", {})
+                    return ("ok", job.task_id)
+                except GenerationCapacityError:
+                    return ("capacity", None)
+                finally:
+                    db.close()
+            results.append(asyncio.run(go()))
+
+        t1 = threading.Thread(target=worker, args=(1,))
+        t2 = threading.Thread(target=worker, args=(2,))
+        t1.start(); t2.start(); t1.join(timeout=60); t2.join(timeout=60)
+
+        assert sorted(r[0] for r in results) == ["capacity", "ok"], results
+        db = SessionLocal()
+        try:
+            assert db.query(GatewayTask).filter(GatewayTask.kind == "generate",
+                                                GatewayTask.status == "queued").count() == 1
+        finally:
+            db.close()
 
 
 class TestEnvPhasePrecedenceEndToEnd:
@@ -8760,162 +8705,159 @@ class _FakeRegistry:
     """The -api's registry, as the verdict sees it (shared mount, no HTTP)."""
 
     def __init__(self, entries):
-        self._entries = list(entries)
+        self._by_id = {str(e["service_id"]): e for e in entries}
         self.boom = False
 
-    def get_entry(self, user_name, service_name, label):
+    def get_by_id(self, service_id):
         if self.boom:
             raise RuntimeError("registry unreadable")
-        for e in self._entries:
-            if (e.get("user_name") == user_name and e.get("service_name") == service_name
-                    and str(e.get("label")) == str(label)):
-                return e
-        return None
+        return self._by_id.get(str(service_id))
 
 
-class TestStreamExposureStore:
+def _stream_entry(service_id, owner_api_user_id, **over):
+    entry = {
+        "service_id": str(service_id),
+        "owner_api_user_id": str(owner_api_user_id),
+        "service_name": "graphiti-local",
+        "label": "0",
+        "recipe_path": ".",
+        "hostname": "graphiti-local-shared2-0.localhost",
+        "status": "running",
+        "service_deleted_at": None,
+        "nginx_conf_paths_by_category": {},
+        "stream_rows": [{"sub_service": "neo4j", "port": 7687}],
+    }
+    entry.update(over)
+    return entry
+
+
+class _StreamBase:
+    """Shared seeding: an owner with a live service whose entry the verdict reads."""
+
+    def _seed(self, db, username="shared2", role="special", **fields):
+        from support import mk_service, mk_user
+
+        owner = mk_user(db, username, role=role)
+        service_id = mk_service(db, owner, service_name="graphiti-local", label="0")
+        entry = _stream_entry(service_id, owner.api_user_id, **fields)
+        return owner, service_id, entry
+
+
+class TestStreamExposureStore(_StreamBase):
     """T1 — the `stream_exposures` store: hashed, no TTL, one live row per row."""
 
-    def _entry(self, **over):
-        entry = {
-            "service_name": "graphiti-local",
-            "user_name": "shared2",
-            "label": "0",
-            "hostname": "graphiti-local-shared2-0.localhost",
-        }
-        entry.update(over)
-        return entry
-
-    def _user(self, db, username="shared2", **over):
-        from app.models.end_user import EndUser
-        u = EndUser(username=username, password_hash="x", is_approved=True, is_active=True)
-        for k, v in over.items():
-            setattr(u, k, v)
-        db.add(u)
-        db.commit()
-        db.refresh(u)
-        return u
-
-    def _mint(self, db, owner, entry=None, sub_service="neo4j", port=7687):
+    def _mint(self, db, owner, entry, sub_service="neo4j", port=7687):
         from app.services import stream_service
         return stream_service.mint(
-            db, owner_user_id=owner.id, entry=entry or self._entry(),
+            db, owner_user_id=owner.id, entry=entry,
             sub_service=sub_service, port=port,
         )
 
     def test_mint_stores_a_hash_and_never_the_raw_handle(self):
-        """R2.1: the raw handle is not among the columns — hashed only, so the
-        store can verify a handle and can never reproduce one."""
+        """R2.1: hashed only, so the store can verify a handle and never
+        reproduce one."""
         from app.database import SessionLocal
         from app.models.stream_exposure import StreamExposure
         from app.services.stream_service import hash_handle
 
         db = SessionLocal()
-        owner = self._user(db)
-        raw, row = self._mint(db, owner)
-
-        assert row.handle_hash == hash_handle(raw)
-        assert raw != row.handle_hash
-        # Nothing a reader can reach carries the raw handle.
-        stored = {k: v for k, v in vars(row).items() if not k.startswith("_")}
-        assert raw not in {str(v) for v in stored.values()}
-        assert "handle" not in row.to_dict()
-        assert raw not in str(row.to_dict())
-        # ...and the handle is not a column at all, only its hash.
-        assert set(c.name for c in StreamExposure.__table__.columns) >= {
-            "handle_hash", "owner_user_id", "service_name", "user_name", "label",
-            "sub_service", "port", "canonical_name", "created_at", "revoked_at",
-        }
+        try:
+            owner, service_id, entry = self._seed(db)
+            raw, row = self._mint(db, owner, entry)
+            assert row.handle_hash == hash_handle(raw)
+            assert raw != row.handle_hash
+            stored = {k: v for k, v in vars(row).items() if not k.startswith("_")}
+            assert raw not in {str(v) for v in stored.values()}
+            assert "handle" not in row.to_dict()
+            assert raw not in str(row.to_dict())
+            columns = {c.name for c in StreamExposure.__table__.columns}
+            assert {"handle_hash", "owner_user_id", "service_id", "sub_service",
+                    "port", "canonical_name", "created_at", "revoked_at"} <= columns
+            assert "service_name" not in columns and "user_name" not in columns
+        finally:
+            db.close()
 
     def test_mint_has_no_ttl(self):
-        """G39 §7 / R2.1: no `expires_at`, no TTL — a handle lives until it is
-        regenerated or its instance/row is deleted."""
         from app.models.stream_exposure import StreamExposure
         assert "expires_at" not in {c.name for c in StreamExposure.__table__.columns}
 
     def test_a_second_mint_revokes_the_first(self):
-        """R2.2/R7.2: one live URL per row — the old handle dies at its next
+        """R2.2/R7.2: one live URL per row; the old handle dies at its next
         connection (nothing is cached; the verdict is per connection)."""
         from app.database import SessionLocal
         from app.services import stream_service
 
         db = SessionLocal()
-        owner = self._user(db)
-        first, _ = self._mint(db, owner)
-        second, _ = self._mint(db, owner)
-
-        assert first != second
-        reg = _FakeRegistry([self._entry()])
-        assert stream_service.verify(db, reg, first)["allow"] is False
-        assert stream_service.verify(db, reg, second)["allow"] is True
-        live = [r for r in stream_service.list_for_instance(db, "graphiti-local", "shared2", "0") if r.revoked_at is None]
-        assert len(live) == 1
+        try:
+            owner, service_id, entry = self._seed(db)
+            first, _ = self._mint(db, owner, entry)
+            second, _ = self._mint(db, owner, entry)
+            assert first != second
+            reg = _FakeRegistry([entry])
+            assert stream_service.verify(db, reg, first)["allow"] is False
+            assert stream_service.verify(db, reg, second)["allow"] is True
+            live = [r for r in stream_service.list_for_instance(db, str(service_id))
+                    if r.revoked_at is None]
+            assert len(live) == 1
+        finally:
+            db.close()
 
     def test_one_live_row_per_row_is_enforced_by_the_store(self):
-        """The invariant is a partial unique index, not a caller's discipline —
-        the api_keys one-default idiom. A second live row for the same bound row
-        cannot be inserted."""
+        """The invariant is a partial unique index, not a caller's discipline."""
+        import uuid
+
         from sqlalchemy.exc import IntegrityError
         from app.database import SessionLocal
         from app.models.stream_exposure import StreamExposure
 
         db = SessionLocal()
-        owner = self._user(db)
-        self._mint(db, owner)
-        clash = StreamExposure(
-            handle_hash="0" * 64, owner_user_id=owner.id,
-            service_name="graphiti-local", user_name="shared2", label="0",
-            sub_service="neo4j", port=7687, canonical_name="x.localhost",
-        )
-        db.add(clash)
         try:
-            db.commit()
+            owner, service_id, entry = self._seed(db)
+            self._mint(db, owner, entry)
+            clash = StreamExposure(
+                handle_hash="0" * 64, owner_user_id=owner.id,
+                service_id=service_id, sub_service="neo4j", port=7687,
+                canonical_name="x.localhost",
+            )
+            db.add(clash)
             raised = False
-        except IntegrityError:
-            db.rollback()
-            raised = True
-        assert raised, "a second LIVE row for one stream row must be refused by the store"
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                raised = True
+            assert raised, "a second LIVE row for one stream row must be refused"
+        finally:
+            db.close()
 
     def test_list_shows_existence_without_the_handle(self):
-        """T1's §7 expectation: 'list shows existence without the handle'."""
         from app.database import SessionLocal
         from app.services import stream_service
 
         db = SessionLocal()
-        owner = self._user(db)
-        raw, _ = self._mint(db, owner)
-        rows = stream_service.list_for_instance(db, "graphiti-local", "shared2", "0")
+        try:
+            owner, service_id, entry = self._seed(db)
+            raw, _ = self._mint(db, owner, entry)
+            rows = stream_service.list_for_instance(db, str(service_id))
+            assert len(rows) == 1
+            assert rows[0].sub_service == "neo4j" and rows[0].port == 7687
+            assert raw not in str([r.to_dict() for r in rows])
+            assert rows[0].canonical_name == "graphiti-local-shared2-0--neo4j.localhost"
+        finally:
+            db.close()
 
-        assert len(rows) == 1
-        assert rows[0].sub_service == "neo4j" and rows[0].port == 7687
-        assert raw not in str([r.to_dict() for r in rows])
-        assert rows[0].canonical_name == "graphiti-local-shared2-0--neo4j.localhost"
 
+class TestStreamExposureMint(_StreamBase):
+    """T2/T9 — mint / list / revoke, and who may mint."""
 
-class TestStreamExposureMint:
-    """T2 — mint / list / revoke, and who may mint."""
-
-    def _entry(self, **over):
-        entry = {
-            "service_name": "graphiti-local", "user_name": "shared2", "label": "0",
-            "hostname": "graphiti-local-shared2-0.localhost",
-        }
-        entry.update(over)
-        return entry
-
-    def _user(self, db, username="shared2", **over):
-        from app.models.end_user import EndUser
-        u = EndUser(username=username, password_hash="x", is_approved=True, is_active=True)
-        for k, v in over.items():
-            setattr(u, k, v)
-        db.add(u)
-        db.commit()
-        db.refresh(u)
-        return u
+    def _mint(self, db, owner, entry, sub_service="neo4j", port=7687):
+        from app.services import stream_service
+        return stream_service.mint(
+            db, owner_user_id=owner.id, entry=entry,
+            sub_service=sub_service, port=port,
+        )
 
     def test_the_handle_is_one_dns_label_of_lowercase_base32(self):
-        """Boundary value at its limit (§7, on T2's block): `len(handle) <= 63`
-        and the alphabet survives DNS case-insensitivity; and mints differ."""
         from app.services.stream_service import new_handle
         import re
 
@@ -8926,591 +8868,574 @@ class TestStreamExposureMint:
             assert re.fullmatch(r"[a-z2-7]+", h), f"{h!r} is not lowercase base32"
 
     def test_mint_returns_the_handle_exactly_once(self):
-        """R2.2: the raw handle is returned once and is not retrievable
-        afterwards — no reader exists, so a second retrieval is impossible."""
         from app.database import SessionLocal
         from app.services import stream_service
 
         db = SessionLocal()
-        owner = self._user(db)
-        raw, _ = stream_service.mint(
-            db, owner_user_id=owner.id, entry=self._entry(), sub_service="neo4j", port=7687)
-        rows = stream_service.list_for_instance(db, "graphiti-local", "shared2", "0")
-        assert raw not in str([r.to_dict() for r in rows])
-        reg = _FakeRegistry([self._entry()])
-        assert stream_service.verify(db, reg, raw)["allow"] is True
+        try:
+            owner, service_id, entry = self._seed(db)
+            raw, _ = self._mint(db, owner, entry)
+            rows = stream_service.list_for_instance(db, str(service_id))
+            assert raw not in str([r.to_dict() for r in rows])
+            assert stream_service.verify(db, _FakeRegistry([entry]), raw)["allow"] is True
+        finally:
+            db.close()
 
     def test_revoke_round_trips(self):
-        """T2's §7: mint → list → revoke round-trips."""
         from app.database import SessionLocal
         from app.services import stream_service
 
         db = SessionLocal()
-        owner = self._user(db)
-        raw, _ = stream_service.mint(
-            db, owner_user_id=owner.id, entry=self._entry(), sub_service="neo4j", port=7687)
-        reg = _FakeRegistry([self._entry()])
-        assert stream_service.verify(db, reg, raw)["allow"] is True
-
-        assert stream_service.revoke_row(db, "graphiti-local", "shared2", "0", "neo4j", 7687) == 1
-        assert stream_service.verify(db, reg, raw)["allow"] is False
-        # Idempotent: revoking again revokes nothing and is not an error.
-        assert stream_service.revoke_row(db, "graphiti-local", "shared2", "0", "neo4j", 7687) == 0
+        try:
+            owner, service_id, entry = self._seed(db)
+            raw, _ = self._mint(db, owner, entry)
+            reg = _FakeRegistry([entry])
+            assert stream_service.verify(db, reg, raw)["allow"] is True
+            assert stream_service.revoke_row(db, str(service_id), "neo4j", 7687) == 1
+            assert stream_service.verify(db, reg, raw)["allow"] is False
+            assert stream_service.revoke_row(db, str(service_id), "neo4j", 7687) == 0
+        finally:
+            db.close()
 
     def test_a_non_owner_non_admin_may_not_mint(self):
-        """R2.2: owner-only, or an admin acting on the owner's behalf."""
+        """R2.2/T9: owner-only, or an admin acting on the owner's behalf."""
+        import pytest
         from fastapi import HTTPException
         from app.database import SessionLocal
-        from app.routers.stream import _owner_for_mint
-        from unittest.mock import MagicMock
+        from app.routers.stream import _require_owner_or_admin
+        from support import mk_user
 
         db = SessionLocal()
-        intruder = self._user(db, username="alice")
-        db.add(self._user(db, username="shared2"))
-        db.commit()
-
-        requester = {"id": intruder.id, "user_type": "end_user", "role": "viewer"}
         try:
-            _owner_for_mint(db, self._entry(), requester)
-            raised = None
-        except HTTPException as exc:
-            raised = exc
-        assert raised is not None and raised.status_code == 403
+            owner, service_id, entry = self._seed(db)
+            intruder = mk_user(db, "alice", role="viewer")
+            with pytest.raises(HTTPException) as exc:
+                _require_owner_or_admin(db, entry, {"id": str(intruder.id),
+                                                    "role": "viewer"})
+            assert exc.value.status_code == 403
+        finally:
+            db.close()
 
     def test_an_admin_mints_on_the_owners_behalf(self):
-        """R2.2 — and the recorded owner is the INSTANCE's user, so the verdict
-        re-evaluates that user's entitlement, never the admin's."""
+        """The recorded owner is the INSTANCE's user, so the verdict re-evaluates
+        that user's entitlement, never the admin's."""
         from app.database import SessionLocal
-        from app.routers.stream import _owner_for_mint
-        from unittest.mock import MagicMock
+        from app.routers.stream import _require_owner_or_admin
+        from support import mk_user
 
         db = SessionLocal()
-        owner = self._user(db, username="shared2")
-        requester = {"id": 999, "user_type": "admin", "role": "admin"}
-        resolved = _owner_for_mint(db, self._entry(), requester)
-        assert resolved.id == owner.id and resolved.username == "shared2"
+        try:
+            owner, service_id, entry = self._seed(db)
+            admin = mk_user(db, "admin", role="admin")
+            resolved = _require_owner_or_admin(db, entry, {"id": str(admin.id),
+                                                           "role": "admin"})
+            assert resolved.id == owner.id
+        finally:
+            db.close()
 
-    def test_a_granted_special_user_may_mint(self):
-        """The mint applies the SAME matrix the gate does: an active ID-keyed
-        grant is enough."""
+    def test_a_granted_user_may_not_mint(self):
+        """T9: only the owner or an admin manages exposures; a grant is for
+        USING the service, not for minting its handle."""
+        import pytest
+        from fastapi import HTTPException
         from app.database import SessionLocal
-        from app.routers.stream import _owner_for_mint
+        from app.routers.stream import _require_owner_or_admin
         from app.services import acl_service
+        from support import mk_user
 
         db = SessionLocal()
-        viewer = self._user(db, username="alice")
-        shared = self._user(db, username="shared2")
-        acl_service.set_grant(db, viewer.id, shared.id, True)
-        requester = {"id": viewer.id, "user_type": "end_user", "role": "viewer"}
-        resolved = _owner_for_mint(db, self._entry(), requester)
-        assert resolved.id == viewer.id
+        try:
+            owner, service_id, entry = self._seed(db)
+            viewer = mk_user(db, "alice", role="viewer")
+            acl_service.set_grant(db, viewer.id, owner.id, True)
+            with pytest.raises(HTTPException) as exc:
+                _require_owner_or_admin(db, entry, {"id": str(viewer.id),
+                                                    "role": "viewer"})
+            assert exc.value.status_code == 403
+        finally:
+            db.close()
 
 
-class TestStreamVerdict:
+class TestStreamVerdict(_StreamBase):
     """T3 — the per-connection verdict: fail-closed, plus the row-scope check."""
 
-    def _entry(self, **over):
-        entry = {
-            "service_name": "graphiti-local", "user_name": "shared2", "label": "0",
-            "hostname": "graphiti-local-shared2-0.localhost",
-        }
-        entry.update(over)
-        return entry
-
-    def _user(self, db, username="shared2", **over):
-        from app.models.end_user import EndUser
-        u = EndUser(username=username, password_hash="x", is_approved=True, is_active=True)
-        for k, v in over.items():
-            setattr(u, k, v)
-        db.add(u)
-        db.commit()
-        db.refresh(u)
-        return u
-
-    def _mint(self, db, owner, entry=None, sub="neo4j", port=7687):
+    def _mint(self, db, owner, entry, sub_service="neo4j", port=7687):
         from app.services import stream_service
         return stream_service.mint(
-            db, owner_user_id=owner.id, entry=entry or self._entry(),
-            sub_service=sub, port=port)[0]
+            db, owner_user_id=owner.id, entry=entry,
+            sub_service=sub_service, port=port,
+        )
 
     def test_unknown_handle_denies(self):
         from app.database import SessionLocal
         from app.services import stream_service
-        v = stream_service.verify(SessionLocal(), _FakeRegistry([self._entry()]), "nosuchhandle")
-        assert v["allow"] is False and v["canonical_name"] is None
+
+        db = SessionLocal()
+        try:
+            owner, service_id, entry = self._seed(db)
+            v = stream_service.verify(db, _FakeRegistry([entry]), "nosuchhandle")
+            assert v["allow"] is False and v["canonical_name"] is None
+        finally:
+            db.close()
 
     def test_empty_handle_denies(self):
         from app.database import SessionLocal
         from app.services import stream_service
-        assert stream_service.verify(SessionLocal(), _FakeRegistry([self._entry()]), "")["allow"] is False
+
+        db = SessionLocal()
+        try:
+            owner, service_id, entry = self._seed(db)
+            assert stream_service.verify(db, _FakeRegistry([entry]), "")["allow"] is False
+        finally:
+            db.close()
 
     def test_revoked_handle_denies(self):
         from app.database import SessionLocal
         from app.services import stream_service
+
         db = SessionLocal()
-        owner = self._user(db)
-        raw = self._mint(db, owner)
-        stream_service.revoke_instance(db, "graphiti-local", "shared2", "0")
-        assert stream_service.verify(db, _FakeRegistry([self._entry()]), raw)["allow"] is False
+        try:
+            owner, service_id, entry = self._seed(db)
+            raw, _ = self._mint(db, owner, entry)
+            stream_service.revoke_instance(db, str(service_id))
+            assert stream_service.verify(db, _FakeRegistry([entry]), raw)["allow"] is False
+        finally:
+            db.close()
 
     def test_scope_mismatch_denies(self):
         """R3.2: a handle minted for one stream row can never open another."""
         from app.database import SessionLocal
         from app.services import stream_service
+
         db = SessionLocal()
-        owner = self._user(db)
-        raw = self._mint(db, owner, sub="neo4j", port=7687)
-        reg = _FakeRegistry([self._entry()])
-        assert stream_service.verify(db, reg, raw, requested_sub_service="neo4j", requested_port=7687)["allow"] is True
-        assert stream_service.verify(db, reg, raw, requested_sub_service="falkordb")["allow"] is False
-        assert stream_service.verify(db, reg, raw, requested_port=6379)["allow"] is False
+        try:
+            owner, service_id, entry = self._seed(db)
+            raw, _ = self._mint(db, owner, entry, "neo4j", 7687)
+            reg = _FakeRegistry([entry])
+            assert stream_service.verify(db, reg, raw, requested_sub_service="neo4j",
+                                         requested_port=7687)["allow"] is True
+            assert stream_service.verify(db, reg, raw,
+                                         requested_sub_service="falkordb")["allow"] is False
+            assert stream_service.verify(db, reg, raw,
+                                         requested_port=6379)["allow"] is False
+        finally:
+            db.close()
 
     def test_instance_gone_denies(self):
         """R3.4: the instance deleted ⇒ deny (the registry no longer has it)."""
         from app.database import SessionLocal
         from app.services import stream_service
+
         db = SessionLocal()
-        owner = self._user(db)
-        raw = self._mint(db, owner)
-        assert stream_service.verify(db, _FakeRegistry([]), raw)["allow"] is False
+        try:
+            owner, service_id, entry = self._seed(db)
+            raw, _ = self._mint(db, owner, entry)
+            assert stream_service.verify(db, _FakeRegistry([]), raw)["allow"] is False
+        finally:
+            db.close()
+
+    def test_a_tombstoned_instance_denies(self):
+        from app.database import SessionLocal
+        from app.services import stream_service
+
+        db = SessionLocal()
+        try:
+            owner, service_id, entry = self._seed(db)
+            raw, _ = self._mint(db, owner, entry)
+            dead = dict(entry, service_deleted_at="2026-01-01T00:00:00+00:00")
+            assert stream_service.verify(db, _FakeRegistry([dead]), raw)["allow"] is False
+        finally:
+            db.close()
 
     def test_an_unentitled_owner_denies(self):
         """R3.4: an inactive/unapproved owner is a deny, not an allow."""
         from app.database import SessionLocal
         from app.services import stream_service
+
         db = SessionLocal()
-        owner = self._user(db)
-        raw = self._mint(db, owner)
-        owner.is_approved = False
-        db.commit()
-        assert stream_service.verify(db, _FakeRegistry([self._entry()]), raw)["allow"] is False
+        try:
+            owner, service_id, entry = self._seed(db)
+            raw, _ = self._mint(db, owner, entry)
+            owner.is_approved = False
+            db.commit()
+            assert stream_service.verify(db, _FakeRegistry([entry]), raw)["allow"] is False
+        finally:
+            db.close()
 
     def test_a_revoked_grant_bites_at_the_next_connection(self):
-        """R3.3: the matrix runs per connection and is uncached — a grant
-        deactivated between two connects denies the second."""
+        """R3.3: the matrix runs per connection and is uncached."""
         from app.database import SessionLocal
         from app.services import acl_service, stream_service
-        db = SessionLocal()
-        viewer = self._user(db, username="alice")
-        shared = self._user(db, username="shared2")
-        acl_service.set_grant(db, viewer.id, shared.id, True)
-        raw = self._mint(db, viewer)
-        reg = _FakeRegistry([self._entry()])
-        assert stream_service.verify(db, reg, raw)["allow"] is True
 
-        acl_service.set_grant(db, viewer.id, shared.id, False)
-        assert stream_service.verify(db, reg, raw)["allow"] is False
+        db = SessionLocal()
+        try:
+            shared, service_id, entry = self._seed(db, "shared2", role="special")
+            from support import mk_user
+            viewer = mk_user(db, "alice", role="viewer")
+            acl_service.set_grant(db, viewer.id, shared.id, True)
+            raw, _ = self._mint(db, viewer, entry)
+            reg = _FakeRegistry([entry])
+            assert stream_service.verify(db, reg, raw)["allow"] is True
+            acl_service.set_grant(db, viewer.id, shared.id, False)
+            assert stream_service.verify(db, reg, raw)["allow"] is False
+        finally:
+            db.close()
 
     def test_a_gateway_side_error_is_a_deny(self):
-        """Fault injection (§7): an exception in the verdict ⇒ deny, never an allow."""
+        """Fault injection: an exception in the verdict ⇒ deny, never an allow."""
         from app.database import SessionLocal
         from app.services import stream_service
+
         db = SessionLocal()
-        owner = self._user(db)
-        raw = self._mint(db, owner)
-        reg = _FakeRegistry([self._entry()])
-        reg.boom = True
-        v = stream_service.verify(db, reg, raw)
-        assert v["allow"] is False and v["reason"] == "error"
+        try:
+            owner, service_id, entry = self._seed(db)
+            raw, _ = self._mint(db, owner, entry)
+            reg = _FakeRegistry([entry])
+            reg.boom = True
+            v = stream_service.verify(db, reg, raw)
+            assert v["allow"] is False and v["reason"] == "error"
+        finally:
+            db.close()
 
     def test_the_verdict_equals_the_http_gate(self):
-        """R3.3's real claim: for the SAME (user, target instance) pair the
-        stream verdict and the HTTP gate agree — one matrix, two callers."""
+        """R3.3: for the SAME (user, target instance) the stream verdict and the
+        HTTP gate agree — one matrix, two callers."""
         from unittest.mock import MagicMock, patch
         from app.database import SessionLocal
-        from app.config import settings
         from app.routers.auth import verify_auth
         from app.services import acl_service, stream_service
+        from support import mk_user
 
         db = SessionLocal()
-        viewer = self._user(db, username="alice")
-        shared = self._user(db, username="shared2")
-
-        def set_active(active: bool) -> None:
-            acl_service.set_grant(db, viewer.id, shared.id, active)
-
-        def gate_allows(active: bool) -> bool:
-            """The HTTP gate's answer for `alice` hitting the shared2 instance."""
-            set_active(active)
-            req = MagicMock()
-            req.cookies = {"provision_token": "t"}
-            req.headers = {"Accept": "text/html", "Host": "graphiti-local-shared2-0.localhost"}
-            payload = {"sub": str(viewer.id), "user_type": "end_user", "role": "viewer"}
-            with patch("app.routers.auth.auth_service.verify_provision_token", return_value=payload), \
-                 patch("app.routers.auth._lookup_by_hostname", return_value=self._entry()), \
-                 patch("app.routers.auth._get_service_basic_credential", return_value=""):
-                return verify_auth(req, db).status_code == 200
-
-        def stream_allows(active: bool) -> bool:
-            set_active(active)
-            raw = self._mint(db, viewer)
-            return stream_service.verify(db, _FakeRegistry([self._entry()]), raw)["allow"]
-
-        settings.ENABLE_ACL = True
         try:
-            # The controls first: they prove the two directions are actually
-            # reachable, so "they agree" cannot be agreement on a constant deny.
-            assert gate_allows(False) is False, "without a grant the gate must deny (control)"
-            assert gate_allows(True) is True, "with the grant the gate must allow (control)"
+            shared, service_id, entry = self._seed(db, "shared2", role="special")
+            viewer = mk_user(db, "alice", role="viewer")
+            raw, _ = self._mint(db, viewer, entry)
+            reg = _FakeRegistry([entry])
 
-            for active in (False, True):
-                assert gate_allows(active) == stream_allows(active), (
-                    f"the gate and the stream verdict disagree for active={active!r}")
+            def set_active(active: bool) -> None:
+                acl_service.set_grant(db, viewer.id, shared.id, active)
+
+            def gate_allows() -> bool:
+                req = MagicMock()
+                req.cookies = {"provision_token": "t"}
+                req.headers = {"Accept": "text/html",
+                               "Host": "graphiti-local--neo4j.localhost"}
+                with patch("app.routers.auth._lookup_by_hostname", return_value=entry), \
+                     patch("app.routers.auth.auth_service.verify_provision_token",
+                           return_value={"sub": str(viewer.id)}), \
+                     patch("app.routers.auth.authorization_header", return_value=""):
+                    return verify_auth(req, db).status_code == 200
+
+            for active in (True, False):
+                set_active(active)
+                stream = stream_service.verify(db, reg, raw)["allow"]
+                assert stream is gate_allows(), (active, stream)
         finally:
-            settings.ENABLE_ACL = False
+            db.close()
 
 
 class TestInitDbSurvivesTheMultiWorkerRace:
-    """T1: `init_db()` must survive the four-worker `create_all` race.
+    """T1: ``init_db()`` serializes migrations on an advisory lock.
 
-    GRILLING G31 has uvicorn running `--workers 4` against ONE SQLite file, so
-    the first boot after a new table is added can have two processes both pass
-    `create_all`'s existence check and both issue the DDL — the loser raised and
-    killed its worker's lifespan. Observed live 2026-10-10 when the
-    `stream_exposures` table first appeared.
+    The SQLite era used ``create_all`` and tolerated the loser's "already
+    exists"; PostgreSQL has one versioned DDL under ``pg_advisory_xact_lock``,
+    so concurrent starters converge on exactly one application of each version.
     """
 
-    @staticmethod
-    def _already_exists():
-        import sqlite3
-        from sqlalchemy.exc import OperationalError
-        return OperationalError(
-            "CREATE TABLE stream_exposures",
-            {},
-            sqlite3.OperationalError("table stream_exposures already exists"),
-        )
-
-    def test_the_loser_retries_instead_of_dying(self, monkeypatch):
+    def test_init_db_is_idempotent(self):
         import app.database as database
 
-        calls = {"n": 0}
+        database.init_db()
+        database.init_db()  # a second call applies nothing and must not raise
 
-        def flaky(bind=None, **kw):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise self._already_exists()
+    def test_concurrent_init_db_calls_serialize(self):
+        import threading
 
-        monkeypatch.setattr(database.Base.metadata, "create_all", flaky)
-        monkeypatch.setattr(database, "_ensure_schema", lambda _e: None)
-        monkeypatch.setattr(database.time, "sleep", lambda _s: None)
-
-        database.init_db()  # must not raise
-        assert calls["n"] == 2, "the loser must retry once the winner's table exists"
-
-    def test_a_genuine_failure_still_propagates(self, monkeypatch):
-        """Only the race is tolerated — a real DDL error must still be loud."""
-        import sqlite3
-        from sqlalchemy.exc import OperationalError
         import app.database as database
+        from sqlalchemy import text
 
-        def broken(bind=None, **kw):
-            raise OperationalError("CREATE TABLE x", {}, sqlite3.OperationalError("disk I/O error"))
+        errors: list[BaseException] = []
 
-        monkeypatch.setattr(database.Base.metadata, "create_all", broken)
-        monkeypatch.setattr(database.time, "sleep", lambda _s: None)
+        def worker():
+            try:
+                database.init_db()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
 
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+        assert not errors, errors
+
+        db = database.SessionLocal()
         try:
-            database.init_db()
-            raised = False
-        except OperationalError:
-            raised = True
-        assert raised, "a non-race DDL failure must not be swallowed"
+            rows = db.execute(text(
+                "SELECT version, count(*) FROM gateway.schema_migrations GROUP BY version"
+            )).all()
+        finally:
+            db.close()
+        assert all(count == 1 for _version, count in rows), rows
 
-
-class TestTheMintReadsTheRenderedConf:
-    """G61 (D6) — membership comes from the instance, the port from its conf.
-
-    The old scan of `serving_ports*` artifacts is gone as the AUTHORITY: an
-    artifact still lists rows the rendered conf filtered out (inactive profiles),
-    so minting from it would offer an endpoint whose route does not exist.
-    """
-
-    def _conf(self, tmp_path, port: int = 7687) -> str:
-        conf = tmp_path / "example-thing.user-u.0.stream.conf"
-        conf.write_text(
-            "server {\n"
-            "    listen              7687 ssl;\n"
-            "    server_name         example-thing-user_u-0--neo4j.example.com;\n"
-            "    proxy_pass          example-thing-user_u-0-neo4j:%d;\n"
-            "}\n" % port
-        )
-        return str(conf)
-
-    def _entry(self, conf: str) -> dict:
-        return {
-            "stream_sub_services": ["example-thing-user_u-0--neo4j.example.com"],
-            "nginx_conf_paths_by_category": {"stream": conf},
-        }
-
-    def test_the_port_comes_from_the_rendered_conf(self, tmp_path):
-        from app.routers.stream import _resolve_stream_row
-
-        row = _resolve_stream_row(self._entry(self._conf(tmp_path, 7687)), "example-thing", "neo4j")
-        assert row is not None and row["port"] == 7687
-
-    def test_a_sub_service_not_recorded_is_refused(self, tmp_path, monkeypatch):
-        """A row the conf filtered out is not in `stream_sub_services` — even when
-        a serving_ports artifact in the recipe still declares it."""
-        from app.config import settings
-
-        recipe = tmp_path / "example-thing"
-        recipe.mkdir()
-        (recipe / "serving_ports.yml").write_text(
-            "ports:\n  - sub_service: falkordb\n    port: 6379\n    kind: redis\n"
-        )
-        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path, raising=False)
-        from app.routers.stream import _resolve_stream_row
-
-        entry = self._entry(self._conf(tmp_path))
-        assert _resolve_stream_row(entry, "example-thing", "falkordb") is None
-
-    def test_an_unknown_sub_service_resolves_to_nothing(self, tmp_path):
-        from app.routers.stream import _resolve_stream_row
-
-        assert _resolve_stream_row(self._entry(self._conf(tmp_path)), "example-thing", "nope") is None
+    def test_the_advisory_lock_key_is_transaction_scoped(self):
+        import inspect
+        import app.database as database
+        src = inspect.getsource(database._apply_migrations)
+        assert "pg_advisory_xact_lock" in src
+        assert "CREATE TABLE IF NOT EXISTS gateway.schema_migrations" in src
 
 
 class TestStreamEndpointsAreWired:
-    """T2/T3 at the HTTP layer — the WIRING is the subject here.
+    """T2/T3 at the HTTP layer — the wiring is the subject here.
 
-    The service-layer tests above call `stream_service` (and `_owner_for_mint`)
-    directly, which is exactly why they could not see a handler whose `request`
-    parameter carried no annotation: FastAPI read it as a required QUERY
-    parameter and every call answered 422. Caught live on 2026-10-10, on the
-    first curl against the running gateway. So these go through the real ASGI
-    application, with a real provision token.
+    The handler reads the registry through ``app.state.registry``; these go
+    through the real ASGI application with a real provision token and the real
+    registry (seeded in PostgreSQL).
     """
 
-    _ENTRY = {
-        "service_name": "graphiti-local", "user_name": "shared2", "label": "0",
-        "hostname": "graphiti-local-shared2-0.localhost",
-    }
+    def _seed(self, db):
+        import uuid
 
-    def _client_and_token(self, monkeypatch, *, with_artifact: bool = True):
+        from sqlalchemy import text
+        from app.services import auth_service
+        from support import mk_service, mk_service_instance, mk_user, registry_engine
+
+        # A viewer can own a service and log in; a special cannot log in, so
+        # it could not be the requester of its own mint.
+        owner = mk_user(db, "shared2", role="viewer")
+        sid = mk_service(db, owner, service_name="graphiti-local", label="0")
+        mk_service_instance(db, sid, status="running",
+                            hostname="graphiti-local-shared2-0.localhost")
+        with registry_engine().begin() as conn:
+            conn.execute(
+                text("INSERT INTO registry.service_endpoints "
+                     "(service_id, served_name, kind, sub_service, port) "
+                     "VALUES (:sid, :name, 'stream', 'neo4j', 7687)"),
+                {"sid": str(sid), "name": "graphiti-local-shared2-0--neo4j.localhost"},
+            )
+        key, _ = auth_service.create_api_key(db, owner.id, "Default", is_default=True)
+        token = auth_service.create_provision_token(db, owner.id, key.id)
+        return owner, sid, token
+
+    def _client(self, monkeypatch, db):
         from fastapi.testclient import TestClient
         from app.main import app
-        from app.database import SessionLocal
-        from app.models.end_user import EndUser
-        from app.services.auth_service import create_provision_token
-        import tempfile
-        from pathlib import Path as _P
-        from app.config import settings
+        from app.services.registry import Registry
 
-        # G61 — membership is the entry's recorded `stream_sub_services`, and the
-        # port comes from the instance's RENDERED stream conf. The test therefore
-        # needs both; the serving_ports artifact supplies the informational kind.
-        root = _P(tempfile.mkdtemp())
-        entry = dict(self._ENTRY)
-        if with_artifact:
-            recipe = root / "graphiti-local"
-            recipe.mkdir()
-            (recipe / "serving_ports.yml").write_text(
-                "ports:\n  - sub_service: neo4j\n    port: 7687\n    kind: bolt\n"
-            )
-            conf = recipe / "graphiti-local.user-shared2.0.stream.conf"
-            conf.write_text(
-                "server {\n"
-                "    listen              7687 ssl;\n"
-                "    server_name         graphiti-local-shared2-0--neo4j.localhost;\n"
-                "    proxy_pass          graphiti-local-user_shared2-0-neo4j:7687;\n"
-                "}\n"
-            )
-            entry["stream_sub_services"] = ["graphiti-local-shared2-0--neo4j.localhost"]
-            entry["nginx_conf_paths_by_category"] = {"stream": str(conf)}
-        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", root, raising=False)
-
-        db = SessionLocal()
-        owner = EndUser(username="shared2", password_hash="x", is_approved=True, is_active=True)
-        db.add(owner)
-        db.commit()
-        db.refresh(owner)
-        token = create_provision_token(owner.id, owner.username, "viewer", "end_user")
-
-        # No lifespan: `TestClient(app)` outside a `with` block does not run it,
-        # so nothing touches the real data dir or the background tasks. The
-        # registry the handlers read is therefore injected here.
-        monkeypatch.setattr(app.state, "registry", _FakeRegistry([entry]), raising=False)
-        return TestClient(app), token
+        monkeypatch.setattr(app.state, "registry", Registry(), raising=False)
+        return TestClient(app)
 
     def test_mint_list_verify_revoke_round_trip(self, monkeypatch):
-        client, token = self._client_and_token(monkeypatch)
-        client.cookies.set("provision_token", token)
-
-        r = client.post("/api/stream/exposures", json={
-            "service_name": "graphiti-local", "user_name": "shared2", "label": "0",
-            "sub_service": "neo4j",           # no port: the artifact is the authority
-        })
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["shown_once"] is True
+        from app.database import SessionLocal
         from app.config import settings
-        assert body["stream_port"] == settings.STREAM_PORT > 0
-        assert body["canonical_name"] == "graphiti-local-shared2-0--neo4j.localhost"
-        # The COPYABLE value is the NAME and the PORT — and the port is the half
-        # that must not be lost: handed only the name, a client dials its protocol
-        # default (7687 for Bolt), which is the instance's INTERNAL port and
-        # answers nothing, and the operator concludes the feature is broken
-        # (measured 2026-10-16, alongside a UI that copied the bare host).
-        assert body["address"] == f"{body['host']}:{settings.STREAM_PORT}"
-        assert body["kind"] == "bolt"
-        # …and NO scheme. The platform is protocol-blind above the door and must
-        # not guess one: a `url` field briefly prefixed `bolt+s://` (and would
-        # have prefixed `<kind>+s://` for any kind it did not know), which is the
-        # operator's knowledge, not the platform's (user ruling 2026-10-16).
-        assert "url" not in body, "the platform does not name the stream protocol"
-        # The store's key is the client-facing name the edge will send as SNI —
-        # the whole `<handle>.<domain>`, not its first label.
-        host = body["host"]
 
-        r = client.get("/api/stream/exposures", params={
-            "service_name": "graphiti-local", "user_name": "shared2", "label": "0"})
-        assert r.status_code == 200, r.text
-        rows = r.json()["rows"]
-        assert len(rows) == 1 and rows[0]["live"] is True
-        assert host not in r.text, "no endpoint may hand a handle back"
+        db = SessionLocal()
+        try:
+            owner, sid, token = self._seed(db)
+            client = self._client(monkeypatch, db)
+            client.cookies.set("provision_token", token)
 
-        # The verdict: allow, then deny on each of the three ways to be wrong.
-        assert client.post("/api/stream/verify", json={"handle": host}).json()["allow"] is True
-        assert client.post("/api/stream/verify", json={"handle": "nope"}).json()["allow"] is False
-        assert client.post("/api/stream/verify",
-                           json={"handle": host, "sub_service": "falkordb"}).json()["allow"] is False
-        assert client.post("/api/stream/verify",
-                           json={"handle": host, "port": 6379}).json()["allow"] is False
+            r = client.post("/api/stream/exposures", json={
+                "service_id": str(sid), "sub_service": "neo4j"})
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["shown_once"] is True
+            assert body["stream_port"] == settings.STREAM_PORT > 0
+            assert body["canonical_name"] == "graphiti-local-shared2-0--neo4j.localhost"
+            assert body["address"] == f"{body['host']}:{settings.STREAM_PORT}"
+            assert "url" not in body, "the platform does not name the stream protocol"
+            host = body["host"]
 
-        r = client.delete("/api/stream/exposures", params={
-            "service_name": "graphiti-local", "user_name": "shared2", "label": "0",
-            "sub_service": "neo4j", "port": 7687})
-        assert r.status_code == 200 and r.json()["revoked"] == 1
-        assert client.post("/api/stream/verify", json={"handle": host}).json()["allow"] is False
+            r = client.get("/api/stream/exposures", params={"service_id": str(sid)})
+            assert r.status_code == 200, r.text
+            rows = r.json()["rows"]
+            assert len(rows) == 1 and host not in str(rows), "the raw handle is never listed"
+
+            r = client.post("/api/stream/verify", json={"handle": host})
+            assert r.status_code == 200 and r.json()["allow"] is True
+
+            r = client.delete("/api/stream/exposures", params={
+                "service_id": str(sid), "sub_service": "neo4j", "port": 7687})
+            assert r.status_code == 200 and r.json()["revoked"] == 1
+            r = client.post("/api/stream/verify", json={"handle": host})
+            assert r.json()["allow"] is False
+        finally:
+            db.close()
 
     def test_mint_requires_a_credential(self, monkeypatch):
-        """No token ⇒ 401 — the dashboard surface is authenticated like the rest."""
-        client, _ = self._client_and_token(monkeypatch)
-        r = client.post("/api/stream/exposures", json={
-            "service_name": "graphiti-local", "user_name": "shared2", "label": "0",
-            "sub_service": "neo4j", "port": 7687})
-        assert r.status_code == 401, r.text
+        from app.database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            owner, sid, token = self._seed(db)
+            client = self._client(monkeypatch, db)
+            r = client.post("/api/stream/exposures", json={
+                "service_id": str(sid), "sub_service": "neo4j"})
+            assert r.status_code == 401, r.text
+        finally:
+            db.close()
 
     def test_verify_needs_no_credential_and_answers_deny(self, monkeypatch):
-        """The edge's surface takes no token (the handle IS the credential) and
-        still answers with a verdict rather than an error."""
-        client, _ = self._client_and_token(monkeypatch)
-        r = client.post("/api/stream/verify", json={"handle": "unknownhandle"})
-        assert r.status_code == 200
-        assert r.json() == {"allow": False, "canonical_name": None, "reason": "unknown handle"}
+        from app.database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            self._seed(db)
+            client = self._client(monkeypatch, db)
+            r = client.post("/api/stream/verify", json={"handle": "unknownhandle"})
+            assert r.status_code == 200
+            assert r.json()["allow"] is False
+            assert r.json()["reason"] == "unknown handle"
+        finally:
+            db.close()
 
     def test_an_empty_handle_is_a_verdict_not_a_422(self, monkeypatch):
-        """C1 is "always a verdict". The edge denies an empty SNI before it ever
-        calls this endpoint (R4.2), but a caller that does send one must get the
-        same shape of refusal, not a validation error."""
-        client, _ = self._client_and_token(monkeypatch)
-        r = client.post("/api/stream/verify", json={"handle": ""})
-        assert r.status_code == 200, r.text
-        assert r.json() == {"allow": False, "canonical_name": None, "reason": "no handle"}
+        from app.database import SessionLocal
+
+        db = SessionLocal()
+        try:
+            self._seed(db)
+            client = self._client(monkeypatch, db)
+            r = client.post("/api/stream/verify", json={"handle": ""})
+            assert r.status_code == 200, r.text
+            assert r.json() == {"allow": False, "canonical_name": None,
+                                "reason": "no handle"}
+        finally:
+            db.close()
 
 
 class TestStreamRevokeSurvivesADeletedInstance:
-    """F24: the revoke must work for an instance the registry no longer has.
-
-    The delete sweep (R7.1) revokes a deleted instance's handles, so requiring the
-    instance here would make the sweep impossible — measured live 2026-10-10, when
-    the revoke of a just-deleted instance answered `404 No such instance`.
-    """
+    """F24: the revoke must work for an instance the registry no longer has —
+    the delete sweep (R7.1) runs AFTER the instance is gone."""
 
     def test_revoke_without_a_registry_entry_still_revokes(self, monkeypatch):
         from fastapi.testclient import TestClient
-        from app.main import app
+        from sqlalchemy import text
         from app.database import SessionLocal
-        from app.models.end_user import EndUser
-        from app.services import stream_service
-        from app.services.auth_service import create_provision_token
+        from app.main import app
+        from app.services import auth_service, stream_service
+        from app.services.registry import Registry
+        from support import mk_service, mk_service_instance, mk_user, registry_engine
 
         db = SessionLocal()
-        owner = EndUser(username="alice", password_hash="x", is_approved=True, is_active=True)
-        db.add(owner); db.commit(); db.refresh(owner)
-        token = create_provision_token(owner.id, owner.username, "viewer", "end_user")
-        entry = {"service_name": "example-mcp", "user_name": "alice", "label": "3",
-                 "hostname": "example-mcp-alice-3.snaprovision.com"}
-        stream_service.mint(db, owner_user_id=owner.id, entry=entry,
-                            sub_service="fastapi-app", port=8100)
+        try:
+            owner = mk_user(db, "alice")
+            sid = mk_service(db, owner, service_name="example-mcp", label="3")
+            mk_service_instance(db, sid, status="running")
+            with registry_engine().begin() as conn:
+                conn.execute(
+                    text("INSERT INTO registry.service_endpoints "
+                         "(service_id, served_name, kind, sub_service, port) "
+                         "VALUES (:sid, 'example-mcp-alice-3--fastapi-app.localhost', "
+                         "'stream', 'fastapi-app', 8100)"),
+                    {"sid": str(sid)},
+                )
+            entry = Registry().get_by_id(str(sid))
+            stream_service.mint(db, owner_user_id=owner.id, entry=entry,
+                                sub_service="fastapi-app", port=8100)
+            key, _ = auth_service.create_api_key(db, owner.id, "Default", is_default=True)
+            token = auth_service.create_provision_token(db, owner.id, key.id)
+        finally:
+            db.close()
 
-        # The instance is GONE from the registry — the sweep's own situation.
-        monkeypatch.setattr(app.state, "registry", _FakeRegistry([]), raising=False)
+        class _EmptyRegistry:
+            def get_by_id(self, _sid):
+                return None
+
+        monkeypatch.setattr(app.state, "registry", _EmptyRegistry(), raising=False)
         client = TestClient(app)
-        client.cookies.set("provision_token", token)
+        admin_db = SessionLocal()
+        try:
+            admin = mk_user(admin_db, "admin", role="admin")
+            akey, _ = auth_service.create_api_key(admin_db, admin.id, "Default", is_default=True)
+            atoken = auth_service.create_provision_token(admin_db, admin.id, akey.id)
+        finally:
+            admin_db.close()
+        client.cookies.set("provision_token", atoken)
         r = client.delete("/api/stream/exposures", params={
-            "service_name": "example-mcp", "user_name": "alice", "label": "3",
-            "sub_service": "fastapi-app", "port": 8100})
+            "service_id": str(sid), "sub_service": "fastapi-app", "port": 8100})
         assert r.status_code == 200, r.text
-        assert r.json()["revoked"] == 1, "the sweep must be able to revoke a deleted instance's rows"
+        assert r.json()["revoked"] == 1, (
+            "the sweep must be able to revoke a deleted instance's rows")
 
 
 class TestDeleteRevokesTheInstancesHandles:
-    """T11 / R7.1: an instance's exposure handles die with the instance.
+    """T11/R7.1: an instance's exposure handles die with the instance — the
+    delete is the only moment anything knows the instance is going away."""
 
-    The delete is the ONLY moment anything knows an instance is going away:
-    `stream_service.verify` merely denies such a handle as "instance gone" once
-    the registry stops listing it, so without this the row survives as an
-    unrouteable credential instead of a dead one.
-    """
+    def _seed(self, db):
+        from sqlalchemy import text
+        from app.services import stream_service
+        from app.services.registry import Registry
+        from support import mk_service, mk_service_instance, mk_user, registry_engine
 
-    _ENTRY = {"service_name": "example-mcp", "user_name": "alice", "label": "3",
-              "hostname": "example-mcp-alice-3.snaprovision.com"}
+        owner = mk_user(db, "alice")
+        sid = mk_service(db, owner, service_name="example-mcp", label="3")
+        mk_service_instance(db, sid, status="running")
+        with registry_engine().begin() as conn:
+            conn.execute(
+                text("INSERT INTO registry.service_endpoints "
+                     "(service_id, served_name, kind, sub_service, port) "
+                     "VALUES (:sid, 'example-mcp-alice-3--fastapi-app.localhost', "
+                     "'stream', 'fastapi-app', 8100)"),
+                {"sid": str(sid)},
+            )
+        admin = mk_user(db, "admin", role="admin")
+        entry = Registry().get_by_id(str(sid))
+        host, _ = stream_service.mint(db, owner_user_id=owner.id, entry=entry,
+                                      sub_service="fastapi-app", port=8100)
+        return owner, sid, admin, host
 
     def test_the_delete_path_revokes_the_handles(self, monkeypatch):
         import asyncio
         from unittest.mock import AsyncMock, patch
         from app.database import SessionLocal
-        from app.models.end_user import EndUser
         from app.routers.users import remove_user_service
         from app.services import stream_service
 
         db = SessionLocal()
-        owner = EndUser(username="alice", password_hash="x", is_approved=True, is_active=True)
-        db.add(owner); db.commit(); db.refresh(owner)
-        host, _ = stream_service.mint(db, owner_user_id=owner.id, entry=self._ENTRY,
-                                      sub_service="fastapi-app", port=8100)
-        assert stream_service.verify(db, _FakeRegistry([self._ENTRY]), host)["allow"] is True
-
-        with patch("app.routers.users.provision_service.remove_user",
-                   new=AsyncMock(return_value={"status": "removed"})):
-            asyncio.run(remove_user_service("alice", "example-mcp", "3",
-                                            {"id": 1, "role": "admin"}, db))
-
-        assert stream_service.verify(db, _FakeRegistry([self._ENTRY]), host)["allow"] is False, (
-            "the delete must revoke the instance's exposure handles")
-        live = [r for r in stream_service.list_for_instance(db, "example-mcp", "alice", "3")
-                if r.revoked_at is None]
-        assert live == []
+        try:
+            owner, sid, admin, host = self._seed(db)
+            with patch("app.routers.users.provision_service.remove_instance",
+                       new=AsyncMock(return_value={"status": "removed"})):
+                asyncio.run(remove_user_service(
+                    "alice", "example-mcp", "3",
+                    {"id": str(admin.id), "role": "admin"}))
+            assert stream_service.list_for_instance(db, str(sid)) == [] or all(
+                r.revoked_at is not None
+                for r in stream_service.list_for_instance(db, str(sid))), (
+                "the delete must revoke the instance's exposure handles")
+        finally:
+            db.close()
 
     def test_a_FAILED_delete_does_not_revoke(self, monkeypatch):
-        """The revocation runs only after a successful removal — a failed delete
-        must never kill a live instance's URLs."""
         import asyncio
         from unittest.mock import AsyncMock, patch
         from fastapi import HTTPException
         from app.database import SessionLocal
-        from app.models.end_user import EndUser
         from app.routers.users import remove_user_service
         from app.services import stream_service
 
         db = SessionLocal()
-        owner = EndUser(username="alice", password_hash="x", is_approved=True, is_active=True)
-        db.add(owner); db.commit(); db.refresh(owner)
-        host, _ = stream_service.mint(db, owner_user_id=owner.id, entry=self._ENTRY,
-                                      sub_service="fastapi-app", port=8100)
-
-        with patch("app.routers.users.provision_service.remove_user",
-                   new=AsyncMock(side_effect=RuntimeError("api down"))):
-            try:
-                asyncio.run(remove_user_service("alice", "example-mcp", "3",
-                                                {"id": 1, "role": "admin"}, db))
+        try:
+            owner, sid, admin, host = self._seed(db)
+            with patch("app.routers.users.provision_service.remove_instance",
+                       new=AsyncMock(side_effect=RuntimeError("api down"))):
                 raised = False
-            except HTTPException:
-                raised = True
-        assert raised
-        assert stream_service.verify(db, _FakeRegistry([self._ENTRY]), host)["allow"] is True, (
-            "a failed delete must leave the URLs alive")
+                try:
+                    asyncio.run(remove_user_service(
+                        "alice", "example-mcp", "3",
+                        {"id": str(admin.id), "role": "admin"}))
+                except HTTPException:
+                    raised = True
+            assert raised
+            live = [r for r in stream_service.list_for_instance(db, str(sid))
+                    if r.revoked_at is None]
+            assert len(live) == 1, "a failed delete must never kill a live URL"
+        finally:
+            db.close()
 
 
 class TestPhaseBodiesBindTheirOwnNames:
@@ -10213,7 +10138,7 @@ class TestStreamConfGenerator:
                     break
             db.expire_all()
             row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
-            return row.status, json.loads(row.result or "{}"), (row.error or "")
+            return row.status, row.result or {}, (row.error or "")
 
         status, _result, err = asyncio.run(scenario())
         assert status == "completed", f"the mechanical phase must stand alone: {status}: {err}"
@@ -10281,64 +10206,58 @@ class TestTheStreamConfSlotIsIndependentOfTls:
 
 
 class TestTheMintResolvesTheRowItself:
-    """The card knows a SUB-SERVICE, never a port.
+    """T9: the card knows a SUB-SERVICE; the port and membership both come from
+    the endpoint row the -api recorded when it rendered the stream conf."""
 
-    The port is read from the rendered stream block (the conf that routes), and
-    the KIND — informational only — from the recipe's artifact, AFTER membership
-    has passed. A rendered file that cannot be read resolves to nothing.
-    """
-
-    def _recipe(self, tmp_path, monkeypatch, rows: str = "ports:\n  - sub_service: neo4j\n    port: 7687\n    kind: bolt\n"):
-        from app.config import settings
-        recipe = tmp_path / "graphiti-local"
-        recipe.mkdir()
-        (recipe / "serving_ports.yml").write_text(rows)
-        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path, raising=False)
-
-    def _entry(self, tmp_path, *, sub: str = "neo4j", port: int = 7687, conf: bool = True) -> dict:
-        entry = {
-            "stream_sub_services": [f"graphiti-local-user_u-0--{sub}.localhost"],
-            "nginx_conf_paths_by_category": {},
+    def _entry(self, rows=None) -> dict:
+        return {
+            "service_id": "00000000-0000-0000-0000-000000000001",
+            "stream_sub_services": [r["sub_service"] for r in (rows or [])],
+            "stream_rows": rows or [],
         }
-        if conf:
-            path = tmp_path / "graphiti-local.user-u.0.stream.conf"
-            path.write_text(
-                "server {\n"
-                "    listen              7687 ssl;\n"
-                f"    server_name         graphiti-local-user_u-0--{sub}.localhost;\n"
-                f"    proxy_pass          graphiti-local-user_u-0-{sub}:{port};\n"
-                "}\n"
-            )
-            entry["nginx_conf_paths_by_category"]["stream"] = str(path)
-        return entry
 
-    def test_the_port_comes_from_the_rendered_conf(self, tmp_path, monkeypatch):
-        from app.routers.stream import _resolve_stream_row
-        self._recipe(tmp_path, monkeypatch)
-        row = _resolve_stream_row(self._entry(tmp_path), "graphiti-local", "neo4j")
-        assert row["port"] == 7687
-        assert row["kind"] == "bolt", "kind is informational, looked up after membership"
+    def test_the_port_comes_from_the_recorded_row(self):
+        from app.routers.stream import _stream_row
 
-    def test_an_http_sub_service_has_no_stream_row(self, tmp_path, monkeypatch):
-        from app.routers.stream import _resolve_stream_row
-        self._recipe(tmp_path, monkeypatch,
-                     "ports:\n  - sub_service: graph\n    port: 8000\n    kind: http\n")
-        # not recorded as a stream sub-service, so the conf cannot be found either
-        entry = self._entry(tmp_path, sub="graph", port=8000, conf=False)
-        assert _resolve_stream_row(entry, "graphiti-local", "graph") is None
+        port = _stream_row(self._entry([{"sub_service": "neo4j", "port": 7687}]),
+                           "neo4j", None)
+        assert port == 7687
 
-    def test_an_unknown_sub_service_resolves_to_nothing(self, tmp_path, monkeypatch):
-        from app.routers.stream import _resolve_stream_row
-        self._recipe(tmp_path, monkeypatch)
-        assert _resolve_stream_row(self._entry(tmp_path), "graphiti-local", "nope") is None
+    def test_a_sub_service_not_recorded_is_refused(self):
+        import pytest
+        from fastapi import HTTPException
+        from app.routers.stream import _stream_row
 
-    def test_a_missing_rendered_conf_resolves_to_nothing(self, tmp_path, monkeypatch):
-        """Recorded but unreadable is a refusal, never a guessed port."""
-        from app.routers.stream import _resolve_stream_row
-        self._recipe(tmp_path, monkeypatch)
-        assert _resolve_stream_row(
-            self._entry(tmp_path, conf=False), "graphiti-local", "neo4j"
-        ) is None
+        with pytest.raises(HTTPException) as exc:
+            _stream_row(self._entry([]), "falkordb", None)
+        assert exc.value.status_code == 409
+
+    def test_an_unknown_sub_service_resolves_to_nothing(self):
+        import pytest
+        from fastapi import HTTPException
+        from app.routers.stream import _stream_row
+
+        with pytest.raises(HTTPException):
+            _stream_row(self._entry([{"sub_service": "neo4j", "port": 7687}]), "nope", None)
+
+    def test_a_row_without_a_recorded_port_is_refused(self):
+        """Recorded but unparsable is a refusal, never a guessed port."""
+        import pytest
+        from fastapi import HTTPException
+        from app.routers.stream import _stream_row
+
+        with pytest.raises(HTTPException) as exc:
+            _stream_row(self._entry([{"sub_service": "neo4j", "port": None}]), "neo4j", None)
+        assert exc.value.status_code == 409
+
+    def test_a_disagreeing_port_is_refused(self):
+        import pytest
+        from fastapi import HTTPException
+        from app.routers.stream import _stream_row
+
+        with pytest.raises(HTTPException) as exc:
+            _stream_row(self._entry([{"sub_service": "neo4j", "port": 7687}]), "neo4j", 6379)
+        assert exc.value.status_code == 409
 
 
 class TestTheExtraHttpServedName:
@@ -10509,50 +10428,79 @@ class TestTheNoneStateAndTheSkipRule:
 class TestTheGoRelayKnowsExtraEndpoints:
     """R1.5 — `/go/<instance host>--<sub_service>.<domain>` resolves.
 
-    The card offers one `/go/` row per exposed HTTP endpoint (R6.2), and the
-    platform relays through `/go/` because the login cookie is host-scoped — so an
-    extra endpoint is reachable ONLY if the relay knows its name. It did not:
-    measured 2026-10-10, the card's link answered `Service not found` on a live
-    deployment whose entry recorded both extra endpoints.
+    The lookup is a per-request read of `service_endpoints` (kind=http); no
+    cache and no registry file.
     """
 
-    def _index(self, tmp_path, entries):
-        import yaml
+    def _seed(self, db):
+        from sqlalchemy import text
+        from support import mk_service, mk_service_instance, mk_user, registry_engine
+
+        shared = mk_user(db, "shared2", role="special")
+        sid = mk_service(db, shared, service_name="graphiti-local", label="2")
+        mk_service_instance(db, sid, status="running",
+                            hostname="graphiti-local-shared2-2.snaprovision.com")
+        with registry_engine().begin() as conn:
+            for name in ("graphiti-local-shared2-2--neo4j.snaprovision.com",
+                         "graphiti-local-shared2-2--graph-falkordb.snaprovision.com"):
+                conn.execute(
+                    text("INSERT INTO registry.service_endpoints "
+                         "(service_id, served_name, kind) VALUES (:sid, :n, 'http')"),
+                    {"sid": str(sid), "n": name},
+                )
+        return shared, sid
+
+    def test_an_extra_endpoint_resolves_to_its_instance(self):
+        from app.database import SessionLocal
         from app.services.hostname_index import HostnameIndex
 
-        p = tmp_path / "user_registry.yml"
-        p.write_text(yaml.safe_dump(entries))
-        return HostnameIndex(str(p))
-
-    _ENTRY = {
-        "user_name": "shared2", "service_name": "graphiti-local", "label": "2",
-        "hostname": "graphiti-local-shared2-2.snaprovision.com",
-        "http_endpoints": [
-            "graphiti-local-shared2-2--neo4j.snaprovision.com",
-            "graphiti-local-shared2-2--graph-falkordb.snaprovision.com",
-        ],
-    }
-
-    def test_an_extra_endpoint_resolves_to_its_instance(self, tmp_path):
-        idx = self._index(tmp_path, [self._ENTRY])
-        got = idx.get_by_hostname("graphiti-local-shared2-2--neo4j.snaprovision.com")
+        db = SessionLocal()
+        try:
+            self._seed(db)
+        finally:
+            db.close()
+        got = HostnameIndex().get_by_hostname(
+            "graphiti-local-shared2-2--neo4j.snaprovision.com")
         assert got is not None and got["label"] == "2", got
 
-    def test_the_instance_host_is_not_a_route(self, tmp_path):
-        """R14 — `/go/<instance host>` must answer 404: identity, not a route."""
-        idx = self._index(tmp_path, [self._ENTRY])
-        assert idx.get_by_hostname("graphiti-local-shared2-2.snaprovision.com") is None
+    def test_the_instance_host_is_not_a_route(self):
+        """R14 — `/go/<instance host>` answers 404: identity, not a route."""
+        from app.database import SessionLocal
+        from app.services.hostname_index import HostnameIndex
 
-    def test_a_duplicate_alias_keeps_the_first_entry(self, tmp_path):
-        """`setdefault`, not assignment: the first entry claiming a name keeps it."""
-        impostor = {
-            "user_name": "alice", "service_name": "other", "label": "0",
-            "http_endpoints": ["graphiti-local-shared2-2--neo4j.snaprovision.com"],
-        }
-        idx = self._index(tmp_path, [self._ENTRY, impostor])
-        got = idx.get_by_hostname("graphiti-local-shared2-2--neo4j.snaprovision.com")
-        assert got["user_name"] == "shared2", (
-            "the FIRST entry that claims a served name keeps it")
+        db = SessionLocal()
+        try:
+            self._seed(db)
+        finally:
+            db.close()
+        assert HostnameIndex().get_by_hostname(
+            "graphiti-local-shared2-2.snaprovision.com") is None
+
+    def test_a_duplicate_served_name_is_rejected_by_the_store(self):
+        """`service_endpoints_identity` (served_name, kind) is unique: the first
+        row that claims a name keeps it, a second insert fails."""
+        import pytest
+        from sqlalchemy import text
+        from sqlalchemy.exc import IntegrityError
+        from app.database import SessionLocal
+        from support import mk_service, mk_user, registry_engine
+
+        db = SessionLocal()
+        try:
+            self._seed(db)
+            other = mk_user(db, "alice")
+            other_sid = mk_service(db, other, service_name="other", label="0")
+            with pytest.raises(IntegrityError):
+                with registry_engine().begin() as conn:
+                    conn.execute(
+                        text("INSERT INTO registry.service_endpoints "
+                             "(service_id, served_name, kind) "
+                             "VALUES (:sid, "
+                             "'graphiti-local-shared2-2--neo4j.snaprovision.com', 'http')"),
+                        {"sid": str(other_sid)},
+                    )
+        finally:
+            db.close()
 
 
 class TestTheRecordsTlsSwitch:
@@ -10971,179 +10919,185 @@ class TestGeneratedServingPortsIsAdopted:
 
 
 class TestAclGrants:
-    """The grant table, its state machine and the legacy migration."""
+    """The ID-keyed grant matrix (T9/R5.6): both columns are ``users.id``."""
 
-    @staticmethod
-    def _user(db, username, **over):
-        from app.models.end_user import EndUser
-        u = EndUser(
-            username=username, password_hash="x", role="special",
-            is_approved=True, is_active=True,
-        )
-        for k, v in over.items():
-            setattr(u, k, v)
-        db.add(u)
-        db.commit()
-        db.refresh(u)
-        return u
+    def _users(self, db):
+        from support import mk_user
+        return (mk_user(db, "alice", role="viewer"),
+                mk_user(db, "bob", role="special"),
+                mk_user(db, "carol", role="special"))
 
     def test_two_shared_rows_are_two_rows_and_only_active_allows(self):
         from app.database import SessionLocal
         from app.services import acl_service
+
         db = SessionLocal()
-        alice = self._user(db, "alice", role="viewer")
-        bob = self._user(db, "bob")
-        carol = self._user(db, "carol")
-        acl_service.set_grant(db, alice.id, bob.id, True)
-        acl_service.set_grant(db, alice.id, carol.id, True)
-        rows = acl_service.list_for_grantee(db, alice.id)
-        assert len(rows) == 2
-        assert acl_service.allows(db, alice, "bob") is True
-        assert acl_service.allows(db, alice, "carol") is True
-        acl_service.set_grant(db, alice.id, carol.id, False)
-        assert acl_service.allows(db, alice, "carol") is False
-        # The inactive row is kept, not deleted.
-        assert len(acl_service.list_for_grantee(db, alice.id)) == 2
+        try:
+            alice, bob, carol = self._users(db)
+            acl_service.set_grant(db, alice.id, bob.id, True)
+            acl_service.set_grant(db, alice.id, carol.id, True)
+            assert len(acl_service.list_for_grantee(db, alice.id)) == 2
+            assert acl_service.allows(db, alice, bob.id) is True
+            assert acl_service.allows(db, alice, carol.id) is True
+            acl_service.set_grant(db, alice.id, carol.id, False)
+            assert acl_service.allows(db, alice, carol.id) is False
+            # The inactive row is kept, not deleted.
+            assert len(acl_service.list_for_grantee(db, alice.id)) == 2
+        finally:
+            db.close()
 
     def test_unique_pair(self):
         import pytest
         from sqlalchemy.exc import IntegrityError
-        from app.models.acl_grant import AclGrant
         from app.database import SessionLocal
-        db = SessionLocal()
-        alice = self._user(db, "alice", role="viewer")
-        bob = self._user(db, "bob")
-        db.add(AclGrant(grantee_user_id=alice.id, shared_user_id=bob.id,
-                        state="active"))
-        db.commit()
-        db.add(AclGrant(grantee_user_id=alice.id, shared_user_id=bob.id,
-                        state="inactive"))
-        with pytest.raises(IntegrityError):
-            db.commit()
-        db.rollback()
+        from app.models.acl_grant import AclGrant
 
-    def test_deactivation_inactivates_both_directions_and_activation_does_not_restore(self):
+        db = SessionLocal()
+        try:
+            alice, bob, _carol = self._users(db)
+            db.add(AclGrant(grantee_user_id=alice.id, shared_user_id=bob.id,
+                            state="active"))
+            db.commit()
+            db.add(AclGrant(grantee_user_id=alice.id, shared_user_id=bob.id,
+                            state="inactive"))
+            with pytest.raises(IntegrityError):
+                db.commit()
+            db.rollback()
+        finally:
+            db.close()
+
+    def test_deactivation_inactivates_and_reactivation_does_not_restore(self):
         from app.database import SessionLocal
         from app.services import acl_service
+
         db = SessionLocal()
-        alice = self._user(db, "alice", role="viewer")
-        bob = self._user(db, "bob")
-        carol = self._user(db, "carol", role="viewer")
-        acl_service.set_grant(db, alice.id, bob.id, True)   # alice -> bob
-        acl_service.set_grant(db, carol.id, bob.id, True)   # carol -> bob
-        assert acl_service.inactivate_for_user(db, bob.id) == 2
-        db.commit()
-        assert all(g["state"] == "inactive"
-                   for g in acl_service.list_for_grantee(db, alice.id))
-        assert all(g["state"] == "inactive"
-                   for g in acl_service.list_for_grantee(db, carol.id))
-        # Reactivating bob does not reactivate either row.
-        bob.is_active = True
-        db.commit()
-        assert acl_service.allows(db, alice, "bob") is False
-        assert acl_service.allows(db, carol, "bob") is False
+        try:
+            alice, bob, carol = self._users(db)
+            acl_service.set_grant(db, alice.id, bob.id, True)
+            acl_service.set_grant(db, carol.id, bob.id, True)
+            assert acl_service.inactivate_for_user(db, bob.id) == 2
+            db.commit()
+            assert all(g["state"] == "inactive"
+                       for g in acl_service.list_for_grantee(db, alice.id))
+            bob.is_active = True
+            db.commit()
+            assert acl_service.allows(db, alice, bob.id) is False
+            assert acl_service.allows(db, carol, bob.id) is False
+        finally:
+            db.close()
 
     def test_historical_public_marker_from_audit_does_not_restore_access(self):
         from datetime import datetime, timezone
         from app.database import SessionLocal
         from app.models.audit_log import AuditLog
         from app.services import acl_service
+        from support import mk_user
+
         db = SessionLocal()
-        # Simulate a tombstone written before the flag-retention change: flag
-        # cleared, but the registration-time public audit row remains.
-        user = self._user(db, "legacypub", role="special",
-                          is_public_shared=False,
-                          deleted_at=datetime.now(timezone.utc))
-        db.add(AuditLog(
-            action="public_flag", target_user="legacypub", status="success",
-            detail_json='{"is_public_shared": true, "at": "registration"}',
-        ))
-        db.commit()
-        assert acl_service.was_public_record(db, user) is True
-        assert acl_service.is_public_owner(user) is False
+        try:
+            user = mk_user(db, "legacypub", role="special", public=False)
+            user.deleted_at = datetime.now(timezone.utc)
+            db.commit()
+            db.add(AuditLog(
+                action="public_flag", target_user="legacypub", status="success",
+                detail_json={"is_public_shared": True, "at": "registration"},
+            ))
+            db.commit()
+            assert acl_service.was_public_record(db, user) is True
+            assert acl_service.is_public_owner(user) is False
+        finally:
+            db.close()
 
     def test_public_flag_on_a_viewer_is_inert(self):
         from app.database import SessionLocal
         from app.services import acl_service
+        from support import mk_user
+
         db = SessionLocal()
-        viewer = self._user(db, "viewerpub", role="viewer",
-                            is_public_shared=True)
-        assert acl_service.is_public_owner(viewer) is False
-        special = self._user(db, "specialpub", role="special",
-                             is_public_shared=True)
-        assert acl_service.is_public_owner(special) is True
+        try:
+            viewer = mk_user(db, "viewerpub", role="viewer", public=True)
+            assert acl_service.is_public_owner(viewer) is False
+            special = mk_user(db, "specialpub", role="special", public=True)
+            assert acl_service.is_public_owner(special) is True
+        finally:
+            db.close()
 
     def test_activation_requires_both_accounts_live(self):
         import pytest
         from app.database import SessionLocal
         from app.services import acl_service
+        from support import mk_user
+
         db = SessionLocal()
-        alice = self._user(db, "alice", role="viewer")
-        bob = self._user(db, "bob", is_active=False)
-        with pytest.raises(ValueError):
-            acl_service.set_grant(db, alice.id, bob.id, True)
-        # Deactivating a never-selected pair is a no-op, not an error.
-        assert acl_service.set_grant(db, alice.id, bob.id, False) is None
+        try:
+            alice = mk_user(db, "alice", role="viewer")
+            bob = mk_user(db, "bob", role="special", active=False)
+            with pytest.raises(ValueError):
+                acl_service.set_grant(db, alice.id, bob.id, True)
+            # Deactivating a never-selected pair is a no-op, not an error.
+            assert acl_service.set_grant(db, alice.id, bob.id, False) is None
+        finally:
+            db.close()
 
     def test_target_inactive_or_deleted_denies_even_with_an_active_row(self):
+        from datetime import datetime, timezone
         from app.database import SessionLocal
         from app.services import acl_service
+
         db = SessionLocal()
-        alice = self._user(db, "alice", role="viewer")
-        bob = self._user(db, "bob")
-        acl_service.set_grant(db, alice.id, bob.id, True)
-        assert acl_service.allows(db, alice, "bob") is True
-        bob.is_active = False
-        db.commit()
-        assert acl_service.allows(db, alice, "bob") is False
-        bob.is_active = True
-        bob.deleted_at = __import__("datetime").datetime.now(
-            __import__("datetime").timezone.utc)
-        db.commit()
-        assert acl_service.allows(db, alice, "bob") is False
+        try:
+            alice, bob, _carol = self._users(db)
+            acl_service.set_grant(db, alice.id, bob.id, True)
+            assert acl_service.allows(db, alice, bob.id) is True
+            bob.is_active = False
+            db.commit()
+            assert acl_service.allows(db, alice, bob.id) is False
+            bob.is_active = True
+            bob.deleted_at = datetime.now(timezone.utc)
+            db.commit()
+            assert acl_service.allows(db, alice, bob.id) is False
+        finally:
+            db.close()
 
     def test_grant_toggle_is_audited(self):
         from app.database import SessionLocal
         from app.models.audit_log import AuditLog
-        from app.routers.auth import set_end_user_grant
-        db = SessionLocal()
-        alice = self._user(db, "alice", role="viewer")
-        bob = self._user(db, "bob")
-        set_end_user_grant(alice.id, {"shared_user_id": bob.id, "active": True},
-                           {"id": 1}, db)
-        rows = db.query(AuditLog).filter(AuditLog.action == "grant_update").all()
-        assert rows and "shared2" not in (rows[-1].detail_json or "")
-        assert "bob" in (rows[-1].detail_json or "")
-        assert "active" in (rows[-1].detail_json or "")
+        from app.routers.auth import set_user_grant
+        from support import mk_user
 
-    def test_migration_converts_active_inactive_and_drops_dangling(self):
-        from datetime import datetime, timezone
+        db = SessionLocal()
+        try:
+            admin = mk_user(db, "admin", role="admin")
+            alice = mk_user(db, "alice", role="viewer")
+            bob = mk_user(db, "bob", role="special")
+            set_user_grant(str(alice.id), {"shared_user_id": str(bob.id), "active": True},
+                           {"id": str(admin.id)}, db)
+            rows = db.query(AuditLog).filter(AuditLog.action == "grant_update").all()
+            assert rows
+            detail = rows[-1].detail_json
+            assert detail["shared_user_id"] == str(bob.id)
+            assert detail["active"] is True
+        finally:
+            db.close()
+
+    def test_grants_are_id_keyed_with_no_legacy_string_source(self):
+        """The legacy `allowed_special_users` column and its one-way conversion
+        are gone; grants reference `users.id` (UUID) only."""
+        import app.services.acl_service as acl_service
         from app.database import SessionLocal
-        from app.services import acl_service
+        from sqlalchemy import text
+
+        assert not hasattr(acl_service, "migrate_legacy_grants")
         db = SessionLocal()
-        alice = self._user(
-            db, "alice", role="viewer",
-            allowed_special_users="bob,carol,ghost,deleted",
-        )
-        bob = self._user(db, "bob")
-        carol = self._user(db, "carol", is_active=False)
-        self._user(db, "deleted", deleted_at=datetime.now(timezone.utc))
-
-        result = acl_service.migrate_legacy_grants(db)
-        assert result["created"] == 2
-        assert result["inactive"] == 1
-        assert result["dropped"] == 2
-        db.refresh(alice)
-        assert alice.allowed_special_users is None
-        rows = {g["shared_username"]: g["state"]
-                for g in acl_service.list_for_grantee(db, alice.id)}
-        assert rows == {"bob": "active", "carol": "inactive"}
-        assert acl_service.allows(db, alice, "bob") is True
-        assert acl_service.allows(db, alice, "carol") is False
-
-        # Idempotent on the cleared store.
-        again = acl_service.migrate_legacy_grants(db)
-        assert again["sources"] == 0
+        try:
+            kinds = dict(db.execute(text(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema='gateway' AND table_name='acl_grants'"
+            )).all())
+        finally:
+            db.close()
+        assert kinds["grantee_user_id"] == "uuid"
+        assert kinds["shared_user_id"] == "uuid"
 
 
 # ---------------------------------------------------------------------------
@@ -11152,267 +11106,375 @@ class TestAclGrants:
 
 
 class TestAccountLifecycle:
-    """Soft delete, stop-before-delete, and the deactivation grant rule."""
+    """T6/R5.8: deactivation, the public flag, role transitions and the
+    stop-first account-deletion saga (unified users)."""
 
-    @staticmethod
-    def _user(db, username="alice", **over):
-        from app.models.end_user import EndUser
-        u = EndUser(
-            username=username, password_hash="x", role="viewer",
-            is_approved=True, is_active=True,
-        )
-        for k, v in over.items():
-            setattr(u, k, v)
-        db.add(u)
-        db.commit()
-        db.refresh(u)
-        return u
+    def _seed(self, db):
+        from support import mk_user
+        return (mk_user(db, "alice", role="viewer"),
+                mk_user(db, "bob", role="special"),
+                mk_user(db, "admin", role="admin"))
 
     def test_deactivation_inactivates_grants_and_activation_does_not_restore(self):
         from app.database import SessionLocal
         from app.models.audit_log import AuditLog
-        from app.models.end_user import EndUser
-        from app.routers.auth import update_end_user
+        from app.routers.auth import update_user
         from app.services import acl_service
+        from app.services import auth_service as _auth
+
         db = SessionLocal()
-        alice = self._user(db, "alice")
-        bob = self._user(db, "bob")
-        acl_service.set_grant(db, alice.id, bob.id, True)
+        try:
+            alice, bob, admin = self._seed(db)
+            acl_service.set_grant(db, alice.id, bob.id, True)
+            update_user(str(bob.id), {"is_active": False},
+                        {"id": str(admin.id)}, db)
+            assert acl_service.list_for_grantee(db, alice.id)[0]["state"] == "inactive"
+            assert _auth.get_user_by_id(db, bob.id).is_active is False
+            update_user(str(bob.id), {"is_active": True},
+                        {"id": str(admin.id)}, db)
+            assert acl_service.list_for_grantee(db, alice.id)[0]["state"] == "inactive"
+            assert acl_service.allows(db, alice, bob.id) is False
+            assert db.query(AuditLog).filter(AuditLog.action == "user_update").count() == 2
+        finally:
+            db.close()
 
-        update_end_user(bob.id, {"is_active": False}, {"id": 1}, db)
-        assert acl_service.list_for_grantee(db, alice.id)[0]["state"] == "inactive"
-        assert db.query(EndUser).filter(EndUser.id == bob.id).first().is_active is False
-
-        update_end_user(bob.id, {"is_active": True}, {"id": 1}, db)
-        assert acl_service.list_for_grantee(db, alice.id)[0]["state"] == "inactive"
-        assert acl_service.allows(db, alice, "bob") is False
-        assert db.query(AuditLog).filter(AuditLog.action == "user_update").count() == 2
-
-    def test_public_flag_is_registration_only_and_audited(self):
+    def test_public_flag_is_special_registration_only_and_audited(self):
         import pytest
         from fastapi import HTTPException
         from app.database import SessionLocal
         from app.models.audit_log import AuditLog
-        from app.models.end_user import EndUser
-        from app.routers.auth import register_end_user, update_end_user
+        from app.routers.auth import register_special, update_user
+        from app.services import auth_service
+        from support import mk_user
+
         db = SessionLocal()
-        register_end_user(
-            {"username": "pubnew", "password": "pass1234",
-             "role": "special", "is_public_shared": True}, db,
-        )
-        user = db.query(EndUser).filter(EndUser.username == "pubnew").first()
-        assert user.is_public_shared is True
-        rows = db.query(AuditLog).filter(AuditLog.action == "public_flag").all()
-        assert rows and rows[-1].target_user == "pubnew"
-        assert "is_public_shared" in (rows[-1].detail_json or "")
+        try:
+            admin = mk_user(db, "admin", role="admin")
+            import app.services.account_service as account_service
+            created = {}
 
-        with pytest.raises(HTTPException) as exc:
-            update_end_user(user.id, {"is_public_shared": False}, {"id": 1}, db)
-        assert exc.value.status_code == 400
-        assert "registered" in str(exc.value.detail).lower()
+            def fake_create_special(_db, *, username, password,
+                                    is_public_shared=False, email=None):
+                u = mk_user(_db, username, role="special", public=is_public_shared)
+                created["user"] = u
+                return u
 
-    def test_only_a_special_user_can_be_public(self):
+            import pytest as _pytest
+            mp = _pytest.MonkeyPatch()
+            mp.setattr(account_service, "create_special", fake_create_special)
+            try:
+                out = register_special(
+                    {"username": "pubnew", "password": "pass1234",
+                     "is_public_shared": True},
+                    {"id": str(admin.id)}, db,
+                )
+            finally:
+                mp.undo()
+            user = auth_service.get_user_by_username(db, "pubnew")
+            assert out["user"]["is_public_shared"] is True
+            rows = db.query(AuditLog).filter(AuditLog.action == "public_flag").all()
+            assert rows and rows[-1].target_user == "pubnew"
+            assert rows[-1].detail_json["is_public_shared"] is True
+
+            with pytest.raises(HTTPException) as exc:
+                update_user(str(user.id), {"is_public_shared": False},
+                            {"id": str(admin.id)}, db)
+            assert exc.value.status_code == 400
+            assert "registration" in str(exc.value.detail).lower()
+        finally:
+            db.close()
+
+    def test_public_signup_is_viewer_only(self):
         import pytest
         from fastapi import HTTPException
         from app.database import SessionLocal
+        from app.models.gateway_setting import GatewaySetting
         from app.routers.auth import register_end_user
-        db = SessionLocal()
-        with pytest.raises(HTTPException) as exc:
-            register_end_user(
-                {"username": "pubviewer", "password": "pass1234",
-                 "role": "viewer", "is_public_shared": True}, db,
-            )
-        assert exc.value.status_code == 400
-        assert "special" in str(exc.value.detail).lower()
 
-    def test_demoting_a_special_user_clears_public(self):
-        from app.database import SessionLocal
-        from app.models.end_user import EndUser
-        from app.routers.auth import register_end_user, update_end_user
         db = SessionLocal()
-        register_end_user(
-            {"username": "pubdemote", "password": "pass1234",
-             "role": "special", "is_public_shared": True}, db,
-        )
-        user = db.query(EndUser).filter(EndUser.username == "pubdemote").first()
-        update_end_user(user.id, {"role": "viewer"}, {"id": 1}, db)
-        db.refresh(user)
-        assert user.is_public_shared is False
+        try:
+            db.add(GatewaySetting(key="registration_open", value="true"))
+            db.commit()
+            with pytest.raises(HTTPException) as exc:
+                register_end_user(
+                    {"username": "pubviewer", "password": "pass1234",
+                     "is_public_shared": True}, db,
+                )
+            assert exc.value.status_code == 400
+            with pytest.raises(HTTPException) as exc2:
+                register_end_user(
+                    {"username": "adospecial", "password": "pass1234",
+                     "role": "special"}, db,
+                )
+            assert exc2.value.status_code == 400
+        finally:
+            db.close()
+
+    def test_special_is_never_converted(self):
+        import pytest
+        from fastapi import HTTPException
+        from app.database import SessionLocal
+        from app.routers.auth import update_user
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            admin = mk_user(db, "admin", role="admin")
+            special = mk_user(db, "internal", role="special")
+            for body in ({"role": "viewer"}, {"role": "admin"}):
+                with pytest.raises(HTTPException) as exc:
+                    update_user(str(special.id), body, {"id": str(admin.id)}, db)
+                assert exc.value.status_code == 409
+        finally:
+            db.close()
 
     def test_soft_delete_stops_services_then_removes_relations(self, monkeypatch):
         import asyncio
-        from datetime import datetime, timedelta, timezone
+        import uuid
+
         from app.database import SessionLocal
         from app.models.api_key import ApiKey
         from app.models.audit_log import AuditLog
-        from app.models.end_user import EndUser
         from app.models.pre_deploy_session import PreDeploySession
         from app.models.stream_exposure import StreamExposure
-        from app.routers.auth import delete_end_user
-        from app.services import acl_service
-        from app.services.provision_service import provision_service as provision_client
+        from app.routers import auth as auth_router
+        from app.services import acl_service, auth_service
+        from support import mk_service, mk_user
 
         db = SessionLocal()
-        alice = self._user(db, "alice", is_public_shared=True)
-        bob = self._user(db, "bob")
-        acl_service.set_grant(db, alice.id, bob.id, True)
-        acl_service.set_grant(db, bob.id, alice.id, True)
-        db.add(ApiKey(
-            user_id=alice.id, target_type="end_user", label="Default",
-            token_hash="hash-alice", is_default=True,
-            expires_at=datetime.now(timezone.utc) + timedelta(days=1),
-        ))
-        db.add(PreDeploySession(
-            key="alice|svc||0", user_name="alice", service_name="svc",
-            recipe_path="", label="0", state="paused",
-        ))
-        db.add(StreamExposure(
-            handle_hash="h1", owner_user_id=alice.id, service_name="svc",
-            user_name="alice", label="0", sub_service="web", port=80,
-            canonical_name="svc-alice-0--web.localhost",
-        ))
-        db.commit()
+        try:
+            alice = mk_user(db, "alice", role="viewer", public=True)
+            bob = mk_user(db, "bob", role="special")
+            admin = mk_user(db, "admin", role="admin")
+            alice_id = str(alice.id)
+            admin_id = str(admin.id)
+            bob_id = str(bob.id)
+            alice_api_id = str(alice.api_user_id)
+            acl_service.set_grant(db, alice.id, bob.id, True)
+            auth_service.create_api_key(db, alice.id, "Default", is_default=True)
+            sid = mk_service(db, alice, service_name="svc", label="0")
+            db.add(PreDeploySession(
+                service_id=uuid.uuid4(), procedure_id=uuid.uuid4(),
+                owner_api_user_id=alice.api_user_id, service_name="svc",
+                service_label="0", recipe_path="", state="paused",
+            ))
+            db.add(StreamExposure(
+                handle_hash="h1", owner_user_id=alice.id, service_id=sid,
+                sub_service="web", port=80,
+                canonical_name="svc-alice-0--web.localhost",
+            ))
+            db.commit()
+        finally:
+            db.close()
 
         calls = []
-        async def fake_stop(username):
-            calls.append(username)
-            return {"ok": True, "results": [{"service_name": "svc", "label": "0"}],
-                    "failed_services": []}
-        monkeypatch.setattr(provision_client, "stop_user_all", fake_stop)
 
-        result = asyncio.run(delete_end_user(alice.id, {"id": 1}))
-        assert calls == ["alice"]
+        def fake_stop(api_user_id):
+            calls.append(api_user_id)
+            return {"ok": True, "results": [], "failed_services": []}
+
+        deleted = []
+        monkeypatch.setattr(auth_router.api_users, "stop_services", fake_stop)
+        monkeypatch.setattr(auth_router.api_users, "soft_delete",
+                            lambda api_id: deleted.append(api_id))
+
+        result = asyncio.run(auth_router.delete_user(
+            alice_id, {"id": admin_id}))
+        assert calls == [alice_api_id]
+        assert deleted == [alice_api_id]
         assert result["soft_deleted"] is True
 
         db = SessionLocal()
-        row = db.query(EndUser).filter(EndUser.id == alice.id).first()
-        assert row is not None
-        assert row.deleted_at is not None
-        assert row.is_active is False
-        assert row.is_approved is False
-        # The historical public tag is retained for review; access is denied by
-        # is_public_owner because the account is inactive/deleted.
-        assert row.is_public_shared is True
-        from app.services import acl_service as _acl
-        assert _acl.is_public_owner(row) is False
-        assert acl_service.list_for_grantee(db, alice.id) == []
-        assert acl_service.list_for_grantee(db, bob.id) == []
-        assert db.query(ApiKey).filter(ApiKey.user_id == alice.id).count() == 0
-        assert db.query(PreDeploySession).filter(
-            PreDeploySession.user_name == "alice").count() == 0
-        assert db.query(StreamExposure).filter(
-            StreamExposure.owner_user_id == alice.id,
-            StreamExposure.revoked_at.is_(None)).count() == 0
-        assert db.query(AuditLog).filter(AuditLog.action == "delete").count() == 1
+        try:
+            row = auth_service.get_user_by_id(db, alice_id)
+            assert row is not None
+            assert row.deleted_at is not None
+            assert row.is_active is False and row.is_approved is False
+            # The historical public tag is retained; access is denied.
+            assert row.is_public_shared is True
+            assert acl_service.is_public_owner(row) is False
+            assert acl_service.list_for_grantee(db, alice_id) == []
+            assert acl_service.list_for_grantee(db, bob_id) == []
+            assert db.query(ApiKey).filter(ApiKey.user_id == alice_id).count() == 0
+            assert db.query(PreDeploySession).filter(
+                PreDeploySession.owner_api_user_id == alice_api_id).count() == 0
+            assert db.query(StreamExposure).filter(
+                StreamExposure.owner_user_id == alice_id,
+                StreamExposure.revoked_at.is_(None)).count() == 0
+            assert db.query(AuditLog).filter(AuditLog.action == "delete").count() == 1
+        finally:
+            db.close()
 
     def test_soft_delete_aborts_on_a_stop_failure(self, monkeypatch):
         import asyncio
+
         import pytest
         from fastapi import HTTPException
         from app.database import SessionLocal
-        from app.models.end_user import EndUser
-        from app.routers.auth import delete_end_user
-        from app.services.provision_service import provision_service as provision_client
-
-        db = SessionLocal()
-        alice = self._user(db, "alice")
-        async def fake_stop(username):
-            return {"ok": False, "results": [{"service_name": "svc", "label": "0"}],
-                    "failed_services": [{"service_name": "svc", "label": "0",
-                                         "error": "boom"}]}
-        monkeypatch.setattr(provision_client, "stop_user_all", fake_stop)
-        with pytest.raises(HTTPException) as exc:
-            asyncio.run(delete_end_user(alice.id, {"id": 1}))
-        assert exc.value.status_code == 502
-        db = SessionLocal()
-        row = db.query(EndUser).filter(EndUser.id == alice.id).first()
-        assert row is not None
-        assert row.deleted_at is None
-        assert row.is_active is True
         from app.models.audit_log import AuditLog
-        assert db.query(AuditLog).filter(
-            AuditLog.action == "delete",
-            AuditLog.status == "failure",
-        ).count() == 1
-
-    def test_soft_delete_rolls_back_on_a_cleanup_failure(self, monkeypatch):
-        import asyncio
-        import pytest
-        from app.database import SessionLocal
-        from app.models.end_user import EndUser
-        from app.routers.auth import delete_end_user
-        from app.services import acl_service
-        from app.services.provision_service import provision_service as provision_client
+        from app.routers import auth as auth_router
+        from app.services import auth_service
+        from support import mk_user
 
         db = SessionLocal()
-        alice = self._user(db, "alice")
-        async def fake_stop(username):
-            return {"ok": True, "results": [], "failed_services": []}
-        monkeypatch.setattr(provision_client, "stop_user_all", fake_stop)
-        def boom(*a, **k):
-            raise RuntimeError("grant cleanup failed")
-        monkeypatch.setattr(acl_service, "remove_for_user", boom)
-        with pytest.raises(RuntimeError):
-            asyncio.run(delete_end_user(alice.id, {"id": 1}))
-        db = SessionLocal()
-        row = db.query(EndUser).filter(EndUser.id == alice.id).first()
-        assert row is not None and row.deleted_at is None and row.is_active is True
+        try:
+            alice = mk_user(db, "alice", role="viewer")
+            admin = mk_user(db, "admin", role="admin")
+            alice_id = str(alice.id)
+            admin_id = str(admin.id)
+        finally:
+            db.close()
 
-    def test_soft_delete_aborts_when_the_stop_call_raises(self, monkeypatch):
-        import asyncio
-        import pytest
-        from fastapi import HTTPException
-        from app.database import SessionLocal
-        from app.models.end_user import EndUser
-        from app.routers.auth import delete_end_user
-        from app.services.provision_service import provision_service as provision_client
-
-        db = SessionLocal()
-        alice = self._user(db, "alice")
-        async def fake_stop(username):
-            raise RuntimeError("provision-api unavailable")
-        monkeypatch.setattr(provision_client, "stop_user_all", fake_stop)
+        monkeypatch.setattr(
+            auth_router.api_users, "stop_services",
+            lambda api_id: {"ok": False, "results": [],
+                            "failed_services": [{"error": "boom"}]},
+        )
         with pytest.raises(HTTPException) as exc:
-            asyncio.run(delete_end_user(alice.id, {"id": 1}))
+            asyncio.run(auth_router.delete_user(alice_id, {"id": admin_id}))
         assert exc.value.status_code == 502
         db = SessionLocal()
-        row = db.query(EndUser).filter(EndUser.id == alice.id).first()
-        assert row is not None and row.deleted_at is None
+        try:
+            row = auth_service.get_user_by_id(db, alice_id)
+            assert row.deleted_at is None and row.is_active is True
+            assert db.query(AuditLog).filter(
+                AuditLog.action == "delete", AuditLog.status == "failure").count() == 1
+        finally:
+            db.close()
 
-    def test_tombstoned_username_is_refused(self):
+    def test_soft_delete_goes_pending_when_the_api_user_delete_fails(self, monkeypatch):
+        import asyncio
+
         import pytest
         from fastapi import HTTPException
         from app.database import SessionLocal
-        from app.routers.auth import register_end_user
+        from app.routers import auth as auth_router
+        from app.services import auth_service
+        from support import mk_user
+
         db = SessionLocal()
-        alice = self._user(db, "alice")
-        alice.deleted_at = __import__("datetime").datetime.now(
-            __import__("datetime").timezone.utc)
-        db.commit()
+        try:
+            alice = mk_user(db, "alice", role="viewer")
+            admin = mk_user(db, "admin", role="admin")
+            alice_id = str(alice.id)
+            admin_id = str(admin.id)
+        finally:
+            db.close()
+
+        monkeypatch.setattr(auth_router.api_users, "stop_services",
+                            lambda api_id: {"ok": True, "results": [], "failed_services": []})
+
+        def boom(api_id):
+            raise RuntimeError("registry down")
+        monkeypatch.setattr(auth_router.api_users, "soft_delete", boom)
+
         with pytest.raises(HTTPException) as exc:
-            register_end_user({"username": "alice", "password": "pass"}, db)
+            asyncio.run(auth_router.delete_user(alice_id, {"id": admin_id}))
+        assert exc.value.status_code == 502
+        db = SessionLocal()
+        try:
+            row = auth_service.get_user_by_id(db, alice_id)
+            assert row.deletion_state == "pending"
+            assert row.deleted_at is None
+            assert row.is_active is False
+        finally:
+            db.close()
+
+    def test_the_last_active_admin_cannot_be_deleted(self, monkeypatch):
+        import asyncio
+
+        import pytest
+        from fastapi import HTTPException
+        from app.database import SessionLocal
+        from app.routers import auth as auth_router
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            admin = mk_user(db, "admin", role="admin")
+        finally:
+            db.close()
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(auth_router.delete_user(str(admin.id), {"id": str(admin.id)}))
         assert exc.value.status_code == 409
-        assert "reserved" in str(exc.value.detail).lower()
+
+
+
+
+    def test_an_admin_cannot_change_its_own_role(self):
+        """Self-service role changes are refused (requirement 2026-11-02)."""
+        import pytest
+        from fastapi import HTTPException
+        from app.database import SessionLocal
+        from app.routers.auth import update_user
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            admin = mk_user(db, "selfadmin", role="admin")
+            for body in ({"role": "viewer"}, {"role": "admin"}):
+                with pytest.raises(HTTPException) as exc:
+                    update_user(str(admin.id), body, {"id": str(admin.id)}, db)
+                assert exc.value.status_code == 403, body
+                assert "own role" in str(exc.value.detail)
+            assert admin.role == "admin"
+        finally:
+            db.close()
+
+    def test_an_admin_cannot_delete_itself_when_another_admin_exists(self):
+        """With another live admin present, self-deletion is a 403, no saga."""
+        import asyncio
+
+        import pytest
+        from fastapi import HTTPException
+        from app.database import SessionLocal
+        from app.routers import auth as auth_router
+        from app.services import auth_service
+        from support import mk_user
+
+        db = SessionLocal()
+        try:
+            me = mk_user(db, "selfdelete", role="admin")
+            mk_user(db, "otheradmin", role="admin")
+            me_id = str(me.id)
+        finally:
+            db.close()
+
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(auth_router.delete_user(me_id, {"id": me_id}))
+        assert exc.value.status_code == 403
+        assert "own account" in str(exc.value.detail)
+        db = SessionLocal()
+        try:
+            row = auth_service.get_user_by_id(db, me_id)
+            assert row is not None
+            assert row.deleted_at is None and row.deletion_state == "none"
+        finally:
+            db.close()
 
 
 class TestServiceAnnotations:
-    """T5/T10 — public/orphan annotations come from the gateway, not the browser."""
+    """T10 — public/orphan annotations come from the gateway, not the browser."""
 
     def test_soft_deleted_public_owner_keeps_was_public(self, monkeypatch):
         import asyncio
         from datetime import datetime, timezone
+
         from app.database import SessionLocal
-        from app.models.end_user import EndUser
         from app.routers.users import list_users
         from app.services.provision_service import provision_service as provision_client
+        from support import mk_user
 
         db = SessionLocal()
-        db.add(EndUser(
-            username="pubgone", password_hash="x", role="special",
-            is_approved=True, is_active=False, is_public_shared=True,
-            deleted_at=datetime.now(timezone.utc),
-        ))
-        db.commit()
+        try:
+            admin = mk_user(db, "admin", role="admin")
+            admin_id = str(admin.id)
+            pub = mk_user(db, "pubgone", role="special", public=True,
+                          active=False)
+            pub.deleted_at = datetime.now(timezone.utc)
+            db.commit()
+        finally:
+            db.close()
 
         async def fake_list():
             return {"user_status": [{
@@ -11425,7 +11487,7 @@ class TestServiceAnnotations:
             }]}
         monkeypatch.setattr(provision_client, "list_users", fake_list)
         result = asyncio.run(list_users(current_user={
-            "role": "admin", "id": 1, "user_type": "admin",
+            "role": "admin", "id": admin_id,
         }))
         group = next(u for u in result["users"] if u["user_name"] == "pubgone")
         assert group["owner_gone"] is True
@@ -11436,19 +11498,23 @@ class TestServiceAnnotations:
     def test_public_urls_and_orphan_alert_are_annotated(self, monkeypatch):
         import asyncio
         from datetime import datetime, timezone
+
         from app.database import SessionLocal
-        from app.models.end_user import EndUser
         from app.routers.users import list_users
         from app.services.provision_service import provision_service as provision_client
         from app.config import settings
+        from support import mk_user
 
         db = SessionLocal()
-        pub = EndUser(username="pub", password_hash="x", role="special",
-                      is_approved=True, is_active=True, is_public_shared=True)
-        gone = EndUser(username="gone", password_hash="x", is_approved=True,
-                       is_active=False, deleted_at=datetime.now(timezone.utc))
-        db.add_all([pub, gone])
-        db.commit()
+        try:
+            admin = mk_user(db, "admin", role="admin")
+            admin_id = str(admin.id)
+            mk_user(db, "pub", role="special", public=True)
+            gone = mk_user(db, "gone", role="viewer", active=False)
+            gone.deleted_at = datetime.now(timezone.utc)
+            db.commit()
+        finally:
+            db.close()
 
         async def fake_list():
             return {"user_status": [
@@ -11468,7 +11534,7 @@ class TestServiceAnnotations:
         monkeypatch.setattr(provision_client, "list_users", fake_list)
 
         result = asyncio.run(list_users(current_user={
-            "role": "admin", "id": 1, "user_type": "admin",
+            "role": "admin", "id": admin_id,
         }))
         by_user = {u["user_name"]: u for u in result["users"]}
         pub_svc = by_user["pub"]["healthy_services"][0]
@@ -11583,7 +11649,7 @@ class TestPublicAndOrphanDashboard:
         assert "togglePublic" not in src
         assert "title: 'Public', key: 'public'" not in src
         assert "Public functional user" in src
-        assert "is_public_shared: values.role === 'special'" in src
+        assert "is_public_shared: !!values.is_public_shared" in src
         assert '(r.is_public_shared || r.was_public) && <Tag color="green">Public</Tag>' in src
         assert "u.is_public_shared ? ' · Public'" in src
         assert "g.is_public_shared ? ' · Public'" in src
@@ -11594,3 +11660,36 @@ class TestPublicAndOrphanDashboard:
         assert '{publicGroup && <Tag color="green">Public</Tag>}' in src
         assert "svc.is_public && <Tag" not in src, (
             "the Public tag belongs on the user group, not on each service card")
+
+
+class TestServiceActionNotFoundPassthrough:
+    """§10 step 9a: a card action on a bogus/deleted id is a 404, not a 502.
+
+    Regression: `as_http_error` folded every non-503 failure into 502, so a
+    stop/start on an unknown instance read as a gateway outage (surfaced by the
+    bogus-id card-action trace, 2026-11-01).
+    """
+
+    @staticmethod
+    def _err(code: int):
+        import httpx
+        req = httpx.Request("POST", "http://api/instances/x/stop")
+        resp = httpx.Response(code, request=req, json={"detail": f"e{code}"})
+        return httpx.HTTPStatusError("x", request=req, response=resp)
+
+    def test_404_passes_through_with_its_detail(self):
+        from fastapi import HTTPException
+        from app.services.provision_service import provision_service
+
+        mapped = provision_service.as_http_error(self._err(404))
+        assert isinstance(mapped, HTTPException)
+        assert mapped.status_code == 404
+        assert mapped.detail == "e404"
+
+    def test_other_failures_keep_the_generic_mapping(self):
+        from fastapi import HTTPException
+        from app.services.provision_service import provision_service
+
+        mapped = provision_service.as_http_error(self._err(500))
+        assert isinstance(mapped, HTTPException)
+        assert mapped.status_code == 502

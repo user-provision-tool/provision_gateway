@@ -51,9 +51,9 @@ export default function LoginPage() {
         <Form onFinish={handleSubmit} layout="vertical" size="large">
           <Form.Item
             name="email"
-            rules={[{ required: true, message: 'Please enter your email' }]}
+            rules={[{ required: true, message: 'Please enter your username or email' }]}
           >
-            <Input prefix={<UserOutlined />} placeholder="Email" />
+            <Input prefix={<UserOutlined />} placeholder="Username or email" />
           </Form.Item>
           <Form.Item
             name="password"
@@ -92,12 +92,9 @@ export default function LoginPage() {
           </Form.Item>
           <Form.Item
             name="email"
-            rules={[
-              { required: true, message: 'Please enter your email' },
-              { type: 'email', message: 'Please enter a valid email' },
-            ]}
+            rules={[{ type: 'email', message: 'Please enter a valid email' }]}
           >
-            <Input prefix={<MailOutlined />} placeholder="Email" />
+            <Input prefix={<MailOutlined />} placeholder="Email (optional)" />
           </Form.Item>
           <Form.Item
             name="password"
