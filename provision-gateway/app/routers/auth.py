@@ -23,6 +23,8 @@ from ..models.user import User
 from ..models.user_login import UserLogin
 from ..schemas.auth import LoginRequest, PasswordChangeRequest
 from ..services import acl_service, account_service, auth_service, audit_service
+from ..services import cross_verify as cross_verify_service
+from ..services.cross_orchestrator import schedule_sync, schedule_sync_threadsafe
 from ..services.api_users_client import ApiUsersClient, ApiUsersUnavailable, api_users
 from ..services.basic_credentials import authorization_header
 from ..services.registry_entry import entry_tls
@@ -186,6 +188,88 @@ def verify_auth(request: Request, db: Session = Depends(get_db)):
     if owner is not None and acl_service.allows(db, user, owner.id):
         return _respond(200, {"X-Service-Basic": authorization_header(entry["service_id"])})
     return _deny("acl_denied", 403, "ACL denied")
+
+
+# ---------------------------------------------------------------------------
+# cross-verify — the cross nginx's token-free subrequest (G83)
+# ---------------------------------------------------------------------------
+
+@router.get("/cross-verify")
+def cross_verify(request: Request, db: Session = Depends(get_db)):
+    """Token-free authorization on ``<source-ip, target-url>``.
+
+    The ONLY caller is the cross nginx; it is trusted by its actual IP. The
+    cross path carries no token and no key at all — this verdict is the only
+    authorization. Every other gateway endpoint keeps its token auth.
+    """
+    client_ip = request.client.host if request.client else ""
+    if not cross_verify_service.is_cross_nginx_caller(client_ip):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "caller is not the cross nginx"},
+            headers={"X-Client-Type": "api"},
+        )
+    source_ip = request.headers.get("X-Source-IP", "")
+    host = (request.headers.get("Host", "") or "").partition(":")[0]
+    result = cross_verify_service.verdict(
+        source_ip, host, db, request.app.state.hostname_index
+    )
+    headers = {"X-Client-Type": "api"}
+    if result["allowed"]:
+        headers["X-Service-Basic"] = result.get("service_basic") or ""
+        return JSONResponse(
+            status_code=200,
+            content={"allowed": True, "reason": result["reason"]},
+            headers=headers,
+        )
+    return JSONResponse(
+        status_code=int(result.get("status") or 403),
+        content={"detail": result["reason"]},
+        headers=headers,
+    )
+
+
+@router.post("/cross-stream-verify")
+async def cross_stream_verify(request: Request, db: Session = Depends(get_db)):
+    """G85 — token-free authorization on ``<source-ip, exposure handle>``.
+
+    The ONLY caller is the cross nginx's stream preread hook. The handle is the
+    SNI (the edge's own exposure URL); it is a credential and is never logged.
+    """
+    client_ip = request.client.host if request.client else ""
+    if not cross_verify_service.is_cross_nginx_caller(client_ip):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "caller is not the cross nginx"},
+            headers={"X-Client-Type": "api"},
+        )
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 — a malformed hook call is a refusal
+        payload = {}
+    handle = str((payload or {}).get("handle") or "")
+    source_ip = request.headers.get("X-Source-IP", "")
+    result = cross_verify_service.stream_verdict(
+        source_ip, handle, db, getattr(request.app.state, "registry", None)
+    )
+    headers = {"X-Client-Type": "api"}
+    if result["allowed"]:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "allow": True,
+                "reason": result["reason"],
+                "canonical_name": result["canonical_name"],
+                "port": result["port"],
+                "inner_port": result["inner_port"],
+            },
+            headers=headers,
+        )
+    return JSONResponse(
+        status_code=int(result.get("status") or 403),
+        content={"allow": False, "detail": result["reason"]},
+        headers=headers,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +477,8 @@ def set_user_grant(user_id: str, req: dict, current_admin: dict = Depends(requir
         detail={"shared_user_id": shared_id, "active": active,
                 "state": row["state"] if row else "none"}, status="success",
     )
+    # An account grant can turn an explicit cross-owner service grant on/off.
+    schedule_sync_threadsafe()
     return {"updated": True, "grant": row}
 
 
@@ -498,6 +584,9 @@ def update_user(user_id: str, req: dict, current_admin: dict = Depends(require_a
             target_user=auth_service.username_for(db, user.id), detail=detail,
             status="success",
         )
+    # Deactivation inactivates the account's grants; the cross-path set follows.
+    if "is_active" in detail:
+        schedule_sync_threadsafe()
     row = _user_payload(db, user)
     row["grants"] = acl_service.list_for_grantee(db, user.id)
     return {"updated": True, "user": row}
@@ -637,6 +726,8 @@ async def delete_user(user_id: str, current_admin: dict = Depends(require_admin)
                     "stream_exposures_revoked": exposures},
             status="success",
         )
+        # The account's services are gone: refresh the cross-path derived state.
+        schedule_sync()
         return {"deleted": True, "soft_deleted": True, "username": username}
     finally:
         db.close()

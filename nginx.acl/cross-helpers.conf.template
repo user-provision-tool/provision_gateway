@@ -1,0 +1,40 @@
+# The cross nginx's auth machinery — included by cross.conf.template.
+#
+# `_auth_cross` is the token-free subrequest: it sends the SOURCE IP (the
+# client's address as seen on the cross network) and the target Host to the
+# gateway, and carries no cookie and no X-Provision-Token. The gateway trusts
+# only this nginx's actual IP. A gateway outage fails the subrequest, which
+# makes auth_request return 500 — the source reaches no target (fail closed).
+#
+# Denials are PLAIN 401/403 with the API client type: the cross path never
+# redirects to the portal and never mints a login.
+
+location = /_auth_cross {
+    internal;
+    resolver 127.0.0.11 valid=30s ipv6=off;
+    # Fail closed FAST. A stopped gateway leaves its cross-network address
+    # unreachable (no RST), so nginx's default 60 s connect timeout would hang
+    # the client instead of returning the documented 500 (measured 2026-11-03).
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 10s;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Source-IP $remote_addr;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    # The gateway's CROSS-NETWORK address, deliberately: a name would resolve
+    # to both attachments and Docker picked the shared one, so the gateway saw
+    # the cross nginx's shared IP instead of the cross IP it trusts (measured
+    # 2026-11-03). The auth call is a cross-network hop by definition.
+    proxy_pass http://172.28.0.4:8770/api/auth/cross-verify;
+}
+
+location @auth_401 {
+    add_header X-Client-Type api always;
+    return 401;
+}
+
+location @auth_403 {
+    add_header X-Client-Type api always;
+    return 403;
+}

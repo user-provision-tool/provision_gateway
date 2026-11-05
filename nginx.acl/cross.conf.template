@@ -1,0 +1,149 @@
+# The cross nginx — the private replica of the edge on the cross network.
+#
+# It is the same image and the same service server blocks as the edge, with the
+# `_auth_cross` subrequest instead of `_auth_jwt`, the target Basic ALWAYS
+# injected (the `map $public_service` stays empty on this branch, so a public
+# target gets the Basic too), no portal, no host ports and no public exposure.
+# It mirrors the client scheme to the internal nginx exactly as the edge does.
+#
+# Assembled by the SHARED entrypoint.sh with cross-specific template paths; the
+# envsubst allow-list leaves every nginx $variable intact.
+#
+# G85 — the cross nginx serves on the SAME numbers the edge uses, but never
+# publishes them: HTTP/HTTPS on ${NGINX_HTTP_PORT}/${NGINX_HTTPS_PORT} and
+# stream on ${STREAM_PORT}. The s2s URL and the edge URL are therefore the same
+# string; only the resolved IP differs.
+
+# The stream hook is njs, shipped in the image but not loaded by default.
+load_module /usr/lib/nginx/modules/ngx_stream_js_module.so;
+
+user nginx;
+worker_processes auto;
+
+error_log  /var/log/nginx/error.log notice;
+pid        /var/run/nginx.pid;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    sendfile        on;
+    keepalive_timeout  65;
+
+    # Docker embedded DNS — resolves subnet-acl-nginx / subnet-acl-gateway at
+    # request time. The cross nginx is on the shared network for both hops.
+    resolver 127.0.0.11 valid=30s ipv6=off;
+
+    # SNI → per-domain cert — the same catch-all rule as the edge.
+    map $ssl_server_name $cert_pem {
+        default                     /etc/nginx/acl/placeholder/fullchain.pem;
+        ~^(?<rest>[^.]+)\.(?<d>.+)$ /certs/$d/fullchain.pem;
+    }
+    map $ssl_server_name $cert_key {
+        default                     /etc/nginx/acl/placeholder/privkey.pem;
+        ~^(?<rest>[^.]+)\.(?<d>.+)$ /certs/$d/privkey.pem;
+    }
+
+    # The client's Host, port included — the same downstream rule as the edge.
+    map $http_host $forwarded_host {
+        ""      $host;
+        default $http_host;
+    }
+
+    # HTTP service traffic: gate, inject, proxy to the internal nginx :80.
+    server {
+        listen ${NGINX_HTTP_PORT} default_server;
+        server_name _;
+        include /etc/nginx/acl/cross-helpers.conf;
+        location / {
+            auth_request /_auth_cross;
+            auth_request_set $service_basic $upstream_http_x_service_basic;
+            auth_request_set $client_type $upstream_http_x_client_type;
+            error_page 401 = @auth_401;
+            error_page 403 = @auth_403;
+            # ALWAYS the target Basic — never the client's Authorization and
+            # never the public branch.
+            proxy_set_header Authorization "Basic $service_basic";
+            proxy_set_header Host $forwarded_host;
+            proxy_set_header X-Forwarded-Proto http;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_pass http://subnet-acl-nginx;
+        }
+    }
+
+    # HTTPS service traffic: terminate TLS with the SNI cert, gate, re-encrypt
+    # to the internal nginx :443 (the same double-TLS shape as the edge).
+    server {
+        listen ${NGINX_HTTPS_PORT} ssl default_server;
+        server_name _;
+        ssl_certificate $cert_pem;
+        ssl_certificate_key $cert_key;
+        include /etc/nginx/acl/cross-helpers.conf;
+        location / {
+            auth_request /_auth_cross;
+            auth_request_set $service_basic $upstream_http_x_service_basic;
+            auth_request_set $client_type $upstream_http_x_client_type;
+            error_page 401 = @auth_401;
+            error_page 403 = @auth_403;
+            proxy_set_header Authorization "Basic $service_basic";
+            proxy_set_header Host $forwarded_host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_ssl_server_name on;
+            proxy_ssl_verify off;
+            proxy_pass https://subnet-acl-nginx;
+        }
+    }
+}
+
+# ======================================================================
+# STREAM — the cross path's stream door (G85)
+# ======================================================================
+# The SAME exposure URL the edge uses ({handle}.{domain}:{STREAM_PORT}); the
+# listener is static (no per-target ports) and never published. The preread
+# hook reads the SNI (the handle) and the source container's address, and asks
+# the token-free cross-stream-verify. On allow it opens the platform-internal
+# TLS hop to the internal nginx's stream listener with the canonical name as
+# the SNI; the internal nginx's stream vhost selects the target by that name.
+# Every failure drops the session. The hook never logs the handle.
+stream {
+    map $ssl_server_name $stream_cert_pem {
+        default                     /etc/nginx/acl/placeholder/fullchain.pem;
+        ~^(?<rest>[^.]+)\.(?<d>.+)$ /certs/$d/fullchain.pem;
+    }
+    map $ssl_server_name $stream_cert_key {
+        default                     /etc/nginx/acl/placeholder/privkey.pem;
+        ~^(?<rest>[^.]+)\.(?<d>.+)$ /certs/$d/privkey.pem;
+    }
+
+    js_import cross_stream_acl from /etc/nginx/acl/cross-stream-acl.js;
+
+    server {
+        listen      ${STREAM_PORT} ssl;
+        ssl_certificate     $stream_cert_pem;
+        ssl_certificate_key $stream_cert_key;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+
+        # Required: the preread phase (and therefore the hook's SNI) does not
+        # exist without it on a listener that terminates TLS.
+        ssl_preread on;
+        js_preread  cross_stream_acl.preread;
+
+        # njs's ngx.fetch resolves names through nginx's OWN resolver.
+        resolver 127.0.0.11 valid=30s ipv6=off;
+
+        # Set by the hook on an allow; empty on a deny — an empty upstream is
+        # unroutable, which is the refusal.
+        set $stream_upstream "";
+        set $stream_sni      "";
+        proxy_pass          $stream_upstream;
+        proxy_ssl           on;
+        proxy_ssl_server_name on;
+        proxy_ssl_name      $stream_sni;
+        proxy_ssl_verify    off;
+    }
+}

@@ -2913,7 +2913,13 @@ class TestGoServiceRedirect:
         # there is no instance URL field and no `primary` row.
         assert "return `/go/${servedName}`" in content, (
             "service card must link each endpoint to /go/{served name}")
-        assert "svc.http_endpoints" in content
+        # G86 — the endpoint body is shared with the `Can call` popup.
+        endpoints = (
+            Path(__file__).parent.parent.parent
+            / "provision-dashboard" / "src" / "components" / "services"
+            / "ServiceEndpointsView.tsx"
+        ).read_text()
+        assert "svc.http_endpoints" in endpoints
         assert "URL: " not in content
         assert "<Text code>primary</Text>" not in content
 
@@ -6516,10 +6522,17 @@ class TestPreDeployCardSourceGuards:
         for btn in (">Rebuild</Button>", "Redeploy</Button>", ">Dup</Button>", "KeyOutlined"):
             assert btn not in actions, f"{btn} must not appear on a pre-deploy card"
 
-    def test_delete_sends_the_recipe_path(self):
-        """The key includes the recipe path, so the delete must pass it too."""
+    def test_delete_uses_the_service_id_route(self):
+        """The DELETE route is keyed by service_id.
+
+        The name-shaped `/pre-deploy/{user}/{service}/{label}` path is the GET
+        route; sending DELETE to it returns 405 and the session is never removed
+        (measured 2026-11-03/04, fixed in the Round-3 dashboard change). The
+        session is identified by its service_id, so no recipe_path is sent.
+        """
         src = self._page()
-        assert "recipe_path: sess.recipe_path" in src
+        assert "client.delete(`/pre-deploy/${sess.service_id}`)" in src
+        assert "client.delete(`/pre-deploy/${sess.user_name}" not in src
 
     def test_a_generation_refusals_retry_is_not_gated_on_its_options(self):
         """G29: the gateway refusal's own Retry, which was a dead control.

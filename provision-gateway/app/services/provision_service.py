@@ -142,6 +142,23 @@ class ProvisionService:
     async def get_instance(self, service_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/instances/{service_id}")
 
+    # ---- Extra resolver / network (G83, generic and opaque) ----
+
+    async def get_extra_resolver(self, service_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"/instances/{service_id}/extra-resolver")
+
+    async def set_extra_resolver(self, service_id: str, *, resolver_ip: str,
+                                 network: str) -> dict[str, Any]:
+        return await self._request(
+            "POST", f"/instances/{service_id}/extra-resolver",
+            json_data={"resolver_ip": resolver_ip, "network": network},
+        )
+
+    async def clear_extra_resolver(self, service_id: str) -> dict[str, Any]:
+        return await self._request(
+            "DELETE", f"/instances/{service_id}/extra-resolver"
+        )
+
     async def remove_instance(self, service_id: str, scope: str = "service") -> dict[str, Any]:
         return await self._request(
             "DELETE", f"/instances/{service_id}", params={"scope": scope}

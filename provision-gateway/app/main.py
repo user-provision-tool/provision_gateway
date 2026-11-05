@@ -20,6 +20,7 @@ from .routers import (
     audit_router,
     llm_router,
     pre_deploy_router,
+    service_grants_router,
     services_router,
     stream_router,
     system_router,
@@ -34,6 +35,7 @@ _reconcile_task: asyncio.Task | None = None
 _docker_events_task: asyncio.Task | None = None
 _project_monitor_task: asyncio.Task | None = None
 _account_repair_task: asyncio.Task | None = None
+_cross_startup_task: asyncio.Task | None = None
 
 
 def _get_reconcile_interval_min() -> int:
@@ -164,6 +166,35 @@ async def _account_repair_loop():
             continue
 
 
+async def _cross_startup_pass():
+    """The ONE cross-service startup pass (across all uvicorn workers).
+
+    The gateway runs `--workers 4`; each worker executes this lifespan, so the
+    pass must be gated. A session-scoped PostgreSQL advisory lock is the right
+    primitive: it is released automatically when the holding connection dies,
+    so a crashed worker cannot leave the pass blocked (a lease row would).
+    Without the gate every worker fans out the same -api updates four times
+    (measured 2026-11-03).
+    """
+    from sqlalchemy import text as _text
+    from .database import engine
+    lock_key = 7_412_003
+    conn = engine.connect()
+    try:
+        acquired = bool(conn.execute(
+            _text("SELECT pg_try_advisory_lock(:k)"), {"k": lock_key}
+        ).scalar())
+        if not acquired:
+            return
+        try:
+            from .services.cross_orchestrator import cross_orchestrator
+            await cross_orchestrator.startup_pass()
+        finally:
+            conn.execute(_text("SELECT pg_advisory_unlock(:k)"), {"k": lock_key})
+    finally:
+        conn.close()
+
+
 async def _project_monitor_loop():
     """Background loop: periodically scan source_projects for new directories.
 
@@ -192,7 +223,7 @@ async def _project_monitor_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
-    global _reconcile_task, _docker_events_task, _project_monitor_task, _account_repair_task
+    global _reconcile_task, _docker_events_task, _project_monitor_task, _account_repair_task, _cross_startup_task
     # Startup
     init_db()
     print(f"[gateway] Database initialized at {settings.DATABASE_URL}")
@@ -260,6 +291,13 @@ async def lifespan(app: FastAPI):
     print("[gateway] Project directory monitor started (polling source_projects every 10s)")
     _account_repair_task = asyncio.create_task(_account_repair_loop())
     print("[gateway] Account repair loop started")
+
+    # G83 — the ONE gateway startup pass. It re-writes the dnsmasq config from
+    # the grant state and re-calls the -api for every granted source, retrying
+    # while the -api boots. Not a periodic reconcile; a stack rebuild restarts
+    # this process, so it converges.
+    _cross_startup_task = asyncio.create_task(_cross_startup_pass())
+    print("[gateway] Cross-service grant startup pass scheduled")
     yield
     # Shutdown
     if _reconcile_task:
@@ -270,6 +308,8 @@ async def lifespan(app: FastAPI):
         _project_monitor_task.cancel()
     if _account_repair_task:
         _account_repair_task.cancel()
+    if _cross_startup_task:
+        _cross_startup_task.cancel()
     print("[gateway] Shutting down")
 
 
@@ -316,6 +356,7 @@ app.include_router(llm_router)
 app.include_router(pre_deploy_router)
 app.include_router(audit_router)
 app.include_router(stream_router)
+app.include_router(service_grants_router)
 
 
 # ---------------------------------------------------------------------------

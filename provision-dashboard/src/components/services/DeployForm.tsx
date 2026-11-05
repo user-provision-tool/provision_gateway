@@ -146,7 +146,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   // refused, because the two remedies differ (G29).
   const [atCapacity, setAtCapacity] = useState<{ code: string; detail: string } | null>(null)
   const [sources, setSources] = useState<{ name: string; files: string[]; has_compose_template?: boolean; recipes?: { path: string; label: string; is_root: boolean; template_files: string[] }[] }[]>([])
-  const [deployableUsers, setDeployableUsers] = useState<{username:string,label:string}[]>([])
+  const [deployableUsers, setDeployableUsers] = useState<{id:string,username:string,label:string}[]>([])
+  // G86 — the folded allowed-services selector: services grouped by OWNER
+  // ACCOUNT, and only the accounts the deploying user can reach (own + active
+  // account grant + public). Same-owner is implicit and is not listed.
+  const [crossTargets, setCrossTargets] = useState<
+    {key:string,label:string,options:{value:string,label:string}[]}[]
+  >([])
   const [sslDomains, setSslDomains] = useState<{domain:string, fullchain_path:string, privkey_path:string}[]>([])
   const [selectedSslDomain, setSelectedSslDomain] = useState<string>('')
 
@@ -434,6 +440,9 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
           setNextLabel(pinnedOnOpen)
           form.setFieldsValue({ label: pinnedOnOpen })
         }
+        // The picker is guarded by the DEPLOYING user, so it loads after the
+        // user field is seeded.
+        await loadCrossTargets(form.getFieldValue('user_name'))
       }
       init()
     }
@@ -449,8 +458,62 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   const loadDeployableUsers = async () => {
     try {
       const { data } = await client.get('/auth/users/deployable')
-      setDeployableUsers((data.users||[]).map((u:any)=>({username:u.username,label:u.username})))
+      setDeployableUsers((data.users||[]).map((u:any)=>({
+        id: u.id, username: u.username, label: u.username,
+      })))
     } catch { /* ignore */ }
+  }
+
+  // G86 — the deploy panel's allowed-services picker, grouped by owner account
+  // and guarded exactly like the service card's `Can call` picker: only the
+  // deploying user's own account (same-owner, implicit — never listed), accounts
+  // with an active account grant, and public accounts. The grant rows are
+  // written after the deploy completes; the gateway validates the same rule.
+  const loadCrossTargets = async (usernameArg?: string) => {
+    const username = usernameArg || form.getFieldValue('user_name')
+    if (!username) { setCrossTargets([]); return }
+    try {
+      const [{ data: servicesData }, { data: usersData }] = await Promise.all([
+        client.get('/services'),
+        client.get('/auth/users/deployable'),
+      ])
+      const deploying = (usersData.users || []).find((u:any)=>u.username === username)
+      const activeShared = new Set<string>()
+      if (deploying?.id) {
+        try {
+          const { data: grantsData } = await client.get(`/auth/users/${deploying.id}/grants`)
+          for (const g of (grantsData.grants || [])) {
+            if (g.state === 'active') activeShared.add(g.shared_username)
+          }
+        } catch { /* not an admin view — only public accounts remain listable */ }
+      }
+      const groups: {key:string,label:string,options:{value:string,label:string}[]}[] = []
+      for (const group of (servicesData.users || [])) {
+        const owner = group.user_name || group.owner_username || ''
+        // Same-owner targets are implicit — no row is ever taken for them.
+        if (!owner || owner === username) continue
+        if (!(activeShared.has(owner) || group.is_public === true)) continue
+        const options: {value:string,label:string}[] = []
+        for (const bucket of ['healthy_services','unhealthy_services','missing_services','failed_services']) {
+          for (const svc of (group[bucket] || [])) {
+            if (svc.status !== 'running') continue
+            options.push({
+              value: svc.service_id,
+              label: `${svc.service_name}:${svc.label}`,
+            })
+          }
+        }
+        if (!options.length) continue
+        options.sort((a,b)=>a.label.localeCompare(b.label))
+        groups.push({
+          key: owner,
+          label: `${owner}${group.is_public ? ' · Public' : ''}`,
+          options,
+        })
+      }
+      groups.sort((a,b)=>a.label.localeCompare(b.label))
+      setCrossTargets(groups)
+    } catch { setCrossTargets([]) }
   }
 
   const loadSources = async () => {
@@ -1323,6 +1386,13 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         }
       }
 
+      // G83 — the folded selector's target services. The gateway writes the
+      // grant rows once the deploy task finishes (the source identity does not
+      // exist before that).
+      if (snap.allowed_target_service_ids && snap.allowed_target_service_ids.length > 0) {
+        payload.allowed_target_service_ids = snap.allowed_target_service_ids
+      }
+
       const { data } = await client.post('/services/deploy', payload)
       message.success(`Deploy queued! Task: ${data.task_id}`)
       onDeployed(data.task_id, snap.user_name, baseName, snap.label || '0')
@@ -1537,6 +1607,8 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
                   const svc = form.getFieldValue('service_name') || ''
                   const { baseName: svcBase } = parseServiceValue(svc)
                   if (val && svcBase) computeNextLabel(val, svcBase)
+                  // G86 — the allowed-services picker is guarded by the user.
+                  loadCrossTargets(val)
                 }}
               />
             </Form.Item>
@@ -1638,6 +1710,33 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
               />
             </Form.Item>
           )}
+          {/* ---- G83: allowed services (folded by default) ---- */}
+          <Collapse ghost>
+            <Collapse.Panel
+              header="Allowed services (cross-service calls)"
+              key="cross-grants"
+            >
+              <Form.Item name="allowed_target_service_ids" style={{ marginBottom: 8 }}>
+                <Select
+                  mode="multiple"
+                  allowClear
+                  showSearch
+                  optionFilterProp="label"
+                  placeholder="None — same-owner targets are implicit"
+                  options={crossTargets}
+                />
+              </Form.Item>
+              <div style={{ fontSize: 12, color: '#999' }}>
+                The new service may call the selected services. Only accounts
+                this user can reach are listed (an active account grant, or a
+                public account); same-owner targets are implicit and never
+                listed. A cross-owner target always needs this row; a private
+                one also needs the active account grant. The grant rows are
+                written after the deploy completes.
+              </div>
+            </Collapse.Panel>
+          </Collapse>
+
           {/* ---- Base file selection (design §Selection & UI) ---- */}
           <Divider plain>Base file selection <span style={{fontSize:12,color:'#999'}}>— stored default pre-selected; save happens on deploy</span></Divider>
           <FileSetSelection

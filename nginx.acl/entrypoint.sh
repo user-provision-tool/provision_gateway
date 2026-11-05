@@ -42,7 +42,9 @@ START_NGINX="${START_NGINX:-1}"
 # STREAM_PORT is the stream listener's port — the ONE shared published door a
 # client dials for an exposure URL (task-doc R8.1). It is substituted into the
 # template's `listen` so the conf and the compose publish can never disagree.
-ENVSUBST_VARS='$PORTAL_SCHEME $PORTAL_HOSTNAME $PORTAL_REDIRECT_PORT $HTTPS_REDIRECT_PORT $STREAM_PORT'
+# G85 — NGINX_HTTP_PORT/NGINX_HTTPS_PORT are the cross nginx's SERVING ports
+# (the edge's client-facing numbers, never published by the cross container).
+ENVSUBST_VARS='$PORTAL_SCHEME $PORTAL_HOSTNAME $PORTAL_REDIRECT_PORT $HTTPS_REDIRECT_PORT $STREAM_PORT $NGINX_HTTP_PORT $NGINX_HTTPS_PORT'
 
 # ---- condvar evaluation ----
 # PORTAL_MODE is an enum (`http` | `https`), not a boolean; ENABLE_ACL is a
@@ -75,7 +77,12 @@ case "$PORTAL_REDIRECT_PORT" in ""|:*) ;; *) PORTAL_REDIRECT_PORT=":$PORTAL_REDI
 # The stream door. 17687 is the value the feature ruled and measured free on
 # this host (R8.1); the compose publishes the same number from the same var.
 STREAM_PORT="${STREAM_PORT:-17687}"
-export PORTAL_SCHEME PORTAL_HOSTNAME PORTAL_REDIRECT_PORT HTTPS_REDIRECT_PORT STREAM_PORT
+# The cross nginx's serving ports default to the standard ones; the compose
+# passes the edge's numbers so the same URL string works on both doors.
+NGINX_HTTP_PORT="${NGINX_HTTP_PORT:-80}"
+NGINX_HTTPS_PORT="${NGINX_HTTPS_PORT:-443}"
+export PORTAL_SCHEME PORTAL_HOSTNAME PORTAL_REDIRECT_PORT HTTPS_REDIRECT_PORT STREAM_PORT \
+       NGINX_HTTP_PORT NGINX_HTTPS_PORT
 
 # ---- frame stack (2-char frames, ${_stack%??} pop) ----
 _push() { _stack="${_stack}$1"; }

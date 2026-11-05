@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid
 from pathlib import Path
 from typing import Any
@@ -15,10 +17,13 @@ from ..database import SessionLocal, get_db
 from ..middleware import require_admin, require_gateway_token
 from ..models.pre_deploy_session import PreDeploySession
 from ..models.user import User
-from ..services import acl_service, audit_service, curl_service, stream_service
+from ..services import acl_service, audit_service, curl_service, service_grants, stream_service
+from ..services.cross_orchestrator import cross_orchestrator
 from ..services.provision_service import provision_service
 
 router = APIRouter(prefix="/api/services", tags=["services"])
+
+_log = logging.getLogger("gateway.services")
 
 
 def _direct_url(served_name: str, tls: bool) -> str:
@@ -69,11 +74,13 @@ def _annotate(result: dict, db: Session) -> dict:
         "is_public": public,
         "was_public": was_public,
     })
+    annotated: list[dict] = []
     for bucket in ("healthy_services", "unhealthy_services", "missing_services",
                    "failed_services"):
         for svc in (result.get(bucket) or []):
             if not isinstance(svc, dict):
                 continue
+            annotated.append(svc)
             svc["owner_api_user_id"] = result["owner_api_user_id"]
             svc["owner_username"] = username
             svc["owner_role"] = owner_role
@@ -86,6 +93,8 @@ def _annotate(result: dict, db: Session) -> dict:
                  for n in (svc.get("http_endpoints") or [])}
                 if public else {}
             )
+    # G83 — the card's cross-service section: effective targets, explicit rows.
+    service_grants.annotate_services(db, annotated)
     return result
 
 
@@ -168,6 +177,46 @@ def _resolve_owner(db: Session, req: dict) -> dict:
             "username": raw_name}
 
 
+async def _finish_deploy(source_service_id: str, task_id: str | None,
+                         target_ids: list[str], actor_id) -> None:
+    """After the deploy task completes, write the panel's grant selection."""
+    if not task_id:
+        return
+    try:
+        while True:
+            data = await provision_service.get_task(task_id)
+            status = str(data.get("status") or "")
+            if status in ("completed", "failed", "cancelled", "unknown"):
+                break
+            await asyncio.sleep(2.0)
+        if status != "completed":
+            return
+        db = SessionLocal()
+        try:
+            for target_id in target_ids:
+                try:
+                    service_grants.set_grant(
+                        db, source_service_id, target_id, actor_user_id=actor_id,
+                    )
+                    audit_service.log_action(
+                        db, action="service_grant_set", actor_user_id=actor_id,
+                        target_service_id=source_service_id,
+                        detail={"source_service_id": source_service_id,
+                                "target_service_id": target_id,
+                                "origin": "deploy_panel"},
+                        status="success",
+                    )
+                except ValueError as exc:
+                    _log.warning("deploy-panel grant %s -> %s skipped: %s",
+                                 source_service_id, target_id, exc)
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001 — the deploy already succeeded
+        _log.exception("deploy-panel grant selection failed for %s", source_service_id)
+        return
+    await cross_orchestrator.sync_all()
+
+
 @router.post("/deploy", status_code=202)
 async def deploy_user(req: dict[str, Any], request: Request,
                       current_admin: dict = Depends(require_admin)):
@@ -199,6 +248,11 @@ async def deploy_user(req: dict[str, Any], request: Request,
 
     payload = dict(req)
     payload.pop("owner_username", None)
+    # The panel's folded allowed-services selector travels with the deploy but is
+    # NOT a -api field: the gateway writes the grant rows after the service
+    # identity exists (the -api creates it during the deploy).
+    raw_targets = payload.pop("allowed_target_service_ids", None) or []
+    target_ids = [str(t) for t in raw_targets if t]
     payload.update({
         "owner_api_user_id": owner["owner_api_user_id"],
         "service_id": service_id,
@@ -250,6 +304,14 @@ async def deploy_user(req: dict[str, Any], request: Request,
     finally:
         db.close()
     _audit_short("register", current_admin, req)
+    # G83 — once the deploy task finishes the service is live: write the panel's
+    # grant selection (if any) and refresh the cross-path config + memberships.
+    if target_ids:
+        asyncio.create_task(_finish_deploy(
+            service_id, result.get("task_id"), target_ids, current_admin["id"],
+        ))
+    else:
+        asyncio.create_task(cross_orchestrator.sync_after_task(result.get("task_id")))
     return result
 
 
@@ -363,6 +425,12 @@ async def _lifecycle(service_id: str, action: str, req: dict | None = None,
     if current_admin:
         _audit_short(action, current_admin, {"service_id": service_id,
                                              "service_name": service_id})
+    # G83 — a lifecycle change moves the live/target set. A rebuild recreates
+    # containers, so wait for its task; remove/start/stop are already complete.
+    if action == "rebuild" and isinstance(result, dict) and result.get("task_id"):
+        asyncio.create_task(cross_orchestrator.sync_after_task(result["task_id"]))
+    elif action in ("remove", "start", "stop"):
+        asyncio.create_task(cross_orchestrator.sync_all())
     return result
 
 

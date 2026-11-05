@@ -9,6 +9,7 @@ from .proxy_config import ProxyConfig
 from .user import User
 from .user_login import UserLogin
 from .acl_grant import AclGrant
+from .service_grant import ServiceGrant
 from .api_key import ApiKey
 from .gateway_task import GatewayTask
 from .pre_deploy_session import PreDeploySession
@@ -25,6 +26,7 @@ __all__ = [
     "User",
     "UserLogin",
     "AclGrant",
+    "ServiceGrant",
     "ApiKey",
     "GatewayTask",
     "PreDeploySession",

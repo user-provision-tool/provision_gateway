@@ -32,6 +32,8 @@ COPY entrypoint.sh          /etc/nginx/acl/entrypoint.sh
 # mounted over (docker-compose.gateway.yml) so a change needs a restart, not a
 # rebuild.
 COPY stream-acl.js          /etc/nginx/acl/stream-acl.js
+# G85 — the cross path's stream hook (the same shape, service-grant verdict).
+COPY cross-stream-acl.js    /etc/nginx/acl/cross-stream-acl.js
 RUN chmod +x /etc/nginx/acl/entrypoint.sh
 
 # Non-root (decision 17): nginx needs to write nginx.conf (assembled by the

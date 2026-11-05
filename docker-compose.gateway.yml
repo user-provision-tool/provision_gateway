@@ -32,6 +32,15 @@ services:
       - DATABASE_URL=postgresql+psycopg://gateway_app:${GATEWAY_DB_PASSWORD:-gateway_app_pw}@subnet-acl-postgres:5432/${POSTGRES_DB:-subnet_acl}
       - GATEWAY_READER_DATABASE_URL=postgresql+psycopg://gateway_reader:${GATEWAY_READER_DB_PASSWORD:-gateway_reader_pw}@subnet-acl-postgres:5432/${POSTGRES_DB:-subnet_acl}
       - PROVISION_COOKIE_TTL=${PROVISION_COOKIE_TTL:-604800}
+      # G83 — the cross service network. The gateway writes the dnsmasq config
+      # through the shared PROVISION_DIR volume and calls the -api with these
+      # opaque values; the static IPs are the cross-network assignments below.
+      - CROSS_NETWORK=${CROSS_NETWORK:-subnet_acl_cross}
+      - CROSS_RESOLVER_IP=${CROSS_RESOLVER_IP:-172.28.0.3}
+      - CROSS_NGINX_IP=${CROSS_NGINX_IP:-172.28.0.2}
+      - CROSS_CONFIG_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/cross
+      - CROSS_TASK_TIMEOUT_SEC=${CROSS_TASK_TIMEOUT_SEC:-30}
+      - CROSS_TASK_RETRIES=${CROSS_TASK_RETRIES:-3}
     networks:
       # Static IP pin: the edge (subnet-acl-nginx-acl) resolves the DNS name
       # 'subnet-acl-gateway' at startup and caches the peer for the container's
@@ -40,6 +49,12 @@ services:
       # edge is restarted (cycle 20260901T102115Z GAP-22). Pin keeps the IP stable.
       subnet_acl_shared:
         ipv4_address: 172.17.0.4
+      # G83 — the gateway is a cross-network member (so a source container can
+      # reach its API). Subordinate to the platform network: the shared network
+      # stays the container's top network.
+      subnet_acl_cross:
+        ipv4_address: 172.28.0.4
+        gw_priority: -1
     restart: unless-stopped
 
   subnet-acl-dashboard:
@@ -115,7 +130,69 @@ services:
       - subnet_acl_shared
     restart: unless-stopped
 
+  # G83 — the cross resolver: dnsmasq on the cross network, no host network,
+  # no upstream. It answers ONLY the service-domain wildcards the gateway writes
+  # (`*.{domain} -> cross nginx`); every out-of-zone name is REFUSED so the
+  # client falls through to 127.0.0.11.
+  subnet-acl-cross-resolver:
+    build:
+      context: ./cross-resolver
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+    container_name: subnet-acl-cross-resolver
+    volumes:
+      # A DIRECTORY mount, not a single file: the gateway replaces the file
+      # atomically (tmp + rename), and a file bind-mount would keep the old inode.
+      - ${PROVISION_DIR:-/srv/provision_subnet_acl}/cross/dnsmasq.d:/etc/dnsmasq.d:ro
+    networks:
+      subnet_acl_cross:
+        ipv4_address: 172.28.0.3
+    restart: unless-stopped
+
+  # G83 — the cross nginx: the private edge replica. Same image and service
+  # server blocks, `_auth_cross` instead of `_auth_jwt`, the target Basic always
+  # injected, cross + shared networks, no host ports, no public exposure.
+  subnet-acl-cross-nginx:
+    image: subnet-acl-nginx-acl:latest
+    container_name: subnet-acl-cross-nginx
+    volumes:
+      - ./nginx.acl/cross.conf.template:/etc/nginx/acl/cross.conf.template:ro
+      - ./nginx.acl/cross-helpers.conf.template:/etc/nginx/acl/cross-helpers.conf.template:ro
+      - ./nginx.acl/cross-stream-acl.js:/etc/nginx/acl/cross-stream-acl.js:ro
+      - ./nginx.acl/entrypoint.sh:/etc/nginx/acl/entrypoint.sh:ro
+      - ${PROVISION_DIR:-/srv/provision_subnet_acl}/ssl:/certs:ro
+    environment:
+      - EDGE_TEMPLATE=/etc/nginx/acl/cross.conf.template
+      - HELPERS_TEMPLATE=/etc/nginx/acl/cross-helpers.conf.template
+      - HELPERS_OUT=/etc/nginx/acl/cross-helpers.conf
+      # G85 — the cross nginx's SERVING ports are the edge's client-facing
+      # numbers (the same URL string on both doors), never published here.
+      - NGINX_HTTP_PORT=${NGINX_HTTP_PORT:-80}
+      - NGINX_HTTPS_PORT=${NGINX_HTTPS_PORT:-443}
+      - STREAM_PORT=${STREAM_PORT:-17687}
+    command: /bin/sh /etc/nginx/acl/entrypoint.sh
+    user: nginx
+    networks:
+      subnet_acl_shared: {}
+      # The static cross-network IP is what the dnsmasq wildcard targets and
+      # what the gateway trusts as the cross-verify caller.
+      subnet_acl_cross:
+        ipv4_address: 172.28.0.2
+        gw_priority: -1
+    restart: unless-stopped
+
 networks:
   subnet_acl_shared:
     external: true
     name: ${SHARED_NETWORK:-subnet_acl_shared}
+  # G83 — the dedicated cross network. A free private range outside the shared
+  # 172.17.0.0/16 and the tenant pools (100.96/97.0.0/16).
+  subnet_acl_cross:
+    name: ${CROSS_NETWORK:-subnet_acl_cross}
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${CROSS_SUBNET:-172.28.0.0/24}

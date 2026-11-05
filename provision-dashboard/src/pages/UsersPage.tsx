@@ -7,6 +7,8 @@ import { useAuth } from '../hooks/useAuth'
 import client from '../api/client'
 import DeployForm from '../components/services/DeployForm'
 import ServiceCard from '../components/users/ServiceCard'
+import CrossGrantsSection from '../components/services/CrossGrantsSection'
+import ServiceEndpointsView from '../components/services/ServiceEndpointsView'
 
 const { Title, Text } = Typography
 
@@ -263,6 +265,8 @@ export default function UsersPage() {
   // the API returns it once and can never return it again (R2.2), so this is the
   // single place it survives — and it dies with the tab, which is the point.
   const [exposureUrls, setExposureUrls] = useState<Record<string,string>>({})
+  // G86 — the `Can call` popup: the target's existing card content, a view.
+  const [peekServiceId, setPeekServiceId] = useState<string | null>(null)
   const [exposureModal, setExposureModal] = useState<{url:string; port:number; row:string} | null>(null)
 
   // R6.1/R6.2: mint from the SUB-SERVICE alone. The port is not sent — the
@@ -1111,9 +1115,10 @@ export default function UsersPage() {
               itself. */}
           <Button size="small" danger onClick={async () => {
             try {
-              const { data } = await client.delete(`/pre-deploy/${sess.user_name}/${sess.service_name}/${sess.label}`, {
-                params: { recipe_path: sess.recipe_path || '' },
-              })
+              // The DELETE route is keyed by service_id. The name-shaped path
+              // is the GET route; sending DELETE to it returns 405 and the
+              // session is never removed (measured 2026-11-03/04).
+              const { data } = await client.delete(`/pre-deploy/${sess.service_id}`)
               message.success(data?.cancelled_job
                 ? 'Running job cancelled and session removed'
                 : 'Session removed')
@@ -1495,94 +1500,64 @@ export default function UsersPage() {
                           </Space>
                         </div>
                       )}
-                      {/* R14 — Endpoints list ONLY: no instance URL field, no
-                          `primary` row. Every HTTP endpoint is
-                          `<instance host>--<sub_service>.<domain>` and is read
-                          from the artifact the deployment recorded, never
-                          typed. The Auth tag lives here, with the section it
-                          qualifies. */}
-                      {(svc.http_endpoints || []).length > 0 && (
-                        <div>
-                          <Text strong>Endpoints: </Text>
-                          {svc.has_auth && <Tag color="blue" style={{marginLeft:4}}>Auth</Tag>}
-                          <Space direction="vertical" size={2}>
-                            {(svc.http_endpoints || []).map((served: string) => {
-                              const sub = served.includes('--')
-                                ? served.split('--').slice(1).join('--').split('.')[0]
-                                : served
-                              return (
-                                <Space key={served} size={6} wrap>
-                                  <Text code>{sub}</Text>
-                                  <a href={goUrlFor(svc, served)} target="_blank" rel="noopener noreferrer">
-                                    <Text code style={{color:'#1677ff'}}>{served}</Text>
-                                  </a>
-                                </Space>
-                              )
-                            })}
-                          </Space>
-                        </div>
-                      )}
-                      {/* R6.2 — the exposure endpoints, read from the RECORDED
-                          state (the entry's stream sub-services). Nothing here
-                          re-derives "TLS is on and a row exists": with TLS off
-                          nothing was recorded, so nothing is offered. The URL
-                          itself is a credential — shown once, kept only in this
-                          page's memory, never fetched back. */}
-                      {(svc.stream_sub_services || []).length > 0 && (
-                        <div>
-                          <Text strong>Stream endpoints: </Text>
-                          <Space direction="vertical" size={2}>
-                            {(svc.stream_sub_services || []).map((canonical: string) => {
-                              const sub = canonical.includes('--')
-                                ? canonical.split('--').slice(1).join('--').split('.')[0]
-                                : canonical
-                              const url = exposureUrls[canonical]
-                              const isOwner = !!myUsername && svc.user_name === myUsername
-                              const canGenerate = isAdmin || isOwner
-                              return (
-                                <Space key={canonical} size={6} wrap>
-                                  <Text code>{sub}</Text>
-                                  {/* Minting is REVOKE + INSERT: the row's previous URL dies at
-                                      its next connection. That is the one consequence the
-                                      operator has to agree to BEFORE it happens, so it is a
-                                      confirmation rather than a warning shown afterwards — the
-                                      old modal claimed the URL was shown only once, while the
-                                      card kept showing it, and the thing that actually matters
-                                      (the old one dying) was buried in the same sentence.
-                                      Only the owner and an admin may mint; a granted viewer
-                                      sees the Show action below. */}
-                                  {canGenerate && (
-                                    <Popconfirm
-                                      title="Old urls will be invalidated, confirm?"
-                                      description="The previous exposure URL for this row stops working at its next connection."
-                                      okText="Generate"
-                                      cancelText="Cancel"
-                                      onConfirm={() => mintExposure(svc, canonical)}
-                                    >
-                                      <Button size="small" type="primary" ghost>
-                                        Generate exposure URL
-                                      </Button>
-                                    </Popconfirm>
-                                  )}
-                                  <Button size="small" onClick={() => showExposure(svc, canonical)}
-                                    title="Read the live exposure URL from the gateway; it is shown in a popup and cleared when the popup closes">
-                                    Show exposure URL
+                      {/* R14/R6.2 — the endpoints body, shared with the G86
+                          `Can call` popup (ServiceEndpointsView). Every HTTP
+                          endpoint is `<instance host>--<sub_service>.<domain>`
+                          and is read from the artifact the deployment recorded,
+                          never typed. The stream actions stay here on the card;
+                          the popup is a view. */}
+                      <ServiceEndpointsView
+                        svc={svc}
+                        goUrlFor={goUrlFor}
+                        streamActions={(canonical: string) => {
+                          const url = exposureUrls[canonical]
+                          const ownerView = !!myUsername && svc.user_name === myUsername
+                          const canGenerate = isAdmin || ownerView
+                          return (
+                            <>
+                              {/* Minting is REVOKE + INSERT: the row's previous URL dies at
+                                  its next connection. That is the one consequence the
+                                  operator has to agree to BEFORE it happens, so it is a
+                                  confirmation rather than a warning shown afterwards — the
+                                  old modal claimed the URL was shown only once, while the
+                                  card kept showing it, and the thing that actually matters
+                                  (the old one dying) was buried in the same sentence.
+                                  Only the owner and an admin may mint; a granted viewer
+                                  sees the Show action below. */}
+                              {canGenerate && (
+                                <Popconfirm
+                                  title="Old urls will be invalidated, confirm?"
+                                  description="The previous exposure URL for this row stops working at its next connection."
+                                  okText="Generate"
+                                  cancelText="Cancel"
+                                  onConfirm={() => mintExposure(svc, canonical)}
+                                >
+                                  <Button size="small" type="primary" ghost>
+                                    Generate exposure URL
                                   </Button>
-                                  {url && (
-                                    <Text code copyable={{text: url}} style={{fontSize:12}}>{url}</Text>
-                                  )}
-                                </Space>
-                              )
-                            })}
-                          </Space>
-                          <div>
-                            <Text type="secondary" style={{fontSize:12}}>
-                              The client must speak TLS — dial the name with the shared stream port
-                              (shown when you generate the URL). The application itself needs none.
-                            </Text>
-                          </div>
-                        </div>
-                      )}
+                                </Popconfirm>
+                              )}
+                              <Button size="small" onClick={() => showExposure(svc, canonical)}
+                                title="Read the live exposure URL from the gateway; it is shown in a popup and cleared when the popup closes">
+                                Show exposure URL
+                              </Button>
+                              {url && (
+                                <Text code copyable={{text: url}} style={{fontSize:12}}>{url}</Text>
+                              )}
+                            </>
+                          )
+                        }}
+                      />
+                      {/* G83 — the cross-service grant section. The admin
+                          assigns, the owner reads; a granted viewer's card is
+                          filtered out before this point. G86: a `Can call`
+                          item opens the target's card in a popup. */}
+                      <CrossGrantsSection
+                        serviceId={svc.service_id}
+                        isAdmin={isAdmin}
+                        isOwner={!!myUsername && svc.user_name === myUsername}
+                        onPeek={setPeekServiceId}
+                      />
                       {(svc as any).subnet && (
                         <div><Text strong>Subnet: </Text><Tag color="purple">{(svc as any).subnet}</Tag></div>
                       )}
@@ -1880,6 +1855,41 @@ export default function UsersPage() {
           </div>
         )}
       </Drawer>
+      {/* G86 — a `Can call` item opens the target's EXISTING card content in a
+          popup: the endpoints and status, not a second grant editor. */}
+      <Modal
+        open={!!peekServiceId}
+        onCancel={() => setPeekServiceId(null)}
+        footer={null}
+        width={760}
+        title={(() => {
+          const s = services.find(x => x.service_id === peekServiceId)
+          return s ? `${s.user_name}:${s.service_name}:${s.label}` : 'Service'
+        })()}
+      >
+        {(() => {
+          const s = services.find(x => x.service_id === peekServiceId)
+          if (!s) return <Text type="secondary">This service is no longer loaded.</Text>
+          return (
+            <Space direction="vertical" size="small" style={{width:'100%'}}>
+              <Space wrap>
+                <Tag color={s.status === 'running' ? 'green' : s.status === 'failed' ? 'red' : 'orange'}>
+                  {s.status}
+                </Tag>
+                <Text type="secondary">owner {s.user_name}</Text>
+                {s.is_public && <Tag color="green">Public</Tag>}
+              </Space>
+              <ServiceEndpointsView svc={s} goUrlFor={goUrlFor} />
+              {!(s.http_endpoints || []).length && !(s.stream_sub_services || []).length && (
+                <Text type="secondary">No endpoints recorded for this instance.</Text>
+              )}
+              <Text type="secondary" style={{fontSize:12}}>
+                Read-only view of the target's card — grants are edited on the source card.
+              </Text>
+            </Space>
+          )
+        })()}
+      </Modal>
       <Modal
         open={!!exposureModal}
         destroyOnClose

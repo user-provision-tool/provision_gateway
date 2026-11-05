@@ -40,6 +40,10 @@ class Settings:
         # (host 8769) and has no gateway at all, so this setting only ever names
         # the fullset door — it is what the card shows beside the URL.
         self.STREAM_PORT: int = int(os.environ.get("STREAM_PORT", "17687"))
+        # The internal nginx's ONE stream listener (stream_conf.INTERNAL_STREAM_PORT).
+        # The cross stream hook dials this after the verdict; the exposure's own
+        # port is the target container port the internal nginx proxies to.
+        self.INTERNAL_STREAM_PORT: int = int(os.environ.get("INTERNAL_STREAM_PORT", "7687"))
 
         # ---- Docker log path ----
         # Log streaming is now proxied to provision-api's per-task SSE endpoint.
@@ -117,6 +121,23 @@ class Settings:
 
         # ---- Exchange code (v4 §6.2) ----
         self.EXCHANGE_CODE_TTL_SEC: int = int(os.environ.get("EXCHANGE_CODE_TTL_SEC", "30"))
+
+        # ---- Cross-service network (GRILLING G83, 2026-11-03) ----
+        # The gateway is a member of the cross network; it writes the dnsmasq
+        # config through the shared PROVISION_DIR volume and calls the -api's
+        # async resolv.conf/membership API with these values. They are opaque to
+        # the -api. The static IPs are the compose's cross-network assignments.
+        self.CROSS_NETWORK: str = os.environ.get("CROSS_NETWORK", "subnet_acl_cross")
+        self.CROSS_RESOLVER_IP: str = os.environ.get("CROSS_RESOLVER_IP", "172.28.0.3")
+        self.CROSS_NGINX_IP: str = os.environ.get("CROSS_NGINX_IP", "172.28.0.2")
+        self.CROSS_CONFIG_DIR: Path = Path(
+            os.environ.get("CROSS_CONFIG_DIR", str(self.PROVISION_DIR / "cross"))
+        )
+        # The update call is fully async: poll the -api's task, retry a timeout.
+        self.CROSS_TASK_TIMEOUT_SEC: float = float(
+            os.environ.get("CROSS_TASK_TIMEOUT_SEC", "30")
+        )
+        self.CROSS_TASK_RETRIES: int = int(os.environ.get("CROSS_TASK_RETRIES", "3"))
 
         # ---- Logging ----
         self.LOG_LEVEL: str = os.environ.get("GATEWAY_LOG_LEVEL", "INFO")
