@@ -793,34 +793,33 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     try {
       const svcVal = form.getFieldValue('service_name') || ''
       const { baseName, recipePath } = parseServiceValue(svcVal)
-      await genJob.startJob({
+      // R1/R11 — Generate is the workflow's SECOND operation: the intake
+      // records `operation=generate` on the shared record and the completion
+      // stops at the review gate. The generation leg is still polled through
+      // the task read model.
+      const { data } = await client.post('/services/generate', {
+        user_name: form.getFieldValue('user_name') || '',
         service_name: baseName,
+        project_root: recipePath ? `${baseName}/${recipePath}` : baseName,
         recipe_path: recipePath,
-        job_type: 'generate_missing',
-        prompt,
-        // G25 — the NAMING follows the TRIGGER: on a guided restart the
-        // generation emits `.fix` files, not `.base`.
-        ...(fixingGuide ? { fix: true } : {}),
-        selection: generationSelection(),
+        label: form.getFieldValue('label') || '0',
+        domain: form.getFieldValue('domain') || 'localhost',
+        passwd: form.getFieldValue('passwd') || '',
+        https: !!form.getFieldValue('https'),
         // G20 — the session this job opens must record the proxy the panel is
         // showing, or a `check` restart replays `false` (see
         // `effectiveUseGlobalProxy`).
         use_global_proxy: effectiveUseGlobalProxy(),
-        user_name: form.getFieldValue('user_name') || '',
-        label: form.getFieldValue('label') || '0',
-        deploy_metadata: {
-          service_name: baseName,
-          user_name: form.getFieldValue('user_name') || '',
-          label: form.getFieldValue('label') || '0',
-          domain: form.getFieldValue('domain') || 'localhost',
-          https: !!form.getFieldValue('https'),
-          // The URL and the credential belong here because they belong to the
-          // REFUSAL record: if the gateway's pool refuses this generation, that
-          // record is what the card's Retry replays, and a retry missing either
-          // is a different deployment (user ruling 2026-09-26).
-          passwd: form.getFieldValue('passwd') || '',
-        },
+        selection: generationSelection(),
+        prompt,
+        env_reference: envRefs,
+        // G25 — the NAMING follows the TRIGGER: on a guided restart the
+        // generation emits `.fix` files, not `.base`.
+        ...(fixingGuide ? { fix: true } : {}),
       })
+      if (data.generation_task_id) {
+        genJob.resumeJob(data.generation_task_id)
+      }
     } catch (err: any) {
       // §4d: a capacity refusal is NOT a failed generation — nothing was
       // accepted, and the remedy is to cancel what is hanging. It must raise
@@ -853,106 +852,6 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
   // then adopt the generated per-user env name (design §2 Deploy auto-run).
   // `snap` = the form values captured BEFORE the panel was closed (the panel is
   // destroyOnClose/preserve=false, so the live form is gone by now).
-  const generateMissingFilesForDeploy = async (snap: any) => {
-    const svcVal = snap.service_name || ''
-    const { baseName, recipePath } = parseServiceValue(svcVal)
-    const jobId = await genJob.startJob({
-      service_name: baseName,
-      recipe_path: recipePath,
-      job_type: 'generate_missing',
-      prompt,
-      // G25 — a guided restart generates `.fix` files, not `.base`.
-      ...(fixingGuide ? { fix: true } : {}),
-      // §5: the reference is CONTEXT for the env phase, not a handoff.
-      env_reference: envRefs,
-      selection: generationSelection(),
-      // G20 — same as the generate entry point: the session this job opens must
-      // record the proxy. Read from the SNAPSHOT, never `form.getFieldValue`:
-      // `handleDeploy` already closed the panel (destroyOnClose), so the live
-      // form is gone here. `snap.use_global_proxy` was set by the shared
-      // `effectiveUseGlobalProxy` predicate at submit.
-      use_global_proxy: !!snap.use_global_proxy,
-      user_name: snap.user_name || '',
-      label: snap.label || '0',
-      deploy_metadata: {
-        service_name: baseName,
-        user_name: snap.user_name || '',
-        label: snap.label || '0',
-        domain: snap.domain || 'localhost',
-        https: !!snap.https,
-        // Same as the entry-point payload above: the refusal record the card's
-        // Retry replays must carry the URL and the credential.
-        passwd: snap.passwd || '',
-      },
-    })
-    if (!jobId) throw new Error('Failed to start generation job')
-    // R4-F50 — THE SESSION is the durable handle, not this hook's ref.
-    //
-    // `genJob.jobIdRef` advances only when THIS hook instance answers the pause
-    // (`submitInput` → `setJob(next)`). An answer that creates the next leg from
-    // anywhere else — the card's `Check`, which re-opens this panel attached to
-    // the parked job — left this loop polling the paused row, which is terminal
-    // forever: it neither deployed nor failed until the 900 s timeout, and the
-    // operator saw "deploying the instance…" with nothing happening (F50,
-    // measured 2026-10-10). The pre-deploy SESSION is keyed by the
-    // (user, service, label) and its `job_id` moves to every new leg the server
-    // creates, so reading it is what makes the auto-run survive an answer from
-    // anywhere. A missing session (404 — cancelled, or already handed off) is
-    // simply "no better information": keep polling what we have.
-    const sessionJobId = async (): Promise<string | null> => {
-      const _u = snap.user_name || ''
-      if (!_u) return null
-      try {
-        const { data } = await client.get(
-          `/pre-deploy/${encodeURIComponent(_u)}/${encodeURIComponent(baseName)}`
-          + `/${encodeURIComponent(snap.label || '0')}`,
-          { params: { recipe_path: recipePath || '' } })
-        sessionServiceIdRef.current = data?.service_id || null
-        sessionProcedureIdRef.current = data?.procedure_id || null
-        return data?.generation_task_id || null
-      } catch {
-        return null
-      }
-    }
-
-    for (let i = 0; i < 900; i++) {
-      await new Promise(r => setTimeout(r, 1000))
-      // G27: read the CURRENT id on every pass, never the one captured here.
-      // Answering a pause creates a NEW job, and a loop pinned to the id it
-      // started with polls a row that is terminal forever — while the popup,
-      // driven by the hook, already shows the resumed leg complete. The deploy
-      // was then never issued and the operator stared at "deploying the
-      // instance…" with nothing happening. Found live in T13.
-      let pollId = genJob.jobIdRef.current ?? jobId
-      // ...and the SESSION outranks the ref: it is the server's own record of
-      // which leg this deployment is on, so a leg it has moved past is a leg
-      // that was answered somewhere this panel cannot see (F50).
-      const liveId = await sessionJobId()
-      if (liveId !== null && liveId !== pollId) pollId = liveId
-      const { data } = await client.get(`/llm/jobs/${pollId}`)
-      if (data.status === 'completed') {
-        const result = data.result || {}
-        const name = result.env_name || null
-        const files = result.files || {}
-        if (name) setPerUserEnv(name)
-        if (Object.keys(files).length > 0) setGeneratedFiles(files)
-        // Return the fresh results synchronously — React state updates are not
-        // visible inside this still-running async flow, and the deploy payload
-        // must reference the just-generated env.raw name + files NOW.
-        // G21 rule 3: hand back the selection AS THE PATH LEFT IT. A path that
-        // resumed after a pause reports only the file that leg produced (e.g.
-        // the env), so the caller's `files[...]` checks cannot see a compose
-        // regenerated EARLIER in the same path — which is exactly the conflict
-        // fix. Returning the selection is what carries it into the payload.
-        return { envName: name, files, selection: result.selection || null }
-      }
-      if (data.status === 'failed' || data.status === 'cancelled') {
-        throw new Error(data.error || `Generation ${data.status}`)
-      }
-    }
-    throw new Error('Generation timed out')
-  }
-
   // Generation job completed → move the result into the review gate. On the
   // Deploy auto-run path (popup open) the completed events are KEPT so the popup
   // freezes on the final frame; the manual Generate path resets into the review
@@ -1105,7 +1004,10 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
 
   const handleDeploy = async (values: any) => {
     setLoading(true)
-    setGenPopupOpen(true)
+    // R11 parity: a DIRECT deploy (files complete) shows no "Deploying…"
+    // popup — the optimistic Building card appears immediately. The popup is
+    // opened below only when the gateway says the workflow is generating.
+    setGenPopupOpen(false)
     deployAutoRunRef.current = true
     // Snapshot the form values BEFORE closing the panel: the modal is
     // destroyOnClose + the Form is preserve={false}, so once the panel is gone
@@ -1155,221 +1057,48 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       // anything generated during THIS call and returns it synchronously
       // (React state is not visible mid-async-flow).
       const sel = effectiveSelection()
-      const hasSelectedCompose = sel.compose.length > 0
-
       const svcVal = snap.service_name || ''
       const { baseName, recipePath } = parseServiceValue(svcVal)
-      const selectedService = sources.find(s => s.name === baseName)
 
-      // ---- Always-on generation (design §2): Deploy auto-runs whatever is
-      // missing (compose/nginx + the per-user env.raw) BEFORE deploying —
-      // no review pause on the Deploy path. ----
-      // A REFUSED retry must NOT run the generation pipeline (GRILLING G20).
-      // Its options are already complete — they are the paths the -api was SENT.
-      // Running generation here is not merely wasteful: the refused deployment's
-      // OWN pre-deploy session reserves the combination (§8b), so the generation
-      // job is refused with 409 and the deploy never dispatches. Found live by
-      // trace T3 — the feature was self-blocking.
-      // §2/§4: a SELECTED env IS the handoff — "when the operator *did* select an
-      // env, that selection is the handoff instead" of the generated `.raw`. The
-      // condition used to force the per-user env generation even then, which
-      // contradicts the design AND made every Deploy pay a ~30s generation window
-      // before the deploy POST — measured across Rounds 24-25 of trace T5, where
-      // it also made a live capacity refusal unreachable.
-      //
-      // The SAME rule now covers the other handoff, the `.raw` this path has just
-      // generated: `slotsSpecified` counts a ready handoff as a satisfied env
-      // slot, so a Deploy after a completed Generate no longer re-runs the
-      // pipeline and re-asks for the credentials just supplied. This condition
-      // used to spell that out in a third clause of its own
-      // (`needsEnv && !perUserEnv && !hasSelectedEnv`) — the same test written
-      // twice, which is how this panel keeps drifting, so it is written once.
-      // G13/G20: `generate new` means NOT SELECTED, and a deploy must send the
-      // -api ALL THREE paths — a refused deployment carries all three, because
-      // any slot left at `generate new` had a file generated and sent for it.
-      // So an unselected slot is a reason to generate, independently of what the
-      // recipe happens to contain on disk. Without the compose/nginx half a
-      // deploy whose nginx slot sat at `generate new` while an `nginx.conf`
-      // existed skipped generation entirely, and the payload carried NO nginx
-      // path at all — found live on `bob|probe-interp||3`.
-      // …except a GATEWAY refusal's retry (`regenerate`), whose record carries
-      // options only as a SEED: nothing was generated, so the pipeline must run.
-      const needsGeneration = (!initialOptions || regenerate) && (
-        !slotsSpecified ||
-        missingFiles.length > 0
-      )
-      if (needsGeneration && !hasSelectedCompose && missingFiles.length > 0 && !genJob.jobState) {
-        message.error('Cannot deploy: missing essential files and no compose selected.')
+      // The UI guard stays (parity); the gateway refuses the same intent as a
+      // structured 4xx (R6). Only the NO-COMPOSE case is blocked here: a
+      // missing serving_ports/nginx slot is exactly what the gateway's
+      // generation fills, so it must not stop the intent.
+      if (sel.compose.length === 0 && !prompt && !genJob.jobState) {
+        message.error('Cannot deploy: no compose file is selected.')
         setLoading(false)
         setGenPopupOpen(false)
         deployAutoRunRef.current = false
         return
       }
-      let envName = perUserEnv
-      let genNow: Record<string, string> = {}
-      if (needsGeneration) {
-        const res = await generateMissingFilesForDeploy(snap)
-        envName = (res && res.envName) || perUserEnv
-        genNow = (res && res.files) || {}
-        // §6/§7: a `generate new` slot FLIPS to the file the generation just
-        // produced, so the selection that rides this deploy payload (and is
-        // persisted as the next default) names the generated file rather than
-        // leaving the slot unset. Without this the next deployment of the same
-        // service would regenerate instead of pre-selecting what was deployed.
-        // G21 rule 3 — adopt the selection the path reported, FIRST. The
-        // generated artifacts REPLACE their slots, and on a resumed path the
-        // replacement happened in an earlier leg, so it is only visible here.
-        const resSel = (res && res.selection) || null
-        if (resSel) {
-          if (Array.isArray(resSel.compose) && resSel.compose.length) sel.compose = resSel.compose
-          if (typeof resSel.nginx === 'string' && resSel.nginx) sel.nginx = resSel.nginx
-          if (typeof resSel.stream_conf === 'string' && resSel.stream_conf) sel.stream_conf = resSel.stream_conf
-          if (typeof resSel.mail_conf === 'string' && resSel.mail_conf) sel.mail_conf = resSel.mail_conf
-          if (typeof resSel.serving_ports === 'string' && resSel.serving_ports) {
-            sel.serving_ports = resSel.serving_ports
-            sel.serving_ports_none = false
-          }
-          if (Array.isArray(resSel.env) && resSel.env.length) sel.env = resSel.env
-        } else {
-          // No reported selection — name what THIS run produced instead, by
-          // PATTERN (GRILLING G33: a generated artifact carries the job's
-          // collision token, so the exact-name lookups this replaces stopped
-          // matching and the payload would keep the file the run just replaced).
-          const producedCompose = Object.keys(genNow).find(isComposeName)
-          if (producedCompose) sel.compose = [producedCompose]
-          const producedNginx = Object.keys(genNow).find(n => n.endsWith('.conf') && !n.endsWith('.j2')
-            && confCategory(n) === 'http')
-          if (producedNginx) sel.nginx = producedNginx
-          const producedStream = Object.keys(genNow).find(n => n.endsWith('.conf') && !n.endsWith('.j2')
-            && confCategory(n) === 'stream')
-          if (producedStream) sel.stream_conf = producedStream
-          const producedPorts = Object.keys(genNow).find(
-            n => /^serving[_-]ports.*\.ya?ml$/.test(n.split('/').pop() || n)
-          )
-          if (producedPorts) { sel.serving_ports = producedPorts; sel.serving_ports_none = false }
-        }
-        // Make the generated artifacts selectable in every picker too.
-        await refreshFileSetCandidates(baseName, recipePath)
-      }
-      // Merge previously generated (reviewed) files with the just-generated
-      // ones — the Deploy auto-run MUST see them (compose/nginx are persisted
-      // for the -api render; re-persisting the env.raw identically is a no-op).
-      const gen = { ...generatedFiles, ...genNow }
 
-      // Save any LLM-generated files first (also persists the selection as the
-      // new stored default — design §Selection & UI L43-46).
-      if (Object.keys(gen).length > 0) {
-        await client.post('/projects/save-generated', {
-          service_name: baseName,
-          recipe_path: recipePath,
-          files: gen,
-          selection: sel,
-        })
-      }
-
-      // The pre-deploy session carries the identity this deploy must adopt.
-      if (!sessionServiceIdRef.current) {
-        try {
-          const { data } = await client.get(
-            `/pre-deploy/${encodeURIComponent(snap.user_name || '')}`
-            + `/${encodeURIComponent(baseName)}/${encodeURIComponent(snap.label || '0')}`,
-            { params: { recipe_path: recipePath || '' } })
-          sessionServiceIdRef.current = data?.service_id || null
-          sessionProcedureIdRef.current = data?.procedure_id || null
-        } catch { /* no session: the gateway allocates */ }
-      }
-
-      // Build deploy payload
+      // Thin migration R1/R11 — the client sends the INTENT; the gateway owns
+      // validation, label reservation, generation, pauses, finalization, the
+      // claim and the register. The browser no longer orchestrates the
+      // generation -> deploy handoff.
       const payload: any = {
         user_name: snap.user_name,
         service_name: baseName,
         project_root: recipePath ? `${baseName}/${recipePath}` : baseName,
-        service_id: sessionServiceIdRef.current || undefined,
-        procedure_id: sessionProcedureIdRef.current || undefined,
         recipe_path: recipePath || '',
         label: snap.label || '0',
         domain: snap.domain || 'localhost',
         passwd: snap.passwd || '',
         https: snap.https || false,
         use_global_proxy: snap.use_global_proxy || false,
-        // The selection is persisted as the new default on 202 accept
-        // (server-side put_file_set) — design §Selection & UI L43-46.
-        selection: sel,
+        // A persisted stream conf is not applicable when TLS is off (the
+        // gateway refuses exactly that intent: R6). The old panel dropped it
+        // from the -api payload; the intent must drop it too.
+        selection: { ...sel, stream_conf: snap.https ? sel.stream_conf : null },
+        prompt,
+        env_reference: envRefs,
+        ...(fixingGuide ? { fix: true } : {}),
       }
-
-      // G20 — the deploy hands the -api ALL THREE paths: any slot left at
-      // `generate new` had a file generated and sent for it, so a refused
-      // deployment always carries all three. The gateway swaps a generated
-      // nginx into the selection, so this is normally already named; when it is
-      // not, take the nginx file this run produced rather than sending a
-      // deployment with no nginx at all — that instance would deploy unroutable
-      // and the edge would 502 its /go/ relay.
-      if (!sel.nginx) {
-        const produced = Object.keys(gen).find(
-          n => (n.endsWith('.conf') || n.endsWith('.conf.j2')) && confCategory(n) === 'http'
-        )
-        if (produced) sel.nginx = produced
-      }
-      // G56 — the stream slot, by the same rule. Only when TLS is on and the
-      // deployment is not in the deliberate no-streams state.
-      if (!sel.stream_conf && httpsOn && !sel.serving_ports_none) {
-        const produced = Object.keys(gen).find(
-          n => (n.endsWith('.conf') || n.endsWith('.conf.j2')) && confCategory(n) === 'stream'
-        )
-        if (produced) sel.stream_conf = produced
-      }
-
-      // What was SELECTED is what is sent — no fallback chain
-      // (deploy-panel-selection-and-generation-todo.md §2). The panel cannot
-      // know which convention-matching file is the right base, and guessing
-      // picked a test overlay (graphiti's docker-compose.test.yml) or let a
-      // stale `.j2` shadow a newer plain file. A slot left at `generate new`
-      // contributes NOTHING here — the generation supplies it.
-      if (sel.compose.length > 0) {
-        payload.compose_file_paths = sel.compose
-      }
-      // G55 — ONE per-category map, never a list and never the singular field.
-      // nginx is no longer "optional": its absence is as fatal as a missing
-      // compose (the instance would deploy unroutable and the edge would 502
-      // the /go/ relay), and the stream slot follows the same rule under TLS.
-      const nginxConfs: Record<string, string> = {}
-      if (sel.nginx) nginxConfs.http = sel.nginx
-      // G41 — the stream category is applicable only when TLS is on. The
-      // selection may still carry one (persisted for a later TLS deploy);
-      // sending it with the toggle off produced a stream conf with no
-      // certificates, which broke `nginx -t` and with it the reload.
-      if (snap.https && sel.stream_conf) nginxConfs.stream = sel.stream_conf
-      if (sel.mail_conf) nginxConfs.mail = sel.mail_conf
-      if (Object.keys(nginxConfs).length > 0) {
-        payload.nginx_confs = nginxConfs
-      }
-      // A selected env is passed even when EMPTY: the only guard is presence,
-      // never size or content. An empty `--env-file` is exactly what the
-      // always-pass invariant wants, since it keeps compose's auto-read of the
-      // recipe `.env` overridden.
-      if (sel.env.length > 0) {
-        payload.env_files = sel.env
-      }
-
-      // Repeatable profiles (later wins is the compose CLI behavior).
-      if (sel.profiles.length > 0) payload.profiles = sel.profiles
-
-      // Interpolation env: ONLY the generated per-user env.raw is passed to
-      // the -api (design §2 — selection is generation context, never the
-      // handoff). Empty list when nothing was generated.
-      if (envName) {
-        payload.env_files = [envName]
-      }
-
-      // HTTPS certs
       if (snap.https) {
         payload.fullchain = snap.fullchain || ''
         payload.privkey = snap.privkey || ''
       }
-
-      // Volume mapping — G60 (D8): send ONLY the operator's OVERRIDES. A row
-      // equal to the -api's golden path is not sent, so a formula change between
-      // preview and deploy is never pinned by a stale value.
+      // Volume mapping — only the operator's OVERRIDES (G60/D8).
       if (snap.volumes && snap.volumes.length > 0) {
         const overrides: Record<string, string> = {}
         for (const v of snap.volumes) {
@@ -1377,26 +1106,58 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         }
         if (Object.keys(overrides).length > 0) payload.volumes = overrides
       }
-
-      // Build args
       if (snap.build_args && snap.build_args.length > 0) {
         payload.build_args = {}
         for (const a of snap.build_args) {
           if (a.key && a.value) payload.build_args[a.key] = a.value
         }
       }
-
-      // G83 — the folded selector's target services. The gateway writes the
-      // grant rows once the deploy task finishes (the source identity does not
-      // exist before that).
+      // G83 — the folded allowed-services selector; the gateway writes the
+      // grant rows after the deploy task finishes.
       if (snap.allowed_target_service_ids && snap.allowed_target_service_ids.length > 0) {
         payload.allowed_target_service_ids = snap.allowed_target_service_ids
       }
 
       const { data } = await client.post('/services/deploy', payload)
-      message.success(`Deploy queued! Task: ${data.task_id}`)
-      onDeployed(data.task_id, snap.user_name, baseName, snap.label || '0')
-      onClose()
+      const workflowId = data.workflow_id || data.service_id
+      if (!workflowId) throw new Error('the gateway did not return a workflow handle')
+
+      // A direct deploy is already handed off: no generation popup (R11/§11
+      // step 3). Only a generating workflow gets the progress popup.
+      if (['deploying', 'building', 'running'].includes(data.stage)) {
+        message.success('Deploy queued!')
+        onDeployed(data.deploy_task_id || data.task_id || '', snap.user_name,
+                   baseName, data.label || snap.label || '0')
+        onClose()
+        return
+      }
+      setGenPopupOpen(true)
+
+      // The popup renders the gateway's workflow read model. A pause is
+      // answered through the same inline prompt, with values only (R4).
+      genJob.adoptJob({ status: 'running', progress: 'starting…', events: [] }, null)
+      for (let i = 0; i < 900; i++) {
+        await new Promise(r => setTimeout(r, 1000))
+        const { data: wf } = await client.get(`/services/workflows/${workflowId}`)
+        const gen = wf.generation
+        if (gen) genJob.adoptJob(gen, gen.task_id || gen.id || null)
+        if (wf.stage === 'paused') continue
+        if (wf.stage === 'refused') {
+          setAtCapacity({ code: wf.reason || 'at_capacity', detail: wf.detail || '' })
+          return
+        }
+        if (wf.stage === 'failed') {
+          throw new Error(wf.detail || gen?.error || 'Deploy failed')
+        }
+        if (wf.stage === 'deploying' || wf.stage === 'building' || wf.stage === 'running') {
+          message.success('Deploy queued!')
+          onDeployed(wf.deploy_task_id || gen?.task_id || '', snap.user_name,
+                     baseName, wf.label || snap.label || '0')
+          onClose()
+          return
+        }
+      }
+      throw new Error('Deploy timed out')
     } catch (err: any) {
       const d = err.response?.data?.detail
       // A capacity refusal is NOT a failed deploy — nothing was accepted, and

@@ -729,27 +729,6 @@ export default function UsersPage() {
     }
   }
 
-  const _fetchServices = async (): Promise<ServiceInstance[]> => {
-    const { data } = await client.get('/services')
-    // The backend (GET /api/users, gateway `list_users`) already ACL-filters the
-    // response to a viewer's own services + their allowed_special_users. Do NOT
-    // re-filter client-side here: the prior `if (endUserViewer && u.user_name !==
-    // admin.email) continue` dropped granted special-user services, hiding them
-    // from the viewer despite the backend returning them (Gap 3).
-    const users = data.users || data.user_status || []
-    setOrphans(Array.isArray(data.orphans) ? data.orphans : [])
-    const all: ServiceInstance[] = []
-    for (const u of users) {
-      for (const s of (u.healthy_services||[])) all.push({...s, user_name: u.user_name})
-      for (const s of (u.unhealthy_services||[])) all.push({...s, user_name: u.user_name})
-      for (const s of (u.missing_services||[])) all.push({...s, user_name: u.user_name})
-      // Failed entries are their own bucket, classified from the registry
-      // status (never container health) — see failed-instance-state-todo.md §3.
-      for (const s of (u.failed_services||[])) all.push({...s, user_name: u.user_name})
-    }
-    return all
-  }
-
   // Drop optimistic "Deleting…" flags for instances that are gone from the
   // server list (so a failed/never-arriving removal can't stick forever).
   const pruneDeleting = (list: ServiceInstance[]) => {
@@ -761,19 +740,35 @@ export default function UsersPage() {
     })
   }
 
+  // The workflow analyses (LLM-fix) still live on the pre-deploy read model;
+  // the session/instance STAGE comes from the unified projection (R9): the
+  // gateway decides session-vs-instance, the client no longer joins them.
   const loadSessions = async () => {
+    if (!isAdmin) { setAnalyses([]); return }  // the analyses surface is admin-only
     try {
       const { data } = await client.get('/pre-deploy')
-      setSessions(data.sessions || [])
       setAnalyses(data.analyses || [])
-    } catch { /* sessions are additive — never block the page */ }
+    } catch { /* analyses are additive — never block the page */ }
+  }
+
+  const _fetchStages = async (): Promise<{ services: ServiceInstance[]; sessions: any[] }> => {
+    const { data } = await client.get('/services/stages')
+    setOrphans(Array.isArray(data.orphans) ? data.orphans : [])
+    const entries: any[] = []
+    for (const g of (data.groups || [])) {
+      for (const e of (g.entries || [])) entries.push({ ...e, user_name: e.user_name || g.user_name })
+    }
+    return {
+      services: entries.filter(e => e.source === 'instance'),
+      sessions: entries.filter(e => e.source === 'session'),
+    }
   }
 
   const loadServices = async () => {
     setLoading(true)
     try {
-      const list = await _fetchServices()
-      setServices(list); pruneDeleting(list)
+      const { services: list, sessions: sess } = await _fetchStages()
+      setServices(list); setSessions(sess); pruneDeleting(list)
     } catch (err: any) { message.error('Failed to load services') }
     finally { setLoading(false) }
   }
@@ -781,8 +776,8 @@ export default function UsersPage() {
   // Silent refresh — no loading spinner, for auto-polling
   const refreshServices = useCallback(async () => {
     try {
-      const list = await _fetchServices()
-      setServices(list); pruneDeleting(list)
+      const { services: list, sessions: sess } = await _fetchStages()
+      setServices(list); setSessions(sess); pruneDeleting(list)
     } catch { /* silent */ }
   }, [])
 
@@ -992,7 +987,7 @@ export default function UsersPage() {
         badge={
           <Badge
             status={sess.state === 'generating' ? 'processing'
-                    : sess.state === 'refused' ? 'error'
+                    : (sess.state === 'refused' || sess.state === 'failed') ? 'error'
                     : sess.state === 'generated' ? 'success' : 'warning'}
             text={sess.state === 'generating' ? 'Generating…'
                   : sess.state === 'refused' ? `Refused (${sess.reason || 'unknown'})`
@@ -1001,6 +996,7 @@ export default function UsersPage() {
                   // and the card read "Paused (awaiting you)" — which was a lie
                   // about a path that is simply waiting for the operator to press
                   // Deploy.
+                  : sess.state === 'failed' ? `Failed (${sess.reason || 'deploy failed'})`
                   : sess.state === 'generated' ? 'Ready to deploy'
                   : `Paused (${sess.reason || 'awaiting you'})`}
           />
@@ -1017,9 +1013,10 @@ export default function UsersPage() {
               EXACT stored options straight to the -api: no re-selection
               and no generation pipeline, so files the rejected attempt
               produced are reused as-is. */}
-          {sess.state === 'refused' && (
+          {(sess.state === 'refused' || sess.state === 'failed') && (
             <Button size="small" type="primary"
-              disabled={!sess.options && sess.reason !== 'generation_at_capacity'}
+              disabled={!sess.options && sess.reason !== 'generation_at_capacity'
+                        && sess.state !== 'failed'}
               onClick={() => {
                 const genRefusal = sess.reason === 'generation_at_capacity'
                 setRetryOptions(sess.options || null)
@@ -1066,7 +1063,10 @@ export default function UsersPage() {
               // already run — and open the panel in fixing mode.
               if (sess.state === 'paused' && sess.reason === 'llm_fix') {
                 setFixingGuide({ guide: sess.guide || '', slot: sess.slot || 'compose' })
-              } else if (sess.generation_task_id != null) {
+              } else if (sess.state !== 'generated' && sess.generation_task_id != null) {
+                // R11 — `generated` is the review gate: the panel opens ready
+                // to Deploy. Re-attaching to the completed leg would open the
+                // "Deploying…" popup and block the Deploy dialog.
                 setResumeJobId(sess.generation_task_id)
               }
               setDeployOpen(true)
@@ -1084,7 +1084,7 @@ export default function UsersPage() {
                   message.warning('This session has no running job to cancel')
                   return
                 }
-                const r = await client.delete(`/llm/jobs/${sess.generation_task_id}`)
+                const r = await client.delete(`/tasks/${sess.generation_task_id}`)
                 // The endpoint answers 200 for ANY existing job: it
                 // no-ops when the job has already stopped and still
                 // returns the row. Reporting success off the response
@@ -1351,7 +1351,7 @@ export default function UsersPage() {
                               <Button size="small" danger icon={<StopOutlined/>}
                                 onClick={async () => {
                                   try {
-                                    await client.delete(`/llm/jobs/${analysis.job_id}`)
+                                    await client.delete(`/tasks/${analysis.job_id}`)
                                     message.success('Analysis cancelled')
                                     loadSessions()
                                   } catch (e: any) {

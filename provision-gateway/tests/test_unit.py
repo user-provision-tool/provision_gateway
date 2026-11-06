@@ -1792,42 +1792,24 @@ class TestTemplateMode:
 class TestG12SaveLogic:
     """Tests that generated files are saved to disk before deployment (G12)."""
 
-    def test_save_block_not_gated(self):
-        """The save-to-disk block should NOT be conditional on anything
-        (implicit LLM auto-generation is retired; the save block stays
-        unconditional)."""
-        from pathlib import Path
-        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
-        content = deploy_form.read_text()
-        # The save block comment explicitly states it saves generated files first
-        anchor_idx = content.find("Save any LLM-generated files first")
-        assert anchor_idx > 0, "Save block comment not found"
-        save_block = content[anchor_idx:anchor_idx + 200]
-        assert "autoDeploy" not in save_block, (
-            "Save block should NOT be gated by the retired autoDeploy flag: " + save_block
-        )
-        assert "Object.keys(gen).length > 0" in save_block, (
-            "Save block should check if generated files exist"
-        )
+    def test_finalization_is_not_gated(self):
+        """R3: the gateway finalizes the generated artifacts unconditionally.
 
-    def test_save_block_executes_before_deploy(self):
-        """The save-to-disk call should appear before the deploy POST payload building."""
-        from pathlib import Path
-        deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
-        content = deploy_form.read_text()
-        # Locate the save block within handleDeploy by finding the comment anchor
-        anchor_idx = content.find("Save any LLM-generated files first")
-        assert anchor_idx > 0, "Save block comment not found"
-        # The save block starts at or near this anchor
-        save_block = content[anchor_idx:anchor_idx + 1200]
-        save_relative = save_block.find("save-generated")
-        payload_relative = save_block.find("Build deploy payload")
-        assert save_relative > 0, "save-generated call not found near anchor"
-        assert payload_relative > 0, "Payload building comment not found near anchor"
-        assert save_relative < payload_relative, (
-            "Save-generated call should appear BEFORE deploy payload building. "
-            f"save at {save_relative}, payload at {payload_relative}"
-        )
+        The browser no longer runs a save-generated step on the deploy path;
+        the server-owned continuation applies the overwrite matrix itself.
+        """
+        import inspect
+        from app.services import deploy_workflow
+        src = inspect.getsource(deploy_workflow.on_generation_completed)
+        assert "finalize_files" in src
+        assert "record.get(\"operation\")" in src, "both operations finalize"
+
+    def test_finalization_executes_before_register(self):
+        """R2: finalization happens before the claim/register, never after."""
+        import inspect
+        from app.services import deploy_workflow
+        src = inspect.getsource(deploy_workflow.on_generation_completed)
+        assert src.index("finalize_files") < src.index("_claim_and_register")
 
 
 # ---------------------------------------------------------------------------
@@ -1975,8 +1957,9 @@ class TestDeployValidation:
         from pathlib import Path
         deploy_form = Path(__file__).parent.parent.parent / "provision-dashboard" / "src" / "components" / "services" / "DeployForm.tsx"
         content = deploy_form.read_text()
-        assert "Cannot deploy: missing essential files" in content, (
-            "handleDeploy should show error message when missing files exist and no generated files"
+        assert "Cannot deploy: no compose file is selected." in content, (
+            "handleDeploy should refuse only the no-compose case; the gateway "
+            "generates the other missing slots"
         )
         assert "missingFiles.length > 0 && Object.keys(generatedFiles).length === 0" in content, (
             "handleDeploy should have the same guard condition as the disabled button"
@@ -1986,7 +1969,7 @@ class TestDeployValidation:
         """The one deploy error the gateway may intercept is a capacity refusal,
         because it must become a card (state refused) rather than a toast."""
         from pathlib import Path
-        content = (Path(__file__).parent.parent / "app" / "routers" / "users.py").read_text()
+        content = (Path(__file__).parent.parent / "app" / "services" / "deploy_workflow.py").read_text()
         assert "at_capacity" in content
         assert "record_refusal" in content or "create_or_replace" in content
 
@@ -2726,10 +2709,10 @@ class TestViewerServiceVisibility:
             / "provision-dashboard" / "src" / "pages" / "UsersPage.tsx"
         )
         content = users_path.read_text()
-        # The fetch must read the backend-filtered payload directly (no owner check).
-        # (Route/API renamed: Services instances live under /services now.)
-        assert "client.get('/services')" in content
-        assert "for (const u of users)" in content
+        # The fetch must read the backend-filtered payload directly (no owner
+        # check). The service/stage read model is the unified projection (R9).
+        assert "client.get('/services/stages')" in content
+        assert "for (const g of (data.groups" in content
 
 
 # ---------------------------------------------------------------------------
@@ -5057,17 +5040,21 @@ class TestDeployFormSelection:
         phase writes .env.raw and reports it as result.env_name)."""
         src = self._src()
         assert "per_user_env" not in src
-        assert "generateMissingFilesForDeploy" in src
+        assert "client.post('/services/generate'" in src
 
     def test_payload_uses_ordered_compose_and_profiles(self):
         src = self._src()
-        assert "compose_file_paths" in src
-        assert "payload.profiles" in src
-        assert "env_files" in src
+        assert "selection: { ...sel" in src, "the client sends the intent's selection"
+        from app.services import deploy_workflow
+        import inspect
+        payload_src = inspect.getsource(deploy_workflow._api_payload)
+        assert "compose_file_paths" in payload_src
+        assert "profiles" in payload_src
+        assert "env_files" in payload_src
 
     def test_selection_persisted_on_deploy(self):
         src = self._src()
-        assert "selection: sel" in src
+        assert "selection: { ...sel" in src
 
     def test_deploy_panel_recomputes_profiles_from_compose_selection(self):
         """GAP-2/GAP-4: the deploy panel derives profile candidates from the
@@ -5106,7 +5093,7 @@ class TestUseGenerationJob:
 
     def test_cancels_via_delete(self):
         src = self._src()
-        assert "client.delete(`/llm/jobs/${jobId}`)" in src
+        assert "client.delete(`/tasks/${jobId}`)" in src
 
 
 # ---------------------------------------------------------------------------
@@ -5643,7 +5630,12 @@ class TestFailedCardSourceGuards:
 
     def test_failed_bucket_is_consumed(self):
         src = self._users_page()
-        assert "failed_services" in src, "the dashboard must consume the -api's failed bucket"
+        # The stage projection (gateway) consumes the -api's failed bucket; the
+        # page renders the resulting unified entries (R9).
+        from app.services import deploy_workflow
+        import inspect
+        assert "failed_services" in inspect.getsource(deploy_workflow.stages)
+        assert "source === 'instance'" in src
 
     def test_failed_card_renders_reason_and_both_actions(self):
         src = self._users_page()
@@ -5982,10 +5974,15 @@ class TestEnvReferencePicker:
         assert "profiles: []," in src
 
     def test_deploy_generation_is_profile_blind_but_the_deploy_is_not(self):
+        import inspect
+        from app.services import deploy_workflow
+        # The generation request drops profiles (they are deploy-time options).
+        assert 'gen_selection.pop("profiles"' in inspect.getsource(
+            deploy_workflow._generation_request)
+        # The -api payload carries them.
+        assert 'payload["profiles"]' in inspect.getsource(deploy_workflow._api_payload)
         src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
-        assert "const generationSelection" in src
-        assert src.count("selection: generationSelection()") == 2
-        assert "if (sel.profiles.length > 0) payload.profiles = sel.profiles" in src
+        assert "selection: { ...sel" in src
 
     def test_generated_files_distinguish_recipe_from_per_user(self):
         src = (_DASH / "src" / "pages" / "ServicesPage.tsx").read_text()
@@ -6335,10 +6332,10 @@ class TestPreDeployWiring:
         the session — the overlap is one card, and a crash after the -api write
         is recoverable."""
         import inspect
-        from app.routers import users as users_router
-        src = inspect.getsource(users_router.deploy_user)
+        from app.services import deploy_workflow
+        src = inspect.getsource(deploy_workflow._claim_and_register)
         call = src.index("register_user")
-        rm = src.index("db.delete(session)")
+        rm = src.index("remove_session")
         assert call < rm, "the session must be removed AFTER the -api registers"
 
     def _seed_session(self, db, username="alice", state="paused",
@@ -6549,10 +6546,11 @@ class TestPreDeployCardSourceGuards:
             "a gateway refusal must be retryable even with no stored options")
         assert "setRetryRegenerate(genRefusal)" in actions, (
             "the panel must be told to regenerate for a gateway refusal")
-        form = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
-        assert "(!initialOptions || regenerate) && (" in form, (
-            "an options-carrying retry must still run the generation when it is a "
-            "gateway refusal")
+        import inspect
+        from app.services import deploy_workflow
+        retry_src = inspect.getsource(deploy_workflow.retry)
+        assert "create_job" in retry_src, (
+            "a generation-capacity refusal re-runs generation on retry")
 
     def test_the_generation_payload_carries_the_url_and_the_password(self):
         """The refusal record can only be as complete as the REQUEST it is built
@@ -6650,7 +6648,7 @@ class TestServiceCardsAndTaskLifecycle:
         assert "return ['queued', 'running', 'awaiting_input', 'paused'].includes(newest.status) ? newest : null" in src
         assert "cancelRowJob" in src
         # It only CANCELS — no page deletes records.
-        assert "client.delete(`/llm/jobs/${id}`)" in src
+        assert "client.delete(`/tasks/${id}`)" in src
         # …and the panel is opened ON the paused job, so its popup comes back.
         assert "resumeJobId={genPanel?.resumeJobId ?? null}" in src
         panel = self._page("components/services/GenerateMissingPanel.tsx")
@@ -6763,15 +6761,16 @@ class TestServiceCardsAndTaskLifecycle:
         assert src.index("_answered_job_id = req.get") < src.index("req = carried")
         # Acted on AFTER the new leg exists — a failed create must not consume
         # the pause it was answering.
-        assert src.index("job = generation_jobs.create_job") < src.index("_answered_job_id is not None")
+        assert src.index("job = generation_jobs.create_job") < src.index('_parent.status = "cancelled"')
         # Only its own parked leg, and cancelled (never removed).
         assert '_parent.status == "paused"' in src
         assert "_parent.service_id == job.service_id" in src
         assert '_parent.status = "cancelled"' in src
         assert "unlink" not in src.split("_answered_job_id")[2], "cancel, never delete"
-        # …and the client names it.
+        # …and the client names it: the answer is the task route, values only.
         hook = self._page("hooks/useGenerationJob.ts")
-        assert "parent_job_id: jobId" in hook
+        assert "/tasks/${jobId}/answer" in hook
+        assert "{ values }" in hook
 
 
 class TestValidateRunsForASelectedCompose:
@@ -7247,26 +7246,37 @@ class TestACapacityRefusalRecordsTheRefusedSession:
 
     def _deploy(self, monkeypatch, tmp_path, status: int, body: dict):
         import asyncio
+        import uuid
 
         import httpx
         from app.database import SessionLocal
-        from app.routers import users as users_router
-        from app.services import pre_deploy_registry as pdr
-        from support import mk_user
+        from app.services import deploy_workflow, pre_deploy_registry as pdr
+        from app.services.provision_service import provision_service
+        from support import mk_task, mk_user
 
         monkeypatch.setenv("GATEWAY_DATA_DIR", str(tmp_path))
         db = SessionLocal()
         try:
             alice = mk_user(db, "alice")
             owner_api_id = str(alice.api_user_id)
-            admin_id = str(alice.id)
+            sid = str(uuid.uuid4())
+            mk_task(db, "gt-leg", status="completed")
+            pdr.create_or_replace(
+                service_id=sid, procedure_id=str(uuid.uuid4()),
+                owner_api_user_id=owner_api_id, service_name="myapp",
+                service_label="0", recipe_path="", state="generated",
+                operation="deploy", generation_task_id="gt-leg",
+                deploy_request={
+                    "user_name": "alice", "service_name": "myapp",
+                    "label": "0", "domain": "localhost",
+                    "compose_file_paths": ["docker-compose.yml"],
+                    "env_files": [".env.1.alice.0"],
+                },
+                deploy_secret_values={"passwd": "x"},
+                selection={"compose": ["docker-compose.yml"], "nginx": "nginx.conf"},
+            )
         finally:
             db.close()
-
-        req = {"user_name": "alice", "service_name": "myapp", "project_root": "myapp",
-               "label": "0", "domain": "localhost", "passwd": "x",
-               "compose_file_paths": ["docker-compose.yml"],
-               "env_files": [".env.1.alice.0"]}
 
         hreq = httpx.Request("POST", "http://api/users")
         hresp = httpx.Response(status, request=hreq, json=body)
@@ -7274,18 +7284,16 @@ class TestACapacityRefusalRecordsTheRefusedSession:
         async def fake_register(**kw):
             raise httpx.HTTPStatusError("boom", request=hreq, response=hresp)
 
-        monkeypatch.setattr(users_router.provision_service, "register_user", fake_register)
-        from app.services.service_manager import service_manager
+        monkeypatch.setattr(provision_service, "register_user", fake_register)
 
-        def fake_get_service(name):
-            return {"files": ["docker-compose.yml"]}
-        monkeypatch.setattr(service_manager, "get_service", fake_get_service)
-        from app.services import file_sets as fs
-        monkeypatch.setattr(fs, "put_file_set", lambda *a, **k: {})
-
+        intent = {"service_name": "myapp", "user_name": "alice",
+                  "owner_api_user_id": owner_api_id, "service_id": sid,
+                  "label": "0"}
         try:
-            asyncio.run(users_router.deploy_user(
-                req, None, {"id": admin_id, "role": "admin"}))
+            asyncio.run(deploy_workflow._claim_and_register(
+                sid, intent,
+                {"compose": ["docker-compose.yml"], "nginx": "nginx.conf"},
+                None))
         except Exception as exc:
             return exc, pdr
         return None, pdr
@@ -7295,7 +7303,7 @@ class TestACapacityRefusalRecordsTheRefusedSession:
             "error": "at_capacity", "detail": "at capacity: 4 task(s) running",
             "running": 4, "capacity": 4})
         assert exc is not None, "the refusal must propagate to the caller"
-        assert getattr(exc, "status_code", None) == 503, f"got {exc}"
+        assert getattr(exc, "status", None) == 503, f"got {exc}"
         sessions = pdr.list_sessions()
         assert len(sessions) == 1, "a refusal must RECORD a pre-deploy session"
         row = sessions[0]
@@ -7313,16 +7321,20 @@ class TestACapacityRefusalRecordsTheRefusedSession:
         exc, pdr = self._deploy(monkeypatch, tmp_path, 503, {
             "detail": {"error": "at_capacity", "detail": "at capacity",
                        "running": 4, "capacity": 4}})
-        assert getattr(exc, "status_code", None) == 503, f"got {exc}"
+        assert getattr(exc, "status", None) == 503, f"got {exc}"
         sessions = pdr.list_sessions()
         assert len(sessions) == 1 and sessions[0]["state"] == "refused"
 
-    def test_a_non_capacity_error_does_not_record_a_refusal(self, monkeypatch, tmp_path):
-        """Only a capacity refusal creates the card — other errors must not."""
+    def test_a_non_capacity_error_fails_closed_with_the_detail(self, monkeypatch, tmp_path):
+        """Only a capacity refusal is retryable; any other error fails closed
+        and its detail stays visible (R2/R8)."""
         exc, pdr = self._deploy(monkeypatch, tmp_path, 409,
                                 {"detail": "already registered"})
-        assert getattr(exc, "status_code", None) == 502, "a 409 stays a generic 502"
-        assert pdr.list_sessions() == []
+        assert getattr(exc, "status", None) == 502, "a 409 stays a generic 502"
+        sessions = pdr.list_sessions()
+        assert len(sessions) == 1
+        assert sessions[0]["state"] == "failed"
+        assert sessions[0]["detail"]
 
 
 class TestASelectedEnvIsTheHandoffNotGenerated:
@@ -7337,14 +7349,16 @@ class TestASelectedEnvIsTheHandoffNotGenerated:
     """
 
     def test_a_selected_env_suppresses_env_generation(self):
-        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
-        assert "hasSelectedEnv" in src
-        assert "!hasSelectedEnv" in src, "a selected env must suppress the env generation"
-        # ...and the whole term is still gated off entirely for a refused retry,
-        # with ONE carve-out: a gateway refusal's own retry regenerates, because
-        # the generation is what was refused (GRILLING G29) — see
-        # `test_a_generation_refusals_retry_is_not_gated_on_its_options`.
-        assert "(!initialOptions || regenerate) && (" in src
+        """The gateway decides generation: a SELECTED env suppresses the
+        per-user env.raw phase; an empty env slot triggers it (R3/R6)."""
+        import inspect
+        from app.services import deploy_workflow
+        src = inspect.getsource(deploy_workflow.generation_needed)
+        assert "selection.get(\"compose\")" in src
+        assert 'selection.get("env")' in src, "the env slot participates"
+        assert "if not (selection.get(\"env\") or []):" in src
+        form = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert "env_reference: envRefs" in form
 
 
 class TestPinnedLabelIsReassertedAtSubmit:
@@ -7594,23 +7608,23 @@ class TestTheGenerateEntryPointCarriesTheGlobalProxy:
     def test_generate_missing_files_sends_the_proxy(self):
         src = self._SRC.read_text()
         start = src.index("const generateMissingFiles = async ()")
-        end = src.index("const generateMissingFilesForDeploy")
+        end = src.index("// Generation job completed", start)
         body = src[start:end]
-        assert "genJob.startJob({" in body, "the named site is the startJob call"
+        assert "client.post('/services/generate'" in body, (
+            "Generate is the workflow's second intake operation (R1)")
         assert "use_global_proxy: effectiveUseGlobalProxy()" in body, (
             "the generate payload must carry the proxy, or the session the job "
             "opens records `false` and `check` replays it (T12)")
 
-    def test_the_deploy_auto_run_reads_the_snapshot(self):
-        """The deploy-scoped generation runs AFTER `onClose()` (destroyOnClose),
-        so it must read the already-computed snapshot, never the live form."""
+    def test_the_deploy_intent_reads_the_snapshot(self):
+        """The deploy runs AFTER `onClose()` (destroyOnClose), so the intent must
+        read the submit-time snapshot, never the live form."""
         src = self._SRC.read_text()
-        start = src.index("const generateMissingFilesForDeploy")
-        end = src.index("const generateMissingFilesForDeploy")
-        end = src.index("\n  // Generation job completed", end)
+        start = src.index("const handleDeploy = async")
+        end = src.index("} catch (err: any)", start)
         body = src[start:end]
-        assert "use_global_proxy: !!snap.use_global_proxy" in body, (
-            "the deploy-scoped generation must reuse the submit-time snapshot")
+        assert "use_global_proxy: snap.use_global_proxy" in body, (
+            "the deploy intent must reuse the submit-time snapshot")
         assert "form.getFieldValue('use_global_proxy')" not in body, (
             "the form is destroyed by then — reading it would re-introduce the "
             "empty-value window the label pin was moved out of")
@@ -11036,10 +11050,14 @@ class TestGeneratedServingPortsIsAdopted:
         assert src.count("resultSel.serving_ports") + src.count("resSel.serving_ports") >= 2
         assert "serving_ports_none = false" in src
 
-    def test_the_candidates_are_refreshed_after_generation(self):
-        src = self._src()
-        assert "refreshFileSetCandidates" in src
-        assert src.count("refreshFileSetCandidates(") >= 2  # both generation paths
+    def test_the_gateway_adopts_the_generated_serving_ports(self):
+        import inspect
+        from app.services import artifact_finalize
+        src = inspect.getsource(artifact_finalize.map_selection)
+        assert "serving_ports" in src
+        # The standalone Generate panel keeps its own candidate refresh.
+        form = self._src()
+        assert "refreshFileSetCandidates" in form
 
 
 # ---------------------------------------------------------------------------

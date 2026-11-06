@@ -38,6 +38,8 @@ REGISTRY_MIGRATIONS_DIR = (
 GATEWAY_TABLES = [
     "gateway.tasks",
     "gateway.pre_deploy_sessions",
+    "gateway.label_reservations",
+    "gateway.service_grants",
     "gateway.stream_exposures",
     "gateway.acl_grants",
     "gateway.api_keys",

@@ -260,7 +260,7 @@ export default function ServicesPage() {
   // and leaves by the background cleanup contract — no page deletes records.
   const cancelRowJob = async (id: number) => {
     try {
-      const { data } = await client.delete(`/llm/jobs/${id}`)
+      const { data } = await client.delete(`/tasks/${id}`)
       if (data?.status === 'cancelled') message.success('Generation cancelled — the robot is back')
       else message.warning(`Nothing to cancel — the job is already ${data?.status || 'stopped'}`)
       loadGenJobs()

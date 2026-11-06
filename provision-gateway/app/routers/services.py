@@ -372,17 +372,6 @@ async def check_deploy_readiness(
     }
 
 
-def _fresh_generated_name(filepath: Path) -> str:
-    """Distinct marked name for an original (unmarked) file (overwrite matrix).
-
-    ``docker-compose.yml`` → ``docker-compose.generated-<epoch>.yml``.
-    """
-    import time as _time
-    stem = filepath.stem
-    suffix = filepath.suffix
-    return f"{stem}.generated-{int(_time.time())}{suffix}"
-
-
 @router.post("/save-generated")
 def save_generated_files(
     req: dict[str, Any],
@@ -414,88 +403,31 @@ def save_generated_files(
     sees the pre-write snapshot.  This is intentional: the window is
     DOCUMENTED, NOT mitigated (no mutex/fencing across processes).
     """
-    import time as _time
     service_name = req.get("service_name")
     recipe_path = req.get("recipe_path", "")
     files = req.get("files", {})
     if not service_name or not files:
         raise HTTPException(400, "service_name and files required")
 
-    # Traversal-safe target (GAP-3): recipe_path and every filename must stay
-    # inside the recipe dir (design §Per-recipe scoping L221-238).
-    from ..services.file_sets import FileSetError, _recipe_dir, _validate_paths
-    project_dir = settings.SOURCE_PROJECTS_DIR / service_name
+    # The overwrite matrix lives in one service function (R3): the standalone
+    # review-Save and the workflow's automatic finalization must agree.
+    from ..services.artifact_finalize import finalize_files
     try:
-        target = _recipe_dir(project_dir, recipe_path)
-    except FileSetError as e:
+        result = finalize_files(service_name, recipe_path, files,
+                                req.get("selection"),
+                                persist_selection=True)
+    except FileNotFoundError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
         raise HTTPException(400, str(e))
-    if not target.exists():
-        target.mkdir(parents=True, exist_ok=True)
 
-    rename_map: dict[str, str] = {}
-    saved = []
-    for filename, content in files.items():
-        if not isinstance(filename, str):
-            raise HTTPException(400, "files must map filename -> content")
-        try:
-            filename = _validate_paths(project_dir, recipe_path, [filename])[0]
-        except FileSetError as e:
-            raise HTTPException(400, str(e))
-        if isinstance(content, dict):
-            # A task result carries {name, sha256, size} metadata only. The
-            # content is read from the on-disk generated file it names.
-            try:
-                content = (target / filename).read_text(encoding="utf-8")
-            except OSError as e:
-                raise HTTPException(409, f"generated file is not on disk: {filename}: {e}")
-        if not isinstance(content, str):
-            raise HTTPException(400, "files must map filename -> string content")
-        filepath = target / filename
-        marker = target / f"{filename}.generated"
-        if filepath.exists() and not marker.is_file():
-            # ORIGINAL (unmarked) — never clobber; write a fresh marked file.
-            new_name = _fresh_generated_name(filepath)
-            new_path = target / new_name
-            new_path.write_text(content)
-            (target / f"{new_name}.generated").write_text("")
-            saved.append(new_name)
-            rename_map[filename] = new_name
-        else:
-            filepath.write_text(content)
-            marker.write_text("")
-            saved.append(filename)
-            rename_map[filename] = filename
-
-    # Persist the selection as the new default (renamed to the saved names).
-    selection = req.get("selection")
-    if isinstance(selection, dict):
-        from ..services.file_sets import FileSetError, put_file_set
-        mapped: dict[str, Any] = {"profiles": selection.get("profiles") or []}
-        mapped["compose"] = [rename_map.get(p, p) for p in (selection.get("compose") or [])]
-        nginx = selection.get("nginx")
-        mapped["nginx"] = rename_map.get(nginx, nginx) if nginx else None
-        mapped["env"] = [rename_map.get(p, p) for p in (selection.get("env") or [])]
-        # R2-F9 — the serving-ports slot must survive this rebuild too. It is
-        # rebuilt here by hand (not passed through), so a category this function
-        # does not know about is silently DROPPED: saving a generation that
-        # produced a `serving_ports.base.<token>.yml` — which the pipeline had
-        # already swapped into the selection — reset the slot to "generate new",
-        # and the very next deploy then carried no artifact for the stream conf
-        # to be built from (the same broken chain as T15's missing picker).
-        sp = selection.get("serving_ports")
-        mapped["serving_ports"] = rename_map.get(sp, sp) if sp else None
-        if selection.get("serving_ports_none"):
-            mapped["serving_ports_none"] = True
-        try:
-            put_file_set(service_name, recipe_path, mapped)
-        except FileSetError:
-            pass  # selection persistence is best-effort — save still succeeds
-
+    saved = result["saved"]
     log_action(db, action="llm_generated_files", admin_id=current_admin["id"],
                target_service=service_name, status="success",
                detail={"files": saved})
 
-    return {"saved": saved, "service": service_name}
+    return {"saved": saved, "service": service_name,
+            "selection": result["selection"]}
 
 
 @router.delete("/{name}")

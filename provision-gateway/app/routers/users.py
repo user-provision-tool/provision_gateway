@@ -46,8 +46,12 @@ def _api_user_row(db: Session, username: str):
     ).mappings().first()
 
 
-def _annotate(result: dict, db: Session) -> dict:
-    username = str(result.get("user_name", ""))
+def _annotate_services(db: Session, username: str, services: list[dict]) -> dict:
+    """Attach owner/public/grant context to card dicts, in place.
+
+    One home for both the per-user service list and the unified stage
+    projection (R9): the card must render identically from either.
+    """
     owner = _owner_record(db, username)
     api_user = _api_user_row(db, username)
     gone = bool(
@@ -60,7 +64,7 @@ def _annotate(result: dict, db: Session) -> dict:
         or (owner is not None and acl_service.was_public_record(db, owner))
     )
     owner_role = owner.role if owner else None
-    result.update({
+    context = {
         "owner_api_user_id": str(api_user["id"]) if api_user else None,
         "owner_username": username,
         "owner_role": owner_role,
@@ -73,28 +77,31 @@ def _annotate(result: dict, db: Session) -> dict:
         "owner_gone": gone,
         "is_public": public,
         "was_public": was_public,
-    })
+    }
+    for svc in services:
+        if not isinstance(svc, dict):
+            continue
+        svc.update(context)
+        svc["has_auth"] = bool(svc.get("has_auth"))
+        svc["public_urls"] = (
+            {n: _direct_url(n, bool(svc.get("tls")))
+             for n in (svc.get("http_endpoints") or [])}
+            if public else {}
+        )
+    # G83 — the card's cross-service section: effective targets, explicit rows.
+    service_grants.annotate_services(db, services)
+    return context
+
+
+def _annotate(result: dict, db: Session) -> dict:
+    username = str(result.get("user_name", ""))
     annotated: list[dict] = []
     for bucket in ("healthy_services", "unhealthy_services", "missing_services",
                    "failed_services"):
         for svc in (result.get(bucket) or []):
-            if not isinstance(svc, dict):
-                continue
-            annotated.append(svc)
-            svc["owner_api_user_id"] = result["owner_api_user_id"]
-            svc["owner_username"] = username
-            svc["owner_role"] = owner_role
-            svc["owner_gone"] = gone
-            svc["is_public"] = public
-            svc["was_public"] = was_public
-            svc["has_auth"] = bool(svc.get("has_auth"))
-            svc["public_urls"] = (
-                {n: _direct_url(n, bool(svc.get("tls")))
-                 for n in (svc.get("http_endpoints") or [])}
-                if public else {}
-            )
-    # G83 — the card's cross-service section: effective targets, explicit rows.
-    service_grants.annotate_services(db, annotated)
+            if isinstance(svc, dict):
+                annotated.append(svc)
+    result.update(_annotate_services(db, username, annotated))
     return result
 
 
@@ -126,6 +133,51 @@ async def list_users(request: Request = None,
     if current_user["role"] == "admin":
         payload["orphans"] = orphans
     return payload
+
+
+@router.get("/workflows/{workflow_id}")
+async def get_workflow(workflow_id: str,
+                       current_user: dict = Depends(require_gateway_token)):
+    """One read-only workflow projection (R8)."""
+    from ..services import deploy_workflow as _wf
+    from ..services import pre_deploy_registry as pdr
+    record = pdr.get_session(workflow_id)
+    if (record is not None and current_user["role"] != "admin"
+            and str(record.get("owner_api_user_id")) != str(current_user["api_user_id"])):
+        raise HTTPException(403, "Access denied: not your workflow")
+    try:
+        return _wf.workflow_status(workflow_id)
+    except KeyError:
+        raise HTTPException(404, "Workflow not found")
+
+
+@router.get("/stages")
+async def list_stages(user_name: str | None = Query(None),
+                      current_user: dict = Depends(require_gateway_token)):
+    """The unified per-tuple stage projection (R9)."""
+    from ..services import deploy_workflow as _wf
+    if current_user["role"] != "admin":
+        db = SessionLocal()
+        try:
+            allowed = acl_service.allowed_usernames(db, current_user["id"])
+        finally:
+            db.close()
+        if user_name and user_name not in allowed:
+            raise HTTPException(403, "Access denied: you can only view your own services")
+        result = await _wf.stages()
+        result["groups"] = [g for g in result["groups"] if g.get("user_name") in allowed]
+        result["count"] = sum(len(g["entries"]) for g in result["groups"])
+        result.pop("orphans", None)
+        return result
+    result = await _wf.stages(user_name)
+    db = SessionLocal()
+    try:
+        for group in result["groups"]:
+            instances = [e for e in group["entries"] if e.get("source") == "instance"]
+            _annotate_services(db, group.get("user_name") or "", instances)
+    finally:
+        db.close()
+    return result
 
 
 @router.get("/{user_name}")
@@ -177,142 +229,52 @@ def _resolve_owner(db: Session, req: dict) -> dict:
             "username": raw_name}
 
 
-async def _finish_deploy(source_service_id: str, task_id: str | None,
-                         target_ids: list[str], actor_id) -> None:
-    """After the deploy task completes, write the panel's grant selection."""
-    if not task_id:
-        return
-    try:
-        while True:
-            data = await provision_service.get_task(task_id)
-            status = str(data.get("status") or "")
-            if status in ("completed", "failed", "cancelled", "unknown"):
-                break
-            await asyncio.sleep(2.0)
-        if status != "completed":
-            return
-        db = SessionLocal()
-        try:
-            for target_id in target_ids:
-                try:
-                    service_grants.set_grant(
-                        db, source_service_id, target_id, actor_user_id=actor_id,
-                    )
-                    audit_service.log_action(
-                        db, action="service_grant_set", actor_user_id=actor_id,
-                        target_service_id=source_service_id,
-                        detail={"source_service_id": source_service_id,
-                                "target_service_id": target_id,
-                                "origin": "deploy_panel"},
-                        status="success",
-                    )
-                except ValueError as exc:
-                    _log.warning("deploy-panel grant %s -> %s skipped: %s",
-                                 source_service_id, target_id, exc)
-        finally:
-            db.close()
-    except Exception:  # noqa: BLE001 — the deploy already succeeded
-        _log.exception("deploy-panel grant selection failed for %s", source_service_id)
-        return
-    await cross_orchestrator.sync_all()
-
-
 @router.post("/deploy", status_code=202)
 async def deploy_user(req: dict[str, Any], request: Request,
                       current_admin: dict = Depends(require_admin)):
-    """Admin deploy of a selected owner's service (R7.6).
+    """Deploy intake — the gateway owns the whole workflow (R1/R2).
 
-    Add-then-remove: the -api writes the instance first; the gateway removes
-    the pre-deploy session only after it has the 202. Nothing is removed before
-    the deploy.
+    The client sends the intent; the gateway validates policy, reserves the
+    label, records `operation=deploy`, runs generation if needed and, on
+    completion, claims and registers without a browser.
     """
-    service_name = req.get("service_name", "")
+    from ..services import deploy_workflow as _wf
     db = SessionLocal()
     try:
         owner = _resolve_owner(db, req)
-        label = str(req.get("label")) if req.get("label") not in (None, "") else None
-        session = None
-        if label is not None:
-            session = db.query(PreDeploySession).filter(
-                PreDeploySession.owner_api_user_id == owner["owner_api_user_id"],
-                PreDeploySession.service_name == service_name,
-                PreDeploySession.service_label == label,
-            ).first()
-        service_id = req.get("service_id") or (str(session.service_id) if session else str(uuid.uuid4()))
-        procedure_id = req.get("procedure_id") or (str(session.procedure_id) if session else str(uuid.uuid4()))
-        recipe_path = req.get("recipe_path") if req.get("recipe_path") is not None else (
-            session.recipe_path if session else ""
-        )
     finally:
         db.close()
-
-    payload = dict(req)
-    payload.pop("owner_username", None)
-    # The panel's folded allowed-services selector travels with the deploy but is
-    # NOT a -api field: the gateway writes the grant rows after the service
-    # identity exists (the -api creates it during the deploy).
-    raw_targets = payload.pop("allowed_target_service_ids", None) or []
-    target_ids = [str(t) for t in raw_targets if t]
-    payload.update({
-        "owner_api_user_id": owner["owner_api_user_id"],
-        "service_id": service_id,
-        "procedure_id": procedure_id,
-        "recipe_path": recipe_path,
-        "label": label,
-    })
+    intent = dict(req)
+    intent["owner_api_user_id"] = owner["owner_api_user_id"]
+    intent["user_name"] = owner["username"]
     try:
-        result = await provision_service.register_user(**payload)
-    except Exception as e:  # noqa: BLE001
-        http_exc = provision_service.as_http_error(e)
-        # T8/G29: a capacity refusal is a CARD, not a toast. Record it on the
-        # pre-deploy session (state `refused`, its own reason + the options
-        # Retry replays) before the caller sees the 503.
-        if (http_exc.status_code == 503
-                and isinstance(http_exc.detail, dict)
-                and http_exc.detail.get("error") == "at_capacity"):
-            from ..services import pre_deploy_registry as pdr
-            detail = str(http_exc.detail.get("detail") or "")
-            if pdr.get_session(service_id) is None:
-                pdr.create_or_replace(
-                    service_id=service_id, procedure_id=procedure_id,
-                    owner_api_user_id=owner["owner_api_user_id"],
-                    service_name=service_name, service_label=label or "0",
-                    recipe_path=recipe_path, state="refused",
-                    reason="at_capacity", detail=detail,
-                    options=pdr.refusal_options(
-                        payload, use_global_proxy=bool(payload.get("use_global_proxy"))),
-                    secret_values=pdr.secret_option_values(payload),
-                )
-            else:
-                pdr.record_refusal(
-                    service_id=service_id, reason="at_capacity",
-                    detail=detail, request=payload,
-                    use_global_proxy=bool(payload.get("use_global_proxy")),
-                )
-        _audit_short("register", current_admin, req, failure=str(e))
-        raise http_exc
+        handle = await _wf.start_deploy(intent, actor_user_id=current_admin["id"])
+    except _wf.WorkflowError as exc:
+        _audit_short("register", current_admin, req,
+                     failure=f"{exc.code}: {exc.detail}")
+        raise HTTPException(exc.status, {"error": exc.code, "detail": exc.detail})
+    _audit_short("register", current_admin, req)
+    return handle
 
+
+@router.post("/generate", status_code=202)
+async def generate_workflow(req: dict[str, Any],
+                            current_admin: dict = Depends(require_admin)):
+    """Generate intake — same identity and selection, no deploy (R1)."""
+    from ..services import deploy_workflow as _wf
     db = SessionLocal()
     try:
-        session = db.query(PreDeploySession).filter_by(service_id=service_id).first()
-        if session is not None:
-            session.deploy_task_id = result.get("task_id")
-            session.procedure_id = uuid.UUID(str(result.get("procedure_id") or procedure_id))
-            db.commit()
-            db.delete(session)
-            db.commit()
+        owner = _resolve_owner(db, req)
     finally:
         db.close()
-    _audit_short("register", current_admin, req)
-    # G83 — once the deploy task finishes the service is live: write the panel's
-    # grant selection (if any) and refresh the cross-path config + memberships.
-    if target_ids:
-        asyncio.create_task(_finish_deploy(
-            service_id, result.get("task_id"), target_ids, current_admin["id"],
-        ))
-    else:
-        asyncio.create_task(cross_orchestrator.sync_after_task(result.get("task_id")))
-    return result
+    intent = dict(req)
+    intent["owner_api_user_id"] = owner["owner_api_user_id"]
+    intent["user_name"] = owner["username"]
+    try:
+        handle = await _wf.start_generate(intent)
+    except _wf.WorkflowError as exc:
+        raise HTTPException(exc.status, {"error": exc.code, "detail": exc.detail})
+    return handle
 
 
 def _audit_short(action: str, actor: dict, req: dict, failure: str | None = None) -> None:
@@ -371,6 +333,18 @@ async def get_next_label(user_name: str, service_name: str,
             ):
                 try:
                     labels.append(int(session.service_label))
+                except (TypeError, ValueError):
+                    pass
+            # Reserved labels are held even before a session row exists (R5).
+            for row in db.execute(
+                text(
+                    "SELECT label FROM gateway.label_reservations "
+                    "WHERE owner_api_user_id=:o AND service_name=:s"
+                ),
+                {"o": str(owner.api_user_id), "s": service_name},
+            ).all():
+                try:
+                    labels.append(int(str(row[0])))
                 except (TypeError, ValueError):
                     pass
     finally:

@@ -109,35 +109,9 @@ async def delete_pre_deploy(service_id: str,
 async def retry_pre_deploy(service_id: str,
                            current_admin: dict = Depends(require_admin)):
     """Retry a refusal: generation-capacity re-runs generation, deploy-capacity
-    replays the stored deployment (R3.2)."""
-    row = pdr.get_session(service_id)
-    if row is None:
-        raise HTTPException(404, "no pre-deploy session for that service")
-    if row.get("state") not in ("refused", "paused", "generated"):
-        raise HTTPException(409, f"session is {row.get('state')}; not retryable")
-    reason = row.get("reason") or ""
-    if reason == "at_capacity":
-        from ..services.provision_service import provision_service
-        options = dict(pdr.replay_options(service_id) or {})
-        options.update({"service_id": service_id,
-                        "owner_api_user_id": row.get("owner_api_user_id"),
-                        "service_name": row.get("service_name"),
-                        "label": row.get("label"),
-                        "recipe_path": row.get("recipe_path")})
-        try:
-            result = await provision_service.register_user(**options)
-        except Exception as exc:  # noqa: BLE001
-            raise provision_service.as_http_error(exc)
-        pdr.set_deploying(service_id, deploy_task_id=result.get("task_id"))
-        return {"action": "deploy", **result}
-    pdr.create_or_replace(
-        service_id=service_id, procedure_id=row["procedure_id"],
-        owner_api_user_id=row["owner_api_user_id"], service_name=row["service_name"],
-        service_label=row["label"], recipe_path=row["recipe_path"],
-        state="generating", generation_task_id=row.get("generation_task_id"),
-        deploy_task_id=row.get("deploy_task_id"), reason=None, detail=None,
-        guide=row.get("guide"), slot=row.get("slot"),
-        use_global_proxy=row.get("use_global_proxy"), options=row.get("options"),
-    )
-    return {"action": "generate", "service_id": service_id,
-            "message": "re-run generation for this session"}
+    replays the stored deployment (R2/R5)."""
+    from ..services import deploy_workflow as _wf
+    try:
+        return await _wf.retry(service_id)
+    except _wf.WorkflowError as exc:
+        raise HTTPException(exc.status, {"error": exc.code, "detail": exc.detail})

@@ -88,12 +88,11 @@ export default function CrossGrantsSection({
   }
 
   const save = async (next: string[]) => {
-    const added = next.filter(x => !explicit.includes(x))
-    const removed = explicit.filter(x => !next.includes(x))
+    // R10 — the desired set is ONE transaction: the server validates every
+    // target and applies add/remove together (all-or-nothing).
     setSaving(true)
     try {
-      for (const id of added) await client.put(`/service-grants/${serviceId}/${id}`)
-      for (const id of removed) await client.delete(`/service-grants/${serviceId}/${id}`)
+      await client.put(`/service-grants/${serviceId}`, { target_service_ids: next })
       message.success('Service grants updated')
       await load()
     } catch (e: any) {

@@ -77,30 +77,18 @@ export function useGenerationJob() {
   }
 
   const submitInput = async (values: Record<string, string>) => {
-    // G27: ANSWERING A PAUSE CREATES A NEW JOB. `POST /llm/jobs/{id}/input` —
-    // which rewrote the parked row and re-ran it — is GONE, so this posts the
-    // pause payload back to the ordinary create entry point under `resume`.
-    // The carried `request` inside it IS the next leg's request (the identity —
-    // user, label, proxy — rides along with it), and `values` is the operator's
-    // input: the edited guidance, or the credential values.
+    // Thin migration R4/R15: the pause answer is the gateway task endpoint and
+    // it takes VALUES ONLY — the server reads the pause from the parent leg.
+    // The dashboard no longer echoes the pause payload back to `/llm/jobs`.
     const pause = jobState?.result?.pause
     if (!pause) {
       throw new Error('this job is not waiting for input — nothing to answer')
     }
     // Errors are surfaced to the caller: a 400 (missing required value) must
     // keep the popup open rather than looking like a successful submit.
-    //
-    // `parent_job_id` names the leg this answer CONSUMES: the server cancels it
-    // once the new leg exists (GRILLING G34 — an answered pause keeps its
-    // `paused` status forever, which is a paused object with nothing owning it,
-    // and a paused record is never swept).
-    const { data } = await client.post('/llm/jobs', { resume: pause, values, parent_job_id: jobId })
-    // Follow the NEXT leg. Without this the caller kept polling the finished
-    // leg, whose `result.files` are absent by construction, and rendered the
-    // review gate EMPTY — an AntD list reading "No data" behind a "Save fixed
-    // files" button with nothing to save — while the real output sat in a job
-    // nothing watched. Found live in Round 32, before this handoff existed.
-    const next = data?.job_id
+    const { data } = await client.post(`/tasks/${jobId}/answer`, { values })
+    // Follow the NEXT leg the server created (the answer creates it).
+    const next = data?.task_id || data?.job_id
     if (next != null) {
       setJob(next)
       setJobState({ status: 'queued', progress: 'queued', phase: '', phase_index: 0, phase_total: 1 })
@@ -152,7 +140,9 @@ export function useGenerationJob() {
     // `queued|running|awaiting_input|paused`. `paused` belongs there (GRILLING
     // G34): G27 made the pause a terminal LEG, but the job still exists, so the
     // DELETE ends it instead of no-op'ing.
-    const { data } = await client.delete(`/llm/jobs/${jobId}`)
+    // R12: one cancel contract — the generic task route; `/llm/jobs/{id}` is
+    // kept as an alias for one release.
+    const { data } = await client.delete(`/tasks/${jobId}`)
     const status = data?.status
     if (status) {
       setJobState((prev: any) => ({ ...(prev || {}), status, progress: status }))
@@ -183,5 +173,19 @@ export function useGenerationJob() {
     poll(id)
   }
 
-  return { jobId, jobIdRef, jobState, polling, startJob, cancelJob, submitInput, resumeJob, reset }
+  /**
+   * Adopt a job state the gateway already owns (thin migration R2/R8).
+   *
+   * The deploy workflow runs server-side; the popup renders the same progress/
+   * events from the workflow read model instead of starting a second client-side
+   * job. The id is the current generation leg, so an answer targets the right
+   * task.
+   */
+  const adoptJob = (state: any, id?: string | null) => {
+    if (id !== undefined) setJob(id)
+    setJobState(withPause(state))
+  }
+
+  return { jobId, jobIdRef, jobState, polling, startJob, cancelJob, submitInput,
+           resumeJob, reset, adoptJob }
 }

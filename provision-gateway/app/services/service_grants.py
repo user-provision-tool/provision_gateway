@@ -256,6 +256,108 @@ def candidates(db: Session, source: dict) -> list[dict]:
     return out
 
 
+def account_candidates(db: Session, username: str) -> dict:
+    """Accessible-account groups for a deploying user (R10).
+
+    Own, active account grant and public accounts are grouped by owner; the
+    `Public` marker is on the GROUP (an account property), never on a service.
+    """
+    user = acl_service.user_by_username(db, username)
+    if user is None or not acl_service.account_live(user):
+        raise ValueError(f"'{username}' is not a live gateway account")
+    accessible = acl_service.allowed_user_ids(db, user.id)
+    entries = entries_by_id()
+    groups: dict[str, dict] = {}
+    for target in entries.values():
+        if not live(target):
+            continue
+        owner_user = user_for(db, target)
+        if owner_user is None or not acl_service.account_live(owner_user):
+            continue
+        same = str(owner_user.id) == str(user.id)
+        public = acl_service.is_public_owner(owner_user)
+        if not (same or public or str(owner_user.id) in accessible):
+            continue
+        reason = "own" if same else ("public" if public else "account_grant")
+        key = str(owner_user.id)
+        group = groups.setdefault(key, {
+            "owner_gateway_user_id": key,
+            "user_name": target.get("user_name"),
+            "is_public": public,
+            "reason": reason,
+            "services": [],
+        })
+        if public and not same:
+            group["reason"] = "public"
+        group["services"].append({
+            **_target_row(target, REASON_SAME_OWNER if same else ""),
+            "implicit": same,
+            "is_public": public,
+        })
+    ordered = sorted(groups.values(),
+                     key=lambda g: (g.get("user_name") or ""))
+    for group in ordered:
+        group["services"].sort(key=lambda s: (s.get("service_name") or "",
+                                              s.get("label") or ""))
+    return {"user_name": username, "groups": ordered}
+
+
+def apply_set(db: Session, source_id: str, target_ids: list[str],
+              actor_user_id=None) -> dict:
+    """Apply the desired target set in ONE transaction (R10).
+
+    Validation runs first and raises before any row is touched; same-owner
+    targets are implicit and are skipped (no row). All-or-nothing: a failure
+    mid-apply rolls back and the previous set remains.
+    """
+    entries = entries_by_id()
+    source = entries.get(str(source_id))
+    if source is None:
+        raise ValueError("source service not found")
+    if not live(source):
+        raise ValueError("the source service must be running")
+
+    desired: set[str] = set()
+    for raw in target_ids or []:
+        target_id = str(raw)
+        if target_id == str(source_id):
+            continue
+        target = entries.get(target_id)
+        if target is None:
+            raise ValueError(f"target service not found: {target_id}")
+        if not live(target):
+            raise ValueError(f"target service is not running: {target_id}")
+        if same_owner(source, target):
+            continue  # implicit — no explicit row
+        if not is_public_target(db, target):
+            target_user = user_for(db, target)
+            source_user = user_for(db, source)
+            if source_user is None or target_user is None:
+                raise ValueError("both owner accounts must have a gateway account")
+            if not acl_service.allows(db, source_user, target_user.id):
+                raise ValueError(
+                    "the source owner has no active account grant for "
+                    f"{target.get('user_name')} — assign that account grant first"
+                )
+        desired.add(target_id)
+
+    current = {str(r.target_service_id): r
+               for r in explicit_rows(db, str(source_id))}
+    try:
+        for target_id in desired - set(current):
+            db.add(ServiceGrant(
+                source_service_id=source_id, target_service_id=target_id,
+                created_by=actor_user_id, created_at=_now(), updated_at=_now(),
+            ))
+        for target_id in set(current) - desired:
+            db.delete(current[target_id])
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return list_for_source(db, source)
+
+
 def annotate_services(db: Session, services: list[dict]) -> None:
     """Attach the effective/explicit sets to service-card dicts, in place."""
     entries = entries_by_id()

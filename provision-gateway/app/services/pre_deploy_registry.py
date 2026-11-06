@@ -14,8 +14,8 @@ from typing import Any
 from sqlalchemy import text
 
 from ..models.pre_deploy_session import (
-    PreDeploySession, STATE_DEPLOYING, STATE_GENERATED, STATE_GENERATING,
-    STATE_PAUSED, STATE_REFUSED,
+    OPERATION_DEPLOY, OPERATION_GENERATE, PreDeploySession, STATE_DEPLOYING,
+    STATE_FAILED, STATE_GENERATED, STATE_GENERATING, STATE_PAUSED, STATE_REFUSED,
 )
 
 OPERATOR_HELD_STATES = (STATE_PAUSED, STATE_REFUSED, STATE_GENERATED)
@@ -132,7 +132,18 @@ def create_or_replace(
     guide: str | None = None, slot: str | None = None,
     use_global_proxy: bool | None = None, options: dict | None = None,
     secret_values: dict | None = None,
+    operation: str | None = None,
+    deploy_request: dict | None = None,
+    deploy_secret_values: dict | None = None,
+    selection: dict | None = None,
+    env_name: str | None = None,
 ) -> dict[str, Any]:
+    """Create or update a session.
+
+    The workflow fields (`operation`, `deploy_request`, `selection`, `env_name`)
+    are only written when supplied: a new generation leg replaces the task link
+    but must NOT reset the operation or the replayable deploy intent.
+    """
     db = _sessions()
     try:
         row = db.query(PreDeploySession).filter_by(service_id=service_id).first()
@@ -159,10 +170,24 @@ def create_or_replace(
         row.use_global_proxy = use_global_proxy
         row.options = options
         # A new leg replaces the replay payload; the encrypted half is written
-        # with it (or cleared when the leg carries no credential).
+        # with it (or cleared when the leg carries no credential). The deploy
+        # intent's own credential half is separate and only touched when the
+        # caller supplies it.
         envelope, version = _encrypt_secret(secret_values or {})
         row.options_secret_enc = envelope
         row.options_key_version = version
+        if operation is not None:
+            row.operation = operation
+        if deploy_request is not None:
+            row.deploy_request = deploy_request
+        if deploy_secret_values is not None:
+            denv, dver = _encrypt_secret(deploy_secret_values or {})
+            row.deploy_secret_enc = denv
+            row.deploy_key_version = dver
+        if selection is not None:
+            row.selection = selection
+        if env_name is not None:
+            row.env_name = env_name
         row.updated_at = _now()
         db.commit()
         db.refresh(row)
@@ -177,23 +202,41 @@ def new_generation_leg(
     guide: str | None = None, slot: str | None = None,
     use_global_proxy: bool | None = None,
 ) -> dict[str, Any]:
-    """A new generation leg replaces the procedure/task links and stale data."""
+    """A new generation leg replaces the procedure/task links and stale data.
+
+    A leg started outside the intake endpoints (the standalone/Check path)
+    defaults to `operation=generate`, so it stops at the review gate. An
+    existing workflow record keeps its operation — answering its pause must not
+    turn a deploy into a review stop or vice versa.
+    """
+    existing = get_session(service_id)
+    operation = (existing or {}).get("operation") or OPERATION_GENERATE
     return create_or_replace(
         service_id=service_id, procedure_id=procedure_id,
         owner_api_user_id=owner_api_user_id, service_name=service_name,
         service_label=service_label, recipe_path=recipe_path,
         state=STATE_GENERATING, generation_task_id=generation_task_id,
         deploy_task_id=None, reason=None, detail=None, guide=guide, slot=slot,
-        use_global_proxy=use_global_proxy, options=None,
+        use_global_proxy=use_global_proxy, options=None, operation=operation,
     )
 
 
 def remove_session(service_id: str) -> bool:
+    """Delete the session and release its label reservation (R5).
+
+    Every path that removes a record — handoff, an explicit delete, a failed
+    leg — must release the reservation, or the identity leaks.
+    """
     db = _sessions()
     try:
         n = db.query(PreDeploySession).filter_by(service_id=service_id).delete(
             synchronize_session=False)
         db.commit()
+        try:
+            from . import label_reservations
+            label_reservations.release(service_id)
+        except Exception:  # noqa: BLE001 — the delete succeeded; release is best-effort
+            pass
         return bool(n)
     finally:
         db.close()
@@ -222,12 +265,20 @@ def finish_leg(task_id: str, state: str | None) -> bool:
         row = db.query(PreDeploySession).filter_by(generation_task_id=task_id).first()
         if row is None or row.state in (STATE_PAUSED, STATE_REFUSED):
             return False
-        if state is None:
+        service_id = str(row.service_id)
+        deleted = state is None
+        if deleted:
             db.delete(row)
         else:
             row.state = state
         row.updated_at = _now()
         db.commit()
+        if deleted:
+            try:
+                from . import label_reservations
+                label_reservations.release(service_id)
+            except Exception:  # noqa: BLE001
+                pass
         return True
     finally:
         db.close()
@@ -274,6 +325,105 @@ def set_deploying(service_id: str, procedure_id=None, deploy_task_id: str | None
         db.close()
 
 
+def claim_for_deploy(service_id: str) -> bool:
+    """Atomically claim `generated -> deploying`; exactly one completer wins.
+
+    The claim is the deploy-once gate (R2): two completion observers, a retry
+    and a reviewed-session Deploy can race, and only the rowcount-1 caller may
+    call the -api register.
+    """
+    db = _sessions()
+    try:
+        n = (
+            db.query(PreDeploySession)
+            .filter_by(service_id=service_id, state=STATE_GENERATED)
+            .update({PreDeploySession.state: STATE_DEPLOYING,
+                     PreDeploySession.updated_at: _now()},
+                    synchronize_session=False)
+        )
+        db.commit()
+        return n == 1
+    finally:
+        db.close()
+
+
+def set_selection(service_id: str, selection: dict | None,
+                  env_name: str | None = None) -> bool:
+    db = _sessions()
+    try:
+        row = db.query(PreDeploySession).filter_by(service_id=service_id).first()
+        if row is None:
+            return False
+        if selection is not None:
+            row.selection = selection
+        if env_name is not None:
+            row.env_name = env_name
+        row.updated_at = _now()
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
+def set_label(service_id: str, label: str) -> bool:
+    """Rebind the session to a newly reserved label (external-race repair)."""
+    db = _sessions()
+    try:
+        row = db.query(PreDeploySession).filter_by(service_id=service_id).first()
+        if row is None:
+            return False
+        row.service_label = str(label)
+        row.updated_at = _now()
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
+def mark_deploy_failed(service_id: str, detail: str,
+                       reason: str = "deploy_failed") -> bool:
+    """Fail closed with the detail visible in the status (R2/R8).
+
+    The row stays as the failure record; the next deploy replaces it and an
+    explicit session delete removes it. No instance was created, so it is not a
+    live card.
+    """
+    db = _sessions()
+    try:
+        row = db.query(PreDeploySession).filter_by(service_id=service_id).first()
+        if row is None:
+            return False
+        row.state = STATE_FAILED
+        row.reason = reason
+        row.detail = detail or ""
+        row.updated_at = _now()
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
+def session_record(service_id: str) -> dict[str, Any] | None:
+    """All session fields, including the replayable intent and its credentials.
+
+    Internal-use only: the public `get_session` deliberately omits both.
+    """
+    db = _sessions()
+    try:
+        row = db.query(PreDeploySession).filter_by(service_id=service_id).first()
+        if row is None:
+            return None
+        data = _to_dict(db, row)
+        data["deploy_request"] = dict(row.deploy_request or {})
+        try:
+            data["deploy_secrets"] = _decrypt_secret(row.deploy_secret_enc)
+        except Exception:  # noqa: BLE001 — a missing/wrong key fails closed
+            data["deploy_secrets"] = {}
+        return data
+    finally:
+        db.close()
+
+
 def _task_row(task_id: str | None):
     if not task_id:
         return None
@@ -289,11 +439,16 @@ def _task_row(task_id: str | None):
 
 
 def _instance_status(service_id) -> str | None:
+    """A live instance for this service id, if one exists (tombstones excluded)."""
     from sqlalchemy import text
     db = _sessions()
     try:
         row = db.execute(
-            text("SELECT status FROM registry.service_instances WHERE service_id=:id"),
+            text(
+                "SELECT i.status FROM registry.service_instances i "
+                "JOIN registry.services s ON s.id = i.service_id "
+                "WHERE i.service_id = :id AND s.deleted_at IS NULL"
+            ),
             {"id": str(service_id)},
         ).first()
         return row[0] if row else None
@@ -304,7 +459,10 @@ def _instance_status(service_id) -> str | None:
 def reconcile(live_task_ids: set[str]) -> dict[str, Any]:
     """Resolve stale pre-deploy sessions by the deploy/generation task (R3.5).
 
-    * operator-held (`paused`/`refused`/`generated`) are never touched;
+    * ANY session whose service id now has a live instance is dropped: the
+      instance is the truth, even for an operator-held (`generated`) row (R13).
+      That is what repairs the accept->delete crash window;
+    * operator-held (`paused`/`refused`/`generated`/`failed`) are otherwise kept;
     * `deploying` + instance exists -> the instance card takes over, drop it;
     * `deploying` + no instance + live/unknown deploy task -> keep;
     * `deploying` + no instance + terminal/no task -> back to `generated`;
@@ -320,7 +478,12 @@ def reconcile(live_task_ids: set[str]) -> dict[str, Any]:
     try:
         rows = db.query(PreDeploySession).all()
         for row in rows:
-            if row.state in OPERATOR_HELD_STATES:
+            # Instance wins — even over an operator-held `generated` row (R13).
+            if _instance_status(row.service_id) is not None:
+                dropped.append(str(row.service_id))
+                db.delete(row)
+                continue
+            if row.state in OPERATOR_HELD_STATES or row.state == STATE_FAILED:
                 kept.append(str(row.service_id))
                 continue
             if row.state == STATE_DEPLOYING:
@@ -355,6 +518,14 @@ def reconcile(live_task_ids: set[str]) -> dict[str, Any]:
         remaining = db.query(PreDeploySession).count()
     finally:
         db.close()
+    # A dropped record releases its label reservation (R5); the reconcile is
+    # another session-removal path, so it owes the same cleanup.
+    for service_id in dropped:
+        try:
+            from . import label_reservations
+            label_reservations.release(service_id)
+        except Exception:  # noqa: BLE001
+            pass
     return {"dropped_stale": dropped, "restored": restored,
             "kept": kept, "remaining": remaining}
 

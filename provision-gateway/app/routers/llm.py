@@ -180,13 +180,32 @@ async def create_generation_job(
     _resume = req.get("resume")
     _answered_job_id = req.get("parent_job_id")
     _resume_values: dict[str, str] | None = None
-    if isinstance(_resume, dict) and _resume.get("request"):
-        carried = dict(_resume["request"])
+    if _resume is not None or _answered_job_id is not None:
+        # R15/C5 — the deprecated answer alias reads the pause from the PARENT
+        # and accepts VALUES ONLY. A client-supplied `resume.request` is never
+        # trusted: it would let the client redefine the next leg's request.
+        if _answered_job_id is None:
+            raise HTTPException(409, {
+                "error": "resume_requires_parent",
+                "detail": ("a divergent client-supplied resume is refused; "
+                           "send parent_job_id and values only"),
+            })
+        _parent = generation_jobs.get_job(db, str(_answered_job_id))
+        if _parent is None:
+            raise HTTPException(404, "parent job not found")
+        if _parent.status != "paused":
+            raise HTTPException(409, f"parent job is not paused: {_parent.status}")
+        _pause: dict = {}
+        if isinstance(_parent.result, dict):
+            _pause = _parent.result.get("pause") or {}
+        if not _pause and isinstance(_parent.pending_input, dict):
+            _pause = _parent.pending_input
+        carried = dict(_pause.get("request") or _parent.request or {})
         _values = {str(k): str(v) for k, v in (req.get("values") or {}).items()}
-        if _resume.get("kind") in ("compose_fix", "validate_ports_fix", "validate_conf_fix") \
-                and _values.get("guidance"):
+        if _pause.get("kind") in ("compose_fix", "validate_ports_fix",
+                                  "validate_conf_fix") and _values.get("guidance"):
             carried["prompt"] = _values["guidance"]
-        if _resume.get("kind") == "input" and _values:
+        if _pause.get("kind") == "input" and _values:
             _resume_values = _values
             carried["resume_values"] = _values
         carried.setdefault("user_name", req.get("user_name") or "")
@@ -408,16 +427,19 @@ async def cancel_generation_job(
     current_admin: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Cancel a generation job — queued, running, parked OR paused.
+    """Deprecated alias of `DELETE /api/tasks/{id}` (R12/C5).
 
-    A paused job is cancellable (GRILLING G34): G27 made a pause a terminal leg
-    whose job has stopped but still exists, so ending it is a status transition
-    to `cancelled` here, never a removal. The set lives in the manager
-    (`CANCELLABLE_STATUSES`), which is also what the card's Delete reads.
+    Same semantics for one release: the same cancellable set, the same 404/409
+    rules, the same session cleanup. New clients call the task route.
     """
-    job = generation_jobs.cancel_job(db, job_id)
+    job = generation_jobs.get_job(db, job_id)
     if not job:
         raise HTTPException(404, "Job not found")
+    if job.operation == "fix_remove":
+        raise HTTPException(409, "fix_remove is not cancellable")
+    if job.status in ("completed", "failed", "cancelled", "unknown"):
+        raise HTTPException(409, f"Task is already terminal: {job.status}")
+    job = generation_jobs.cancel_job(db, job_id)
     log_action(db, action="llm_generation_job_cancel", admin_id=current_admin["id"],
                target_service=job.service_name, status="cancelled",
                detail={"job_id": job.task_id})

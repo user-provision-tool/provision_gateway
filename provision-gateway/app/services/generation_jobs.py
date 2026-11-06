@@ -2246,6 +2246,11 @@ class GenerationJobManager:
                         "events": events,
                     }
                     self._set_status(job_id, JOB_STATUS_COMPLETED, progress="completed", result=result, usage=usage_total, events=events)
+                    # Thin-migration R2 — the server-owned continuation. The
+                    # session's `operation` decides whether this completion
+                    # finalizes+registers (deploy) or stops at the review gate
+                    # (generate). Standalone jobs have no session.
+                    await self._continue_workflow(request, result)
                 except JobCancelled:
                     self._set_status(job_id, JOB_STATUS_CANCELLED, progress="cancelled")
                 except GenerationJobError as exc:
@@ -2254,6 +2259,30 @@ class GenerationJobManager:
                     self._set_status(job_id, JOB_STATUS_FAILED, progress="failed", error=str(exc))
         finally:
             self._tasks.pop(job_id, None)
+
+    async def _continue_workflow(self, request: dict[str, Any],
+                                 result: dict[str, Any]) -> None:
+        """Hand a completed session-scoped leg to the gateway workflow (R2).
+
+        The session, not the job, is the workflow: `operation=deploy` finalizes
+        and registers, `operation=generate` stops at the review gate. A job with
+        no session (standalone generation) has nothing to continue.
+        """
+        service_id = request.get("service_id")
+        if not service_id or not request.get("user_name"):
+            return
+        from . import pre_deploy_registry as _pdr
+        if _pdr.get_session(str(service_id)) is None:
+            return
+        from .deploy_workflow import on_generation_completed
+        try:
+            await on_generation_completed(
+                service_id=str(service_id), request=request, result=result,
+            )
+        except Exception:  # noqa: BLE001 — the job is already completed
+            import logging
+            logging.getLogger("gateway.generation").exception(
+                "workflow continuation failed for %s", service_id)
 
     # ------------------------------------------------------------------
     # Context construction (decision 5a)
