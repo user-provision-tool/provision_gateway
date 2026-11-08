@@ -380,7 +380,20 @@ async def _lifecycle(service_id: str, action: str, req: dict | None = None,
         if action == "remove":
             result = await provision_service.remove_instance(service_id, "service")
         elif action == "rebuild":
-            result = await provision_service.rebuild_instance(service_id, **(req or {}))
+            req = dict(req or {})
+            if req.pop("use_global_proxy", False):
+                # The Redeploy modal's "use global proxy" tick is not part of
+                # the -api's RebuildRequest; expand it here into the four proxy
+                # build args a context build needs, or the build reaches no
+                # package index.
+                from ..services.proxy_service import inject_proxy_build_args
+                db = SessionLocal()
+                try:
+                    req["build_args"] = inject_proxy_build_args(
+                        db, req.get("build_args"), True)
+                finally:
+                    db.close()
+            result = await provision_service.rebuild_instance(service_id, **req)
         elif action == "start":
             result = await provision_service.start_instance(service_id)
         elif action == "stop":

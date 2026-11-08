@@ -241,22 +241,23 @@ def stream_verdict(source_ip: str, handle_host: str, db: Session, registry) -> d
     if denial is not None:
         _STATS["denied"] += 1
         _log.warning(
-            "cross-stream-verify denied: source=%s reason=%s",
-            str(source["service_id"]), denial["reason"],
+            "cross-stream-verify denied: source_ip=%s source=%s reason=%s",
+            source_ip, str(source["service_id"]), denial["reason"],
         )
         return denial
     result = decide(db, source, entry)
     if not result["allowed"]:
         _STATS["denied"] += 1
         _log.warning(
-            "cross-stream-verify denied: source=%s target=%s reason=%s",
-            str(source["service_id"]), str(entry["service_id"]), result["reason"],
+            "cross-stream-verify denied: source_ip=%s source=%s target=%s reason=%s",
+            source_ip, str(source["service_id"]), str(entry["service_id"]),
+            result["reason"],
         )
         return result
     _STATS["allowed"] += 1
     _log.info(
-        "cross-stream-verify allowed: source=%s canonical=%s reason=%s",
-        str(source["service_id"]), row.canonical_name, result["reason"],
+        "cross-stream-verify allowed: source_ip=%s source=%s canonical=%s reason=%s",
+        source_ip, str(source["service_id"]), row.canonical_name, result["reason"],
     )
     return {
         "allowed": True,

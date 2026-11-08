@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -27,6 +28,11 @@ from .routers import (
     tasks_router,
     users_router,
 )
+
+# G89 — the gateway's own INFO records (the cross-stream-verify allow line,
+# which carries the raw source IP) must reach a handler: uvicorn configures
+# only its own loggers, and the root fallback drops INFO.
+logging.basicConfig(level=logging.INFO)
 
 _start_time = time.time()
 

@@ -7,6 +7,7 @@ caller rule, and the grant-driven resolver config. The live end-to-end run is
 
 from __future__ import annotations
 
+import logging
 import types
 
 import pytest
@@ -176,3 +177,49 @@ def test_dnsmasq_config_is_grant_driven_and_idempotent(monkeypatch, tmp_path):
     assert o.write_dnsmasq_config({"localhost"}) is True
     content = (tmp_path / "dnsmasq.d" / "cross.conf").read_text()
     assert "snaprovision.com" not in content
+
+
+def test_stream_verdict_logs_the_raw_source_ip_and_never_the_handle(monkeypatch, caplog):
+    """G89 — the stream verdict adds the RAW source IP to the resolved id.
+
+    The handle is a credential, so it must never appear in the log; the raw IP
+    (the value the cross nginx sent as X-Source-IP) is the new observable.
+    """
+    monkeypatch.setattr(cross_verify, "resolve_source", lambda ip: _source())
+    monkeypatch.setattr(
+        cross_verify, "_stream_target",
+        lambda db, registry, handle: (
+            types.SimpleNamespace(canonical_name="target--app.example.com", port=9000),
+            {"service_id": "target-1"},
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        cross_verify, "decide",
+        lambda db, source, target: {"allowed": True, "reason": "grant"},
+    )
+    with caplog.at_level(logging.INFO, logger="gateway.cross_verify"):
+        verdict = cross_verify.stream_verdict(
+            "172.28.0.9", "secret-handle.example.com", _Db(), None
+        )
+    assert verdict["allowed"] is True
+    assert "source_ip=172.28.0.9" in caplog.text
+    assert "source=source-1" in caplog.text
+    assert "secret-handle.example.com" not in caplog.text
+
+
+def test_stream_verdict_denial_logs_the_raw_source_ip(monkeypatch, caplog):
+    monkeypatch.setattr(cross_verify, "resolve_source", lambda ip: _source())
+    monkeypatch.setattr(
+        cross_verify, "_stream_target",
+        lambda db, registry, handle: (
+            None, None, {"allowed": False, "status": 403, "reason": "unknown handle"}
+        ),
+    )
+    with caplog.at_level(logging.INFO, logger="gateway.cross_verify"):
+        verdict = cross_verify.stream_verdict(
+            "172.28.0.9", "secret-handle.example.com", _Db(), None
+        )
+    assert verdict["allowed"] is False
+    assert "source_ip=172.28.0.9" in caplog.text
+    assert "secret-handle.example.com" not in caplog.text

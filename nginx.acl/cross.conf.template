@@ -120,6 +120,14 @@ stream {
         ~^(?<rest>[^.]+)\.(?<d>.+)$ /certs/$d/privkey.pem;
     }
 
+    # G89 / R7.3 — the cross stream access log records the SENDER at this hop:
+    # $remote_addr is the source container's cross-network address (the browser
+    # host at the edge). $ssl_server_name is deliberately NOT in the format —
+    # here it is the exposure handle, a credential.
+    log_format stream_sender '$remote_addr - [STREAM $time_local] $protocol '
+                             '$status $bytes_sent $bytes_received $session_time';
+    access_log /var/log/nginx/stream-access.log stream_sender;
+
     js_import cross_stream_acl from /etc/nginx/acl/cross-stream-acl.js;
 
     server {

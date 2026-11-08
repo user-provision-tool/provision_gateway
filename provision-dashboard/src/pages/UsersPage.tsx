@@ -1879,7 +1879,28 @@ export default function UsersPage() {
                 <Text type="secondary">owner {s.user_name}</Text>
                 {s.is_public && <Tag color="green">Public</Tag>}
               </Space>
-              <ServiceEndpointsView svc={s} goUrlFor={goUrlFor} />
+              <ServiceEndpointsView
+                svc={s}
+                goUrlFor={goUrlFor}
+                // The popup is still a VIEW: it offers only the read action
+                // (Show exposure URL), never Generate — minting stays on the
+                // target's own card. Without this slot the stream rows were
+                // rendered with no action at all.
+                streamActions={(canonical: string) => {
+                  const url = exposureUrls[canonical]
+                  return (
+                    <>
+                      <Button size="small" onClick={() => showExposure(s, canonical)}
+                        title="Read the live exposure URL from the gateway; it is shown in a popup and cleared when the popup closes">
+                        Show exposure URL
+                      </Button>
+                      {url && (
+                        <Text code copyable={{text: url}} style={{fontSize:12}}>{url}</Text>
+                      )}
+                    </>
+                  )
+                }}
+              />
               {!(s.http_endpoints || []).length && !(s.stream_sub_services || []).length && (
                 <Text type="secondary">No endpoints recorded for this instance.</Text>
               )}

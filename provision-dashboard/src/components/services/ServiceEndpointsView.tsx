@@ -9,7 +9,8 @@ const { Text } = Typography
  * existing card content, not a second simplified view.
  *
  * `streamActions` is the card's per-row action slot (Generate / Show / the
- * shown-once URL). The popup omits it: it is a view, never an editor.
+ * shown-once URL). The card passes both actions; the `Can call` popup passes
+ * the READ-ONLY slot (Show + the shown-once URL) — a view, never an editor.
  */
 export interface ServiceEndpointsViewProps {
   svc: any

@@ -42,6 +42,27 @@ def test_entrypoint_substitutes_the_serving_ports():
     assert 'NGINX_HTTPS_PORT="${NGINX_HTTPS_PORT:-443}"' in entry
 
 
+def _stream_log_format(conf: str) -> str:
+    start = conf.index("log_format stream_sender")
+    return conf[start:conf.index(";", start) + 1]
+
+
+def test_stream_access_log_records_the_sender_ip_and_never_the_handle():
+    """G89 — the edge and the cross log the sender at the hop, never the SNI.
+
+    On both doors ``$remote_addr`` is the sender of that hop (the browser host
+    at the edge, the source container's cross-network address at the cross);
+    ``$ssl_server_name`` there is the exposure handle, a credential, so it must
+    not appear in the stream log format.
+    """
+    for name in ("edge.conf.template", "cross.conf.template"):
+        conf = _read(name)
+        fmt = _stream_log_format(conf)
+        assert "$remote_addr" in fmt
+        assert "$ssl_server_name" not in fmt
+        assert "access_log /var/log/nginx/stream-access.log stream_sender;" in conf
+
+
 def test_cross_hook_calls_the_token_free_verify_with_the_source_ip_and_never_logs_the_handle():
     hook = _read("cross-stream-acl.js")
     assert "/api/auth/cross-stream-verify" in hook
