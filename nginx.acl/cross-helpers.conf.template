@@ -11,7 +11,8 @@
 
 location = /_auth_cross {
     internal;
-    resolver 127.0.0.11 valid=30s ipv6=off;
+    # G91 — HTTP consumer: re-resolve within 10 s, no restart after a change.
+    resolver 127.0.0.11 valid=10s ipv6=off;
     # Fail closed FAST. A stopped gateway leaves its cross-network address
     # unreachable (no RST), so nginx's default 60 s connect timeout would hang
     # the client instead of returning the documented 500 (measured 2026-11-03).
@@ -22,11 +23,13 @@ location = /_auth_cross {
     proxy_set_header X-Source-IP $remote_addr;
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    # The gateway's CROSS-NETWORK address, deliberately: a name would resolve
-    # to both attachments and Docker picked the shared one, so the gateway saw
-    # the cross nginx's shared IP instead of the cross IP it trusts (measured
-    # 2026-11-03). The auth call is a cross-network hop by definition.
-    proxy_pass http://172.28.0.4:8770/api/auth/cross-verify;
+    # G91 — the gateway's CROSS-ONLY alias, deliberately (never the plain name:
+    # it is ambiguous for a dual-homed gateway and Docker may return the shared
+    # address, making the gateway see the cross nginx's shared IP). The variable
+    # keeps the path re-resolving; the URI stays explicit so the rewritten request
+    # URI is not passed to cross-verify.
+    set $gateway_cross_upstream subnet-acl-gateway-cross;
+    proxy_pass http://$gateway_cross_upstream:8770/api/auth/cross-verify;
 }
 
 location @auth_401 {

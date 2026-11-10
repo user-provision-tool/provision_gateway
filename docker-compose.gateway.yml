@@ -32,28 +32,30 @@ services:
       - DATABASE_URL=postgresql+psycopg://gateway_app:${GATEWAY_DB_PASSWORD:-gateway_app_pw}@subnet-acl-postgres:5432/${POSTGRES_DB:-subnet_acl}
       - GATEWAY_READER_DATABASE_URL=postgresql+psycopg://gateway_reader:${GATEWAY_READER_DB_PASSWORD:-gateway_reader_pw}@subnet-acl-postgres:5432/${POSTGRES_DB:-subnet_acl}
       - PROVISION_COOKIE_TTL=${PROVISION_COOKIE_TTL:-604800}
-      # G83 — the cross service network. The gateway writes the dnsmasq config
-      # through the shared PROVISION_DIR volume and calls the -api with these
-      # opaque values; the static IPs are the cross-network assignments below.
+      # G83/G91 — the cross service network. The gateway writes the dnsmasq
+      # config through the shared PROVISION_DIR volume and calls the -api with
+      # these opaque values. G91: the cross nginx / resolver addresses are NOT
+      # settings any more — the gateway resolves the cross nginx's cross-only
+      # alias and the resolver's plain name itself (see app/services/cross_values.py).
       - CROSS_NETWORK=${CROSS_NETWORK:-subnet_acl_cross}
-      - CROSS_RESOLVER_IP=${CROSS_RESOLVER_IP:-172.28.0.3}
-      - CROSS_NGINX_IP=${CROSS_NGINX_IP:-172.28.0.2}
       - CROSS_CONFIG_DIR=${PROVISION_DIR:-/srv/provision_subnet_acl}/cross
       - CROSS_TASK_TIMEOUT_SEC=${CROSS_TASK_TIMEOUT_SEC:-30}
       - CROSS_TASK_RETRIES=${CROSS_TASK_RETRIES:-3}
+      # The ~5 s periodic resolve that owns both dynamic cross-path values.
+      - CROSS_WATCH_INTERVAL_SEC=${CROSS_WATCH_INTERVAL_SEC:-5}
     networks:
-      # Static IP pin: the edge (subnet-acl-nginx-acl) resolves the DNS name
-      # 'subnet-acl-gateway' at startup and caches the peer for the container's
-      # lifetime. Without a pin, any gateway recreate can move the container to a
-      # new IP and silently break every edge -> gateway proxy hop (502) until the
-      # edge is restarted (cycle 20260901T102115Z GAP-22). Pin keeps the IP stable.
-      subnet_acl_shared:
-        ipv4_address: 172.17.0.4
+      # G91 — no static IP pins anywhere. Every container gets a dynamic address
+      # and every name consumer re-resolves (edge/dashboard/cross nginx via
+      # variable upstreams; the gateway via its ~5 s resolve loop).
+      subnet_acl_shared: {}
       # G83 — the gateway is a cross-network member (so a source container can
       # reach its API). Subordinate to the platform network: the shared network
-      # stays the container's top network.
+      # stays the container's top network. G91 — the cross-only alias is what
+      # the cross nginx dials for cross-verify; the plain name is ambiguous for
+      # a dual-homed container, so it is never used for this hop.
       subnet_acl_cross:
-        ipv4_address: 172.28.0.4
+        aliases:
+          - subnet-acl-gateway-cross
         gw_priority: -1
     restart: unless-stopped
 
@@ -148,8 +150,7 @@ services:
       # atomically (tmp + rename), and a file bind-mount would keep the old inode.
       - ${PROVISION_DIR:-/srv/provision_subnet_acl}/cross/dnsmasq.d:/etc/dnsmasq.d:ro
     networks:
-      subnet_acl_cross:
-        ipv4_address: 172.28.0.3
+      subnet_acl_cross: {}
     restart: unless-stopped
 
   # G83 — the cross nginx: the private edge replica. Same image and service
@@ -177,10 +178,12 @@ services:
     user: nginx
     networks:
       subnet_acl_shared: {}
-      # The static cross-network IP is what the dnsmasq wildcard targets and
-      # what the gateway trusts as the cross-verify caller.
+      # G91 — no pin. The dnsmasq wildcard and the cross-verify trust are fed by
+      # the gateway's periodic resolve of this cross-only alias; the shared
+      # address is never used for either (a dual-homed plain name is ambiguous).
       subnet_acl_cross:
-        ipv4_address: 172.28.0.2
+        aliases:
+          - subnet-acl-cross-nginx-cross
         gw_priority: -1
     restart: unless-stopped
 
@@ -195,4 +198,4 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: ${CROSS_SUBNET:-172.28.0.0/24}
+        - subnet: ${CROSS_SUBNET:-172.28.0.0/20}

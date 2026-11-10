@@ -122,14 +122,17 @@ class Settings:
         # ---- Exchange code (v4 §6.2) ----
         self.EXCHANGE_CODE_TTL_SEC: int = int(os.environ.get("EXCHANGE_CODE_TTL_SEC", "30"))
 
-        # ---- Cross-service network (GRILLING G83, 2026-11-03) ----
+        # ---- Cross-service network (GRILLING G83, 2026-11-03; G91, 2026-11-09) ----
         # The gateway is a member of the cross network; it writes the dnsmasq
         # config through the shared PROVISION_DIR volume and calls the -api's
         # async resolv.conf/membership API with these values. They are opaque to
-        # the -api. The static IPs are the compose's cross-network assignments.
+        # the -api. G91 — the cross nginx / resolver addresses are NOT settings:
+        # they are resolved from Docker DNS (a dynamic-address stack has no pins),
+        # the cross nginx through its cross-only alias and the resolver through
+        # its plain name. `cross_values` owns the current value.
         self.CROSS_NETWORK: str = os.environ.get("CROSS_NETWORK", "subnet_acl_cross")
-        self.CROSS_RESOLVER_IP: str = os.environ.get("CROSS_RESOLVER_IP", "172.28.0.3")
-        self.CROSS_NGINX_IP: str = os.environ.get("CROSS_NGINX_IP", "172.28.0.2")
+        self.CROSS_NGINX_NAME: str = "subnet-acl-cross-nginx-cross"
+        self.CROSS_RESOLVER_NAME: str = "subnet-acl-cross-resolver"
         self.CROSS_CONFIG_DIR: Path = Path(
             os.environ.get("CROSS_CONFIG_DIR", str(self.PROVISION_DIR / "cross"))
         )
@@ -138,6 +141,10 @@ class Settings:
             os.environ.get("CROSS_TASK_TIMEOUT_SEC", "30")
         )
         self.CROSS_TASK_RETRIES: int = int(os.environ.get("CROSS_TASK_RETRIES", "3"))
+        # The ~5 s periodic resolve that detects a changed cross nginx / resolver.
+        self.CROSS_WATCH_INTERVAL_SEC: float = float(
+            os.environ.get("CROSS_WATCH_INTERVAL_SEC", "5")
+        )
 
         # ---- Logging ----
         self.LOG_LEVEL: str = os.environ.get("GATEWAY_LOG_LEVEL", "INFO")

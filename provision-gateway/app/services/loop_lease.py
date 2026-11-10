@@ -1,9 +1,15 @@
 """Claim a periodic loop for this worker (GRILLING G31).
 
 `acquire_lease` is one atomic statement: an INSERT that becomes an UPDATE only
-while the existing lease has expired. SQLite evaluates the `WHERE` on the
+while the existing lease has expired. PostgreSQL evaluates the `WHERE` on the
 `DO UPDATE`, so a live lease makes the statement touch no row — `rowcount` is 0
 and the caller skips its turn. No read-then-write race, and no lock of our own.
+
+The table is **schema-qualified** (`gateway.loop_leases`): the gateway role's
+`search_path` is `"$user", public`, so an unqualified name raised "relation does
+not exist", the catch-all fallback returned True on every call, and every loop
+ran in all four workers (measured 2026-11-09: zero rows in the table). The ORM
+model already declares the schema; only this raw SQL was missing it.
 """
 
 from __future__ import annotations
@@ -27,9 +33,10 @@ def acquire_lease(name: str, seconds: float) -> bool:
     try:
         res = db.execute(
             text(
-                "INSERT INTO loop_leases (name, locked_until) VALUES (:n, :u) "
+                "INSERT INTO gateway.loop_leases AS ll (name, locked_until) "
+                "VALUES (:n, :u) "
                 "ON CONFLICT(name) DO UPDATE SET locked_until = :u "
-                "WHERE loop_leases.locked_until < :now"
+                "WHERE ll.locked_until < :now"
             ),
             {"n": name, "u": now + float(seconds), "now": now},
         )

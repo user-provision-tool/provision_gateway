@@ -32,27 +32,23 @@ from ..database import reader_engine
 from ..models.service_grant import ServiceGrant
 from ..models.stream_exposure import StreamExposure
 from ..models.user import User
-from . import acl_service
+from . import acl_service, cross_values
 from .basic_credentials import authorization_header
 from .stream_service import hash_handle
 
 _log = logging.getLogger("gateway.cross_verify")
 
-_CROSS_NGINX_IP: str | None = None
 _STATS = {"allowed": 0, "denied": 0}
 
 
 def cross_nginx_ip() -> str | None:
-    """The cross nginx's actual IP, from config or Docker DNS (cached)."""
-    global _CROSS_NGINX_IP
-    if settings.CROSS_NGINX_IP:
-        return settings.CROSS_NGINX_IP
-    if _CROSS_NGINX_IP is None:
-        try:
-            _CROSS_NGINX_IP = socket.gethostbyname("subnet-acl-cross-nginx")
-        except OSError:
-            return None
-    return _CROSS_NGINX_IP
+    """The cross nginx's current cross-network IP (G91: resolved, never pinned).
+
+    Resolved on every call, not read from a cache: the trust check must compare
+    the caller against the address that is true *now*, regardless of which
+    worker's watch loop refreshed last.
+    """
+    return cross_values.resolve_cross_nginx_ip()
 
 
 def _normalize_ip(value: str) -> str:

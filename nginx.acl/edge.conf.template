@@ -39,7 +39,10 @@ http {
 
     # Docker embedded DNS — resolves subnet-acl-gateway / subnet-acl-dashboard /
     # subnet-acl-nginx at request time (variable proxy_pass helper locations).
-    resolver 127.0.0.11 valid=30s ipv6=off;
+    # G91 — the HTTP consumers re-resolve within 10 s; the stream contexts keep
+    # their own valid=30s (a stream session is long-lived and the hook carries
+    # its own resolver).
+    resolver 127.0.0.11 valid=10s ipv6=off;
 
     # ------------------------------------------------------------------
     # SNI → per-domain cert — DYNAMIC catch-all, keyed on the DOMAIN
@@ -134,16 +137,21 @@ http {
     server {
         listen 80;
         server_name ${PORTAL_HOSTNAME} 127.0.0.1 localhost;
+        # G91 — variable upstreams: the names are resolved per request through
+        # the http resolver, so a gateway/dashboard recreate is picked up
+        # without a restart, and the portal starts with either peer down.
+        set $gateway_upstream subnet-acl-gateway;
+        set $dashboard_upstream subnet-acl-dashboard;
         # [if PORTAL_MODE=https] return 301 https://$host$request_uri;
         # Internal-only endpoints must not be reachable via the portal (GAP-31).
         location = /api/auth/verify   { return 404; }
         location = /api/auth/exchange { return 404; }
         # /api/ → gateway with the fixed SSE task-log timeout (U3).
-        location /api/  { proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s; }
-        location /go/   { rewrite ^/go/(.*) /api/auth/go/$1 break; proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
-        location /login { proxy_pass http://subnet-acl-dashboard:80; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
-        location /alert { proxy_pass http://subnet-acl-dashboard:80; }
-        location /     { proxy_pass http://subnet-acl-dashboard:80; }
+        location /api/  { proxy_pass http://$gateway_upstream:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s; }
+        location /go/   { rewrite ^/go/(.*) /api/auth/go/$1 break; proxy_pass http://$gateway_upstream:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+        location /login { proxy_pass http://$dashboard_upstream:80; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+        location /alert { proxy_pass http://$dashboard_upstream:80; }
+        location /     { proxy_pass http://$dashboard_upstream:80; }
     }
     # [if PORTAL_MODE=https]
     server {
@@ -151,13 +159,16 @@ http {
         server_name ${PORTAL_HOSTNAME};
         ssl_certificate /certs/portal/fullchain.pem;
         ssl_certificate_key /certs/portal/privkey.pem;
+        # G91 — variable upstreams (resolved per request, no restart needed).
+        set $gateway_upstream subnet-acl-gateway;
+        set $dashboard_upstream subnet-acl-dashboard;
         location = /api/auth/verify   { return 404; }
         location = /api/auth/exchange { return 404; }
-        location /api/  { proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s; }
-        location /go/   { rewrite ^/go/(.*) /api/auth/go/$1 break; proxy_pass http://subnet-acl-gateway:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
-        location /login { proxy_pass http://subnet-acl-dashboard:80; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
-        location /alert { proxy_pass http://subnet-acl-dashboard:80; }
-        location /     { proxy_pass http://subnet-acl-dashboard:80; }
+        location /api/  { proxy_pass http://$gateway_upstream:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_read_timeout 3600s; }
+        location /go/   { rewrite ^/go/(.*) /api/auth/go/$1 break; proxy_pass http://$gateway_upstream:8770; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+        location /login { proxy_pass http://$dashboard_upstream:80; proxy_set_header X-Forwarded-Proto $scheme; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; }
+        location /alert { proxy_pass http://$dashboard_upstream:80; }
+        location /     { proxy_pass http://$dashboard_upstream:80; }
     }
     # [endif]
 
@@ -192,7 +203,9 @@ http {
             proxy_set_header Host $forwarded_host;
             proxy_set_header X-Forwarded-Proto http;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_pass http://subnet-acl-nginx;
+            # G91 — variable upstream; the internal nginx may be recreated.
+            set $internal_upstream subnet-acl-nginx;
+            proxy_pass http://$internal_upstream;
         }
         include /etc/nginx/acl/acl-helpers.conf;
     }
@@ -220,7 +233,9 @@ http {
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_ssl_server_name on;
             proxy_ssl_verify off;
-            proxy_pass https://subnet-acl-nginx;
+            # G91 — variable upstream; the internal nginx may be recreated.
+            set $internal_upstream subnet-acl-nginx;
+            proxy_pass https://$internal_upstream;
         }
         include /etc/nginx/acl/acl-helpers.conf;
     }
@@ -237,7 +252,9 @@ http {
             proxy_set_header Host $forwarded_host;
             proxy_set_header X-Forwarded-Proto http;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_pass http://subnet-acl-nginx;
+            # G91 — variable upstream; the internal nginx may be recreated.
+            set $internal_upstream subnet-acl-nginx;
+            proxy_pass http://$internal_upstream;
         }
         include /etc/nginx/acl/acl-helpers.conf;
     }
@@ -253,7 +270,9 @@ http {
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_ssl_server_name on;
             proxy_ssl_verify off;
-            proxy_pass https://subnet-acl-nginx;
+            # G91 — variable upstream; the internal nginx may be recreated.
+            set $internal_upstream subnet-acl-nginx;
+            proxy_pass https://$internal_upstream;
         }
         include /etc/nginx/acl/acl-helpers.conf;
     }

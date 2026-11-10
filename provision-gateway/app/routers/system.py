@@ -18,6 +18,26 @@ router = APIRouter(prefix="/api/system", tags=["system"])
 _start_time = time.time()
 
 
+def acl_state(edge_env: dict[str, str] | None) -> dict:
+    """The gateway-vs-edge ACL state.
+
+    G80 — fullset is ACL-on unconditionally and the ``ENABLE_ACL`` switch is
+    gone from the deployment (the edge template renders the gate by default).
+    An ABSENT value therefore means ACL-on; a PRESENT ``false`` still wins, so
+    a deployment that re-adds the switch keeps the drift check that exists
+    because of the 2026-08-28 gateway-on/edge-off outage. ``None`` (the edge env
+    unreadable) is unknown, never a fabricated mismatch of true-vs-false.
+    """
+    gateway = bool(settings.ENABLE_ACL)
+    if edge_env is None:
+        edge = None
+    else:
+        edge = edge_env.get("ENABLE_ACL", "true").lower() == "true"
+    return {"gateway": gateway, "edge": edge,
+            "enabled": bool(gateway and edge),
+            "consistent": edge is not None and gateway == edge}
+
+
 @router.get("/status")
 async def system_status(
     current_user: dict = Depends(require_gateway_token),
@@ -114,20 +134,14 @@ async def system_status(
 
     # ACL state: the gateway setting AND the edge container env must BOTH be on
     # for ACL to be effective — a gateway-on/edge-off drift (the 2026-08-28 G3
-    # outage) silently exposes native Basic on the internal nginx.
-    acl = {
-        "gateway": bool(settings.ENABLE_ACL),
-        "edge": False,
-        "enabled": False,
-        "consistent": False,
-    }
+    # outage) silently exposes native Basic on the internal nginx. G80 removed
+    # the switch from the deployment, so an ABSENT value means on (see
+    # acl_state); only an explicit edge-off is a mismatch.
     try:
         edge_env = await provision_service.container_env("subnet-acl-nginx-acl")
-        acl["edge"] = edge_env.get("ENABLE_ACL", "false").lower() == "true"
     except Exception:
-        acl["edge"] = None  # edge env unreadable → unknown
-    acl["enabled"] = bool(acl["gateway"] and acl["edge"])
-    acl["consistent"] = acl["gateway"] == acl["edge"]
+        edge_env = None  # edge env unreadable → unknown
+    acl = acl_state(edge_env)
 
     return {
         "provision_api": provision_api_status,

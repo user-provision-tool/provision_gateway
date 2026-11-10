@@ -42,6 +42,7 @@ _docker_events_task: asyncio.Task | None = None
 _project_monitor_task: asyncio.Task | None = None
 _account_repair_task: asyncio.Task | None = None
 _cross_startup_task: asyncio.Task | None = None
+_cross_watch_task: asyncio.Task | None = None
 
 
 def _get_reconcile_interval_min() -> int:
@@ -229,7 +230,7 @@ async def _project_monitor_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
-    global _reconcile_task, _docker_events_task, _project_monitor_task, _account_repair_task, _cross_startup_task
+    global _reconcile_task, _docker_events_task, _project_monitor_task, _account_repair_task, _cross_startup_task, _cross_watch_task
     # Startup
     init_db()
     print(f"[gateway] Database initialized at {settings.DATABASE_URL}")
@@ -304,6 +305,14 @@ async def lifespan(app: FastAPI):
     # this process, so it converges.
     _cross_startup_task = asyncio.create_task(_cross_startup_pass())
     print("[gateway] Cross-service grant startup pass scheduled")
+
+    # G91 — the ~5 s resolve that owns both dynamic cross-path values. One
+    # worker acts per tick (the loop lease); the others skip. It rewrites the
+    # dnsmasq records on a cross-nginx change and triggers the re-apply pass
+    # on a resolver change. No other component detects an address change.
+    from .services.cross_orchestrator import cross_orchestrator as _cross_orchestrator
+    _cross_watch_task = asyncio.create_task(_cross_orchestrator.watch_loop())
+    print("[gateway] Cross-service address watch started")
     yield
     # Shutdown
     if _reconcile_task:
@@ -316,6 +325,8 @@ async def lifespan(app: FastAPI):
         _account_repair_task.cancel()
     if _cross_startup_task:
         _cross_startup_task.cancel()
+    if _cross_watch_task:
+        _cross_watch_task.cancel()
     print("[gateway] Shutting down")
 
 

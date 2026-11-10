@@ -2533,6 +2533,55 @@ class TestNewConfigSettings:
         assert hasattr(s, "PROVISION_COOKIE_TTL") or hasattr(s, "provision_cookie_ttl")
 
 
+class TestAclState:
+    """G80 — the edge has no ENABLE_ACL env any more; absent means ACL-on.
+
+    A false "ACL: Mismatch" badge is a false alarm on the safety indicator that
+    exists because of the 2026-08-28 gateway-on/edge-off outage, so the default
+    and the drift case are both pinned here.
+    """
+
+    def test_absent_enable_acl_on_the_edge_means_acl_on(self):
+        from app.routers.system import acl_state
+        state = acl_state({"PORTAL_MODE": "http"})
+        assert state["edge"] is True and state["enabled"] is True
+        assert state["consistent"] is True
+
+    def test_an_explicit_edge_off_is_still_a_mismatch(self):
+        from app.routers.system import acl_state
+        state = acl_state({"ENABLE_ACL": "false"})
+        assert state["edge"] is False and state["enabled"] is False
+        assert state["consistent"] is False
+
+    def test_an_unreadable_edge_env_is_unknown_not_a_match(self):
+        from app.routers.system import acl_state
+        state = acl_state(None)
+        assert state["edge"] is None
+        assert state["consistent"] is False
+
+
+class TestLoopLease:
+    """G31 — the lease table is schema-qualified, so a live claim is respected.
+
+    Before the fix the unqualified INSERT raised "relation does not exist", the
+    catch-all fallback returned True, and every loop ran in all four workers.
+    These tests fail if that path comes back: the second acquire must be refused
+    while the first window is live.
+    """
+
+    def test_a_live_lease_is_not_reacquired(self):
+        from app.services.loop_lease import acquire_lease
+        assert acquire_lease("unit_test_lease", 60) is True
+        assert acquire_lease("unit_test_lease", 60) is False
+
+    def test_an_expired_lease_is_reacquired(self):
+        import time
+        from app.services.loop_lease import acquire_lease
+        assert acquire_lease("unit_test_lease_expired", 0.05) is True
+        time.sleep(0.1)
+        assert acquire_lease("unit_test_lease_expired", 60) is True
+
+
 # ---------------------------------------------------------------------------
 # Tests for auth verify endpoint response headers (golden requirement alignment)
 # ---------------------------------------------------------------------------
@@ -2845,9 +2894,12 @@ class TestEdgeSetTokenReachable:
             "for the F7 /go/ handoff — v5 §4.3/§8.8 (Gap 1)."
         )
         # The relay must still forward the full query string to the exchange.
-        assert "proxy_pass http://subnet-acl-gateway:8770/api/auth/exchange$is_args$args" in block, (
+        # G91 — the gateway is a variable upstream (dynamic address); the URI
+        # and the query string are unchanged.
+        assert "proxy_pass http://$gateway_upstream:8770/api/auth/exchange$is_args$args" in block, (
             "edge `/_set_token` must relay `$is_args$args` to the gateway exchange (F12)."
         )
+        assert "set $gateway_upstream subnet-acl-gateway;" in block
 
     def test_set_token_kept_outside_auth_request_location(self):
         from pathlib import Path

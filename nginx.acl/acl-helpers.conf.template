@@ -37,7 +37,9 @@
 # --- auth_request target: gateway verify (fail-closed) ---
 location = /_auth_jwt {
     internal;
-    resolver 127.0.0.11 valid=30s ipv6=off;
+    # G91 — HTTP consumer: re-resolve the gateway within 10 s, no restart.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    set $gateway_upstream subnet-acl-gateway;
     proxy_pass_request_body off;
     proxy_set_header Content-Length "";
     proxy_set_header X-Original-URI $request_uri;
@@ -67,7 +69,7 @@ location = /_auth_jwt {
     # Fail-closed (decision 3): if the gateway is unreachable the subrequest
     # 502s, which makes auth_request return 500 to the client → service
     # unreachable rather than exposed.
-    proxy_pass http://subnet-acl-gateway:8770/api/auth/verify;
+    proxy_pass http://$gateway_upstream:8770/api/auth/verify;
 }
 
 # --- 401: challenge for API / portal redirect for browser ---
@@ -115,7 +117,9 @@ location @auth_403 {
 # this URL (design v5 §4.3/§8.8); the 30s signed code is the credential (not
 # single-use — the window is the guarantee; see the note at /_auth_jwt).
 location = /_set_token {
-    resolver 127.0.0.11 valid=30s ipv6=off;
+    # G91 — HTTP consumer: re-resolve the gateway within 10 s, no restart.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    set $gateway_upstream subnet-acl-gateway;
     proxy_pass_request_body off;
     proxy_set_header Content-Length "";
     proxy_set_header X-Original-URI $request_uri;
@@ -124,5 +128,5 @@ location = /_set_token {
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     # Forward the signed 30 s exchange code as-is — the `?code=` the /go/ 303
     # handed the client (no JWT rides in the URL; F13).
-    proxy_pass http://subnet-acl-gateway:8770/api/auth/exchange$is_args$args;
+    proxy_pass http://$gateway_upstream:8770/api/auth/exchange$is_args$args;
 }

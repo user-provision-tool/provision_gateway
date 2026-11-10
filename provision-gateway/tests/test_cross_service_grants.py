@@ -12,7 +12,7 @@ import types
 
 import pytest
 
-from app.services import cross_verify
+from app.services import cross_values, cross_verify
 from app.services.cross_orchestrator import CrossOrchestrator
 from app.config import settings
 
@@ -56,6 +56,10 @@ def _no_account_service(monkeypatch):
                         lambda user: False)
     monkeypatch.setattr(cross_verify.acl_service, "allows",
                         lambda db, grantee, shared_id: False)
+    # G91 — the value cache is process-wide; every test starts empty.
+    cross_values.reset()
+    yield
+    cross_values.reset()
 
 
 def test_same_owner_is_allowed():
@@ -145,7 +149,7 @@ def test_unknown_source_is_401():
 
 
 def test_only_the_cross_nginx_ip_is_trusted(monkeypatch):
-    monkeypatch.setattr(settings, "CROSS_NGINX_IP", "172.28.0.2")
+    monkeypatch.setattr(cross_verify, "cross_nginx_ip", lambda: "172.28.0.2")
     monkeypatch.setattr(cross_verify, "_ptr_name", lambda ip: "some-app")
     assert cross_verify.is_cross_nginx_caller("172.28.0.2")
     assert cross_verify.is_cross_nginx_caller("::ffff:172.28.0.2")
@@ -154,16 +158,48 @@ def test_only_the_cross_nginx_ip_is_trusted(monkeypatch):
 
 def test_the_shared_network_caller_is_trusted_by_container_identity(monkeypatch):
     """G85 — the stream hook's fetch can leave over the shared network."""
-    monkeypatch.setattr(settings, "CROSS_NGINX_IP", "172.28.0.2")
+    monkeypatch.setattr(cross_verify, "cross_nginx_ip", lambda: "172.28.0.2")
     monkeypatch.setattr(cross_verify, "_ptr_name",
                         lambda ip: "subnet-acl-cross-nginx" if ip == "172.17.0.5" else "app")
     assert cross_verify.is_cross_nginx_caller("172.17.0.5")
     assert not cross_verify.is_cross_nginx_caller("172.17.0.9")
 
 
+def test_cross_values_refresh_reports_each_change(monkeypatch):
+    """G91 — one resolve reports which dynamic value moved."""
+    names = {}
+    monkeypatch.setattr(
+        cross_values, "_resolve",
+        lambda name: names.get(name, "10.0.0.9"),
+    )
+    names[settings.CROSS_NGINX_NAME] = "10.0.0.2"
+    names[settings.CROSS_RESOLVER_NAME] = "10.0.0.3"
+    first = cross_values.refresh()
+    assert not first["cross_nginx_changed"] and not first["resolver_changed"]
+
+    names[settings.CROSS_NGINX_NAME] = "10.0.0.4"
+    second = cross_values.refresh()
+    assert second["cross_nginx_changed"] and not second["resolver_changed"]
+    assert second["cross_nginx_ip"] == "10.0.0.4"
+
+    names[settings.CROSS_RESOLVER_NAME] = "10.0.0.5"
+    third = cross_values.refresh()
+    assert not third["cross_nginx_changed"] and third["resolver_changed"]
+    assert third["resolver_ip"] == "10.0.0.5"
+
+
+def test_cross_values_keep_the_last_value_on_a_failed_resolve(monkeypatch):
+    cross_values.set_current(cross_nginx_ip="10.0.0.2", resolver_ip="10.0.0.3")
+    monkeypatch.setattr(cross_values, "_resolve", lambda name: None)
+    result = cross_values.refresh()
+    assert result["cross_nginx_ip"] == "10.0.0.2"
+    assert result["resolver_ip"] == "10.0.0.3"
+    assert not result["cross_nginx_changed"] and not result["resolver_changed"]
+
+
 def test_dnsmasq_config_is_grant_driven_and_idempotent(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "CROSS_CONFIG_DIR", tmp_path)
-    monkeypatch.setattr(settings, "CROSS_NGINX_IP", "172.28.0.2")
+    cross_values.set_current(cross_nginx_ip="172.28.0.2")
     o = CrossOrchestrator()
     assert o.write_dnsmasq_config({"localhost", "snaprovision.com"}) is True
     content = (tmp_path / "dnsmasq.d" / "cross.conf").read_text()

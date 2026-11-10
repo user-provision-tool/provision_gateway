@@ -7,9 +7,10 @@ The gateway owns two derived artifacts:
 2. each granted source's **resolv.conf + cross-network membership**, applied by
    the -api through its asynchronous generic API.
 
-They are refreshed on every grant/lifecycle change and once on the gateway's
-own startup (a one-time pass, not a periodic reconcile). A stack rebuild
-restarts the gateway, so it converges.
+They are refreshed on every grant/lifecycle change, once on the gateway's own
+startup, and — since G91 (no static pins) — by a ~5 s address watch that
+re-resolves the two dynamic values: a changed cross nginx rewrites the dnsmasq
+records, a changed cross resolver triggers the re-apply pass.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from pathlib import Path
 
 from ..config import settings
 from ..database import SessionLocal
-from . import service_grants
+from . import cross_values, service_grants
 from .provision_service import provision_service
 
 _log = logging.getLogger("gateway.cross_orchestrator")
@@ -40,13 +41,22 @@ class CrossOrchestrator:
     def _config_path(self) -> Path:
         return settings.CROSS_CONFIG_DIR / "dnsmasq.d" / "cross.conf"
 
-    def write_dnsmasq_config(self, domains: set[str]) -> bool:
+    def write_dnsmasq_config(
+        self, domains: set[str], *, cross_nginx_ip: str | None = None,
+    ) -> bool:
         """Rewrite the resolver config atomically; True when the content changed.
 
-        Every wildcard points at the cross nginx's cross-network IP. The file is
-        a directory mount (not a single-file mount) so an atomic replace is seen
-        by the resolver container; its watcher restarts dnsmasq when mtime moves.
+        Every wildcard points at the cross nginx's current **cross-network** IP
+        (G91: resolved through the cross-only alias, never a startup constant).
+        The file is a directory mount (not a single-file mount) so an atomic
+        replace is seen by the resolver container; its watcher restarts dnsmasq
+        when mtime moves. A missing value is not written: an empty wildcard
+        target would black-hole the whole cross path.
         """
+        cross_ip = cross_nginx_ip or cross_values.current_cross_nginx_ip()
+        if not cross_ip:
+            _log.error("cross nginx address is not resolved; dnsmasq config left as is")
+            return False
         path = self._config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = [CONFIG_HEADER, "no-resolv\n", "no-hosts\n"]
@@ -56,7 +66,7 @@ class CrossOrchestrator:
             # REFUSED. REFUSED for an IN-ZONE name would make a client treat
             # the name as failing rather than as IPv4-only (measured 2026-11-03).
             lines.append(f"local=/{domain}/\n")
-            lines.append(f"address=/*.{domain}/{settings.CROSS_NGINX_IP}\n")
+            lines.append(f"address=/*.{domain}/{cross_ip}\n")
         content = "".join(lines)
         try:
             if path.read_text(encoding="utf-8") == content:
@@ -84,14 +94,18 @@ class CrossOrchestrator:
             await asyncio.sleep(0.5)
         raise TimeoutError(f"the -api task {task_id} did not finish in time")
 
-    async def _apply(self, service_id: str, present: bool) -> bool:
+    async def _apply(
+        self, service_id: str, present: bool, *, resolver_ip: str | None = None,
+    ) -> bool:
         """Submit + poll, with the ruling's timeout/retry."""
         last: Exception | None = None
         for attempt in range(1, settings.CROSS_TASK_RETRIES + 1):
             try:
                 if present:
+                    if not resolver_ip:
+                        raise RuntimeError("the cross resolver address is not resolved")
                     data = await provision_service.set_extra_resolver(
-                        service_id, resolver_ip=settings.CROSS_RESOLVER_IP,
+                        service_id, resolver_ip=resolver_ip,
                         network=settings.CROSS_NETWORK,
                     )
                 else:
@@ -109,34 +123,53 @@ class CrossOrchestrator:
         _log.error("cross-path update for %s gave up: %s", service_id, last)
         return False
 
-    async def _sync_source(self, entry: dict) -> bool:
+    async def _sync_source(self, entry: dict, *, resolver_ip: str) -> bool:
         service_id = str(entry["service_id"])
         try:
             current = await provision_service.get_extra_resolver(service_id)
         except Exception:  # noqa: BLE001 — a stale read is not a reason to skip
             current = {}
-        if (current.get("extra_resolver") == settings.CROSS_RESOLVER_IP
+        if (current.get("extra_resolver") == resolver_ip
                 and current.get("extra_network") == settings.CROSS_NETWORK):
             return True
-        return await self._apply(service_id, present=True)
+        return await self._apply(service_id, present=True, resolver_ip=resolver_ip)
 
     async def _clear_source(self, service_id: str) -> bool:
         return await self._apply(service_id, present=False)
 
     async def sync_all(self) -> dict:
-        """Refresh the resolver config and every source's resolv.conf/membership."""
+        """Refresh the resolver config and every source's resolv.conf/membership.
+
+        Both dynamic values are snapshotted once per pass (G91): the dnsmasq
+        records and the resolver pair must carry one coherent pair, and a value
+        changing mid-pass must not split them.
+        """
+        cross_ip = cross_values.current_cross_nginx_ip()
+        resolver_ip = cross_values.current_resolver_ip()
         db = SessionLocal()
         try:
             domains = service_grants.reachable_domains(db)
-            changed = self.write_dnsmasq_config(domains)
+            changed = (
+                self.write_dnsmasq_config(domains, cross_nginx_ip=cross_ip)
+                if cross_ip else False
+            )
             sources = service_grants.sources_with_targets(db)
             entries = service_grants.entries_by_id()
         finally:
             db.close()
+        if not resolver_ip:
+            _log.error(
+                "cross resolver address is not resolved; the resolver pair is not applied"
+            )
+            return {"domains": sorted(domains), "config_changed": changed,
+                    "sources": len(sources), "applied": 0, "failed": len(sources),
+                    "cleared": 0, "clear_failed": 0,
+                    "error": "cross resolver address not resolved"}
         applied = 0
         for service_id in list(sources):
             entry = entries.get(str(service_id))
-            if entry is not None and await self._sync_source(entry):
+            if entry is not None and await self._sync_source(
+                    entry, resolver_ip=resolver_ip):
                 applied += 1
         # A live service that lost its last target must release the pair. A
         # stopped service keeps it: its containers are re-applied when they
@@ -177,6 +210,43 @@ class CrossOrchestrator:
                       attempt, last.get("failed"), last.get("clear_failed"))
             await asyncio.sleep(10.0)
         return last
+
+    async def _refresh_dnsmasq(self, cross_nginx_ip: str) -> None:
+        """Rewrite the resolver records from the grant state and the new address."""
+        db = SessionLocal()
+        try:
+            domains = service_grants.reachable_domains(db)
+        finally:
+            db.close()
+        self.write_dnsmasq_config(domains, cross_nginx_ip=cross_nginx_ip)
+
+    async def watch_loop(self) -> None:
+        """The ~5 s resolve that owns both dynamic values (GRILLING G91).
+
+        One worker runs it (the lease); every tick re-resolves the cross nginx
+        alias and the resolver name. A cross-nginx change rewrites the dnsmasq
+        records (the trust check already reads the same current value); a
+        resolver change triggers the full re-apply pass. Nothing else watches:
+        the `-api` stays a writer and has no detection role.
+        """
+        from .loop_lease import acquire_lease
+
+        interval = max(1.0, settings.CROSS_WATCH_INTERVAL_SEC)
+        while True:
+            try:
+                if acquire_lease("cross_watch", max(30.0, interval * 3)):
+                    result = await asyncio.to_thread(cross_values.refresh)
+                    if result["cross_nginx_changed"]:
+                        _log.info("cross nginx address changed to %s",
+                                  result["cross_nginx_ip"])
+                        await self._refresh_dnsmasq(result["cross_nginx_ip"])
+                    if result["resolver_changed"]:
+                        _log.info("cross resolver address changed to %s; "
+                                  "running the re-apply pass", result["resolver_ip"])
+                        await self.sync_all()
+            except Exception:  # noqa: BLE001 — the next tick retries
+                _log.exception("cross-path address watch failed")
+            await asyncio.sleep(interval)
 
     async def sync_after_task(self, task_id: str) -> None:
         """Wait for a deploy/rebuild task to finish, then refresh everything."""
