@@ -52,6 +52,17 @@ body {
   animation: redeploy-blink-anim 1s ease-in-out infinite;
 }
 
+/* G90 placeholder card: a card-creating operation inserts this blinking card
+   at click and replaces it with the real card when the refresh returns it. */
+@keyframes placeholder-blink-anim {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+.placeholder-blink {
+  animation: placeholder-blink-anim 1.2s ease-in-out infinite;
+}
+
 .setup-container {
   display: flex;
   justify-content: center;

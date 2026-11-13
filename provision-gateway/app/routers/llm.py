@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -270,8 +271,13 @@ async def create_generation_job(
                     request=req,
                     use_global_proxy=bool(req.get("use_global_proxy")),
                 )
-        raise HTTPException(503, {"error": e.code, "detail": str(e),
-                                  "running": e.in_flight, "capacity": e.capacity})
+        raise HTTPException(503, {
+            "error": e.code, "detail": str(e),
+            "queued": getattr(e, "queued", None),
+            "capacity": getattr(e, "capacity", None),
+            "heartbeat_age_s": getattr(e, "age_s", None),
+            "stale_after_s": getattr(e, "stale_after_s", None),
+        })
 
     if _session_scoped:
         from ..services import pre_deploy_registry as pdr
@@ -440,7 +446,10 @@ async def cancel_generation_job(
     if job.status in ("completed", "failed", "cancelled", "unknown"):
         raise HTTPException(409, f"Task is already terminal: {job.status}")
     job = generation_jobs.cancel_job(db, job_id)
+    settled = await asyncio.to_thread(generation_jobs.wait_for_terminal, job.task_id)
     log_action(db, action="llm_generation_job_cancel", admin_id=current_admin["id"],
-               target_service=job.service_name, status="cancelled",
+               target_service=job.service_name, status=settled.get("status"),
                detail={"job_id": job.task_id})
-    return {"job_id": job.task_id, "status": job.status}
+    return {"job_id": job.task_id, "status": settled.get("status"),
+            "confirmed": settled.get("confirmed"),
+            "error": None if settled.get("confirmed") else "cancellation_unconfirmed"}

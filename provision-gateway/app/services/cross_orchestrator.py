@@ -81,9 +81,11 @@ class CrossOrchestrator:
         return True
 
     async def _poll_task(self, task_id: str) -> None:
+        """Read the task row directly (R9.2) instead of polling the -api."""
+        from . import registry_tasks
         deadline = time.monotonic() + settings.CROSS_TASK_TIMEOUT_SEC
         while time.monotonic() < deadline:
-            data = await provision_service.get_task(task_id)
+            data = await asyncio.to_thread(registry_tasks.get, task_id) or {}
             status = str(data.get("status") or "")
             if status == "completed":
                 return
@@ -97,7 +99,15 @@ class CrossOrchestrator:
     async def _apply(
         self, service_id: str, present: bool, *, resolver_ip: str | None = None,
     ) -> bool:
-        """Submit + poll, with the ruling's timeout/retry."""
+        """Submit + poll, with the ruling's timeout/retry.
+
+        G92: a queue refusal or a queued-wait timeout DEFERS to the next sync
+        cycle instead of retrying. Retrying a refusal submits the same work
+        again into a full queue — the feedback loop that saturated the queue on
+        the first post-queue startup pass (measured 2026-11-10) — and the queue
+        itself has no wait timeout, so a task still queued after the caller's
+        30 s is delayed, not failed.
+        """
         last: Exception | None = None
         for attempt in range(1, settings.CROSS_TASK_RETRIES + 1):
             try:
@@ -112,8 +122,19 @@ class CrossOrchestrator:
                     data = await provision_service.clear_extra_resolver(service_id)
                 await self._poll_task(str(data["task_id"]))
                 return True
+            except TimeoutError as exc:
+                _log.info(
+                    "cross-path update for %s is still queued; deferring to the "
+                    "next sync cycle", service_id)
+                last = exc
+                return False
             except Exception as exc:  # noqa: BLE001 — retry, then report
                 last = exc
+                code = _refusal_code(exc)
+                if code in ("queue_full", "queue_unavailable"):
+                    _log.info(
+                        "cross-path update for %s deferred: %s", service_id, code)
+                    return False
                 _log.warning(
                     "cross-path update for %s attempt %d/%d failed: %s",
                     service_id, attempt, settings.CROSS_TASK_RETRIES, exc,
@@ -249,10 +270,14 @@ class CrossOrchestrator:
             await asyncio.sleep(interval)
 
     async def sync_after_task(self, task_id: str) -> None:
-        """Wait for a deploy/rebuild task to finish, then refresh everything."""
+        """Wait for a deploy/rebuild task to finish, then refresh everything.
+
+        Reads the task row directly (R9.2) instead of polling the -api.
+        """
+        from . import registry_tasks
         try:
             while True:
-                data = await provision_service.get_task(task_id)
+                data = await asyncio.to_thread(registry_tasks.get, task_id) or {}
                 if str(data.get("status") or "") in (
                         "completed", "failed", "cancelled", "unknown"):
                     break
@@ -263,6 +288,24 @@ class CrossOrchestrator:
 
 
 cross_orchestrator = CrossOrchestrator()
+
+
+def _refusal_code(exc: Exception) -> str | None:
+    """The -api's queue refusal code from an httpx error, if any."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(body, dict):
+        if isinstance(body.get("error"), str):
+            return body["error"]
+        detail = body.get("detail")
+        if isinstance(detail, dict) and isinstance(detail.get("error"), str):
+            return detail["error"]
+    return None
 
 
 def schedule_sync() -> None:

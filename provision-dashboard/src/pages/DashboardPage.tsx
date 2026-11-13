@@ -96,6 +96,12 @@ export default function DashboardPage() {
           <Card style={{height:110}}><Statistic title="Running Tasks" value={sysStatus?.tasks_running ?? 0}/></Card>
         </Col>
         <Col xs={24} sm={12} md={6}>
+          {/* G92 R7.3 — the same counts as the Services-page bar and the card. */}
+          <Card style={{height:110}}>
+            <Statistic title="Queuing Tasks" value={sysStatus?.tasks_queued ?? 0}/>
+          </Card>
+        </Col>
+        <Col xs={24} sm={12} md={6}>
           <Card style={{height:110}}>
             <Statistic title="Containers" value={cStats.total_expected ?? 0}
               suffix={<span style={{fontSize:12,display:'block',marginTop:4}}>

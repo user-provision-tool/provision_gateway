@@ -18,8 +18,9 @@ const epochSeconds = (v: any): number | undefined => {
 }
 
 const STATUS_COLORS: Record<string, string> = {
-  queued: 'default', running: 'processing', paused: 'warning', awaiting_input: 'warning',
-  completed: 'success', failed: 'error', cancelled: 'warning', unknown: 'default',
+  queued: 'default', planned: 'blue', running: 'processing', paused: 'warning',
+  awaiting_input: 'warning', completed: 'success', failed: 'error',
+  cancelled: 'warning', unknown: 'default',
 }
 
 type Row = {
@@ -118,7 +119,7 @@ export default function TasksPage() {
       render: (_: any, r: Row) => (
         <Space>
           <Button size="small" icon={<EyeOutlined />} onClick={() => openLogs(r.id)}>Logs</Button>
-          {['queued', 'running'].includes(r.status) && (
+          {['queued', 'planned', 'running'].includes(r.status) && (
             <Popconfirm title="Cancel?" onConfirm={() => cancelTask(r.id)}>
               <Button size="small" danger icon={<PauseCircleOutlined />} />
             </Popconfirm>

@@ -37,6 +37,8 @@ REGISTRY_MIGRATIONS_DIR = (
 
 GATEWAY_TABLES = [
     "gateway.tasks",
+    "gateway.queue_config",
+    "gateway.queue_state",
     "gateway.pre_deploy_sessions",
     "gateway.label_reservations",
     "gateway.service_grants",
@@ -57,6 +59,8 @@ GATEWAY_TABLES = [
 
 REGISTRY_TABLES = [
     "registry.tasks",
+    "registry.queue_config",
+    "registry.queue_state",
     "registry.service_basic",
     "registry.service_endpoints",
     "registry.service_instances",
@@ -177,6 +181,17 @@ def truncate() -> None:
             "TRUNCATE " + ", ".join(GATEWAY_TABLES + REGISTRY_TABLES)
             + " RESTART IDENTITY CASCADE"
         )
+        # Re-seed the queue singletons: every test starts with the documented
+        # defaults and a fresh planner heartbeat.
+        for schema in ("gateway", "registry"):
+            conn.execute(
+                f"INSERT INTO {schema}.queue_config (id) VALUES (1) "
+                "ON CONFLICT (id) DO NOTHING"
+            )
+            conn.execute(
+                f"INSERT INTO {schema}.queue_state (id, last_dispatch_at) "
+                "VALUES (1, now()) ON CONFLICT (id) DO NOTHING"
+            )
 
 
 def provision() -> None:

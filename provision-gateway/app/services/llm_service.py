@@ -21,6 +21,16 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+
+class LLMAbort(Exception):
+    """The caller asked to stop this call (cancel or run timeout).
+
+    Raised from a streaming progress callback. `_chat_stream` must let it
+    propagate (never swallow it as a progress-callback error): leaving the
+    `async with client.stream(...)` closes the in-flight HTTP request, which is
+    the gateway's abort rung (G92).
+    """
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -1408,6 +1418,10 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
                             )
                             try:
                                 on_delta(est)
+                            except LLMAbort:
+                                # Close the in-flight request: unwinding the
+                                # stream context is the abort (never swallow it).
+                                raise
                             except Exception:
                                 pass
 

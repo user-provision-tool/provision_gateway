@@ -51,11 +51,13 @@ export interface ServiceCardProps {
   alert?: ReactNode
   /** The header's right-hand buttons. */
   actions?: ReactNode
+  /** Extra class on the panel — the placeholder card's blink lives here. */
+  className?: string
   children?: ReactNode
 }
 
 export default function ServiceCard({
-  panelKey, badge, title, label, headerExtra, alert, actions, children,
+  panelKey, badge, title, label, headerExtra, alert, actions, className, children,
   ...rest
 }: ServiceCardProps) {
   // `...rest` is LOAD-BEARING, not tidiness. AntD renders a `Collapse`'s
@@ -81,6 +83,7 @@ export default function ServiceCard({
       {...rest}
       key={panelKey}
       panelKey={panelKey}
+      className={className}
       header={
         // ONE row: the badge, the service name, then the status note INLINE.
         // The note used to be a block on a line of its own (and, on a failed

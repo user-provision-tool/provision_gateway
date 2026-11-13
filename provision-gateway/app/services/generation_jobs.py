@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -38,11 +39,16 @@ from ..models.gateway_task import (
     STATUS_COMPLETED as JOB_STATUS_COMPLETED,
     STATUS_FAILED as JOB_STATUS_FAILED,
     STATUS_PAUSED as JOB_STATUS_PAUSED,
+    STATUS_PLANNED as JOB_STATUS_PLANNED,
     STATUS_QUEUED as JOB_STATUS_QUEUED,
     STATUS_RUNNING as JOB_STATUS_RUNNING,
     job_origin,
 )
-from .llm_service import llm_service
+from .llm_service import llm_service, LLMAbort
+from .queue_contract import (
+    CANCEL_TIMEOUTS as QC_CANCEL_TIMEOUTS,
+    GenerationCapacityError, QueueFullError, QueueUnavailableError,
+)
 
 ProgressFn = Callable[[str], Awaitable[None]]
 
@@ -327,28 +333,6 @@ def _int_setting(name: str, default: int) -> int:
         return default
 
 
-class GenerationCapacityError(RuntimeError):
-    """The GATEWAY's own generation pool is full (GRILLING G29).
-
-    A sibling of the -api's `TaskCapacityError`, with a different reason: that
-    one guards the HOST against concurrent docker work, this one guards the LLM
-    endpoint and cost. Both are refusals the operator must see, and they are
-    distinguished by a stable code so the card can show the right remedy —
-    `at_capacity` ("cancel a hanging task and retry") versus
-    `generation_at_capacity` ("wait for a generation, or cancel one").
-    """
-
-    code = "generation_at_capacity"
-
-    def __init__(self, in_flight: int, capacity: int):
-        self.in_flight = in_flight
-        self.capacity = capacity
-        super().__init__(
-            f"generation at capacity: {in_flight} job(s) running (limit {capacity}); "
-            "wait for one to finish, or cancel one"
-        )
-
-
 class GenerationJobManager:
     """Creates, runs, polls, cancels and prunes generation jobs.
 
@@ -488,68 +472,24 @@ class GenerationJobManager:
         # below: only finished rows are eligible.
         self.prune_excess(db)
 
-        # CAPACITY, COUNTED IN THE DATABASE (GRILLING G31). Not from an
-        # in-memory map: the gateway runs `uvicorn --workers 4`, so a per-process
-        # count would let four workers each admit `limit` jobs and the effective
-        # limit would be four times the configured one. Counting here, inside the
-        # same transaction as the insert, is what makes the number true.
-        #
-        # `awaiting_input` counts as in-flight: a parked leg still holds its
-        # slot's work (G27 will make a pause TERMINAL, at which point it stops
-        # counting — the two changes go together).
-        from ..config import settings as _settings
-        from sqlalchemy import text as _text
-        limit = _int_setting("GATEWAY_MAX_GENERATIONS", 4)
-        # Serialize admission ACROSS workers: a plain count-then-insert lets two
-        # uvicorn workers both see "N below the limit" and both insert. The
-        # transaction-scoped advisory lock makes the count and the insert one
-        # critical section, so the limit is the limit.
-        db.execute(_text("SELECT pg_advisory_xact_lock(:k)"),
-                   {"k": 7_412_003})
-        in_flight = (
-            db.query(GenerationJob)
-            .filter(GenerationJob.status.in_([JOB_STATUS_QUEUED, JOB_STATUS_RUNNING,
-                                              JOB_STATUS_AWAITING_INPUT]))
-            .count()
-        )
-        if in_flight >= limit:
-            db.rollback()
-            raise GenerationCapacityError(in_flight, limit)
+        # ADMISSION (R1): 20 queued + the planner heartbeat. The check and the
+        # insert are one critical section across the four uvicorn workers (the
+        # transaction-scoped advisory lock inside `admit`). A refusal writes no
+        # row: the caller sees `queue_full` / `queue_unavailable`.
+        from .task_queue import gateway_queue
+        gateway_queue.admit(db)
 
+        # The credential handoff MUST exist before a worker can claim the row
+        # (the scheduler may claim the instant this transaction becomes
+        # visible), so it is registered BEFORE the commit.
+        if resume_values:
+            _RESUME_HANDOFF[job.task_id] = dict(resume_values)
         db.add(job)
         db.commit()
         db.refresh(job)
-        # The credential handoff MUST exist before the runner can claim/read it.
-        if resume_values:
-            _RESUME_HANDOFF[job.task_id] = dict(resume_values)
-        loop = asyncio.get_running_loop()
-        self._tasks[job.task_id] = loop.create_task(self._run_job(job.task_id))
+        # No in-process task here: the scheduler claims `planned -> running`
+        # and only then starts the runner (workers are consumers, T3/R4).
         return job
-
-    def claim_job(self, job_id: int) -> bool:
-        """Claim a queued job for THIS process — atomically (GRILLING G31).
-
-        `UPDATE ... WHERE id = ? AND status = 'queued'` and a rowcount check:
-        exactly one caller can win, whoever it is and whichever process it runs
-        in. Without it two workers can both see a `queued` row and both run the
-        job — the same job, twice, writing the same files.
-
-        Returns True when this caller owns the job."""
-        from ..database import SessionLocal
-
-        db = SessionLocal()
-        try:
-            n = (
-                db.query(GenerationJob)
-                .filter(GenerationJob.id == job_id,
-                        GenerationJob.status == JOB_STATUS_QUEUED)
-                .update({GenerationJob.status: JOB_STATUS_RUNNING},
-                        synchronize_session=False)
-            )
-            db.commit()
-            return n == 1
-        finally:
-            db.close()
 
     @classmethod
     def _compute_phases(cls, job_type: str, request: dict[str, Any]) -> list[str]:
@@ -965,27 +905,74 @@ class GenerationJobManager:
         # cannot leak one. The old code also DELETEd the mirrored task here to
         # free a pool slot — a leak class that no longer exists.
         if job.status in self.CANCELLABLE_STATUSES:
-            _had_runner = job.status in self._RUNNING_LEG_STATUSES
-            if _had_runner:
+            if job.status in (JOB_STATUS_QUEUED, JOB_STATUS_PLANNED,
+                              JOB_STATUS_PAUSED):
+                # Not running: the cancel is immediate and the row is terminal.
+                job.status = JOB_STATUS_CANCELLED
+                job.progress = "cancelled"
+                job.finished_at = datetime.now(timezone.utc)
+                job.updated_at = datetime.now(timezone.utc)
+                from ..services import pre_deploy_registry as _pdr
+                _pdr.finish_leg(job_id, None)
+            else:
+                # Running (or awaiting an answer): request the abort and let the
+                # runner settle. The caller polls up to the per-kind cancellation
+                # timeout; an unsettled request stays visible as `running` with
+                # `cancel_requested_at` (the watchdog fails it) (R6.3).
+                if job.cancel_requested_at is None:
+                    job.cancel_requested_at = datetime.now(timezone.utc)
+                job.progress = "cancelling…"
+                job.updated_at = datetime.now(timezone.utc)
                 self._cancelled.add(job_id)
-            job.status = JOB_STATUS_CANCELLED
-            # A live leg's runner writes the final progress itself as it unwinds;
-            # a paused leg has no runner, so this write is its LAST word and must
-            # not promise a further one ("cancelling…" would stay forever).
-            job.progress = "cancelling…" if _had_runner else "cancelled"
-            job.updated_at = datetime.now(timezone.utc)
             db.commit()
             db.refresh(job)
-            # This write is the OTHER way a job reaches a terminal status, and
-            # the rule is about the status, not about who wrote it: a cancelled
-            # leg owns no session either. `None` = the leg produced nothing to
-            # hand on, so its record goes. `finish_leg` never touches a
-            # `paused`/`refused` session, which is what makes this safe to call
-            # unconditionally — the delete path's own cancel must not destroy the
-            # record the operator is looking at.
-            from ..services import pre_deploy_registry as _pdr
-            _pdr.finish_leg(job_id, None)
         return job
+
+    def signal_cancel(self, task_id: str) -> None:
+        """Wake this process's runner (the row remains the cross-process truth)."""
+        self._cancelled.add(task_id)
+
+    def wait_for_terminal(self, job_id: str, timeout: int | None = None) -> dict:
+        """Poll a cancelled row to terminal within the cancellation bound.
+
+        Returns ``{task_id, status, confirmed, error}``; an unsettled cancel is
+        ``cancellation_unconfirmed`` and the row stays visible to the watchdog.
+        """
+        import time as _time
+        from .task_queue import gateway_queue
+        row = self._job_row(job_id)
+        if row is None:
+            return {"task_id": job_id, "status": None, "confirmed": False}
+        kind = "fix_analysis" if row.get("operation") == "fix" else "generate"
+        limit = timeout if timeout is not None else int(
+            gateway_queue.config().get(f"cancel_timeout_{kind}",
+                                       QC_CANCEL_TIMEOUTS.get(kind, 120)))
+        deadline = _time.monotonic() + limit
+        while _time.monotonic() < deadline:
+            current = self._job_row(job_id)
+            if current and current["status"] in self._TERMINAL:
+                return {"task_id": job_id, "status": current["status"],
+                        "confirmed": True, "error": current.get("error")}
+            _time.sleep(0.25)
+        current = self._job_row(job_id)
+        return {"task_id": job_id,
+                "status": current["status"] if current else None,
+                "confirmed": False, "error": "cancellation_unconfirmed",
+                "timeout_s": limit}
+
+    @staticmethod
+    def _job_row(job_id: str) -> dict | None:
+        from ..database import SessionLocal
+        db = SessionLocal()
+        try:
+            row = db.execute(
+                sql_text("SELECT task_id, status, operation, error "
+                         "FROM gateway.tasks WHERE task_id=:id"),
+                {"id": str(job_id)},
+            ).mappings().first()
+            return dict(row) if row else None
+        finally:
+            db.close()
 
     def cancel_session_after_task_cancel(self, task_id: str) -> None:
         """A cancelled generation leg removes its session unless operator-held."""
@@ -1054,20 +1041,39 @@ class GenerationJobManager:
             db.close()
 
     def recover_stale_jobs(self, db: Session) -> int:
-        """A restart leaves `unknown`; the recovery sweep terminalizes it (R4.2)."""
+        """A restart fails ONLY running rows; `queued`/`planned` survive (R2.2).
+
+        A generation task creates no containers, so its "runtime cleanup" is
+        nothing beyond the row write; generated files stay in place (R6.2).
+        """
+        dead = [
+            row.task_id
+            for row in db.query(GenerationJob)
+            .filter(GenerationJob.status == JOB_STATUS_RUNNING)
+            .all()
+        ]
         rows = (
             db.query(GenerationJob)
-            .filter(GenerationJob.status.in_([JOB_STATUS_QUEUED, JOB_STATUS_RUNNING]))
+            .filter(GenerationJob.status == JOB_STATUS_RUNNING)
             .update(
                 {
-                    "status": "unknown",
-                    "error": "gateway restarted — runner lost",
+                    "status": JOB_STATUS_FAILED,
+                    "error": "interrupted by restart",
+                    "finished_at": datetime.now(timezone.utc),
                     "updated_at": datetime.now(timezone.utc),
                 },
                 synchronize_session=False,
             )
         )
         db.commit()
+        # Release the sessions of the legs that just died (a live leg owns a
+        # `generating` reservation; a failed one must not keep it).
+        for task_id in dead:
+            try:
+                from ..services import pre_deploy_registry as _pdr
+                _pdr.finish_leg(task_id, None)
+            except Exception:  # noqa: BLE001
+                pass
         self._tasks.clear()
         self._cancelled.clear()
         self._cancel_polled.clear()
@@ -1126,6 +1132,18 @@ class GenerationJobManager:
                 from ..services import pre_deploy_registry as _pdr
                 _pdr.finish_leg(job_id, None)
                 return
+            # A queued/planned cancel writes `cancelled` directly; a running
+            # cancel (and a run timeout) writes `cancel_requested_at` and lets
+            # the runner settle. If the runner's own terminal write races that
+            # request, the request wins: CANCELLED for an operator cancel, and
+            # FAILED for a run-timeout abort (R5.1/R6.2).
+            if job.cancel_requested_at is not None and status in (
+                    JOB_STATUS_COMPLETED, JOB_STATUS_FAILED,
+                    JOB_STATUS_CANCELLED):
+                if (job.error or "").startswith("run timeout"):
+                    status = JOB_STATUS_FAILED
+                else:
+                    status = JOB_STATUS_CANCELLED
             job.status = status
             if status in (JOB_STATUS_COMPLETED, JOB_STATUS_FAILED, JOB_STATUS_CANCELLED):
                 # The job is over: its cancel bookkeeping is moot. Both maps only
@@ -1133,6 +1151,9 @@ class GenerationJobManager:
                 # that happened to reuse it (ids restart at 1 in a fresh DB).
                 self._cancelled.discard(job_id)
                 self._cancel_polled.pop(job_id, None)
+                # R7.1 — the telemetry clock. A queued/planned cancel never
+                # started, so it keeps a NULL started_at.
+                job.finished_at = datetime.now(timezone.utc)
             if progress:
                 job.progress = progress
             if error is not None:
@@ -1213,9 +1234,34 @@ class GenerationJobManager:
         if now - self._cancel_polled.get(job_id, 0.0) < 1.0:
             return
         self._cancel_polled[job_id] = now
-        if self.job_status(job_id) == JOB_STATUS_CANCELLED:
+        if self._cancel_requested(job_id):
             self._cancelled.add(job_id)
             raise JobCancelled()
+
+    def _cancel_requested(self, job_id: int) -> bool:
+        """A row is cancelling when cancelled OR when the abort was requested.
+
+        The queue's cancel path writes ``cancel_requested_at`` and leaves the
+        row ``running`` until the runner settles; the run-timeout watchdog uses
+        the same field. Both must stop the runner.
+        """
+        from ..database import SessionLocal
+        db = SessionLocal()
+        try:
+            row = db.execute(
+                sql_text(
+                    "SELECT status, cancel_requested_at FROM gateway.tasks "
+                    "WHERE task_id=:id"),
+                {"id": str(job_id)},
+            ).mappings().first()
+            if not row:
+                return False
+            return (row["status"] == JOB_STATUS_CANCELLED
+                    or row["cancel_requested_at"] is not None)
+        except Exception:  # noqa: BLE001 — a store failure must not stop the runner
+            return False
+        finally:
+            db.close()
 
     async def _run_job(self, job_id: int) -> None:
         from ..database import SessionLocal
@@ -1234,17 +1280,17 @@ class GenerationJobManager:
             )
             if not job:
                 return
+            # ONLY THE CLAIMANT RUNS IT: the scheduler's `planned -> running`
+            # claim is the single winner (T3/R4). A row that is not running was
+            # cancelled between the claim and this load, or never claimed.
+            if job.status != JOB_STATUS_RUNNING:
+                return
             request = _as_dict(job.request)
             service_name = job.service_name
             recipe_path = job.recipe_path or ""
         finally:
             db.close()
 
-        # ONLY THE CLAIMANT RUNS IT (GRILLING G31). A second process that sees
-        # the same `queued` row must not run it too — the atomic UPDATE inside
-        # `claim_job` decides, and the loser returns quietly.
-        if not self.claim_job(job_id):
-            return
         handoff = _RESUME_HANDOFF.pop(str(job_id), None)
         if handoff:
             request["resume_values"] = handoff
@@ -1371,7 +1417,16 @@ class GenerationJobManager:
                         def _live_est(est_out: int) -> None:
                             """Streaming progress: update ONE in-place row with the
                             estimated output tokens as the response arrives (the
-                            exact usage replaces it when the call completes)."""
+                            exact usage replaces it when the call completes).
+
+                            Also the cancel polling point: a cancel/timeout
+                            raises out of the LLM stream, closing the in-flight
+                            request (the abort rung, G92).
+                            """
+                            try:
+                                self._check_cancelled(job_id)
+                            except JobCancelled:
+                                raise LLMAbort() from None
                             try:
                                 asyncio.get_running_loop().create_task(_event(
                                     fname, "running", {
@@ -2251,7 +2306,7 @@ class GenerationJobManager:
                     # finalizes+registers (deploy) or stops at the review gate
                     # (generate). Standalone jobs have no session.
                     await self._continue_workflow(request, result)
-                except JobCancelled:
+                except (JobCancelled, LLMAbort):
                     self._set_status(job_id, JOB_STATUS_CANCELLED, progress="cancelled")
                 except GenerationJobError as exc:
                     self._set_status(job_id, JOB_STATUS_FAILED, progress="failed", error=str(exc))

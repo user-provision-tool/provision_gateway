@@ -9,6 +9,7 @@ from sqlalchemy.orm import synonym
 from ..database import Base
 
 STATUS_QUEUED = "queued"
+STATUS_PLANNED = "planned"
 STATUS_RUNNING = "running"
 STATUS_AWAITING_INPUT = "awaiting_input"  # reserved/import-only
 STATUS_PAUSED = "paused"
@@ -53,6 +54,11 @@ class GatewayTask(Base):
     target_snapshot = Column(JSONB, nullable=True)
     events = Column(JSONB, nullable=True)
     pending_input = Column(JSONB, nullable=True)
+    # Queue columns (G92): the plan order and the telemetry/abort clocks.
+    plan_seq = Column(Integer, nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    cancel_requested_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
@@ -98,6 +104,11 @@ class GatewayTask(Base):
             "usage": self.usage,
             "events": self.events,
             "pending_input": self.pending_input,
+            "plan_seq": self.plan_seq,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+            "cancel_requested_at": (self.cancel_requested_at.isoformat()
+                                    if self.cancel_requested_at else None),
             "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,

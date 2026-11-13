@@ -4,6 +4,10 @@ import { Typography, Card, Tag, Space, Button, Empty, Spin, message, Input, Coll
 import { RocketOutlined, ReloadOutlined, EyeOutlined, EyeInvisibleOutlined, SearchOutlined, CaretRightOutlined, PauseOutlined, DeleteOutlined, CopyOutlined, LinkOutlined, KeyOutlined, UnlockOutlined, SwapOutlined, UnorderedListOutlined, DashboardOutlined, GlobalOutlined, StopOutlined, RobotOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import { useAuth } from '../hooks/useAuth'
+import {
+  PendingCode, PlaceholderCard, addPlaceholder, batchBlocking, cardBusy,
+  pendingLabel, placeholderKey, queueLabel, reconcilePlaceholders, statusBadge,
+} from '../contracts'
 import client from '../api/client'
 import DeployForm from '../components/services/DeployForm'
 import ServiceCard from '../components/users/ServiceCard'
@@ -123,6 +127,28 @@ function SessionAlert({ sess }: { sess: any }) {
         tone="warning"
         text="generation pool was full — this generation was refused"
         detail={sess.detail || 'Wait for a running generation to finish, or cancel one, then retry.'}
+      />
+    )
+  }
+  // G92 — the bounded queue's refusals. `queue_full` means 20 tasks are already
+  // waiting; `queue_unavailable` means the planner heartbeat is stale (a service
+  // problem, not a busy one). Both are actionable and must not read as a
+  // generic failure.
+  if (sess.state === 'refused' && sess.reason === 'queue_full') {
+    return (
+      <HeaderNote
+        tone="warning"
+        text="the task queue is full — this task was not accepted"
+        detail={sess.detail || 'Wait for queued work to start, or cancel a queued task, then retry.'}
+      />
+    )
+  }
+  if (sess.state === 'refused' && sess.reason === 'queue_unavailable') {
+    return (
+      <HeaderNote
+        tone="error"
+        text="the task queue is unavailable — the planner is down"
+        detail={sess.detail || 'Nothing was queued. Retry once the planner heartbeat is fresh.'}
       />
     )
   }
@@ -393,9 +419,24 @@ export default function UsersPage() {
   // Batch (multi-select) delete also uses the typed-confirm modal (feature 2 —
   // no plain-Popconfirm delete path remains).
   const [delBatch, setDelBatch] = useState(false)
-  // Optimistic "Deleting…" overlay (the durable state is the -api registry
-  // status 'deleting'; this only bridges click → next poll).
-  const [deletingKeys, setDeletingKeys] = useState<Set<string>>(new Set())
+  // G90 pending state: card key → the operator-initiated label shown INSTEAD
+  // of the server badge until the operation settles. `deleting` is the only
+  // code that also bridges click → the card leaving the stages list; every
+  // other code is cleared by its own request. The durable `deleting` status is
+  // the -api registry's; this map is the click-time acknowledgment.
+  const [pending, setPending] = useState<Record<string, PendingCode>>({})
+  // Card-creating operations (deploy) insert a blinking placeholder card
+  // synchronously at submit; it is replaced by the real entry (G90).
+  const [placeholders, setPlaceholders] = useState<PlaceholderCard[]>([])
+  // Buttons that are neither status changes nor card creations (password
+  // remove, exposure Generate/Show): loading only, no badge change.
+  const [controlBusy, setControlBusy] = useState<Record<string, boolean>>({})
+  const withBusy = async (key: string, fn: () => Promise<void>) => {
+    setControlBusy(prev => ({ ...prev, [key]: true }))
+    try { await fn() } finally {
+      setControlBusy(prev => { const n = { ...prev }; delete n[key]; return n })
+    }
+  }
   const [editorLoading, setEditorLoading] = useState(false)
   const [editorSaving, setEditorSaving] = useState(false)
 
@@ -414,6 +455,8 @@ export default function UsersPage() {
 
   // Batch selection state
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
+  // G92 — both queues' telemetry for the Services-page top bar (R7.3).
+  const [queueStats, setQueueStats] = useState<any>(null)
   const [batchLoading, setBatchLoading] = useState(false)
 
   // Rebuild confirmation modal
@@ -706,39 +749,108 @@ export default function UsersPage() {
     })
   }
 
-  // Batch action: start/stop/rebuild/remove selected services
+  // Batch action: start/stop/rebuild selected services. Each item is its own
+  // request and its own result (R8.3): the first refusal never aborts the rest,
+  // and the operator sees every refusal's reason. The bar pre-filters by
+  // status (R8.2), so a dispatched batch is expected to be all-valid.
   const batchAction = async (action: string) => {
     setBatchLoading(true)
     const keys = Array.from(selectedKeys)
+    // Batch start/stop is a status-changing click too (G90): each selected card
+    // gets its pending label for the duration of the loop.
+    if (action === 'start' || action === 'stop') {
+      const code: PendingCode = action === 'start' ? 'starting' : 'stopping'
+      setPending(prev => {
+        const next = { ...prev }
+        for (const k of keys) next[k] = code
+        return next
+      })
+    }
+    const results: { key: string; ok: boolean; error?: string }[] = []
     try {
       for (const key of keys) {
         const sid = key.startsWith('svc:') ? key.slice(4) : key
-        switch (action) {
-          case 'stop': await client.post(`/services/instances/${sid}/stop`); break
-          case 'start': await client.post(`/services/instances/${sid}/start`); break
-          case 'rebuild': await client.post(`/services/instances/${sid}/rebuild`, {no_cache: true}); break
+        try {
+          switch (action) {
+            case 'stop': await client.post(`/services/instances/${sid}/stop`); break
+            case 'start': await client.post(`/services/instances/${sid}/start`); break
+            case 'rebuild': await client.post(`/services/instances/${sid}/rebuild`, {no_cache: true}); break
+          }
+          results.push({ key, ok: true })
+        } catch (err: any) {
+          const d = err.response?.data?.detail
+          const reason = typeof d === 'string' ? d : (d?.detail || d?.error || 'refused')
+          results.push({ key, ok: false, error: reason })
         }
       }
-      message.success(`Batch ${action}: ${keys.length} service(s) processed`)
-      setSelectedKeys(new Set())
+      const failed = results.filter(r => !r.ok)
+      if (failed.length === 0) {
+        message.success(`Batch ${action}: ${results.length} service(s) processed`)
+        setSelectedKeys(new Set())
+      } else {
+        // Per-item outcomes, never one generic failure.
+        message.warning(
+          `Batch ${action}: ${results.length - failed.length} processed, ` +
+          `${failed.length} refused — ${failed
+            .map(r => `${svcNameFor(r.key)}: ${r.error}`).join('; ')}`,
+          8,
+        )
+      }
       refreshServices()
-    } catch (err: any) {
-      message.error(err.response?.data?.detail || `Batch ${action} failed`)
     } finally {
       setBatchLoading(false)
+      if (action === 'start' || action === 'stop') {
+        setPending(prev => {
+          const next = { ...prev }
+          for (const k of keys) {
+            if (next[k] === 'starting' || next[k] === 'stopping') delete next[k]
+          }
+          return next
+        })
+      }
     }
   }
 
-  // Drop optimistic "Deleting…" flags for instances that are gone from the
-  // server list (so a failed/never-arriving removal can't stick forever).
-  const pruneDeleting = (list: ServiceInstance[]) => {
-    setDeletingKeys(prev => {
-      if (prev.size === 0) return prev
-      const live = new Set(list.map(s => `${s.user_name}-${s.service_name}-${s.label}`))
-      const next = new Set([...prev].filter(k => live.has(k)))
-      return next.size === prev.size ? prev : next
+  const svcNameFor = (key: string) => {
+    const sid = key.startsWith('svc:') ? key.slice(4) : key
+    const svc = services.find(s => s.service_id === sid)
+    return svc ? `${svc.user_name}/${svc.service_name}/${svc.label}` : sid
+  }
+  const selectedStatuses = (): string[] =>
+    Array.from(selectedKeys).map(k => {
+      const sid = k.startsWith('svc:') ? k.slice(4) : k
+      return services.find(s => s.service_id === sid)?.status || 'unknown'
+    })
+
+  // Drop a `Deleting…` code only once its card has left the stages list — and
+  // compare the SAME key shape the code was set with (`svc:<service_id>`). The
+  // old code compared name-shaped keys, so the first refresh dropped the flag
+  // while the card was still there and the badge silently reverted (the defect
+  // R1.2 exists to fix). Other codes are cleared by their own request, never
+  // by a poll.
+  const prunePending = (list: ServiceInstance[]) => {
+    setPending(prev => {
+      const keys = Object.keys(prev)
+      if (keys.length === 0) return prev
+      const live = new Set(list.map(s => `svc:${s.service_id}`))
+      let changed = false
+      const next: Record<string, PendingCode> = {}
+      for (const k of keys) {
+        if (prev[k] === 'deleting' && k.startsWith('svc:') && !live.has(k)) {
+          changed = true
+          continue
+        }
+        next[k] = prev[k]
+      }
+      return changed ? next : prev
     })
   }
+
+  // Replace placeholders with the real cards the moment the stages refresh
+  // includes their triple; keep the others waiting.
+  useEffect(() => {
+    setPlaceholders(prev => reconcilePlaceholders(prev, services, sessions))
+  }, [services, sessions])
 
   // The workflow analyses (LLM-fix) still live on the pre-deploy read model;
   // the session/instance STAGE comes from the unified projection (R9): the
@@ -768,7 +880,7 @@ export default function UsersPage() {
     setLoading(true)
     try {
       const { services: list, sessions: sess } = await _fetchStages()
-      setServices(list); setSessions(sess); pruneDeleting(list)
+      setServices(list); setSessions(sess); prunePending(list)
     } catch (err: any) { message.error('Failed to load services') }
     finally { setLoading(false) }
   }
@@ -777,17 +889,30 @@ export default function UsersPage() {
   const refreshServices = useCallback(async () => {
     try {
       const { services: list, sessions: sess } = await _fetchStages()
-      setServices(list); setSessions(sess); pruneDeleting(list)
+      setServices(list); setSessions(sess); prunePending(list)
     } catch { /* silent */ }
   }, [])
+
+  // The queue telemetry (R7.3): one read serves the top bar, the Dashboard and
+  // the Settings page. Admin-only at the server (task doc §3.1).
+  const loadQueueStats = useCallback(async () => {
+    if (!isAdmin) return
+    try {
+      const { data } = await client.get('/system/queue')
+      setQueueStats(data)
+    } catch { /* silent: the bar simply stays at its last values */ }
+  }, [isAdmin])
 
   // Auto-poll every 10s — silent refresh, no loading spinner. Sessions and
   // analyses poll with it: `failed + analyzing` is a LIVE gateway-side state, and
   // a card that only learns about it on mount would show it never.
   useEffect(() => {
-    const interval = setInterval(() => { refreshServices(); loadSessions() }, 10000)
+    loadQueueStats()
+    const interval = setInterval(() => {
+      refreshServices(); loadSessions(); loadQueueStats()
+    }, 10000)
     return () => clearInterval(interval)
-  }, [refreshServices])
+  }, [refreshServices, loadQueueStats])
 
   // ONE grouping, TWO card kinds. A pre-deploy session is NOT a separate
   // category: it is the same service card at an earlier point of the path, so it
@@ -802,8 +927,11 @@ export default function UsersPage() {
     const order: string[] = []
     const svcsByUser: Record<string, ServiceInstance[]> = {}
     const sessByUser: Record<string, any[]> = {}
+    const phByUser: Record<string, PlaceholderCard[]> = {}
     const ensure = (un: string) => {
-      if (!svcsByUser[un]) { svcsByUser[un] = []; sessByUser[un] = []; order.push(un) }
+      if (!svcsByUser[un]) {
+        svcsByUser[un] = []; sessByUser[un] = []; phByUser[un] = []; order.push(un)
+      }
     }
     for (const s of services) {
       const un = s.user_name || 'unknown'
@@ -817,31 +945,29 @@ export default function UsersPage() {
       ensure(un)
       if (matches(un, sess.service_name)) sessByUser[un].push(sess)
     }
+    // A placeholder is the deploy's waiting card: it may be the FIRST thing the
+    // user's group has ever held, so it creates the group (admin-only, like the
+    // deploy button that produced it).
+    for (const ph of (isAdmin ? placeholders : [])) {
+      ensure(ph.user)
+      if (matches(ph.user, ph.service)) phByUser[ph.user].push(ph)
+    }
     return order
-      .map(un => ({ userName: un, svcs: svcsByUser[un], sessions: sessByUser[un] }))
-      .filter(g => g.svcs.length > 0 || g.sessions.length > 0)
-  }, [services, sessions, search, isAdmin])
+      .map(un => ({
+        userName: un, svcs: svcsByUser[un], sessions: sessByUser[un],
+        placeholders: phByUser[un],
+      }))
+      .filter(g => g.svcs.length > 0 || g.sessions.length > 0 || g.placeholders.length > 0)
+  }, [services, sessions, placeholders, search, isAdmin])
 
   const getBadge = (s: ServiceInstance, key?: string, analyzing = false) => {
-    // Failed: its own state, read from the registry — never an ordinary
-    // "0 up, 1 down", which is what a failed entry used to look like.
-    // `+ analyzing` (GRILLING G26 row 2) is layered on from the GATEWAY's own
-    // analysis job while one runs: the instance is still `failed` in the -api
-    // registry at that moment, because nothing moves until the analysis
-    // succeeds, so the registry alone cannot express this state.
-    if (s.status === 'failed') {
-      const stage = s.failure?.stage ? ` (${s.failure.stage})` : ''
-      if (analyzing) return <Badge status="processing" text={`Failed${stage} + analyzing`}/>
-      return <Badge status="error" text={`Failed${stage}`}/>
-    }
-    // Building: containers don't exist yet, don't show misleading "down" count
-    if (s.status === 'building') return <Badge status="processing" text="Building..."/>
-    // Deleting: persisted server-side in the registry (like 'building'), so it
-    // survives a page refresh; the local key set only bridges the instant
-    // between the click and the next poll.
-    if (s.status === 'deleting' || (key && deletingKeys.has(key))) {
-      return <Badge status="processing" text="Deleting..."/>
-    }
+    // G90 badge precedence: the operator's pending code is checked FIRST, so a
+    // delete on a `failed` or `building` card changes the badge in the same
+    // render as the click. Only after that do the server states apply.
+    const status = statusBadge(s.status, key ? pending[key] : undefined, {
+      analyzing, failedStage: s.failure?.stage,
+    })
+    if (status) return <Badge status={status.tone} text={status.text}/>
     const h = Object.keys(s.healthy_containers||{}).length
     const uh = Object.keys(s.unhealthy_containers||{}).length
     const m = Object.keys(s.missing_containers||{}).length
@@ -853,26 +979,40 @@ export default function UsersPage() {
   // Cancel a `building` service by cancelling the -api task behind it (§4b).
   // The task list carries each task's {user_name, service_name, label} target,
   // so the card finds its own task rather than the registry carrying a task id.
-  const cancelBuilding = async (svc: ServiceInstance) => {
+  const cancelBuilding = async (svc: ServiceInstance, key: string) => {
+    // Acknowledged at click: the task lookup below is itself a round-trip, and
+    // without this the card would read `Building…` for both of them (R1.3).
+    setPending(prev => ({ ...prev, [key]: 'cancelling' }))
     try {
-      const { data } = await client.get('/tasks')
-      const tasks = data.tasks || []
-      const task = tasks.find((t: any) =>
-        (t.status === 'running' || t.status === 'pending') &&
-        t.target?.user_name === svc.user_name &&
-        t.target?.service_name === svc.service_name &&
-        String(t.target?.label ?? '') === String(svc.label)
-      )
-      if (!task) {
-        message.warning('No running task found for this service — refreshing')
-        refreshServices()
+      // The stage projection carries the instance's CURRENT task id; that is
+      // the row the queue cancelled, whichever queue it is in (R9.2).
+      let taskId = (svc as any).task_id as string | undefined
+      if (!taskId) {
+        const { data } = await client.get('/tasks')
+        const tasks = data.tasks || []
+        const task = tasks.find((t: any) =>
+          (t.status === 'running' || t.status === 'planned'
+            || t.status === 'queued' || t.status === 'pending') &&
+          (t.target?.user_name === svc.user_name
+            || t.service_name === svc.service_name)
+        )
+        taskId = task?.task_id
+      }
+      if (!taskId) {
+        message.warning('No active task found for this service — refreshing')
         return
       }
-      await client.delete(`/tasks/${task.task_id}`)
-      message.success('Cancellation requested — the service will be marked failed')
-      refreshServices()
+      const { data } = await client.delete(`/tasks/${taskId}`)
+      if (data?.confirmed === false || data?.error === 'cancellation_unconfirmed') {
+        message.warning('Cancellation is still settling — the reconciler will finish it')
+      } else {
+        message.success('Cancellation requested')
+      }
     } catch (e: any) {
       message.error(e.response?.data?.detail || 'Cancel failed')
+    } finally {
+      setPending(prev => { const n = { ...prev }; delete n[key]; return n })
+      refreshServices()
     }
   }
 
@@ -899,13 +1039,18 @@ export default function UsersPage() {
   // Needed for a protected instance whose registry plaintext is gone: the gate
   // can never satisfy that auth_basic again, so the layer has to come off.
   const handleRemovePwd = async (user: string, service: string, label: string) => {
-    try {
-      const sid = serviceIdFor(user, service, label)
-      if (!sid) throw new Error('service not found')
-      await client.delete(`/services/instances/${sid}/password`)
-      message.success('Service password removed — auth_basic is off, the ACL gate still applies')
-      refreshServices()
-    } catch (err: any) { message.error(err.response?.data?.detail || 'Failed to remove the service password') }
+    // R1.5: the clicked control acknowledges at once; the card badge is
+    // deliberately unchanged (removing auth_basic is not a status change).
+    const busyKey = `remove-pwd:${serviceIdFor(user, service, label) || `${user}-${service}-${label}`}`
+    await withBusy(busyKey, async () => {
+      try {
+        const sid = serviceIdFor(user, service, label)
+        if (!sid) throw new Error('service not found')
+        await client.delete(`/services/instances/${sid}/password`)
+        message.success('Service password removed — auth_basic is off, the ACL gate still applies')
+        refreshServices()
+      } catch (err: any) { message.error(err.response?.data?.detail || 'Failed to remove the service password') }
+    })
   }
 
   const handleCloneAll = async () => {
@@ -941,7 +1086,10 @@ export default function UsersPage() {
     setRebuildTarget(null)
     setRebuildProxy(false)
     setRebuildLoading(false)
-    setTimeout(refreshServices, 2000)
+    // R3.2: no 2 s timer — the silent stages refresh follows the POST at once.
+    // It also restores a true badge after a rejection, replacing the optimistic
+    // `building` state set at click.
+    refreshServices()
   }
 
   // Highlight matching text
@@ -974,6 +1122,8 @@ export default function UsersPage() {
     // offered `delete`, the server answered "cancel it first", and no
     // cancel existed. Found live in T14.
     const isJobLive = !!sess.job_live
+    // G90: the session card's own pending label wins over its state badge.
+    const pendingCode = pending[key]
     return (
       <ServiceCard
         key={key}
@@ -985,21 +1135,27 @@ export default function UsersPage() {
         // card exists to say. Caught by T14 after `job_live` was
         // introduced for the cancel gate.
         badge={
-          <Badge
-            status={sess.state === 'generating' ? 'processing'
-                    : (sess.state === 'refused' || sess.state === 'failed') ? 'error'
-                    : sess.state === 'generated' ? 'success' : 'warning'}
-            text={sess.state === 'generating' ? 'Generating…'
-                  : sess.state === 'refused' ? `Refused (${sess.reason || 'unknown'})`
-                  // The leg ENDED and its files are ready; the deploy has not been
-                  // sent. Without this case the state fell into the `else` branch
-                  // and the card read "Paused (awaiting you)" — which was a lie
-                  // about a path that is simply waiting for the operator to press
-                  // Deploy.
-                  : sess.state === 'failed' ? `Failed (${sess.reason || 'deploy failed'})`
-                  : sess.state === 'generated' ? 'Ready to deploy'
-                  : `Paused (${sess.reason || 'awaiting you'})`}
-          />
+          pendingCode
+            ? <Badge status="processing" text={pendingLabel(pendingCode)!}/>
+            : <Badge
+                status={sess.state === 'generating'
+                          ? (sess.job_status === 'queued' ? 'default' : 'processing')
+                        : (sess.state === 'refused' || sess.state === 'failed') ? 'error'
+                        : sess.state === 'generated' ? 'success' : 'warning'}
+                text={sess.state === 'generating'
+                      ? (sess.job_status === 'queued' ? 'Queued (generation)'
+                         : sess.job_status === 'planned' ? 'Planned (generation)'
+                         : 'Generating…')
+                      : sess.state === 'refused' ? `Refused (${sess.reason || 'unknown'})`
+                      // The leg ENDED and its files are ready; the deploy has not been
+                      // sent. Without this case the state fell into the `else` branch
+                      // and the card read "Paused (awaiting you)" — which was a lie
+                      // about a path that is simply waiting for the operator to press
+                      // Deploy.
+                      : sess.state === 'failed' ? `Failed (${sess.reason || 'deploy failed'})`
+                      : sess.state === 'generated' ? 'Ready to deploy'
+                      : `Paused (${sess.reason || 'awaiting you'})`}
+              />
         }
         title={<Text strong>{sess.service_name}</Text>}
         label={<Tag>{sess.label}</Tag>}
@@ -1078,7 +1234,9 @@ export default function UsersPage() {
               has no job by construction) it did nothing and claimed it
               had. */}
           {isJobLive && (
-            <Button size="small" danger onClick={async () => {
+            <Button size="small" danger loading={pendingCode === 'cancelling'}
+              onClick={async () => {
+              setPending(prev => ({ ...prev, [key]: 'cancelling' }))
               try {
                 if (sess.generation_task_id == null) {
                   message.warning('This session has no running job to cancel')
@@ -1099,10 +1257,15 @@ export default function UsersPage() {
                   message.warning(
                     `Nothing to cancel — the job is already ${r.data?.status || 'stopped'}`)
                 }
-                loadSessions()
               } catch (e: any) {
                 const d = e.response?.data?.detail
                 message.error(typeof d === 'string' ? d : (d?.detail || 'Cancel failed'))
+              } finally {
+                // R1.4: both read models settle together — the session card and
+                // the analyses behind it.
+                setPending(prev => { const n = { ...prev }; delete n[key]; return n })
+                loadSessions()
+                refreshServices()
               }
             }}>Cancel</Button>
           )}
@@ -1113,7 +1276,9 @@ export default function UsersPage() {
               button; deleting IS the operator saying "stop this and
               forget it", so it is always offered and does the cancel
               itself. */}
-          <Button size="small" danger onClick={async () => {
+          <Button size="small" danger loading={pendingCode === 'deleting'}
+            onClick={async () => {
+            setPending(prev => ({ ...prev, [key]: 'deleting' }))
             try {
               // The DELETE route is keyed by service_id. The name-shaped path
               // is the GET route; sending DELETE to it returns 405 and the
@@ -1122,10 +1287,13 @@ export default function UsersPage() {
               message.success(data?.cancelled_job
                 ? 'Running job cancelled and session removed'
                 : 'Session removed')
-              loadSessions()
             } catch (e: any) {
               const d = e.response?.data?.detail
               message.error(typeof d === 'string' ? d : (d?.detail || 'Delete failed'))
+            } finally {
+              setPending(prev => { const n = { ...prev }; delete n[key]; return n })
+              loadSessions()
+              refreshServices()
             }
           }}>Delete</Button>
           {/* SESSION-ACTIONS-END */}
@@ -1192,7 +1360,26 @@ export default function UsersPage() {
     <div>
       <div style={{display:'flex',justifyContent:'space-between',marginBottom:16,flexWrap:'wrap',gap:8}}>
         <Title level={3} style={{margin:0}}>Services</Title>
-        <Space>
+        <Space wrap>
+          {/* G92 R7.3 — the queue bar: the same counts as the Dashboard cards
+              and the per-card position, read from the one stats endpoint. */}
+          {isAdmin && queueStats && (() => {
+            const g = queueStats.gateway?.counts || {}
+            const r = queueStats.registry?.counts || {}
+            const queued = (g.queued || 0) + (r.queued || 0)
+            const planned = (g.planned || 0) + (r.planned || 0)
+            const running = (g.running || 0) + (r.running || 0)
+            const down = queueStats.gateway?.heartbeat?.alive === false
+              || queueStats.registry?.heartbeat?.alive === false
+            return (
+              <Space size={4}>
+                <Tag color={queued ? 'gold' : 'default'}>Queued {queued}</Tag>
+                <Tag color={planned ? 'blue' : 'default'}>Planned {planned}</Tag>
+                <Tag color={running ? 'processing' : 'default'}>Running {running}</Tag>
+                {down && <Tag color="red">Planner down</Tag>}
+              </Space>
+            )
+          })()}
           {/* B1 / G58 — this is NOT a credential field, and it sits on a page
               that also renders password inputs (the deploy panel). A bare
               unannotated text input is exactly what a browser's password
@@ -1208,6 +1395,23 @@ export default function UsersPage() {
         </Space>
       </div>
 
+      {isAdmin && queueStats && (
+        queueStats.gateway?.heartbeat?.alive === false
+        || queueStats.registry?.heartbeat?.alive === false
+      ) && (
+        <Alert
+          type="error"
+          showIcon
+          style={{marginBottom:12}}
+          message="The task queue is unavailable"
+          description={
+            `A planner heartbeat is stale (gateway: ${queueStats.gateway?.heartbeat?.age_s ?? '?'}s, ` +
+            `provision API: ${queueStats.registry?.heartbeat?.age_s ?? '?'}s) — new tasks will be ` +
+            `refused with queue_unavailable until the planner is back.`
+          }
+        />
+      )}
+
       {isAdmin && orphans.length > 0 && (
         <Alert
           type="warning"
@@ -1217,26 +1421,54 @@ export default function UsersPage() {
         />
       )}
 
-      {selectedKeys.size > 0 && isAdmin && (
-        <Card size="small" style={{marginBottom:12,background:'#fffbe6',borderColor:'#faad14'}}>
-          <Space>
-            <Text strong>{selectedKeys.size} selected</Text>
-            <Button size="small" loading={batchLoading} onClick={()=>batchAction('stop')}>Stop</Button>
-            <Button size="small" loading={batchLoading} onClick={()=>batchAction('start')}>Start</Button>
-            <Button size="small" loading={batchLoading} icon={<RocketOutlined/>} onClick={()=>batchAction('rebuild')}>Rebuild</Button>
-            <Button size="small" danger loading={batchLoading} disabled={batchLoading} onClick={()=>{
-              setDelBatch(true); setDelToken(Math.random().toString(36).slice(2,8)); setDelInput(''); setDelOpen(true)
-            }}>Remove</Button>
-            <Button size="small" onClick={()=>setSelectedKeys(new Set())}>Clear</Button>
-          </Space>
-        </Card>
-      )}
+      {selectedKeys.size > 0 && isAdmin && (() => {
+        // R8.2 — the pre-filter: an action is enabled only when EVERY selected
+        // card is in its allowed set; otherwise it is greyed with the blocking
+        // states named, so a batch never fails part-way.
+        const statuses = selectedStatuses()
+        const blocked = (action: 'start' | 'stop' | 'rebuild' | 'delete') =>
+          batchBlocking(action, statuses)
+        const tip = (action: 'start' | 'stop' | 'rebuild' | 'delete') => {
+          const b = blocked(action)
+          return b.length ? `Not available: ${b.join(', ')} selected` : ''
+        }
+        return (
+          <Card size="small" style={{marginBottom:12,background:'#fffbe6',borderColor:'#faad14'}}>
+            <Space wrap>
+              <Text strong>{selectedKeys.size} selected</Text>
+              <Tooltip title={tip('stop')}>
+                <Button size="small" loading={batchLoading}
+                  disabled={blocked('stop').length > 0}
+                  onClick={()=>batchAction('stop')}>Stop</Button>
+              </Tooltip>
+              <Tooltip title={tip('start')}>
+                <Button size="small" loading={batchLoading}
+                  disabled={blocked('start').length > 0}
+                  onClick={()=>batchAction('start')}>Start</Button>
+              </Tooltip>
+              <Tooltip title={tip('rebuild')}>
+                <Button size="small" loading={batchLoading} icon={<RocketOutlined/>}
+                  disabled={blocked('rebuild').length > 0}
+                  onClick={()=>batchAction('rebuild')}>Rebuild</Button>
+              </Tooltip>
+              <Tooltip title={tip('delete')}>
+                <Button size="small" danger loading={batchLoading}
+                  disabled={batchLoading || blocked('delete').length > 0}
+                  onClick={()=>{
+                    setDelBatch(true); setDelToken(Math.random().toString(36).slice(2,8)); setDelInput(''); setDelOpen(true)
+                  }}>Remove</Button>
+              </Tooltip>
+              <Button size="small" onClick={()=>setSelectedKeys(new Set())}>Clear</Button>
+            </Space>
+          </Card>
+        )
+      })()}
 
       {loading ? <Spin/> : groups.length===0 ? (
         <Card><Empty description={search?"No matches":"No services deployed"}/></Card>
       ) : (
-        groups.map(({ userName, svcs: userSvcs, sessions: userSessions }, idx) => {
-          const isBusy = (s: any) => s.status === 'building' || s.status === 'deleting'
+        groups.map(({ userName, svcs: userSvcs, sessions: userSessions, placeholders: userPlaceholders }, idx) => {
+          const isBusy = (s: any) => cardBusy(s.status)
           const allHealthy = userSvcs.every(s => isBusy(s) || (Object.keys(s.unhealthy_containers||{}).length===0 && Object.keys(s.missing_containers||{}).length===0))
           const healthyCount = userSvcs.filter(s => Object.keys(s.healthy_containers||{}).length > 0 && Object.keys(s.unhealthy_containers||{}).length===0 && Object.keys(s.missing_containers||{}).length===0).length
           const buildingCount = userSvcs.filter(s => isBusy(s)).length
@@ -1297,9 +1529,34 @@ export default function UsersPage() {
                   first, because a session is the instance's own future and the
                   operator's attention is on the work in flight. */}
               {userSessions.map((sess) => renderSessionCard(sess))}
+              {/* G90 placeholder cards: inserted synchronously at deploy submit,
+                  blinking, replaced by the real card when the stages refresh
+                  returns the triple. They are waiting cards, not statuses. */}
+              {userPlaceholders.map((ph) => (
+                <ServiceCard
+                  key={`placeholder:${ph.key}`}
+                  panelKey={`placeholder:${ph.key}`}
+                  className="placeholder-blink"
+                  badge={<Badge status="processing" text="Deploying…"/>}
+                  title={<Text strong>{highlight(ph.service, search)}</Text>}
+                  label={<Tag>{ph.label}</Tag>}
+                  headerExtra={<Text type="secondary">{ph.user}</Text>}
+                >
+                  <Text type="secondary">
+                    Waiting for the deployment to appear — this card is replaced as soon as
+                    the service is registered.
+                  </Text>
+                </ServiceCard>
+              ))}
               {userSvcs.map((svc) => {
                 const key = `svc:${svc.service_id}`
-                const isDeleting = svc.status === 'deleting' || deletingKeys.has(key)
+                const isDeleting = svc.status === 'deleting' || pending[key] === 'deleting'
+                // Waiting (`queued`/`planned`) and building cards offer CANCEL
+                // ONLY — the server refuses delete/rebuild with 409 (R8.1).
+                const busyCard = cardBusy(svc.status) || isDeleting
+                const isRunning = Object.keys(svc.healthy_containers||{}).length > 0
+                const startStopCode = pending[key] === 'starting' || pending[key] === 'stopping'
+                  ? pending[key] : null
                 const containers = {...svc.healthy_containers, ...svc.unhealthy_containers, ...svc.missing_containers}
                 const pwdVisible = visiblePwds[key] || false
                 // A fix ANALYSIS running for this instance (GRILLING G26). While
@@ -1336,10 +1593,15 @@ export default function UsersPage() {
                               this cancels the underlying -api task — the same
                               operation the Tasks page button performs; the registry
                               then moves building → failed ("cancelled by operator"). */}
-                          {svc.status === 'building' && (
-                            <Tooltip title="Cancel this build — the task is cancelled and the service is marked failed">
+                          {(svc.status === 'building' || svc.status === 'queued'
+                            || svc.status === 'planned') && (
+                            <Tooltip title={svc.status === 'building'
+                              ? 'Cancel this build — the task is aborted and the service is marked failed'
+                              : 'Cancel this waiting task — a creation card disappears; an existing card reverts'}>
                               <Button size="small" danger icon={<StopOutlined/>}
-                                onClick={()=>cancelBuilding(svc)}>Cancel</Button>
+                                loading={pending[key] === 'cancelling'}
+                                disabled={pending[key] === 'cancelling'}
+                                onClick={()=>cancelBuilding(svc, key)}>Cancel</Button>
                             </Tooltip>
                           )}
                           {/* An ANALYSIS in flight is cancellable too (G26 row 2):
@@ -1349,13 +1611,19 @@ export default function UsersPage() {
                           {isAnalyzing && (
                             <Tooltip title="Cancel the analysis — the service returns to failed">
                               <Button size="small" danger icon={<StopOutlined/>}
+                                loading={pending[key] === 'cancelling'}
+                                disabled={pending[key] === 'cancelling'}
                                 onClick={async () => {
+                                  setPending(prev => ({ ...prev, [key]: 'cancelling' }))
                                   try {
                                     await client.delete(`/tasks/${analysis.job_id}`)
                                     message.success('Analysis cancelled')
-                                    loadSessions()
                                   } catch (e: any) {
                                     message.error(e.response?.data?.detail || 'Cancel failed')
+                                  } finally {
+                                    setPending(prev => { const n = { ...prev }; delete n[key]; return n })
+                                    loadSessions()
+                                    refreshServices()
                                   }
                                 }}>Cancel</Button>
                             </Tooltip>
@@ -1416,21 +1684,31 @@ export default function UsersPage() {
                               first look at the card.
                               Actions are disabled while the instance is being
                               deleted (server status 'deleting' or optimistic). */}
-                          {svc.status !== 'building' && svc.status !== 'failed' && !isDeleting && <Tooltip title={Object.keys(svc.healthy_containers||{}).length > 0 ? 'Stop containers' : 'Start containers'}>
-                            <Button size="small" 
-                              icon={Object.keys(svc.healthy_containers||{}).length > 0 ? <PauseOutlined/> : <CaretRightOutlined/>}
-                              type={Object.keys(svc.healthy_containers||{}).length > 0 ? 'default' : 'primary'}
+                          {!busyCard && svc.status !== 'failed' && <Tooltip title={isRunning ? 'Stop containers' : 'Start containers'}>
+                            <Button size="small"
+                              loading={!!startStopCode}
+                              icon={isRunning ? <PauseOutlined/> : <CaretRightOutlined/>}
+                              type={isRunning ? 'default' : 'primary'}
+                              disabled={!!startStopCode}
                               onClick={()=>{
-                                const isRunning = Object.keys(svc.healthy_containers||{}).length > 0
                                 const action = isRunning ? 'stop' : 'start'
+                                const code: PendingCode = isRunning ? 'stopping' : 'starting'
                                 const label = isRunning ? 'Stopping...' : 'Starting...'
+                                // Acknowledged synchronously — before the POST is
+                                // even sent (R1.1).
+                                setPending(prev => ({ ...prev, [key]: code }))
                                 client.post(`/services/instances/${svc.service_id}/${action}`)
                                   .then(()=>{message.success(label); refreshServices()})
                                   .catch(e=>message.error(e.response?.data?.detail||'Failed'))
+                                  .finally(() => setPending(prev => {
+                                    const n = { ...prev }
+                                    if (n[key] === code) delete n[key]
+                                    return n
+                                  }))
                               }}
                             />
                           </Tooltip>}
-                          {svc.status !== 'failed' && <>
+                          {svc.status !== 'failed' && !busyCard && <>
                           <Button size="small" disabled={isDeleting} onClick={()=>{
                             setRebuildTarget({user:svc.user_name,service:svc.service_name,label:svc.label,noCache:false})
                             setRebuildProxy(false)
@@ -1453,7 +1731,9 @@ export default function UsersPage() {
                             onConfirm={()=>handleRemovePwd(svc.user_name,svc.service_name,svc.label)}
                           >
                             <Tooltip title="Remove service password">
-                              <Button size="small" disabled={isDeleting} icon={<UnlockOutlined/>}/>
+                              <Button size="small" disabled={isDeleting}
+                                loading={!!controlBusy[`remove-pwd:${svc.service_id}`]}
+                                icon={<UnlockOutlined/>}/>
                             </Tooltip>
                           </Popconfirm>
                           <Tooltip title="Duplicate for another user">
@@ -1472,6 +1752,14 @@ export default function UsersPage() {
                     </>}
                   >
                     <Space direction="vertical" style={{width:'100%'}} size="small">
+                      {(svc as any).queue && (svc.status === 'queued' || svc.status === 'planned') && (
+                        <Text type="secondary" style={{fontSize:12}}>
+                          {(svc as any).queue.status === 'planned'
+                            ? 'In the current plan — a worker will start it next'
+                            : `Queue: ${queueLabel((svc as any).queue) || 'waiting'}`}
+                          {' · ETA approximate'}
+                        </Text>
+                      )}
                       {svc.status === 'failed' && (
                         <div style={{background:'#fff2f0', border:'1px solid #ffccc7', borderRadius:6, padding:'8px 12px'}}>
                           <Space direction="vertical" size={4} style={{width:'100%'}}>
@@ -1513,6 +1801,10 @@ export default function UsersPage() {
                           const url = exposureUrls[canonical]
                           const ownerView = !!myUsername && svc.user_name === myUsername
                           const canGenerate = isAdmin || ownerView
+                          // R1.5: the clicked control acknowledges at once; the
+                          // card badge is unchanged (minting is not a status).
+                          const mintKey = `mint:${svc.service_id}:${canonical}`
+                          const showKey = `show:${svc.service_id}:${canonical}`
                           return (
                             <>
                               {/* Minting is REVOKE + INSERT: the row's previous URL dies at
@@ -1530,14 +1822,16 @@ export default function UsersPage() {
                                   description="The previous exposure URL for this row stops working at its next connection."
                                   okText="Generate"
                                   cancelText="Cancel"
-                                  onConfirm={() => mintExposure(svc, canonical)}
+                                  onConfirm={() => withBusy(mintKey, () => mintExposure(svc, canonical))}
                                 >
-                                  <Button size="small" type="primary" ghost>
+                                  <Button size="small" type="primary" ghost
+                                    loading={!!controlBusy[mintKey]}>
                                     Generate exposure URL
                                   </Button>
                                 </Popconfirm>
                               )}
-                              <Button size="small" onClick={() => showExposure(svc, canonical)}
+                              <Button size="small" loading={!!controlBusy[showKey]}
+                                onClick={() => withBusy(showKey, () => showExposure(svc, canonical))}
                                 title="Read the live exposure URL from the gateway; it is shown in a popup and cleared when the popup closes">
                                 Show exposure URL
                               </Button>
@@ -1708,9 +2002,19 @@ export default function UsersPage() {
         regenerate={retryRegenerate}
         resumeJobId={resumeJobId}
         fixingGuide={fixingGuide}
-        onClose={()=>{setDeployOpen(false); setPreselectedDeploy(undefined); setPreselectedUser(undefined); setPreselectedLabel(undefined); setPreselectedUseGlobalProxy(null); setRetryOptions(null); setRetryRegenerate(false); setResumeJobId(null); setFixingGuide(null); if(deployParam) setSearchParams({})}}
+        onClose={()=>{setDeployOpen(false); setPreselectedDeploy(undefined); setPreselectedUser(undefined); setPreselectedLabel(undefined); setPreselectedUseGlobalProxy(null); setRetryOptions(null); setRetryRegenerate(false); setResumeJobId(null); setFixingGuide(null); if(deployParam) setSearchParams({}); refreshServices()}}
+        // T3/T4: submit inserts the blinking placeholder synchronously and a
+        // rejected submit removes it (no orphan waiting card).
+        onDeployStarted={(user: string, service: string, label: string)=>{
+          setPlaceholders(prev => addPlaceholder(prev, user, service, label))
+        }}
+        onDeployFailed={(user: string, service: string, label: string)=>{
+          setPlaceholders(prev => prev.filter(p => p.key !== placeholderKey(user, service, label)))
+        }}
         onDeployed={(taskId: string, user: string, service: string, label: string)=>{
         setDeployOpen(false); setPreselectedDeploy(undefined); if(deployParam) setSearchParams({});
+        // The deploy is accepted: its waiting placeholder has done its job.
+        setPlaceholders(prev => prev.filter(p => p.key !== placeholderKey(user, service, label)))
         // Optimistic update: immediately show the new service as "building"
         const optimisticEntry: ServiceInstance = {
           service_id: '', user_name: user, service_name: service, label: label,
@@ -1722,8 +2026,8 @@ export default function UsersPage() {
           const filtered = prev.filter(s => !(s.user_name === user && s.service_name === service && s.label === label))
           return [...filtered, optimisticEntry]
         })
-        // Then also do a real reload (will update once registry is written)
-        setTimeout(refreshServices, 2000)
+        // R3.2: refresh as soon as the POST resolves — no 2 s timer.
+        refreshServices()
       }}/>
 
       {/* Password change modal */}
@@ -1741,20 +2045,52 @@ export default function UsersPage() {
             : (delTarget ? [`svc:${delTarget.service_id}`] : [])
           setDelOpen(false); setDelBatch(false); setDelInput('')
           if (keys.length === 0) return
-          // Optimistic "Deleting..." until the next poll (the -api also persists
-          // a 'deleting' registry status, which is what survives a refresh).
-          setDeletingKeys(prev => new Set([...prev, ...keys]))
+          // Acknowledged at confirm (R1.2): every target card reads `Deleting…`
+          // at once, even a `failed` or `building` one, and keeps reading it
+          // across refreshes until the card leaves the stages list (prunePending).
+          setPending(prev => {
+            const next = { ...prev }
+            for (const k of keys) next[k] = 'deleting'
+            return next
+          })
           if (delBatch) setSelectedKeys(new Set())
-          for (const key of keys) {
+          const wasBatch = delBatch
+          // Per-item outcomes (R8.3): every target is its own request and its
+          // own report; a refusal never hides the targets that were accepted.
+          const outcomes = keys.map(async (key) => {
             const sid = key.startsWith('svc:') ? key.slice(4) : key
-            if (!sid) continue
-            client.delete(`/services/instances/${sid}`, { params: { scope: 'service' } })
-              .then(() => { message.success('Deleting service…'); refreshServices() })
-              .catch(() => {
-                setDeletingKeys(prev => { const n = new Set(prev); n.delete(key); return n })
-                message.error('Failed to delete')
+            if (!sid) return { key, ok: false, error: 'no service id' }
+            try {
+              await client.delete(`/services/instances/${sid}`,
+                                  { params: { scope: 'service' } })
+              return { key, ok: true }
+            } catch (e: any) {
+              const d = e.response?.data?.detail
+              const reason = typeof d === 'string' ? d : (d?.detail || d?.error || 'refused')
+              // R4.1: a rejected delete clears the pending state so the card
+              // falls back to its true server badge and can be retried.
+              setPending(prev => {
+                const n = { ...prev }
+                if (n[key] === 'deleting') delete n[key]
+                return n
               })
-          }
+              return { key, ok: false, error: reason }
+            }
+          })
+          Promise.all(outcomes).then((results) => {
+            const failed = results.filter(r => !r.ok)
+            if (!wasBatch) {
+              if (failed.length) message.error(`Delete refused: ${failed[0].error}`)
+              else message.success('Deleting service…')
+            } else if (failed.length) {
+              message.warning(
+                `Delete: ${results.length - failed.length} accepted, ${failed.length} refused — ` +
+                failed.map(r => `${svcNameFor(r.key)}: ${r.error}`).join('; '), 8)
+            } else {
+              message.success(`Deleting ${results.length} service(s)…`)
+            }
+            refreshServices()
+          })
         }}>
         <p>This deletes {delBatch ? 'the selected services' : 'the service'}: containers are stopped, the service identity is tombstoned and the card disappears. <b>Generated files, user data and volumes are preserved</b> by the no-auto-delete rule; only the per-instance stream conf is removed. The tombstone cannot be undone.</p>
         <p>Type <Text code>{delToken}</Text> to confirm:</p>

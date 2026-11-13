@@ -31,7 +31,10 @@ const { Text } = Typography
  * was accepted, and with no timeout on long builds a toast would scroll away before the
  * operator could act on it (§4d).
  */
-const REFUSAL_CODES = ['at_capacity', 'generation_at_capacity']
+const REFUSAL_CODES = ['at_capacity', 'generation_at_capacity',
+  // G92 — the bounded queue's own refusals: `queue_full` (20 already queued)
+  // and `queue_unavailable` (stale planner heartbeat). Same persistent alert.
+  'queue_full', 'queue_unavailable']
 const refusalOf = (err: any): { code: string; detail: string } | null => {
   if (err?.response?.status !== 503) return null
   const d = err?.response?.data?.detail
@@ -103,6 +106,12 @@ interface DeployFormProps {
   open: boolean
   onClose: () => void
   onDeployed: (taskId: string, user: string, service: string, label: string) => void
+  // GRILLING G90 / task trace T0: the card-creating contract. `onDeployStarted`
+  // fires SYNCHRONOUSLY at submit (after the client guard, before the POST) so
+  // the page inserts the blinking placeholder; `onDeployFailed` fires on any
+  // rejection so the placeholder is removed and no waiting card is orphaned.
+  onDeployStarted: (user: string, service: string, label: string) => void
+  onDeployFailed: (user: string, service: string, label: string) => void
   preselectedService?: string
   // Retry from a failed card prefills the user too, so the same
   // (user, service, label) key is reused rather than drifting to a new one
@@ -137,7 +146,7 @@ interface DeployFormProps {
   preselectedUseGlobalProxy?: boolean | null
 }
 
-export default function DeployForm({ open, onClose, onDeployed, preselectedService, preselectedUser, preselectedLabel, initialOptions, regenerate, resumeJobId, fixingGuide, preselectedUseGlobalProxy }: DeployFormProps) {
+export default function DeployForm({ open, onClose, onDeployed, onDeployStarted, onDeployFailed, preselectedService, preselectedUser, preselectedLabel, initialOptions, regenerate, resumeJobId, fixingGuide, preselectedUseGlobalProxy }: DeployFormProps) {
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
   const [proxyEnabled, setProxyEnabled] = useState(false)
@@ -1049,6 +1058,11 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
     // payload) reads it, and the panel is gone by then (destroyOnClose), so
     // `form.getFieldValue` must not be read again after this point.
     snap.use_global_proxy = effectiveUseGlobalProxy()
+    // The submitted triple, captured before the panel closes: it is the
+    // placeholder key for the whole call, including every failure path.
+    const svcVal = snap.service_name || ''
+    const { baseName, recipePath } = parseServiceValue(svcVal)
+    const deployLabel = String(snap.label || '0')
     // Close the deploy panel immediately — the Deploying… popup is the UI from
     // here on (it lives in this component, which stays mounted).
     onClose()
@@ -1057,8 +1071,6 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       // anything generated during THIS call and returns it synchronously
       // (React state is not visible mid-async-flow).
       const sel = effectiveSelection()
-      const svcVal = snap.service_name || ''
-      const { baseName, recipePath } = parseServiceValue(svcVal)
 
       // The UI guard stays (parity); the gateway refuses the same intent as a
       // structured 4xx (R6). Only the NO-COMPOSE case is blocked here: a
@@ -1071,6 +1083,9 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         deployAutoRunRef.current = false
         return
       }
+      // The client guard passed: this submission creates a card, so the page
+      // shows its blinking placeholder NOW — before the POST below.
+      onDeployStarted(snap.user_name, baseName, deployLabel)
 
       // Thin migration R1/R11 — the client sends the INTENT; the gateway owns
       // validation, label reservation, generation, pauses, finalization, the
@@ -1081,7 +1096,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         service_name: baseName,
         project_root: recipePath ? `${baseName}/${recipePath}` : baseName,
         recipe_path: recipePath || '',
-        label: snap.label || '0',
+        label: deployLabel,
         domain: snap.domain || 'localhost',
         passwd: snap.passwd || '',
         https: snap.https || false,
@@ -1127,7 +1142,7 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
       if (['deploying', 'building', 'running'].includes(data.stage)) {
         message.success('Deploy queued!')
         onDeployed(data.deploy_task_id || data.task_id || '', snap.user_name,
-                   baseName, data.label || snap.label || '0')
+                   baseName, String(data.label || deployLabel))
         onClose()
         return
       }
@@ -1143,6 +1158,9 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         if (gen) genJob.adoptJob(gen, gen.task_id || gen.id || null)
         if (wf.stage === 'paused') continue
         if (wf.stage === 'refused') {
+          // A refusal accepted nothing: the placeholder must not linger and
+          // claim a deployment that never started (R4.1).
+          onDeployFailed(snap.user_name, baseName, deployLabel)
           setAtCapacity({ code: wf.reason || 'at_capacity', detail: wf.detail || '' })
           return
         }
@@ -1152,13 +1170,16 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         if (wf.stage === 'deploying' || wf.stage === 'building' || wf.stage === 'running') {
           message.success('Deploy queued!')
           onDeployed(wf.deploy_task_id || gen?.task_id || '', snap.user_name,
-                     baseName, wf.label || snap.label || '0')
+                     baseName, String(wf.label || deployLabel))
           onClose()
           return
         }
       }
       throw new Error('Deploy timed out')
     } catch (err: any) {
+      // Every rejection removes the waiting card; the error toast below is the
+      // page's existing one (R4.1).
+      onDeployFailed(snap.user_name, baseName, deployLabel)
       const d = err.response?.data?.detail
       // A capacity refusal is NOT a failed deploy — nothing was accepted, and
       // the remedy is to cancel whatever is hanging. It gets a PERSISTENT
@@ -1286,15 +1307,25 @@ export default function DeployForm({ open, onClose, onDeployed, preselectedServi
         style={{marginBottom:16}}
         message={atCapacity.code === 'generation_at_capacity'
           ? "The generation pool is full — nothing was queued"
+          : atCapacity.code === 'queue_full'
+          ? "The task queue is full — nothing was queued"
+          : atCapacity.code === 'queue_unavailable'
+          ? "The task queue is unavailable — nothing was queued"
           : "Platform is at capacity — nothing was queued"}
         description={<>
-          {atCapacity.detail || (atCapacity.code === 'generation_at_capacity'
+          {atCapacity.detail || (atCapacity.code === 'queue_unavailable'
+            ? 'The planner heartbeat is stale. Retry once it is fresh.'
+            : atCapacity.code === 'queue_full'
+            ? 'Wait for queued work to start, or cancel a queued task.'
+            : atCapacity.code === 'generation_at_capacity'
             ? 'Wait for a running generation to finish, or cancel one.'
             : 'Cancel a task that has been hanging, then retry.')}
           <div style={{marginTop:6}}>
             <Button size="small" onClick={()=>{ onClose(); window.location.href = '/tasks' }}>
               {atCapacity.code === 'generation_at_capacity'
                 ? 'Go to Tasks and cancel a running generation'
+                : atCapacity.code === 'queue_full'
+                ? 'Go to Tasks and cancel a queued task'
                 : 'Go to Tasks and cancel a hanging task'}
             </Button>
           </div>

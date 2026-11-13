@@ -503,19 +503,19 @@ async def _claim_and_register(service_id: str, intent: dict,
                     attempt_label = candidate
                     continue
             detail = str(getattr(http_exc, "detail", None) or exc)
-            at_capacity = (
-                getattr(http_exc, "status_code", None) == 503
-                and isinstance(getattr(http_exc, "detail", None), dict)
-                and http_exc.detail.get("error") == "at_capacity"
-            )
-            if at_capacity:
+            detail_json = getattr(http_exc, "detail", None)
+            refusal = (detail_json.get("error")
+                       if getattr(http_exc, "status_code", None) == 503
+                       and isinstance(detail_json, dict) else None)
+            if refusal in ("at_capacity", "queue_full", "queue_unavailable"):
                 pdr.record_refusal(
-                    service_id=service_id, reason="at_capacity",
-                    detail=str(http_exc.detail.get("detail") or ""),
+                    service_id=service_id, reason=refusal,
+                    detail=str(detail_json.get("detail") or ""),
                     request=payload,
                     use_global_proxy=bool(resolved.get("use_global_proxy")),
                 )
-                raise WorkflowError("at_capacity", str(http_exc.detail.get("detail") or ""), 503) from exc
+                raise WorkflowError(
+                    refusal, str(detail_json.get("detail") or ""), 503) from exc
             pdr.mark_deploy_failed(service_id, detail)
             label_reservations.release(service_id)
             raise WorkflowError("deploy_failed", detail, 502) from exc
@@ -541,14 +541,15 @@ async def _claim_and_register(service_id: str, intent: dict,
 async def _after_deploy(source_service_id: str, task_id: str | None,
                         target_ids: list[str], actor_id) -> None:
     """Grants after the task, then the cross-path sync (existing calls)."""
-    from . import service_grants
+    from . import registry_tasks, service_grants
     from .cross_orchestrator import cross_orchestrator
-    from .provision_service import provision_service
     if not task_id:
         return
     try:
+        # R9.2: read the task row directly; submit/cancel are the only HTTP
+        # calls to the -api and they already happened.
         while True:
-            data = await provision_service.get_task(task_id)
+            data = await asyncio.to_thread(registry_tasks.get, task_id) or {}
             status = str(data.get("status") or "")
             if status in ("completed", "failed", "cancelled", "unknown"):
                 break
@@ -631,7 +632,8 @@ async def on_generation_completed(*, service_id: str, request: dict,
     except WorkflowError as exc:
         # _claim_and_register already recorded a capacity refusal / failure;
         # a policy failure here is a fail-closed deploy failure.
-        if exc.code not in ("at_capacity", "deploy_failed"):
+        if exc.code not in ("at_capacity", "queue_full", "queue_unavailable",
+                            "deploy_failed"):
             pdr.mark_deploy_failed(service_id, f"{exc.code}: {exc.detail}")
             label_reservations.release(service_id)
 
@@ -864,10 +866,44 @@ async def stages(user_name: str | None = None) -> dict:
     for uname, entries in leftover.items():
         groups_out.append({"user_name": uname, "entries": entries})
 
+    # G92 R8.1 — a session card shows `queued`/`planned` while its generation
+    # job waits in the gateway queue. One query for every referenced job.
+    statuses = _generation_statuses(
+        [s.get("generation_task_id") for s in sessions.values()
+         if s.get("generation_task_id")]
+    )
+    for group in groups_out:
+        for entry in group.get("entries") or []:
+            task_id = entry.get("generation_task_id")
+            if task_id:
+                entry["job_status"] = statuses.get(str(task_id))
+            nested = entry.get("session")
+            if isinstance(nested, dict) and nested.get("generation_task_id"):
+                nested["job_status"] = statuses.get(str(nested["generation_task_id"]))
+
     groups_out.sort(key=lambda g: g.get("user_name") or "")
     return {"groups": groups_out,
             "count": sum(len(g["entries"]) for g in groups_out),
             "orphans": payload.get("orphans") or []}
+
+
+def _generation_statuses(task_ids: list[str]) -> dict[str, str]:
+    ids = [str(t) for t in task_ids if t]
+    if not ids:
+        return {}
+    from sqlalchemy import text as _text
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            _text("SELECT task_id, status FROM gateway.tasks "
+                  "WHERE task_id = ANY(:ids)"),
+            {"ids": ids},
+        ).mappings().all()
+        return {str(r["task_id"]): r["status"] for r in rows}
+    except Exception:  # noqa: BLE001 — a card must render without this
+        return {}
+    finally:
+        db.close()
 
 
 def workflow_status(workflow_id: str) -> dict:

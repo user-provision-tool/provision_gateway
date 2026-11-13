@@ -13,9 +13,87 @@ export default function SettingsPage() {
   return (
     <div>
       <Title level={3}>Settings</Title>
-      {isAdmin ? <><LlmPanel /><ProxyPanel /></> : <Card><Empty description="Settings management requires admin role."/></Card>}
+      {isAdmin ? <><LlmPanel /><ProxyPanel /><QueuePanel /></> : <Card><Empty description="Settings management requires admin role."/></Card>}
       <Card title="System Info"><Space direction="vertical"><Text><strong>Gateway:</strong> v1.0.0</Text><Text><strong>Provision API:</strong> gateway-managed (no direct client access)</Text></Space></Card>
     </div>
+  )
+}
+
+// ---- Queue Panel (G92 R7.3: both systems' queue settings) ----
+function QueuePanel() {
+  const [stats, setStats] = useState<any>(null)
+  const [loaded, setLoaded] = useState(false)
+
+  useEffect(() => {
+    client.get('/system/queue')
+      .then(r => setStats(r.data))
+      .catch(() => {})
+      .finally(() => setLoaded(true))
+  }, [])
+
+  const kinds = ['generate', 'fix_analysis', 'deploy', 'rebuild', 'remove', 'update']
+
+  const queueCard = (title: string, q: any) => {
+    if (!q) return null
+    const hb = q.heartbeat || {}
+    return (
+      <Card size="small" title={title} style={{ marginBottom: 12 }}>
+        <Space direction="vertical" style={{ width: '100%' }} size={4}>
+          <Space wrap>
+            <Tag>cap {q.cap}</Tag>
+            <Tag>workers {q.workers}</Tag>
+            <Tag>plan {q.plan_size}</Tag>
+            <Tag>window {q.span_s}s</Tag>
+            <Tag color={hb.alive ? 'green' : 'red'}>
+              planner {hb.alive ? `alive (${hb.age_s ?? 0}s)` : `stale (${hb.age_s ?? '?'}s)`}
+            </Tag>
+            {q.pinned_workers > 0 && <Tag color="orange">{q.pinned_workers} pinned</Tag>}
+          </Space>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            Queued {q.counts?.queued ?? 0} · Planned {q.counts?.planned ?? 0} ·
+            Running {q.counts?.running ?? 0}
+          </Text>
+          <table style={{ fontSize: 12, borderCollapse: 'collapse' }}>
+            <thead>
+              <tr>
+                <th style={{ textAlign: 'left', paddingRight: 12 }}>kind</th>
+                <th style={{ textAlign: 'right', paddingRight: 12 }}>run timeout</th>
+                <th style={{ textAlign: 'right', paddingRight: 12 }}>cancel timeout</th>
+                <th style={{ textAlign: 'right' }}>median (last 50)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {kinds.map(k => (
+                <tr key={k}>
+                  <td style={{ paddingRight: 12 }}>{k}</td>
+                  <td style={{ textAlign: 'right', paddingRight: 12 }}>
+                    {q.config?.[`run_timeout_${k}`] ?? '—'}s
+                  </td>
+                  <td style={{ textAlign: 'right', paddingRight: 12 }}>
+                    {q.config?.[`cancel_timeout_${k}`] ?? '—'}s
+                  </td>
+                  <td style={{ textAlign: 'right' }}>
+                    {q.kinds?.[k]?.median_s != null ? `${q.kinds[k].median_s}s` : '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <Text type="secondary" style={{ fontSize: 11 }}>
+            There is no queue-wait timeout and no end-to-end deadline.
+          </Text>
+        </Space>
+      </Card>
+    )
+  }
+
+  return (
+    <Card title={<span><ApiOutlined /> Task Queues</span>} style={{ marginBottom: 16 }}>
+      {!loaded ? <Spin /> : !stats ? <Empty description="Queue stats unavailable" /> : <>
+        {queueCard('Gateway — generation queue', stats.gateway)}
+        {queueCard('Provision API — deploy queue', stats.registry)}
+      </>}
+    </Card>
   )
 }
 

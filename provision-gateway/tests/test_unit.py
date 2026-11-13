@@ -11,6 +11,33 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from app.services.auth_service import hash_password, verify_password, create_provision_token, decode_token
 
 
+async def pump_gateway_queue(manager, job_id, until, timeout=15.0):
+    """Drive the queue in a test: plan, claim, run — until the job settles.
+
+    The real deployment runs the scheduler as a background loop; a unit test
+    must pump it explicitly. ``manager`` is a fresh instance whose ``_run_job``
+    is used as the runner, so its per-loop asyncio locks stay on this loop.
+    """
+    import asyncio
+    import time
+    from app.services.task_queue import gateway_queue
+
+    gateway_queue.runner = manager._run_job
+    previous = manager._cancelled
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            await asyncio.to_thread(gateway_queue.planner_tick)
+            await gateway_queue.dispatch()
+            status = manager.job_status(job_id)
+            if status in until:
+                return status
+            await asyncio.sleep(0.02)
+        return manager.job_status(job_id)
+    finally:
+        gateway_queue.runner = None
+
+
 class TestAuthService:
     """Test password hashing and JWT."""
 
@@ -4448,28 +4475,35 @@ class TestGenerationJobs:
         with pytest.raises(GenerationJobError):
             m._compute_phases("weird", {})
 
-    def test_create_job_persists_queued_and_schedules(self, tmp_path):
-        """create_job persists a queued job and schedules a runner task."""
+    def test_create_job_persists_queued_and_is_claimed_by_the_planner(self, tmp_path):
+        """create_job writes `queued`; only the planner/scheduler run it (T3)."""
         import asyncio
-        from unittest.mock import AsyncMock
         from app.services.generation_jobs import GenerationJobManager
+        from app.services.task_queue import gateway_queue
 
         async def scenario():
             Session = self._make_session(tmp_path)
             db = Session()
             m = GenerationJobManager()
-            m._run_job = AsyncMock()
             job = m.create_job(db, "myapp", "docker", "generate_missing",
                                {"prompt": "build it", "selection": {"compose": []}})
-            return job, db, m
+            assert m._tasks == {}, "no runner is started at submit"
+            # Plan exhaustion -> a plan; the scheduler claims planned -> running.
+            await asyncio.to_thread(gateway_queue.planner_tick)
+            plan = db.execute(__import__("sqlalchemy").text(
+                "SELECT status, plan_seq FROM gateway.tasks WHERE task_id=:id"),
+                {"id": job.id}).mappings().first()
+            claimed = await asyncio.to_thread(gateway_queue.claim_next)
+            return job, plan, claimed
 
-        job, db, m = asyncio.run(scenario())
+        job, plan, claimed = asyncio.run(scenario())
         assert job.id is not None
         assert job.status == "queued"
         assert job.phase == "compose"
         assert job.phase_total == 8  # compose → validate → serving_ports → validate_ports → stream_conf → nginx → validate_conf → env
         assert job.progress == "queued"
-        m._run_job.assert_awaited_once()
+        assert plan["status"] == "planned" and plan["plan_seq"] == 1
+        assert claimed == job.id
 
     def test_get_and_list_jobs_newest_first(self, tmp_path):
         """GET /api/llm/jobs lists newest-first and hides request/result by default."""
@@ -4515,12 +4549,40 @@ class TestGenerationJobs:
 
         active, done, m, db = asyncio.run(scenario())
         cancelled = m.cancel_job(db, active.id)
+        # A queued leg is cancelled IMMEDIATELY and has no runner to signal.
         assert cancelled.status == JOB_STATUS_CANCELLED
-        assert active.id in m._cancelled
+        assert cancelled.finished_at is not None
+        assert active.id not in m._cancelled
         # Completed jobs are not cancellable.
         again = m.cancel_job(db, done.id)
         assert again.status == JOB_STATUS_COMPLETED
         assert m.cancel_job(db, "gt-nonexistent") is None
+
+    def test_cancel_running_requests_the_abort_and_waits(self, tmp_path):
+        """A running leg keeps `running` + `cancel_requested_at` until it settles."""
+        import asyncio
+        from app.services.generation_jobs import (
+            GenerationJobManager, JOB_STATUS_RUNNING, JOB_STATUS_CANCELLED,
+        )
+
+        async def scenario():
+            Session = self._make_session(tmp_path)
+            db = Session()
+            m = GenerationJobManager()
+            job = m.create_job(db, "a", "", "env_file",
+                               {"category": "env_file", "prompt": "x"})
+            job.status = JOB_STATUS_RUNNING
+            db.commit()
+            m.cancel_job(db, job.id)
+            db.refresh(job)
+            # The runner observes the row on its next poll and settles it.
+            job.status = JOB_STATUS_CANCELLED
+            db.commit()
+            return m.wait_for_terminal(job.id, timeout=5)
+
+        settled = asyncio.run(scenario())
+        assert settled["confirmed"] is True
+        assert settled["status"] == JOB_STATUS_CANCELLED
 
     def test_cancel_job_covers_a_paused_leg(self, tmp_path):
         """A `paused` job IS cancellable (GRILLING G27 + G34).
@@ -4601,7 +4663,7 @@ class TestGenerationJobs:
         from unittest.mock import AsyncMock
         from app.services.generation_jobs import (
             GenerationJobManager, JOB_STATUS_FAILED, JOB_STATUS_RUNNING,
-            JOB_STATUS_COMPLETED,
+            JOB_STATUS_COMPLETED, JOB_STATUS_QUEUED,
         )
 
         async def scenario():
@@ -4622,13 +4684,13 @@ class TestGenerationJobs:
             return recovered, terminalized, ids, maker, m
 
         recovered, terminalized, (qid, rid, did), maker, m = asyncio.run(scenario())
-        assert recovered == 2
-        assert terminalized == 2
+        assert recovered == 1, "only the running row dies on a restart (R2.2)"
+        assert terminalized == 0
         # Fresh session: reload the rows after the bulk UPDATEs.
         db2 = maker()
-        assert m.get_job(db2, qid).status == JOB_STATUS_FAILED
+        assert m.get_job(db2, qid).status == JOB_STATUS_QUEUED, "the backlog survives"
         assert m.get_job(db2, rid).status == JOB_STATUS_FAILED
-        assert "no surviving runner" in m.get_job(db2, qid).error
+        assert "interrupted by restart" in m.get_job(db2, rid).error
         assert m.get_job(db2, did).status == JOB_STATUS_COMPLETED
         assert m._tasks == {} and m._cancelled == set()
 
@@ -5705,8 +5767,11 @@ class TestFailedCardSourceGuards:
         src = self._users_page()
         assert "cancelBuilding" in src
         assert "svc.status === 'building'" in src
+        # G92: the waiting states are Cancel-only too, and the cancel targets
+        # the card's CURRENT task id (from the stage projection).
+        assert "svc.status === 'queued'" in src and "svc.status === 'planned'" in src
         # Cancel goes through the existing task-cancel endpoint — no new machinery.
-        assert "tasks/${task.task_id}" in src
+        assert "client.delete(`/tasks/${taskId}`)" in src
 
     def test_failed_card_state_does_not_read_the_task_log(self):
         """The failure reason is read off the instance, never fetched."""
@@ -7751,9 +7816,9 @@ class TestTheGenerationRouterRecordsTheRequestProxy:
 
 
 class TestTheGatewayRefusesAtItsOwnCapacity:
-    """G29/T7: the gateway runs its OWN generation pool, so it has its OWN
-    refusal with its OWN code (`generation_at_capacity`, not the -api's
-    `at_capacity`), recorded on the session the card reads."""
+    """G92: the bounded queue refuses with `queue_full` at 20 queued (and
+    `queue_unavailable` when the planner heartbeat is stale), recorded on the
+    session the card reads."""
 
     @staticmethod
     def _jobs(n: int, status: str) -> None:
@@ -7785,14 +7850,13 @@ class TestTheGatewayRefusesAtItsOwnCapacity:
 
     def test_the_pool_refuses_at_its_own_limit(self, monkeypatch):
         """The refusal carries its counts AND its remedy, not just a failure."""
-        from app.config import settings
         from app.database import SessionLocal
         from app.services.generation_jobs import (
             GenerationCapacityError, GenerationJobManager,
         )
+        from app.services.queue_contract import QueueFullError
 
-        monkeypatch.setattr(settings, "GATEWAY_MAX_GENERATIONS", 2)
-        self._jobs(2, "running")
+        self._jobs(20, "queued")
 
         db = SessionLocal()
         try:
@@ -7801,9 +7865,33 @@ class TestTheGatewayRefusesAtItsOwnCapacity:
                     db, "probe-new", "", "generate_missing", {})
         finally:
             db.close()
-        assert exc.value.code == "generation_at_capacity", "its OWN code, not the -api's"
-        assert (exc.value.in_flight, exc.value.capacity) == (2, 2)
+        assert isinstance(exc.value, QueueFullError)
+        assert exc.value.code == "queue_full"
+        assert (exc.value.queued, exc.value.capacity) == (20, 20)
         assert "cancel" in str(exc.value).lower(), "the remedy travels with the refusal"
+
+    def test_a_stale_planner_refuses_queue_unavailable(self, monkeypatch):
+        from sqlalchemy import text
+        from app.database import SessionLocal
+        from app.services.queue_contract import QueueUnavailableError
+        from app.services.generation_jobs import (
+            GenerationCapacityError, GenerationJobManager,
+        )
+
+        db = SessionLocal()
+        try:
+            db.execute(text(
+                "UPDATE gateway.queue_state SET last_dispatch_at = now() - interval '1 hour' "
+                "WHERE id=1"))
+            db.commit()
+            with pytest.raises(GenerationCapacityError) as exc:
+                GenerationJobManager().create_job(
+                    db, "probe-new", "", "generate_missing", {})
+        finally:
+            db.close()
+        assert isinstance(exc.value, QueueUnavailableError)
+        assert exc.value.code == "queue_unavailable"
+        assert exc.value.stale_after_s == 30
 
     def test_the_router_records_the_refusal_on_the_session(self, monkeypatch):
         """Recorded on the SESSION, with its own reason — the card the operator
@@ -7817,8 +7905,7 @@ class TestTheGatewayRefusesAtItsOwnCapacity:
         from app.services import pre_deploy_registry as pdr
         from support import mk_user
 
-        monkeypatch.setattr(settings, "GATEWAY_MAX_GENERATIONS", 1)
-        self._jobs(1, "running")
+        self._jobs(20, "queued")
         monkeypatch.setattr(llm_router, "log_action", lambda *a, **k: None)
 
         db = SessionLocal()
@@ -7833,13 +7920,13 @@ class TestTheGatewayRefusesAtItsOwnCapacity:
                 asyncio.run(llm_router.create_generation_job(
                     req, {"id": str(alice.id), "role": "admin"}, db))
             assert exc.value.status_code == 503, exc.value
-            assert exc.value.detail["error"] == "generation_at_capacity"
-            assert (exc.value.detail["running"], exc.value.detail["capacity"]) == (1, 1)
+            assert exc.value.detail["error"] == "queue_full"
+            assert (exc.value.detail["queued"], exc.value.detail["capacity"]) == (20, 20)
 
             row = pdr.get_session(str(sid))
             assert row is not None, "the refusal must land on the session the card reads"
             assert row["state"] == "refused"
-            assert row["reason"] == "generation_at_capacity", (
+            assert row["reason"] == "queue_full", (
                 "the card picks the remedy by the reason; `at_capacity` would send "
                 "the operator to cancel a docker task that does not exist")
             assert "cancel" in row["detail"].lower()
@@ -7857,8 +7944,7 @@ class TestTheGatewayRefusesAtItsOwnCapacity:
         from app.services import pre_deploy_registry as pdr
         from support import mk_user
 
-        monkeypatch.setattr(settings, "GATEWAY_MAX_GENERATIONS", 1)
-        self._jobs(1, "running")
+        self._jobs(20, "queued")
         monkeypatch.setattr(llm_router, "log_action", lambda *a, **k: None)
 
         db = SessionLocal()
@@ -8136,19 +8222,21 @@ class TestTheCleanupContract:
 
     def test_a_paused_record_survives_recovery(self):
         """A paused leg is terminal under G27; a restart must not rewrite it,
-        while a genuinely interrupted leg becomes `unknown` then `failed`."""
+        while a genuinely interrupted (running) leg is failed immediately and a
+        queued/planned backlog survives (R2.2)."""
         from app.database import SessionLocal
         from app.services.generation_jobs import generation_jobs
 
-        paused, interrupted = self._jobs([("a", "paused"), ("b", "running")])
+        paused, interrupted, queued = self._jobs(
+            [("a", "paused"), ("b", "running"), ("c", "queued")])
         db = SessionLocal()
         try:
             recovered = generation_jobs.recover_stale_jobs(db)
-            assert recovered == 1, "exactly the interrupted row is recovered"
+            assert recovered == 1, "exactly the running row is recovered"
             assert generation_jobs.get_job(db, paused).status == "paused"
-            assert generation_jobs.get_job(db, interrupted).status == "unknown"
-            generation_jobs.terminalize_unknown(db)
             assert generation_jobs.get_job(db, interrupted).status == "failed"
+            assert "interrupted by restart" in generation_jobs.get_job(db, interrupted).error
+            assert generation_jobs.get_job(db, queued).status == "queued"
         finally:
             db.close()
 
@@ -8268,10 +8356,8 @@ class TestAPauseIsALegAndTheAnswerIsANewJob:
                 "user_name": "alice", "label": "0",
             })
             jid = job.id
-            for _ in range(200):
-                await asyncio.sleep(0.05)
-                if m.job_status(jid) == JOB_STATUS_PAUSED:
-                    break
+            await pump_gateway_queue(
+                m, jid, ("paused", "failed", "completed", "cancelled"))
             db.expire_all()
             row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
             return jid, row.status, row.result or {}, db.query(GenerationJob).count()
@@ -8326,11 +8412,7 @@ class TestAPauseIsALegAndTheAnswerIsANewJob:
                 db, "myapp", "", "generate_missing", carried,
                 resume_values={"OPENAI_API_KEY": "sk-from-the-operator"})
             jid = job.id
-            for _ in range(200):
-                await asyncio.sleep(0.05)
-                if m.job_status(jid) in ("completed", "failed"):
-                    return m.job_status(jid)
-            return "timed out"
+            return await pump_gateway_queue(m, jid, ("completed", "failed"))
 
         assert asyncio.run(scenario()) == "completed"
         written = (tmp_path / "myapp" / ".env.raw.alice.0").read_text()
@@ -8413,10 +8495,8 @@ class TestAValidationFailurePausesWhereASessionCanExist:
             db = SessionLocal()
             job = m.create_job(db, "myapp", "", "generate_missing", request)
             jid = job.id
-            for _ in range(200):
-                await asyncio.sleep(0.05)
-                if m.job_status(jid) in ("completed", "failed", "paused"):
-                    break
+            await pump_gateway_queue(
+                m, jid, ("completed", "failed", "paused", "cancelled"))
             db.expire_all()
             row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
             return row.status, row.result or {}, (row.error or "")
@@ -8507,10 +8587,8 @@ class TestAValidationFailurePausesWhereASessionCanExist:
                 "skip_env": True, "user_name": "alice", "label": "0",
             })
             jid = job.id
-            for _ in range(200):
-                await asyncio.sleep(0.05)
-                if m.job_status(jid) in ("completed", "failed", "paused"):
-                    break
+            await pump_gateway_queue(
+                m, jid, ("completed", "failed", "paused", "cancelled"))
             db.expire_all()
             row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
             return row.status, row.result or {}, (row.error or "")
@@ -8617,7 +8695,10 @@ class TestCancelAndAdmissionRaces:
                 t2 = threading.Thread(target=finish)
                 t1.start(); t2.start(); t1.join(timeout=30); t2.join(timeout=30)
                 row = generation_jobs.get_job(db, tid)
-                if seen.get("cancel_status") == "cancelled":
+                if seen.get("cancel_status") in ("cancelled", "running"):
+                    # A queued cancel ends the row; a running cancel records
+                    # `cancel_requested_at` and makes the terminal write
+                    # CANCELLED (G92 R6.2).
                     assert row.status == "cancelled", (i, row.status)
                 else:
                     assert row.status == "completed", (i, row.status)
@@ -8627,18 +8708,22 @@ class TestCancelAndAdmissionRaces:
     def test_capacity_limit_holds_across_concurrent_admissions(self, monkeypatch):
         import asyncio
         import threading
-        from unittest.mock import AsyncMock
 
-        from app.config import settings
+        from sqlalchemy import text
         from app.database import SessionLocal
         from app.models.gateway_task import GatewayTask
         from app.services.generation_jobs import (
             GenerationCapacityError, GenerationJobManager,
         )
 
-        monkeypatch.setattr(settings, "GATEWAY_MAX_GENERATIONS", 1)
+        # A one-slot queue: exactly one of the two concurrent submits wins.
+        db0 = SessionLocal()
+        try:
+            db0.execute(text("UPDATE gateway.queue_config SET queue_cap=1 WHERE id=1"))
+            db0.commit()
+        finally:
+            db0.close()
         m = GenerationJobManager()
-        m._run_job = AsyncMock()
 
         results = []
         barrier = threading.Barrier(2)
@@ -10327,10 +10412,8 @@ class TestStreamConfGenerator:
                 "deploy_metadata": {"https": True, "domain": "example.test"},
             })
             jid = job.id
-            for _ in range(200):
-                await asyncio.sleep(0.05)
-                if m.job_status(jid) in ("completed", "failed", "paused"):
-                    break
+            await pump_gateway_queue(
+                m, jid, ("completed", "failed", "paused", "cancelled"))
             db.expire_all()
             row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
             return row.status, row.result or {}, (row.error or "")

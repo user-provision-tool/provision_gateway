@@ -91,15 +91,25 @@ class ProvisionService:
             # testing this wiring directly (Round 20) after nine failed attempts
             # to produce a live refusal.
             _inner = body.get("detail") if isinstance(body.get("detail"), dict) else {}
-            if body.get("error") == "at_capacity" or _inner.get("error") == "at_capacity":
+            code = body.get("error") if isinstance(body.get("error"), str) else None
+            if code is None and isinstance(_inner.get("error"), str):
+                code = _inner["error"]
+            # G92: the bounded queue's refusals travel with the same rule as
+            # `at_capacity` — nothing was accepted, and the dashboard branches
+            # on the code to show the right remedy.
+            if code in ("at_capacity", "queue_full", "queue_unavailable"):
                 body = {**body, **{k: v for k, v in _inner.items() if k not in body}}
                 return HTTPException(
                     503,
                     {
-                        "error": "at_capacity",
-                        "detail": body.get("detail") or str(exc),
+                        "error": code,
+                        "detail": body.get("detail") if isinstance(body.get("detail"), str)
+                        else str(exc),
                         "running": body.get("running"),
+                        "queued": body.get("queued"),
                         "capacity": body.get("capacity"),
+                        "heartbeat_age_s": body.get("heartbeat_age_s"),
+                        "stale_after_s": body.get("stale_after_s"),
                     },
                 )
         # A card action on an unknown instance is a CLIENT error, not a
@@ -315,7 +325,10 @@ class ProvisionService:
         return await self._request("GET", f"/tasks/{task_id}/logfile")
 
     async def cancel_task(self, task_id: str) -> dict[str, Any]:
-        return await self._request("DELETE", f"/tasks/{task_id}")
+        # The -api waits up to the per-kind cancellation timeout (the longest
+        # is 300 s); the client bound sits above it so the settle report is not
+        # lost to a transport timeout.
+        return await self._request("DELETE", f"/tasks/{task_id}", timeout=360.0)
 
     async def stream_task_log(self, task_id: str, tail: int = 200, follow: bool = True):
         """Stream task build log from provision-api via SSE.

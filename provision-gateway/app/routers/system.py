@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
@@ -125,10 +126,14 @@ async def system_status(
     except Exception:
         pass
 
+    # Queue counts come from the task rows (R9.2), not from an -api HTTP poll.
+    tasks_queued = tasks_planned = 0
     try:
-        tasks_result = await provision_service.list_tasks()
-        tasks_list = tasks_result if isinstance(tasks_result, list) else tasks_result.get("tasks", [])
-        tasks_running = sum(1 for t in tasks_list if t.get("status") in ("pending", "running"))
+        from ..services.task_queue import gateway_queue
+        counts = await asyncio.to_thread(gateway_queue.counts)
+        tasks_running = counts["running"]
+        tasks_queued = counts["queued"] + counts["planned"]
+        tasks_planned = counts["planned"]
     except Exception:
         pass
 
@@ -153,12 +158,28 @@ async def system_status(
         "services_count": services_count,
         "users_count": users_count,
         "tasks_running": tasks_running,
+        "tasks_queued": tasks_queued,
+        "tasks_planned": tasks_planned,
         "service_stats": service_stats,
         "container_stats": container_stats,
         "nginx_http_port": settings.NGINX_HTTP_PORT,
         "nginx_https_port": settings.NGINX_HTTPS_PORT,
         "acl": acl,
     }
+
+
+@router.get("/queue")
+async def system_queue(
+    current_admin: dict = Depends(require_admin),
+):
+    """Both queues' telemetry: counts, positions, ETA, heartbeat, settings.
+
+    Admin-only (task doc §3.1). The gateway half is its own store; the
+    registry half is read read-only through ``gateway_reader`` — the -api owns
+    it and never reads back (R9.1/R9.2).
+    """
+    from ..services.task_queue import gateway_queue
+    return await asyncio.to_thread(gateway_queue.stats)
 
 
 @router.get("/stats")

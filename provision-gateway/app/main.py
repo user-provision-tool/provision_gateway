@@ -43,6 +43,7 @@ _project_monitor_task: asyncio.Task | None = None
 _account_repair_task: asyncio.Task | None = None
 _cross_startup_task: asyncio.Task | None = None
 _cross_watch_task: asyncio.Task | None = None
+_queue_task: asyncio.Task | None = None
 
 
 def _get_reconcile_interval_min() -> int:
@@ -230,7 +231,7 @@ async def _project_monitor_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
-    global _reconcile_task, _docker_events_task, _project_monitor_task, _account_repair_task, _cross_startup_task, _cross_watch_task
+    global _reconcile_task, _docker_events_task, _project_monitor_task, _account_repair_task, _cross_startup_task, _cross_watch_task, _queue_task
     # Startup
     init_db()
     print(f"[gateway] Database initialized at {settings.DATABASE_URL}")
@@ -263,13 +264,13 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         print(f"[gateway] WARNING: default-key backfill failed: {exc}")
 
-    # Generation jobs left queued/running by a previous process are dead —
-    # mark them failed ("interrupted by gateway restart") so polls resolve.
+    # G92 restart semantics: only RUNNING rows are failed ("interrupted by
+    # restart"); the queued/planned backlog survives for the planner/workers.
     try:
         from .services.generation_jobs import generation_jobs
         stale = generation_jobs.recover_stale_jobs(SessionLocal())
         if stale:
-            print(f"[gateway] Marked {stale} stale generation task(s) unknown (restart recovery)")
+            print(f"[gateway] Failed {stale} running generation task(s) (interrupted by restart)")
         terminal = generation_jobs.terminalize_unknown(SessionLocal())
         if terminal:
             print(f"[gateway] Terminalized {terminal} unknown task(s) as failed")
@@ -313,6 +314,13 @@ async def lifespan(app: FastAPI):
     from .services.cross_orchestrator import cross_orchestrator as _cross_orchestrator
     _cross_watch_task = asyncio.create_task(_cross_orchestrator.watch_loop())
     print("[gateway] Cross-service address watch started")
+
+    # G92 — the bounded generation queue: one planner (advisory-locked across
+    # the four uvicorn workers), the scheduler that claims `planned -> running`,
+    # and the timeout/cancel watchdog.
+    from .services.task_queue import gateway_queue as _gateway_queue
+    _queue_task = _gateway_queue.start()
+    print("[gateway] Generation queue planner/scheduler started")
     yield
     # Shutdown
     if _reconcile_task:
@@ -327,6 +335,8 @@ async def lifespan(app: FastAPI):
         _cross_startup_task.cancel()
     if _cross_watch_task:
         _cross_watch_task.cancel()
+    if _queue_task:
+        _queue_task.cancel()
     print("[gateway] Shutting down")
 
 

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
-  apiKeyScopes, cardKey, cardLabel, instanceRoutes, ownerLabel, ownerTags,
-  targetDisplay, taskFamily, taskLogRoute, taskRoute,
+  addPlaceholder, apiKeyScopes, batchBlocking, batchEnabled, cardBusy, cardKey,
+  cardLabel, formatEta, instanceRoutes, ownerLabel, ownerTags, pendingLabel,
+  placeholderKey, queueLabel, reconcilePlaceholders, statusBadge, targetDisplay,
+  taskFamily, taskLogRoute, taskRoute,
 } from './contracts'
 
 describe('identity and route contracts', () => {
@@ -59,5 +61,86 @@ describe('one-card merge', () => {
     expect(cardLabel(null, 'Ready to deploy', false)).toBe('Ready to deploy')
     expect(cardLabel(null, 'Deploying…', false)).toBe('Deploying…')
     expect(cardLabel({ service_id: 's', status: 'running' }, null, true)).toBeNull()
+  })
+})
+
+describe('instant feedback (GRILLING G90)', () => {
+  it('maps every pending code to its click-time label', () => {
+    expect(pendingLabel('starting')).toBe('Starting…')
+    expect(pendingLabel('stopping')).toBe('Stopping…')
+    expect(pendingLabel('deleting')).toBe('Deleting…')
+    expect(pendingLabel('cancelling')).toBe('Cancelling…')
+    expect(pendingLabel('removing')).toBe('Removing…')
+    expect(pendingLabel(null)).toBeNull()
+    expect(pendingLabel(undefined)).toBeNull()
+  })
+
+  it('lets the operator-pending state win over failed and building', () => {
+    expect(statusBadge('failed', 'deleting', { failedStage: 'build' })?.text).toBe('Deleting…')
+    expect(statusBadge('building', 'cancelling')?.text).toBe('Cancelling…')
+    expect(statusBadge('failed', 'starting')?.tone).toBe('processing')
+    expect(statusBadge('unknown', 'stopping')?.text).toBe('Stopping…')
+  })
+
+  it('keeps the server badge when no operation is pending', () => {
+    expect(statusBadge('failed', null, { failedStage: 'compose' }))
+      .toEqual({ tone: 'error', text: 'Failed (compose)' })
+    expect(statusBadge('failed', null, { analyzing: true })?.text).toBe('Failed + analyzing')
+    expect(statusBadge('building', undefined)?.text).toBe('Building...')
+    expect(statusBadge('deleting', undefined)?.text).toBe('Deleting...')
+    // `running`/`unknown` need the container counts; the helper declines.
+    expect(statusBadge('running', undefined)).toBeNull()
+    expect(statusBadge(undefined, null)).toBeNull()
+  })
+
+  it('keys a placeholder by user + service + label, one per triple', () => {
+    expect(placeholderKey('alice', 'example-s2s', 3)).toBe('alice::example-s2s::3')
+    const one = addPlaceholder([], 'alice', 'example-s2s', 3)
+    expect(one).toHaveLength(1)
+    expect(addPlaceholder(one, 'alice', 'example-s2s', '3')).toBe(one)
+    expect(addPlaceholder(one, 'alice', 'example-s2s', 4)).toHaveLength(2)
+  })
+
+  it('shows the queued and planned waiting states', () => {
+    expect(statusBadge('queued', undefined)).toEqual({ tone: 'default', text: 'Queued' })
+    expect(statusBadge('planned', undefined)).toEqual({ tone: 'processing', text: 'Planned' })
+    expect(cardBusy('queued') && cardBusy('planned') && cardBusy('building')).toBe(true)
+    expect(cardBusy('running')).toBe(false)
+  })
+
+  it('labels a queued card with its position and approximate ETA', () => {
+    expect(queueLabel({ status: 'queued', position: 3, eta_start_s: 120 }))
+      .toBe('3 ahead · ~2m')
+    expect(queueLabel({ status: 'planned' })).toBe('planned')
+    expect(queueLabel(null)).toBeNull()
+    expect(formatEta(45)).toBe('45s')
+    expect(formatEta(3720)).toBe('1h 2m')
+  })
+
+  it('pre-filters a batch: every selected card must be in the allowed set', () => {
+    expect(batchEnabled('stop', ['running', 'running'])).toBe(true)
+    expect(batchEnabled('stop', ['running', 'building'])).toBe(false)
+    expect(batchBlocking('stop', ['running', 'building', 'queued']))
+      .toEqual(['building', 'queued'])
+    // A building/queued/planned card allows no destructive batch action.
+    expect(batchBlocking('delete', ['queued'])).toEqual(['queued'])
+    expect(batchBlocking('rebuild', ['building'])).toEqual(['building'])
+    expect(batchEnabled('start', [])).toBe(false)
+  })
+
+  it('replaces a placeholder when the stages refresh returns its triple', () => {
+    const list = [
+      ...addPlaceholder([], 'alice', 'example-s2s', 3),
+      ...addPlaceholder([], 'bob', 'example-s2s', 3),
+    ]
+    const services = [{ user_name: 'alice', service_name: 'example-s2s', label: 3 }]
+    const after = reconcilePlaceholders(list, services, [])
+    expect(after.map(p => p.key)).toEqual(['bob::example-s2s::3'])
+    // A pre-deploy session counts too — the card exists before registration.
+    const sessions = [{ user_name: 'bob', service_name: 'example-s2s', label: '3' }]
+    expect(reconcilePlaceholders(list, [], sessions).map(p => p.key))
+      .toEqual(['alice::example-s2s::3'])
+    // No matching entry: the list is returned unchanged (same reference).
+    expect(reconcilePlaceholders(list, [], [])).toBe(list)
   })
 })

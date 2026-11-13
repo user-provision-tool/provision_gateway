@@ -72,6 +72,7 @@ async def cancel_task(task_id: str, current_admin: dict = Depends(require_admin)
             return await provision_service.cancel_task(task_id)
         except Exception as e:  # noqa: BLE001
             raise provision_service.as_task_error(e)
+    from ..services.generation_jobs import generation_jobs
     db = SessionLocal()
     try:
         row = db.execute(
@@ -84,21 +85,21 @@ async def cancel_task(task_id: str, current_admin: dict = Depends(require_admin)
             raise HTTPException(409, "fix_remove is not cancellable")
         if row["status"] in TERMINAL or row["status"] == "unknown":
             raise HTTPException(409, f"Task is already terminal: {row['status']}")
-        if row["status"] not in ("queued", "running", "paused", "awaiting_input"):
+        if row["status"] not in ("queued", "planned", "running", "paused",
+                                 "awaiting_input"):
             raise HTTPException(409, f"Task cannot be cancelled: {row['status']}")
-        db.execute(
-            text("UPDATE gateway.tasks SET status='cancelled', updated_at=now() "
-                 "WHERE task_id=:id AND status IN ('queued','running','paused','awaiting_input')"),
-            {"id": task_id},
-        )
-        db.commit()
+        generation_jobs.cancel_job(db, task_id)
     finally:
         db.close()
+    # The caller waits for the abort to settle within the per-kind cancellation
+    # timeout (R6.3); an unsettled cancel is reported, never hidden.
+    settled = await asyncio.to_thread(generation_jobs.wait_for_terminal, task_id)
     # Session rules: a live generation cancel removes its session; an
     # operator-held paused/refused session is kept.
-    from ..services import generation_jobs as _gj
-    _gj.generation_jobs.cancel_session_after_task_cancel(task_id)
-    return {"task_id": task_id, "status": "cancelled"}
+    generation_jobs.cancel_session_after_task_cancel(task_id)
+    return {"task_id": task_id, "status": settled.get("status"),
+            "confirmed": settled.get("confirmed"),
+            "error": None if settled.get("confirmed") else "cancellation_unconfirmed"}
 
 
 @router.post("/{task_id}/answer")
