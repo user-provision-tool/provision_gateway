@@ -94,8 +94,9 @@ async def apply_service_grant_set(source_id: str, body: dict,
         )
     finally:
         db.close()
-    await cross_orchestrator.sync_all()
-    return {"updated": True, **result}
+    # G94 R10.1 — the targeted grant sync: only this source is read/submitted.
+    sync = await cross_orchestrator.sync_source(source_id)
+    return {"updated": True, **result, "sync": sync}
 
 
 @router.put("/{source_id}/{target_id}")
@@ -119,8 +120,9 @@ async def set_service_grant(source_id: str, target_id: str,
         result["grant"] = row
     finally:
         db.close()
-    await cross_orchestrator.sync_all()
-    return {"updated": True, **result}
+    # G94 R10.1 — the targeted grant sync: only this source is read/submitted.
+    sync = await cross_orchestrator.sync_source(source_id)
+    return {"updated": True, **result, "sync": sync}
 
 
 @router.delete("/{source_id}/{target_id}")
@@ -139,5 +141,5 @@ async def remove_service_grant(source_id: str, target_id: str,
         result = service_grants.list_for_source(db, entry) if entry else {}
     finally:
         db.close()
-    await cross_orchestrator.sync_all()
-    return {"removed": removed, **result}
+    sync = await cross_orchestrator.sync_source(source_id)
+    return {"removed": removed, **result, "sync": sync}

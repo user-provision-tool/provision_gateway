@@ -43,6 +43,8 @@ SELECT s.id                AS service_id,
        i.profiles,
        i.volumes,
        i.build_args,
+       i.extra_resolver,
+       i.extra_network,
        i.tls
   FROM registry.services s
   JOIN registry.api_users a ON a.id = s.owner_api_user_id

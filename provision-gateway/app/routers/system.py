@@ -127,13 +127,19 @@ async def system_status(
         pass
 
     # Queue counts come from the task rows (R9.2), not from an -api HTTP poll.
+    # `tasks_*` are the OPERATOR lane (the cards' counts, R8); the maintenance
+    # lane is reported separately (G94 R5.2).
     tasks_queued = tasks_planned = 0
+    tasks_queued_maintenance = tasks_maintenance = 0
     try:
         from ..services.task_queue import gateway_queue
         counts = await asyncio.to_thread(gateway_queue.counts)
-        tasks_running = counts["running"]
-        tasks_queued = counts["queued"] + counts["planned"]
-        tasks_planned = counts["planned"]
+        tasks_running = counts["operator"]["running"]
+        tasks_queued = counts["operator"]["queued"] + counts["operator"]["planned"]
+        tasks_planned = counts["operator"]["planned"]
+        maint = counts["maintenance"]
+        tasks_queued_maintenance = maint["queued"] + maint["planned"]
+        tasks_maintenance = maint["queued"] + maint["planned"] + maint["running"]
     except Exception:
         pass
 
@@ -160,6 +166,8 @@ async def system_status(
         "tasks_running": tasks_running,
         "tasks_queued": tasks_queued,
         "tasks_planned": tasks_planned,
+        "tasks_queued_maintenance": tasks_queued_maintenance,
+        "tasks_maintenance": tasks_maintenance,
         "service_stats": service_stats,
         "container_stats": container_stats,
         "nginx_http_port": settings.NGINX_HTTP_PORT,

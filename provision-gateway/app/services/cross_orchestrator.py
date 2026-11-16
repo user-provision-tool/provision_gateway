@@ -96,6 +96,24 @@ class CrossOrchestrator:
             await asyncio.sleep(0.5)
         raise TimeoutError(f"the -api task {task_id} did not finish in time")
 
+    async def _pair_matches(
+        self, service_id: str, present: bool, resolver_ip: str | None,
+    ) -> bool:
+        """The stored pair after a deduplicated task (R4.2/G94).
+
+        Only the dedupe path reads it: the global reconciler compares the one
+        entries query instead (R10.3), and the targeted sync owns exactly one
+        source.
+        """
+        try:
+            current = await provision_service.get_extra_resolver(service_id)
+        except Exception:  # noqa: BLE001 — re-submitting is the safe fallback
+            return False
+        if not present:
+            return not current.get("extra_resolver")
+        return (current.get("extra_resolver") == resolver_ip
+                and current.get("extra_network") == settings.CROSS_NETWORK)
+
     async def _apply(
         self, service_id: str, present: bool, *, resolver_ip: str | None = None,
     ) -> bool:
@@ -107,6 +125,11 @@ class CrossOrchestrator:
         the first post-queue startup pass (measured 2026-11-10) — and the queue
         itself has no wait timeout, so a task still queued after the caller's
         30 s is delayed, not failed.
+
+        G94 R4.2: the -api's maintenance in-flight guard may answer with an
+        existing task (`deduplicated`). The click polls that task; if the stored
+        pair still does not match the desired state, the in-flight row was the
+        opposite direction, so one fresh submit follows after it settles.
         """
         last: Exception | None = None
         for attempt in range(1, settings.CROSS_TASK_RETRIES + 1):
@@ -121,6 +144,13 @@ class CrossOrchestrator:
                 else:
                     data = await provision_service.clear_extra_resolver(service_id)
                 await self._poll_task(str(data["task_id"]))
+                if data.get("deduplicated"):
+                    if await self._pair_matches(service_id, present, resolver_ip):
+                        return True
+                    _log.info(
+                        "deduplicated update for %s settled; the pair still "
+                        "differs, submitting the desired direction", service_id)
+                    continue
                 return True
             except TimeoutError as exc:
                 _log.info(
@@ -145,25 +175,29 @@ class CrossOrchestrator:
         return False
 
     async def _sync_source(self, entry: dict, *, resolver_ip: str) -> bool:
+        """Compare the STORED pair from the entries query; submit only if stale.
+
+        No per-source HTTP GET: the global reconciler reads the pairs in the
+        same one query that produced the entries (R10.3).
+        """
         service_id = str(entry["service_id"])
-        try:
-            current = await provision_service.get_extra_resolver(service_id)
-        except Exception:  # noqa: BLE001 — a stale read is not a reason to skip
-            current = {}
-        if (current.get("extra_resolver") == resolver_ip
-                and current.get("extra_network") == settings.CROSS_NETWORK):
+        if (entry.get("extra_resolver") == resolver_ip
+                and entry.get("extra_network") == settings.CROSS_NETWORK):
             return True
         return await self._apply(service_id, present=True, resolver_ip=resolver_ip)
 
-    async def _clear_source(self, service_id: str) -> bool:
-        return await self._apply(service_id, present=False)
+    async def _clear_source(self, entry: dict) -> bool:
+        if not entry.get("extra_resolver"):
+            return True
+        return await self._apply(str(entry["service_id"]), present=False)
 
     async def sync_all(self) -> dict:
-        """Refresh the resolver config and every source's resolv.conf/membership.
+        """The GLOBAL reconciler: every source's resolv.conf/membership.
 
-        Both dynamic values are snapshotted once per pass (G91): the dnsmasq
-        records and the resolver pair must carry one coherent pair, and a value
-        changing mid-pass must not split them.
+        Runs only on gateway startup, a cross resolver/nginx address change and
+        service lifecycle changes (G94 R10.2). Both dynamic values are
+        snapshotted once per pass (G91), and the stored-pair diff uses the one
+        read-only entries query — never one HTTP GET per source (R10.3).
         """
         cross_ip = cross_values.current_cross_nginx_ip()
         resolver_ip = cross_values.current_resolver_ip()
@@ -200,19 +234,50 @@ class CrossOrchestrator:
         for service_id, entry in entries.items():
             if str(service_id) in sources or not service_grants.live(entry):
                 continue
-            try:
-                current = await provision_service.get_extra_resolver(str(service_id))
-            except Exception:  # noqa: BLE001
-                continue
-            if current.get("extra_resolver"):
-                if await self._clear_source(str(service_id)):
-                    cleared += 1
-                else:
-                    clear_failed += 1
+            if await self._clear_source(entry):
+                cleared += 1 if entry.get("extra_resolver") else 0
+            else:
+                clear_failed += 1
         return {"domains": sorted(domains), "config_changed": changed,
                 "sources": len(sources), "applied": applied,
                 "failed": len(sources) - applied,
                 "cleared": cleared, "clear_failed": clear_failed}
+
+    async def sync_source(self, service_id: str) -> dict:
+        """The TARGETED grant sync: dnsmasq + the affected source only (R10.1).
+
+        A grant set/bulk set/remove calls this, and the request awaits the one
+        maintenance task. It never sweeps the other sources: a stale one is the
+        global reconciler's job (startup/address/lifecycle).
+        """
+        cross_ip = cross_values.current_cross_nginx_ip()
+        resolver_ip = cross_values.current_resolver_ip()
+        db = SessionLocal()
+        try:
+            domains = service_grants.reachable_domains(db)
+            entries = service_grants.entries_by_id()
+            entry = entries.get(str(service_id))
+            targets = service_grants.targets_for(db, entry) if entry else []
+        finally:
+            db.close()
+        changed = (
+            self.write_dnsmasq_config(domains, cross_nginx_ip=cross_ip)
+            if cross_ip else False
+        )
+        result = {"service_id": str(service_id), "domains": sorted(domains),
+                  "config_changed": changed, "applied": 0, "cleared": 0}
+        if entry is None:
+            return result
+        if not resolver_ip:
+            result["error"] = "cross resolver address not resolved"
+            return result
+        if targets:
+            if await self._sync_source(entry, resolver_ip=resolver_ip):
+                result["applied"] = 1
+        elif service_grants.live(entry) and entry.get("extra_resolver"):
+            if await self._clear_source(entry):
+                result["cleared"] = 1
+        return result
 
     async def startup_pass(self) -> dict:
         """The gateway's one-time startup pass, retried while the -api boots.

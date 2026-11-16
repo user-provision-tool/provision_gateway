@@ -93,12 +93,18 @@ export default function DashboardPage() {
           <Card style={{height:110}}><Statistic title="Users" value={sysStatus?.users_count ?? 0}/></Card>
         </Col>
         <Col xs={24} sm={12} md={6}>
-          <Card style={{height:110}}><Statistic title="Running Tasks" value={sysStatus?.tasks_running ?? 0}/></Card>
-        </Col>
-        <Col xs={24} sm={12} md={6}>
-          {/* G92 R7.3 — the same counts as the Services-page bar and the card. */}
+          {/* The running and queuing (queued + planned) operator counts in one
+              block, as "{running} / {queuing}". G92 R7.3 / G94 R5.2 — the
+              maintenance lane stays a separate count and never appears in a
+              card status. */}
           <Card style={{height:110}}>
-            <Statistic title="Queuing Tasks" value={sysStatus?.tasks_queued ?? 0}/>
+            <Statistic title={'Running \\ Queuing Tasks'}
+              value={`${sysStatus?.tasks_running ?? 0} / ${sysStatus?.tasks_queued ?? 0}`}
+              suffix={(sysStatus?.tasks_maintenance ?? 0) > 0
+                ? <span style={{fontSize:12,display:'block',marginTop:4}}>
+                    <Tag color="purple">+{sysStatus.tasks_maintenance} maintenance</Tag>
+                  </span>
+                : undefined}/>
           </Card>
         </Col>
         <Col xs={24} sm={12} md={6}>

@@ -78,6 +78,8 @@ class TestContract:
         spec.loader.exec_module(api)
 
         assert tuple(gw.STATES) == tuple(api.STATES)
+        assert tuple(gw.LANES) == tuple(api.LANES)
+        assert tuple(gw.MAINTENANCE_KINDS) == tuple(api.MAINTENANCE_KINDS)
         assert tuple(gw.ERROR_CODES) == tuple(api.ERROR_CODES)
         assert tuple(gw.KINDS) == tuple(api.KINDS)
         assert gw.RUN_TIMEOUTS == api.RUN_TIMEOUTS
@@ -87,9 +89,14 @@ class TestContract:
         assert tuple(gw.STATS_HEARTBEAT_KEYS) == tuple(api.STATS_HEARTBEAT_KEYS)
         assert tuple(gw.STATS_TASK_KEYS) == tuple(api.STATS_TASK_KEYS)
         assert tuple(gw.STATS_KIND_KEYS) == tuple(api.STATS_KIND_KEYS)
+        assert tuple(gw.STATS_LANE_KEYS) == tuple(api.STATS_LANE_KEYS)
         for key in ("DEFAULT_QUEUE_CAP", "DEFAULT_WORKERS", "DEFAULT_PLAN_SIZE",
+                    "DEFAULT_QUEUE_CAP_MAINTENANCE", "DEFAULT_WORKERS_MAINTENANCE",
+                    "DEFAULT_PLAN_SIZE_MAINTENANCE",
                     "DEFAULT_SPAN_S", "DEFAULT_HEARTBEAT_STALE_S"):
             assert getattr(gw, key) == getattr(api, key)
+        for kind in ("update", "deploy", "generate"):
+            assert gw.lane_for_kind(kind) == api.lane_for_kind(kind)
 
 
 class TestPlanner:
@@ -367,3 +374,56 @@ class TestTelemetry:
                 "now(), now())"), {"p": uuid.uuid4()})
         row = registry_tasks.get("api-read")
         assert row is not None and row["status"] == "planned"
+
+
+class TestLaneTelemetry:
+    """G94 R5/R7: the read model exposes the -api's two lanes."""
+
+    def test_registry_stats_expose_both_lanes(self):
+        from app.services.task_queue import gateway_queue
+        from support import registry_engine
+
+        with registry_engine().begin() as conn:
+            conn.execute(text(
+                "INSERT INTO registry.tasks (task_id, procedure_id, service_id, executor, "
+                "kind, lane, operation, status, created_at, updated_at) VALUES "
+                "('api-op-q', :p, NULL, 'api', 'deploy', 'operator', 'register', "
+                "'queued', now(), now()), "
+                "('api-mt-q', :p2, NULL, 'api', 'update', 'maintenance', "
+                "'resolv_conf_set', 'queued', now(), now()), "
+                "('api-mt-p', :p3, NULL, 'api', 'update', 'maintenance', "
+                "'resolv_conf_set', 'planned', now() + interval '1 second', now())"
+            ), {"p": uuid.uuid4(), "p2": uuid.uuid4(), "p3": uuid.uuid4()})
+
+        stats = gateway_queue.stats()["registry"]
+        # Top-level stays the operator lane (R8/R5.3).
+        assert stats["counts"]["queued"] == 1
+        assert "api-op-q" in stats["tasks"]
+        assert "api-mt-q" not in stats["tasks"]
+        maintenance = stats["lanes"]["maintenance"]
+        assert maintenance["counts"]["queued"] == 1
+        assert maintenance["counts"]["planned"] == 1
+        assert maintenance["cap"] == 20
+        assert maintenance["span_s"] is None
+        assert maintenance["tasks"]["api-mt-q"]["position"] == 0
+        assert maintenance["tasks"]["api-mt-q"]["lane"] == "maintenance"
+        assert stats["lanes"]["operator"]["tasks"]["api-op-q"]["position"] == 0
+
+    def test_counts_split_by_lane(self):
+        from app.services.task_queue import gateway_queue
+        from support import registry_engine
+
+        with registry_engine().begin() as conn:
+            conn.execute(text(
+                "INSERT INTO registry.tasks (task_id, procedure_id, service_id, executor, "
+                "kind, lane, operation, status, created_at, updated_at) VALUES "
+                "('api-op-q2', :p, NULL, 'api', 'deploy', 'operator', 'register', "
+                "'queued', now(), now()), "
+                "('api-mt-q2', :p2, NULL, 'api', 'update', 'maintenance', "
+                "'resolv_conf_set', 'queued', now(), now())"
+            ), {"p": uuid.uuid4(), "p2": uuid.uuid4()})
+
+        counts = gateway_queue.counts()
+        assert counts["maintenance"]["queued"] == 1
+        assert counts["operator"]["queued"] == 1
+        assert counts["queued"] == 2

@@ -93,6 +93,8 @@ export const cardBusy = (status?: string | null): boolean =>
 
 export interface QueueInfo {
   status?: string
+  /** `operator` is the only lane a card ever shows (G94 R5.3). */
+  lane?: string
   position?: number | null
   eta_start_s?: number | null
   eta_finish_s?: number | null

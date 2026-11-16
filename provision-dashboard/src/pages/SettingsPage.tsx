@@ -33,55 +33,101 @@ function QueuePanel() {
 
   const kinds = ['generate', 'fix_analysis', 'deploy', 'rebuild', 'remove', 'update']
 
-  const queueCard = (title: string, q: any) => {
-    if (!q) return null
-    const hb = q.heartbeat || {}
+  const heartbeatTag = (hb: any) => (
+    <Tag color={hb?.alive ? 'green' : 'red'}>
+      planner {hb?.alive ? `alive (${hb?.age_s ?? 0}s)` : `stale (${hb?.age_s ?? '?'}s)`}
+    </Tag>
+  )
+
+  const kindTable = (q: any) => (
+    <table style={{ fontSize: 12, borderCollapse: 'collapse' }}>
+      <thead>
+        <tr>
+          <th style={{ textAlign: 'left', paddingRight: 12 }}>kind</th>
+          <th style={{ textAlign: 'right', paddingRight: 12 }}>run timeout</th>
+          <th style={{ textAlign: 'right', paddingRight: 12 }}>cancel timeout</th>
+          <th style={{ textAlign: 'right' }}>median (last 50)</th>
+        </tr>
+      </thead>
+      <tbody>
+        {kinds.map(k => (
+          <tr key={k}>
+            <td style={{ paddingRight: 12 }}>{k}</td>
+            <td style={{ textAlign: 'right', paddingRight: 12 }}>
+              {q?.config?.[`run_timeout_${k}`] ?? '—'}s
+            </td>
+            <td style={{ textAlign: 'right', paddingRight: 12 }}>
+              {q?.config?.[`cancel_timeout_${k}`] ?? '—'}s
+            </td>
+            <td style={{ textAlign: 'right' }}>
+              {q?.kinds?.[k]?.median_s != null ? `${q.kinds[k].median_s}s` : '—'}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+
+  // G94 R5.2 — one block per lane: its own cap/workers/plan depth, its own
+  // counts and last-plan time. The maintenance lane has no dispatch window.
+  const laneBlock = (title: string, l: any) => {
+    if (!l) return null
     return (
-      <Card size="small" title={title} style={{ marginBottom: 12 }}>
+      <Card size="small" type="inner" title={title} style={{ marginBottom: 8 }}>
+        <Space wrap size={4}>
+          <Tag>cap {l.cap}</Tag>
+          <Tag>workers {l.workers}</Tag>
+          <Tag>plan {l.plan_size}</Tag>
+          {l.span_s != null && <Tag>window {l.span_s}s</Tag>}
+          {l.pinned_workers > 0 && <Tag color="orange">{l.pinned_workers} pinned</Tag>}
+        </Space>
+        <div>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            Queued {l.counts?.queued ?? 0} · Planned {l.counts?.planned ?? 0} ·
+            Running {l.counts?.running ?? 0} · last plan{' '}
+            {l.last_plan_at ? new Date(l.last_plan_at).toLocaleTimeString() : '—'}
+          </Text>
+        </div>
+      </Card>
+    )
+  }
+
+  const gatewayCard = (q: any) => {
+    if (!q) return null
+    return (
+      <Card size="small" title="Gateway — generation queue (operator lane)"
+        style={{ marginBottom: 12 }}>
         <Space direction="vertical" style={{ width: '100%' }} size={4}>
           <Space wrap>
             <Tag>cap {q.cap}</Tag>
             <Tag>workers {q.workers}</Tag>
             <Tag>plan {q.plan_size}</Tag>
             <Tag>window {q.span_s}s</Tag>
-            <Tag color={hb.alive ? 'green' : 'red'}>
-              planner {hb.alive ? `alive (${hb.age_s ?? 0}s)` : `stale (${hb.age_s ?? '?'}s)`}
-            </Tag>
+            {heartbeatTag(q.heartbeat)}
             {q.pinned_workers > 0 && <Tag color="orange">{q.pinned_workers} pinned</Tag>}
           </Space>
           <Text type="secondary" style={{ fontSize: 12 }}>
             Queued {q.counts?.queued ?? 0} · Planned {q.counts?.planned ?? 0} ·
             Running {q.counts?.running ?? 0}
           </Text>
-          <table style={{ fontSize: 12, borderCollapse: 'collapse' }}>
-            <thead>
-              <tr>
-                <th style={{ textAlign: 'left', paddingRight: 12 }}>kind</th>
-                <th style={{ textAlign: 'right', paddingRight: 12 }}>run timeout</th>
-                <th style={{ textAlign: 'right', paddingRight: 12 }}>cancel timeout</th>
-                <th style={{ textAlign: 'right' }}>median (last 50)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {kinds.map(k => (
-                <tr key={k}>
-                  <td style={{ paddingRight: 12 }}>{k}</td>
-                  <td style={{ textAlign: 'right', paddingRight: 12 }}>
-                    {q.config?.[`run_timeout_${k}`] ?? '—'}s
-                  </td>
-                  <td style={{ textAlign: 'right', paddingRight: 12 }}>
-                    {q.config?.[`cancel_timeout_${k}`] ?? '—'}s
-                  </td>
-                  <td style={{ textAlign: 'right' }}>
-                    {q.kinds?.[k]?.median_s != null ? `${q.kinds[k].median_s}s` : '—'}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          <Text type="secondary" style={{ fontSize: 11 }}>
-            There is no queue-wait timeout and no end-to-end deadline.
-          </Text>
+          {kindTable(q)}
+        </Space>
+      </Card>
+    )
+  }
+
+  const registryCard = (q: any) => {
+    if (!q) return null
+    return (
+      <Card size="small" title="Provision API — two lanes" style={{ marginBottom: 12 }}>
+        <Space direction="vertical" style={{ width: '100%' }} size={4}>
+          <Space wrap>
+            {heartbeatTag(q.heartbeat)}
+            {q.pinned_workers > 0 && <Tag color="orange">{q.pinned_workers} pinned</Tag>}
+          </Space>
+          {laneBlock('Operator lane (deploy / rebuild / remove)', q.lanes?.operator)}
+          {laneBlock('Maintenance lane (update / resolv.conf sync)', q.lanes?.maintenance)}
+          {kindTable(q)}
         </Space>
       </Card>
     )
@@ -90,8 +136,11 @@ function QueuePanel() {
   return (
     <Card title={<span><ApiOutlined /> Task Queues</span>} style={{ marginBottom: 16 }}>
       {!loaded ? <Spin /> : !stats ? <Empty description="Queue stats unavailable" /> : <>
-        {queueCard('Gateway — generation queue', stats.gateway)}
-        {queueCard('Provision API — deploy queue', stats.registry)}
+        {gatewayCard(stats.gateway)}
+        {registryCard(stats.registry)}
+        <Text type="secondary" style={{ fontSize: 11 }}>
+          There is no queue-wait timeout and no end-to-end deadline.
+        </Text>
       </>}
     </Card>
   )

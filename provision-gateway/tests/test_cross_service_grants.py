@@ -259,3 +259,98 @@ def test_stream_verdict_denial_logs_the_raw_source_ip(monkeypatch, caplog):
     assert verdict["allowed"] is False
     assert "source_ip=172.28.0.9" in caplog.text
     assert "secret-handle.example.com" not in caplog.text
+
+
+class _FakeSession:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def close(self):
+        pass
+
+
+def test_targeted_sync_touches_only_the_affected_source(monkeypatch):
+    """G94 R10.1 — a grant click reads/submits its source and no other."""
+    import asyncio
+    from app.services import cross_orchestrator as co
+
+    orch = CrossOrchestrator()
+    calls = []
+    entries = {
+        "source-1": {"service_id": "source-1", "status": "running",
+                     "extra_resolver": None, "extra_network": None},
+        "other-1": {"service_id": "other-1", "status": "running",
+                    "extra_resolver": "stale", "extra_network": "stale"},
+    }
+    monkeypatch.setattr(co, "SessionLocal", _FakeSession)
+    monkeypatch.setattr(co.cross_values, "current_cross_nginx_ip", lambda: "172.28.0.2")
+    monkeypatch.setattr(co.cross_values, "current_resolver_ip", lambda: "172.28.0.3")
+    monkeypatch.setattr(orch, "write_dnsmasq_config",
+                        lambda domains, cross_nginx_ip=None: False)
+    monkeypatch.setattr(co.service_grants, "reachable_domains", lambda db: {"localhost"})
+    monkeypatch.setattr(co.service_grants, "entries_by_id", lambda: entries)
+    monkeypatch.setattr(
+        co.service_grants, "targets_for",
+        lambda db, entry: ([{"service_id": "target-1"}]
+                           if entry and entry["service_id"] == "source-1" else []))
+    monkeypatch.setattr(co.service_grants, "live", lambda entry: True)
+
+    async def fake_apply(service_id, present, *, resolver_ip=None):
+        calls.append((service_id, present, resolver_ip))
+        return True
+
+    monkeypatch.setattr(orch, "_apply", fake_apply)
+    result = asyncio.run(orch.sync_source("source-1"))
+
+    assert result["applied"] == 1
+    assert calls == [("source-1", True, "172.28.0.3")]
+    # The other stale source is the global reconciler's job, not this click's.
+    assert all(service_id != "other-1" for service_id, _p, _r in calls)
+
+
+def test_global_reconciler_diffs_stored_pairs_without_http_reads(monkeypatch):
+    """G94 R10.2/R10.3 — one entries query drives the pass; no per-source GET."""
+    import asyncio
+    from app.services import cross_orchestrator as co
+
+    orch = CrossOrchestrator()
+    entries = {
+        "s1": {"service_id": "s1", "status": "running",
+               "extra_resolver": "172.28.0.3",
+               "extra_network": settings.CROSS_NETWORK},
+        "s2": {"service_id": "s2", "status": "running",
+               "extra_resolver": "old", "extra_network": "old"},
+        "s3": {"service_id": "s3", "status": "running",
+               "extra_resolver": "old", "extra_network": "old"},
+    }
+    applied = []
+    monkeypatch.setattr(co, "SessionLocal", _FakeSession)
+    monkeypatch.setattr(co.cross_values, "current_cross_nginx_ip", lambda: "172.28.0.2")
+    monkeypatch.setattr(co.cross_values, "current_resolver_ip", lambda: "172.28.0.3")
+    monkeypatch.setattr(orch, "write_dnsmasq_config",
+                        lambda domains, cross_nginx_ip=None: False)
+    monkeypatch.setattr(co.service_grants, "reachable_domains", lambda db: {"localhost"})
+    monkeypatch.setattr(co.service_grants, "sources_with_targets",
+                        lambda db: {"s1": [], "s2": []})
+    monkeypatch.setattr(co.service_grants, "entries_by_id", lambda: entries)
+    monkeypatch.setattr(co.service_grants, "live", lambda entry: True)
+
+    async def fake_apply(service_id, present, *, resolver_ip=None):
+        applied.append((service_id, present))
+        return True
+
+    async def _no_http_read(service_id):
+        raise AssertionError("the global reconciler must not GET each source")
+
+    monkeypatch.setattr(orch, "_apply", fake_apply)
+    monkeypatch.setattr(co.provision_service, "get_extra_resolver", _no_http_read)
+    result = asyncio.run(orch.sync_all())
+
+    # s1 already carries the desired pair; s2 is stale; s3 lost its targets.
+    assert applied == [("s2", True), ("s3", False)]
+    assert result["applied"] == 2
+    assert result["cleared"] == 1
+    assert result["failed"] == 0

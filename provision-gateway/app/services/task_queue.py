@@ -174,6 +174,12 @@ class GatewayQueue:
             if planned:
                 db.commit()  # heartbeat only; the plan is not refilled (D2)
                 return
+            # The lane is exhausted and its plan is (re)formed: mark the
+            # per-lane plan time. A stuck plan stops advancing it (G94 R4.3).
+            db.execute(
+                text("UPDATE gateway.queue_state SET last_plan_operator_at=now(), "
+                     "updated_at=now() WHERE id=1")
+            )
             self._write_plan(db, self.config(db))
             db.commit()
         except Exception:  # noqa: BLE001 — the queue outlives one bad tick
@@ -385,18 +391,30 @@ class GatewayQueue:
     # ------------------------------------------------------------------
     # Telemetry (T6/R7)
     # ------------------------------------------------------------------
-    def counts(self) -> dict[str, int]:
-        """Cheap status counts from both queues (the dashboard cards)."""
+    def counts(self) -> dict[str, Any]:
+        """Cheap status counts from both queues, split by lane (the cards).
+
+        Top-level keys are the combined totals (the gateway generation queue +
+        both -api lanes); ``operator`` and ``maintenance`` carry the split the
+        Dashboard and the Services bar need (G94 R5.2). The gateway queue is
+        operator-only.
+        """
         from ..database import ReaderSessionLocal, SessionLocal
 
-        def one(db: Session, table: str) -> dict[str, int]:
-            out = {"queued": 0, "planned": 0, "running": 0}
+        def one(db: Session, table: str) -> dict[str, Any]:
+            out = {
+                "queued": 0, "planned": 0, "running": 0,
+                "operator": {"queued": 0, "planned": 0, "running": 0},
+                "maintenance": {"queued": 0, "planned": 0, "running": 0},
+            }
             for row in db.execute(
-                text(f"SELECT status, count(*) AS n FROM {table} "
+                text(f"SELECT lane, status, count(*) AS n FROM {table} "
                      "WHERE deleted_at IS NULL AND status IN "
-                     "('queued','planned','running') GROUP BY status")
+                     "('queued','planned','running') GROUP BY lane, status")
             ).mappings():
-                out[row["status"]] = row["n"]
+                lane = row["lane"] if row["lane"] in qc.LANES else qc.OPERATOR
+                out[row["status"]] += row["n"]
+                out[lane][row["status"]] += row["n"]
             return out
 
         gw = SessionLocal()
@@ -409,7 +427,15 @@ class GatewayQueue:
             r = one(rd, "registry.tasks")
         finally:
             rd.close()
-        return {k: g[k] + r[k] for k in ("queued", "planned", "running")}
+        out: dict[str, Any] = {
+            key: g[key] + r[key] for key in ("queued", "planned", "running")
+        }
+        for lane in qc.LANES:
+            out[lane] = {
+                key: g[lane][key] + r[lane][key]
+                for key in ("queued", "planned", "running")
+            }
+        return out
 
     def stats(self) -> dict[str, Any]:
         from ..database import ReaderSessionLocal, SessionLocal
@@ -438,15 +464,17 @@ class GatewayQueue:
         ).mappings().first()
         cfg = qc.config_from_row(dict(cfg_row) if cfg_row else None)
 
-        counts = {state: 0 for state in qc.STATES}
+        lane_counts = {lane: {state: 0 for state in qc.STATES}
+                       for lane in qc.LANES}
         for row in db.execute(
-            text(f"SELECT status, count(*) AS n FROM {tasks_table} "
-                 "WHERE deleted_at IS NULL GROUP BY status")
+            text(f"SELECT lane, status, count(*) AS n FROM {tasks_table} "
+                 "WHERE deleted_at IS NULL GROUP BY lane, status")
         ).mappings():
-            counts[row["status"]] = row["n"]
+            lane = row["lane"] if row["lane"] in lane_counts else qc.OPERATOR
+            lane_counts[lane][row["status"]] = row["n"]
 
         state = db.execute(
-            text(f"SELECT last_dispatch_at FROM {state_table} WHERE id=1")
+            text(f"SELECT * FROM {state_table} WHERE id=1")
         ).mappings().first()
         last = state["last_dispatch_at"] if state else None
         stale = int(cfg["heartbeat_stale_s"])
@@ -456,21 +484,27 @@ class GatewayQueue:
         medians, samples, global_median = self._medians(db, tasks_table)
 
         active = db.execute(
-            text(f"SELECT task_id, kind, operation, status, plan_seq, created_at, "
-                 f"started_at, finished_at FROM {tasks_table} "
+            text(f"SELECT task_id, kind, operation, lane, status, plan_seq, "
+                 f"created_at, started_at, finished_at FROM {tasks_table} "
                  "WHERE status IN ('queued','planned','running') "
                  "AND deleted_at IS NULL ORDER BY created_at, task_id")
         ).mappings().all()
-        queued = [r for r in active if r["status"] == qc.QUEUED]
-        positions = {r["task_id"]: idx for idx, r in enumerate(queued)}
-        workers = max(1, int(cfg["workers"]))
-        tasks: dict[str, Any] = {}
+        queued_by_lane: dict[str, list[dict]] = {lane: [] for lane in qc.LANES}
+        for row in active:
+            if row["status"] == qc.QUEUED:
+                lane = row["lane"] if row["lane"] in queued_by_lane else qc.OPERATOR
+                queued_by_lane[lane].append(dict(row))
+        lane_tasks: dict[str, dict[str, Any]] = {lane: {} for lane in qc.LANES}
         now = _now()
         for row in active:
+            lane = row["lane"] if row["lane"] in lane_tasks else qc.OPERATOR
             kind = self._kind(row)
             estimate = medians.get(kind, global_median) or 0.0
-            position = positions.get(row["task_id"])
+            workers = max(1, int(qc.lane_config(cfg, lane)["workers"]))
+            position = None
             if row["status"] == qc.QUEUED:
+                order = [r["task_id"] for r in queued_by_lane.get(lane, [])]
+                position = order.index(row["task_id"]) if row["task_id"] in order else None
                 start = (position or 0) / workers * estimate
                 finish = start + estimate
             elif row["status"] == qc.PLANNED:
@@ -480,9 +514,10 @@ class GatewayQueue:
                 if row["started_at"]:
                     elapsed = max(0.0, (now - row["started_at"]).total_seconds())
                 start, finish = 0.0, max(0.0, estimate - elapsed)
-            tasks[row["task_id"]] = {
+            lane_tasks.setdefault(lane, {})[row["task_id"]] = {
                 "status": row["status"],
                 "kind": kind,
+                "lane": lane,
                 "plan_seq": row["plan_seq"],
                 "position": position,
                 "eta_start_s": round(start, 1),
@@ -491,25 +526,42 @@ class GatewayQueue:
                 "finished_at": row["finished_at"].isoformat() if row["finished_at"] else None,
             }
 
-        pinned = 0
+        pinned_by_lane = {lane: 0 for lane in qc.LANES}
         for row in db.execute(
-            text(f"SELECT kind, operation, cancel_requested_at FROM {tasks_table} "
+            text(f"SELECT lane, kind, operation, cancel_requested_at FROM {tasks_table} "
                  "WHERE status='running' AND cancel_requested_at IS NOT NULL "
                  "AND deleted_at IS NULL")
         ).mappings():
             kind = self._kind(row)
+            lane = row["lane"] if row["lane"] in pinned_by_lane else qc.OPERATOR
             limit = int(cfg.get(f"cancel_timeout_{kind}", qc.CANCEL_TIMEOUTS[kind]))
             if (now - row["cancel_requested_at"]).total_seconds() > limit:
-                pinned += 1
+                pinned_by_lane[lane] += 1
 
+        lanes: dict[str, Any] = {}
+        for lane in qc.LANES:
+            limits = qc.lane_config(cfg, lane)
+            plan_at = (state.get(f"last_plan_{lane}_at") if state else None) or last
+            lanes[lane] = {
+                "counts": lane_counts[lane],
+                "workers": int(limits["workers"]),
+                "cap": int(limits["cap"]),
+                "plan_size": int(limits["plan_size"]),
+                "span_s": limits["span_s"],
+                "pinned_workers": pinned_by_lane[lane],
+                "last_plan_at": plan_at.isoformat() if plan_at else None,
+                "tasks": lane_tasks.get(lane, {}),
+            }
+
+        operator = lanes[qc.OPERATOR]
         return {
             "queue": queue,
-            "counts": counts,
-            "workers": int(cfg["workers"]),
-            "pinned_workers": pinned,
-            "cap": int(cfg["queue_cap"]),
-            "span_s": int(cfg["span_s"]),
-            "plan_size": int(cfg["plan_size"]),
+            "counts": operator["counts"],
+            "workers": operator["workers"],
+            "pinned_workers": operator["pinned_workers"],
+            "cap": operator["cap"],
+            "span_s": operator["span_s"],
+            "plan_size": operator["plan_size"],
             "heartbeat": {
                 "last_dispatch_at": last.isoformat() if last else None,
                 "age_s": age,
@@ -517,12 +569,13 @@ class GatewayQueue:
                 "stale_after_s": stale,
             },
             "planner_interval_s": int(cfg["planner_interval_s"]),
-            "tasks": tasks,
+            "tasks": operator["tasks"],
             "kinds": {
                 kind: {"median_s": round(value, 1), "samples": samples.get(kind, 0)}
                 for kind, value in medians.items()
             },
             "config": cfg,
+            "lanes": lanes,
         }
 
     @staticmethod

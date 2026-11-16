@@ -1367,15 +1367,18 @@ export default function UsersPage() {
             const g = queueStats.gateway?.counts || {}
             const r = queueStats.registry?.counts || {}
             const queued = (g.queued || 0) + (r.queued || 0)
-            const planned = (g.planned || 0) + (r.planned || 0)
             const running = (g.running || 0) + (r.running || 0)
+            // G94 R5.2 — the maintenance lane is its own count; cards stay
+            // operator-only, so it never joins the three card states above.
+            const m = queueStats.registry?.lanes?.maintenance?.counts || {}
+            const maintenance = (m.queued || 0) + (m.planned || 0) + (m.running || 0)
             const down = queueStats.gateway?.heartbeat?.alive === false
               || queueStats.registry?.heartbeat?.alive === false
             return (
               <Space size={4}>
                 <Tag color={queued ? 'gold' : 'default'}>Queued {queued}</Tag>
-                <Tag color={planned ? 'blue' : 'default'}>Planned {planned}</Tag>
                 <Tag color={running ? 'processing' : 'default'}>Running {running}</Tag>
+                {maintenance > 0 && <Tag color="purple">Maintenance {maintenance}</Tag>}
                 {down && <Tag color="red">Planner down</Tag>}
               </Space>
             )

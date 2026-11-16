@@ -19,7 +19,7 @@ def get(task_id: str) -> dict[str, Any] | None:
     try:
         row = db.execute(
             text(
-                "SELECT task_id, status, kind, operation, error, result, "
+                "SELECT task_id, status, kind, lane, operation, error, result, "
                 "       plan_seq, started_at, finished_at, created_at, updated_at "
                 "FROM registry.tasks WHERE task_id=:id"
             ),
@@ -44,7 +44,7 @@ def active_for_service(service_id: str) -> dict[str, Any] | None:
     try:
         row = db.execute(
             text(
-                "SELECT task_id, status, kind, operation, plan_seq, started_at, "
+                "SELECT task_id, status, kind, lane, operation, plan_seq, started_at, "
                 "       created_at FROM registry.tasks "
                 "WHERE service_id=:sid AND deleted_at IS NULL "
                 "AND status IN ('queued','planned','running') "

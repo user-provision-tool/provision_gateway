@@ -192,6 +192,15 @@ def truncate() -> None:
                 f"INSERT INTO {schema}.queue_state (id, last_dispatch_at) "
                 "VALUES (1, now()) ON CONFLICT (id) DO NOTHING"
             )
+        # The lane plan timestamps exist on the registry table and on the
+        # gateway state (operator only); a fresh seeded row needs both.
+        conn.execute(
+            "UPDATE registry.queue_state SET last_plan_operator_at=now(), "
+            "last_plan_maintenance_at=now() WHERE id=1"
+        )
+        conn.execute(
+            "UPDATE gateway.queue_state SET last_plan_operator_at=now() WHERE id=1"
+        )
 
 
 def provision() -> None:
