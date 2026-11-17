@@ -696,6 +696,108 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
         except Exception:
             return None
 
+    # ------------------------------------------------------------------
+    # LLM env guard (S13) — validate a SELECTED env list before deploy
+    # ------------------------------------------------------------------
+
+    def _env_validation_prompt(
+        self,
+        *,
+        env_files: list[tuple[str, str]],
+        compose_files: list[tuple[str, str]],
+        service_name: str,
+        profiles: list[str] | None = None,
+    ) -> str:
+        """One-shot reviewer prompt. It must never rewrite the env."""
+        def _block(title: str, entries: list[tuple[str, str]]) -> str:
+            parts = [f"--- {title} ---"]
+            for name, content in entries:
+                clipped = content[:24000]
+                parts.append(f"<{name}>\n{clipped}\n</{name}>")
+            return "\n".join(parts)
+
+        profile_line = (
+            f"Activated compose profiles: {', '.join(profiles)}\n"
+            if profiles else "No compose profiles are activated.\n"
+        )
+        return (
+            "You are reviewing a Docker Compose interpolation env file set "
+            f"immediately before it is deployed for service '{service_name}'.\n"
+            "The env files are listed in selection order; later files win.\n"
+            f"{profile_line}"
+            "Check ONLY for real deployment-breaking problems in the env "
+            "content: a variable required by the compose (or by the activated "
+            "profiles) with no value and no default, an invalid KEY=VALUE "
+            "line, or a value that clearly contradicts its documented meaning "
+            "in the compose/base files. Do NOT rewrite or output the file. "
+            "Do not report style preferences.\n\n"
+            f"{_block('compose', compose_files)}\n\n"
+            f"{_block('env', env_files)}\n\n"
+            "Answer with ONE JSON object and nothing else:\n"
+            '{"valid": true|false, "findings": ["<one sentence each>"], '
+            '"guide": "<short instruction naming the file and variable to fix>"}\n'
+            "`valid` is true only when there are no findings."
+        )
+
+    async def validate_env_selection(
+        self,
+        db: Session,
+        *,
+        env_files: list[tuple[str, str]],
+        compose_files: list[tuple[str, str]],
+        service_name: str,
+        profiles: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Validate the exact selected env list with the configured LLM.
+
+        Returns ``{"valid", "findings", "guide", "error"}``. It only READS the
+        content it is given — the caller owns the files and this method never
+        writes one. Any transport/shape failure is reported as
+        ``valid=False`` with ``error`` set so the deploy can block.
+        """
+        base_url, model, headers = self._resolve_endpoint(db)
+        prompt = self._env_validation_prompt(
+            env_files=env_files, compose_files=compose_files,
+            service_name=service_name, profiles=profiles,
+        )
+        try:
+            out = await self._chat(
+                base_url, model, headers,
+                [{"role": "user", "content": prompt}],
+                max_tokens=4000, stream=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — a failed call blocks
+            return {"valid": False, "findings": [], "guide": "",
+                    "error": f"LLM call failed: {exc}"}
+        if not out or out.get("_error"):
+            return {"valid": False, "findings": [], "guide": "",
+                    "error": str((out or {}).get("_error") or "the LLM returned no response")}
+        try:
+            content = (((out.get("choices") or [{}])[0]
+                        .get("message") or {}).get("content") or "")
+        except Exception:  # noqa: BLE001
+            content = ""
+        parsed = self._json_first(content, want_object=True)
+        if not isinstance(parsed, dict):
+            return {"valid": False, "findings": [], "guide": "",
+                    "error": "the LLM returned no parseable verdict"}
+        raw = parsed.get("findings")
+        entries = raw if isinstance(raw, list) else ([raw] if raw else [])
+        findings: list[str] = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                message = str(
+                    entry.get("message") or entry.get("finding")
+                    or entry.get("detail") or "").strip()
+            else:
+                message = str(entry or "").strip()
+            if message:
+                findings.append(message)
+        guide = str(parsed.get("guide") or "").strip()
+        # Findings block regardless of the model's own `valid` flag.
+        valid = bool(parsed.get("valid")) and not findings
+        return {"valid": valid, "findings": findings, "guide": guide, "error": None}
+
     # ==================================================================
     # ENV PROMPTS — READ THIS BEFORE ADDING A VARIABLE NAME
     # ==================================================================

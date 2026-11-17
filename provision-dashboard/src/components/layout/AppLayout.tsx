@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, type ReactNode } from 'react'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
-import { Layout, Menu, Button, Typography, Dropdown, theme, Modal, Input, message, Space, Tag, notification } from 'antd'
+import { Layout, Menu, Button, Typography, Dropdown, theme, Modal, Input, message, Space, Tag, notification, Badge } from 'antd'
 import {
   DashboardOutlined,
   AppstoreOutlined,
@@ -14,6 +14,7 @@ import {
   KeyOutlined,
   QuestionCircleOutlined,
   SafetyCertificateOutlined,
+  BellOutlined,
 } from '@ant-design/icons'
 import { useAuth } from '../../hooks/useAuth'
 import client from '../../api/client'
@@ -25,7 +26,7 @@ const { Text } = Typography
 // groups; the last group is pinned to the BOTTOM of the sider (still inside the
 // sidebar — same Menu surface/handling, just pushed down).
 // Route names match the labels: Services → /services, Source Projects → /projects.
-const menuGroups: { key: string; icon: JSX.Element; label: string }[][] = [
+const menuGroups: { key: string; icon: JSX.Element; label: ReactNode }[][] = [
   [{ key: '/dashboard', icon: <DashboardOutlined />, label: 'Dashboard' }],
   [
     { key: '/services', icon: <UserOutlined />, label: 'Services' },
@@ -39,9 +40,12 @@ const menuGroups: { key: string; icon: JSX.Element; label: string }[][] = [
   ],
 ]
 // Pinned to the sidebar bottom.
-const menuBottomGroup: { key: string; icon: JSX.Element; label: string }[] = [
+const menuBottomGroup: { key: string; icon: JSX.Element; label: ReactNode }[] = [
   { key: '/settings', icon: <SettingOutlined />, label: 'Settings' },
   { key: '/audit', icon: <AuditOutlined />, label: 'Audit' },
+  // R5 — the Alerts Center entry sits below Audit; its label carries the
+  // unread-active badge, refreshed by the same 10 s poll as the page.
+  { key: '/alerts', icon: <BellOutlined />, label: 'Alerts' },
 ]
 // Inset horizontal rule between sidebar groups (indented from both edges).
 const menuDivider = { type: 'divider' as const, style: { margin: '6px 12px', minWidth: 'auto' } }
@@ -56,6 +60,8 @@ export default function AppLayout() {
   const [currentPwd, setCurrentPwd] = useState('')
   const [newPwd, setNewPwd] = useState('')
   const [pwdLoading, setPwdLoading] = useState(false)
+  // R5 — the sidebar badge: the unread ACTIVE count, from /api/alerts/count.
+  const [unreadAlerts, setUnreadAlerts] = useState(0)
 
   // Troubleshoot chat
   const [chatOpen, setChatOpen] = useState(false)
@@ -65,6 +71,22 @@ export default function AppLayout() {
 
   const isAdmin = admin?.role === 'admin'
   const isEndUser = (admin as any)?.user_type === 'end_user'
+
+  // Poll the unread-active count for the sidebar badge. Admin-only at the
+  // server; viewers skip the request (they cannot reach the page either).
+  useEffect(() => {
+    if (!isAdmin) return
+    let cancelled = false
+    const poll = async () => {
+      try {
+        const { data } = await client.get('/alerts/count')
+        if (!cancelled) setUnreadAlerts(Number(data?.unread) || 0)
+      } catch { /* the badge simply keeps its last value */ }
+    }
+    poll()
+    const timer = setInterval(poll, 10000)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [isAdmin])
   
   // Determine visible menu items based on user type and role. The viewer filter
   // applies PER GROUP and empty groups (and their dividers) are dropped, so a
@@ -76,9 +98,25 @@ export default function AppLayout() {
     .filter(g => g.length > 0)
   const visibleBottom = menuBottomGroup.filter(m => canSee(m.key))
 
-  // Flatten groups into antd items with an inset divider between groups.
+  // Flatten groups into antd items with an inset divider between groups. The
+  // Alerts entry's label carries the live unread-active badge.
+  const withAlertBadge = (item: { key: string; icon: JSX.Element; label: ReactNode }) =>
+    item.key === '/alerts'
+      ? {
+          ...item,
+          label: (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+              {item.label}
+              {unreadAlerts > 0 && <Badge count={unreadAlerts} size="small" />}
+            </span>
+          ),
+        }
+      : item
   const toItems = (groups: typeof menuGroups) =>
-    groups.flatMap((g, i) => (i === 0 ? g : [menuDivider, ...g]))
+    groups.flatMap((g, i) => {
+      const items = g.map(withAlertBadge)
+      return i === 0 ? items : [menuDivider, ...items]
+    })
   const topMenuItems = toItems(visibleGroups)
   const bottomMenuItems = toItems([visibleBottom].filter(g => g.length > 0))
 

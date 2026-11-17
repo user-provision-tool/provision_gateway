@@ -5099,7 +5099,9 @@ class TestFileSetSelection:
     def test_env_disabled_without_needs_env(self):
         src = self._src()
         assert "needsEnv" in src
-        assert "No ${VAR} interpolation detected" in src
+        # S11 — `needs_env:false` is a hint (None auto-selected), not a lock.
+        assert "interpolation detected in the selected compose" in src
+        assert 'noneLabel="None — send no env files"' in src
 
     def test_profiles_multi_select(self):
         src = self._src()
@@ -6109,11 +6111,17 @@ class TestEnvReferencePicker:
         assert "Per-user, per-service generated file" in src
         assert '<Tag color="gold">recipe</Tag><Tag color="purple">per-user</Tag>' in src
 
-    def test_serving_ports_has_the_same_generate_new_tag(self):
+    def test_every_picker_offers_generate_new_inside_the_control(self):
+        """T0/R8 — the sentinel is a picker OPTION, not a tag beside it."""
         src = (_DASH / "src" / "components" / "services" / "FileSetSelection.tsx").read_text()
-        assert "!sel.serving_ports && !sel.serving_ports_none" in src
-        assert src.count("generate new — the pipeline will create one") >= 3, (
-            "compose, serving ports and nginx use the same generate-new tag")
+        assert "generate new — the pipeline will create one" in src, "the shared label exists"
+        assert src.count("GENERATE_NEW_LABEL") >= 4, (
+            "compose, serving ports and nginx use the sentinel; env reuses the "
+            "ordered multi")
+        # The sentinel is never written into the selection/payload.
+        assert "GENERATE_NEW) set(" in src or "v === GENERATE_NEW" in src
+        # The old side-tag renderings are gone.
+        assert "!sel.serving_ports && !sel.serving_ports_none" not in src
 
     def test_the_source_projects_robot_is_clickable_when_base_files_exist(self):
         src = (_DASH / "src" / "pages" / "ServicesPage.tsx").read_text()
@@ -7473,7 +7481,8 @@ class TestASelectedEnvIsTheHandoffNotGenerated:
         src = inspect.getsource(deploy_workflow.generation_needed)
         assert "selection.get(\"compose\")" in src
         assert 'selection.get("env")' in src, "the env slot participates"
-        assert "if not (selection.get(\"env\") or []):" in src
+        # S11 — a selected list and the explicit `env_none` both suppress it.
+        assert 'if not (selection.get("env") or []) and not selection.get("env_none"):' in src
         form = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
         assert "env_reference: envRefs" in form
 
@@ -11975,3 +11984,48 @@ class TestServiceActionNotFoundPassthrough:
         mapped = provision_service.as_http_error(self._err(500))
         assert isinstance(mapped, HTTPException)
         assert mapped.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# T3/R5 — the Dashboard status degrades instead of blocking on a down -api
+# ---------------------------------------------------------------------------
+
+
+class TestSystemStatusDegrades:
+    """One short deadline; local queue counts survive an -api outage."""
+
+    def test_a_hanging_api_yields_a_degraded_payload_in_seconds(self, monkeypatch):
+        import asyncio
+        from app.routers import system
+
+        async def hang(*_a, **_k):
+            await asyncio.sleep(10)
+
+        monkeypatch.setattr(system, "STATUS_DEGRADED_DEADLINE_S", 0.05)
+        monkeypatch.setattr(system.provision_service, "health", hang)
+        monkeypatch.setattr(
+            "app.services.proxy_service.has_active_proxy", lambda db: False)
+        counts = {
+            "operator": {"running": 1, "queued": 2, "planned": 3},
+            "maintenance": {"running": 1, "queued": 0, "planned": 0},
+        }
+        monkeypatch.setattr(
+            system.gateway_queue if hasattr(system, "gateway_queue") else
+            __import__("app.services.task_queue", fromlist=["gateway_queue"]).gateway_queue,
+            "counts", lambda: counts)
+
+        out = asyncio.run(system.system_status(current_user={}, db=object()))
+
+        assert out["degraded"] is True
+        assert out["provision_api"]["status"] == "unreachable"
+        # The registry-backed counts are never lost to the -api outage.
+        assert out["tasks_running"] == 1
+        assert out["tasks_queued"] == 5
+        assert out["tasks_planned"] == 3
+        assert "unavailable_sections" in out
+
+    def test_the_per_probe_bound_is_below_the_old_default(self):
+        from app.routers import system
+
+        assert system.STATUS_PROBE_TIMEOUT_S <= 2.0
+        assert system.STATUS_DEGRADED_DEADLINE_S <= 10.0

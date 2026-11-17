@@ -9,6 +9,11 @@ from typing import Any
 from ..config import settings
 
 
+def _timeout(value: float | None) -> dict[str, float]:
+    """No override when the caller did not ask for one (the 300 s default)."""
+    return {} if value is None else {"timeout": value}
+
+
 class ProvisionService:
     """Async HTTP client wrapper for provision-api."""
 
@@ -127,8 +132,8 @@ class ProvisionService:
 
     # ---- Users ----
 
-    async def list_users(self) -> dict[str, Any]:
-        return await self._request("GET", "/users")
+    async def list_users(self, timeout: float | None = None) -> dict[str, Any]:
+        return await self._request("GET", "/users", **_timeout(timeout))
 
     async def get_service_url_base(
         self, service_name: str, user_name: str, label: str, domain: str = "localhost"
@@ -277,29 +282,32 @@ class ProvisionService:
 
     # ---- Docker / Host stats ----
 
-    async def docker_ps(self) -> list[dict[str, Any]]:
-        return await self._request("GET", "/docker/ps")
+    async def docker_ps(self, timeout: float | None = None) -> list[dict[str, Any]]:
+        return await self._request("GET", "/docker/ps", **_timeout(timeout))
 
-    async def docker_stats(self) -> list[dict[str, Any]]:
-        return await self._request("GET", "/docker/stats")
+    async def docker_stats(self, timeout: float | None = None) -> list[dict[str, Any]]:
+        return await self._request("GET", "/docker/stats", **_timeout(timeout))
 
-    async def docker_info(self) -> dict[str, Any]:
-        return await self._request("GET", "/docker/info")
+    async def docker_info(self, timeout: float | None = None) -> dict[str, Any]:
+        return await self._request("GET", "/docker/info", **_timeout(timeout))
 
-    async def host_stats(self) -> dict[str, Any]:
-        return await self._request("GET", "/host/stats")
+    async def host_stats(self, timeout: float | None = None) -> dict[str, Any]:
+        return await self._request("GET", "/host/stats", **_timeout(timeout))
 
-    async def container_exists(self, container: str) -> bool:
-        r = await self._request("GET", f"/docker/container/{container}/exists")
+    async def container_exists(self, container: str, timeout: float | None = None) -> bool:
+        r = await self._request(
+            "GET", f"/docker/container/{container}/exists", **_timeout(timeout))
         return r.get("exists", False)
 
-    async def container_running(self, container: str) -> bool:
-        r = await self._request("GET", f"/docker/container/{container}/running")
+    async def container_running(self, container: str, timeout: float | None = None) -> bool:
+        r = await self._request(
+            "GET", f"/docker/container/{container}/running", **_timeout(timeout))
         return r.get("running", False)
 
-    async def container_env(self, container: str) -> dict[str, str]:
+    async def container_env(self, container: str, timeout: float | None = None) -> dict[str, str]:
         """Read a container's environment (e.g. ENABLE_ACL on the edge)."""
-        r = await self._request("GET", f"/docker/container/{container}/env")
+        r = await self._request(
+            "GET", f"/docker/container/{container}/env", **_timeout(timeout))
         return r.get("env", {})
 
     async def network_connect(self, network: str, container: str) -> dict[str, Any]:
@@ -374,13 +382,13 @@ class ProvisionService:
 
     # ---- Container & Service stats (registry-based, not docker ps) ----
 
-    async def get_container_stats(self) -> dict[str, Any]:
+    async def get_container_stats(self, timeout: float | None = None) -> dict[str, Any]:
         """Get container statistics from provision-api (registry only, not all docker containers)."""
-        return await self._request("GET", "/container-stats")
+        return await self._request("GET", "/container-stats", **_timeout(timeout))
 
-    async def get_service_stats(self) -> dict[str, Any]:
+    async def get_service_stats(self, timeout: float | None = None) -> dict[str, Any]:
         """Get service statistics from provision-api (registry only)."""
-        return await self._request("GET", "/service-stats")
+        return await self._request("GET", "/service-stats", **_timeout(timeout))
 
     # ---- Service readiness ----
 

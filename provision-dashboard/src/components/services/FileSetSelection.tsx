@@ -32,6 +32,10 @@ export interface FileSetSelectionData {
   serving_ports?: string | null
   serving_ports_none?: boolean
   env: string[]
+  // S11 — the env picker's deliberate NO-ENV state, the env counterpart of
+  // `serving_ports_none`: "send no env files at all", as distinct from "no file
+  // selected yet" (which is the `generate new` state).
+  env_none?: boolean
   profiles: string[]
 }
 
@@ -55,7 +59,7 @@ export interface FileSetStale {
   profiles?: string[]
 }
 
-export const EMPTY_SELECTION: FileSetSelectionData = { compose: [], nginx: null, stream_conf: null, mail_conf: null, serving_ports: null, env: [], profiles: [] }
+export const EMPTY_SELECTION: FileSetSelectionData = { compose: [], nginx: null, stream_conf: null, mail_conf: null, serving_ports: null, env: [], env_none: false, profiles: [] }
 export const EMPTY_CANDIDATES: FileSetCandidates = { compose: [], nginx: [], stream_conf: [], mail_conf: [], serving_ports: [], env: [], profiles: [] }
 
 /** The nginx category of a conf file name (G55). The category, not the picker
@@ -125,6 +129,16 @@ export function phaseOfFile(filename: string): string {
  * `Select` cannot distinguish "cleared" from "chose the None entry", and the two
  * mean different things — cleared returns to "the pipeline generates one". */
 const SERVING_PORTS_NONE = '__none__'
+/** S11 — the env picker's deliberate-NO-ENV sentinel, the same shape as
+ * `SERVING_PORTS_NONE`: "send no env files", not "cleared". */
+const ENV_NONE = '__env_none__'
+
+/** T0/R8 — `generate new` is a FIRST-CLASS option inside every picker, compose
+ * included: it is the first selectable entry and is the shown value when the
+ * slot is empty. It is a sentinel that contributes NOTHING to the deploy
+ * payload (choosing it sets the slot back to empty). */
+export const GENERATE_NEW = '__generate_new__'
+export const GENERATE_NEW_LABEL = 'generate new — the pipeline will create one'
 
 function moveItem(list: string[], idx: number, dir: -1 | 1): string[] {
   const next = [...list]
@@ -134,49 +148,90 @@ function moveItem(list: string[], idx: number, dir: -1 | 1): string[] {
   return next
 }
 
-function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled, onOpenFile }: {
+/** The one row shape for a SELECTED file (F1/F2/F6): the name is clickable
+ * (when an opener is supplied) and a red cross removes it. Serving ports,
+ * nginx and the env-reference list all use THIS component, so the affordances
+ * cannot drift apart. A stale selection stays visible, red + struck through. */
+export function SelectedFileRow({ name, onOpen, onRemove, stale, disabled }: {
+  name: string
+  onOpen?: (name: string) => void
+  onRemove?: () => void
+  stale?: boolean
+  disabled?: boolean
+}) {
+  const mark = stale ? { color: '#cf1322', textDecoration: 'line-through' as const } : {}
+  return (
+    <Space style={{ display: 'flex', width: '100%' }} size={4}>
+      {onOpen ? (
+        <Button type="link" size="small"
+          style={{ padding: 0, fontFamily: 'monospace', fontSize: 13, ...mark }}
+          onClick={() => onOpen(name)}>{name}</Button>
+      ) : (
+        <span style={{ fontFamily: 'monospace', fontSize: 13, ...mark }}>{name}</span>
+      )}
+      {onRemove && (
+        <Button size="small" type="text" danger icon={<CloseOutlined />}
+          disabled={disabled} onClick={onRemove} />
+      )}
+    </Space>
+  )
+}
+
+function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled, onOpenFile, noneSelected, noneLabel }: {
   values: string[]
   candidates: string[]
   staleMark: (v: string) => boolean
-  onOrderChange: (next: string[]) => void
+  // S11 — the second argument carries the deliberate-NO-FILE state with the
+  // list, so a caller can apply BOTH in one update (two `set` calls from the
+  // same render closure would race and one would overwrite the other).
+  onOrderChange: (next: string[], none?: boolean) => void
   disabled: boolean
   onOpenFile?: (name: string) => void
+  noneSelected?: boolean
+  noneLabel?: string
 }) {
   const remaining = candidates.filter(c => !values.includes(c))
   return (
     <Space direction="vertical" style={{ width: '100%' }} size={4}>
       {values.map((v, i) => (
         <Space key={v} style={{ display: 'flex' }} size={4}>
-          <Button size="small" icon={<ArrowUpOutlined />} disabled={disabled || i === 0} onClick={() => onOrderChange(moveItem(values, i, -1))} />
-          <Button size="small" icon={<ArrowDownOutlined />} disabled={disabled || i === values.length - 1} onClick={() => onOrderChange(moveItem(values, i, 1))} />
+          <Button size="small" icon={<ArrowUpOutlined />} disabled={disabled || i === 0} onClick={() => onOrderChange(moveItem(values, i, -1), false)} />
+          <Button size="small" icon={<ArrowDownOutlined />} disabled={disabled || i === values.length - 1} onClick={() => onOrderChange(moveItem(values, i, 1), false)} />
           {/* A missing selection stays SELECTED but is shown red + struck
               through — no separate alert block. */}
-          {onOpenFile ? (
-            <Button type="link" size="small"
-              style={{ padding: 0, fontFamily: 'monospace', fontSize: 13,
-                ...(staleMark(v) ? { color: '#cf1322', textDecoration: 'line-through' } : {}) }}
-              onClick={() => onOpenFile(v)}>{v}</Button>
-          ) : (
-            <span style={{ fontFamily: 'monospace', fontSize: 13,
-              ...(staleMark(v) ? { color: '#cf1322', textDecoration: 'line-through' } : {}) }}>{v}</span>
-          )}
-          <Button size="small" type="text" danger icon={<CloseOutlined />} disabled={disabled} onClick={() => onOrderChange(values.filter(x => x !== v))} />
+          <SelectedFileRow
+            name={v}
+            onOpen={onOpenFile}
+            stale={staleMark(v)}
+            disabled={disabled}
+            onRemove={() => onOrderChange(values.filter(x => x !== v), false)}
+          />
         </Space>
       ))}
       <Select
         placeholder="Add from recipe…"
         style={{ width: '100%' }}
-        disabled={disabled || remaining.length === 0}
-        value={null}
-        onChange={(v) => { if (v) onOrderChange([...values, String(v)]) }}
-        options={remaining.map(c => ({ value: c, label: c }))}
+        disabled={disabled}
+        // T0/R8 — the sentinel is the shown value while the slot is empty and
+        // is always the first option. Choosing it clears the ordered list; it
+        // never enters the selection (or the deploy payload). S11 — an optional
+        // `None` entry beside it records the deliberate no-file state.
+        value={noneSelected ? ENV_NONE : values.length === 0 ? GENERATE_NEW : null}
+        onChange={(v) => {
+          if (!v) return
+          // None and `generate new` both empty the list; only the flag differs,
+          // and both are applied in ONE update.
+          if (v === ENV_NONE) { onOrderChange([], true); return }
+          if (v === GENERATE_NEW) { onOrderChange([], false); return }
+          onOrderChange([...values, String(v)], false)
+        }}
+        options={[
+          { value: GENERATE_NEW, label: GENERATE_NEW_LABEL },
+          ...(noneLabel ? [{ value: ENV_NONE, label: noneLabel }] : []),
+          ...remaining.map(c => ({ value: c, label: c })),
+        ]}
       />
-      {/* §1: `generate new` is the DEFAULT — an empty slot means the pipeline
-          generates one, and it contributes nothing to the deploy payload. Shown
-          explicitly here so "no selection" reads as a choice, not an oversight. */}
-      {values.length === 0 && (
-        <Tag color="blue" style={{ width: 'fit-content' }}>generate new — the pipeline will create one</Tag>
-      )}
+      {/* All options are in the picker; the previous tag beside it is gone. */}
     </Space>
   )
 }
@@ -198,20 +253,22 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
   // A stale name stays readable as SELECTED, in red with a line through it.
   // The label is a node so both the dropdown AND the selected tag render it.
   const strike = { color: '#cf1322', textDecoration: 'line-through' as const }
+  // F2 — ADD-MODE. Selected files are rows above the picker, so they are
+  // filtered OUT of the dropdown; only the still-open categories are offered
+  // (one per category is enforced by disabling the categories already held).
   const nginxOptions = [...new Set([
     ...candidates.nginx,
     ...(candidates.stream_conf || []),
     ...(candidates.mail_conf || []),
-    ...selectedConfs,
-  ])].map(c => ({
+  ])].filter(c => !selectedConfs.includes(c)).map(c => ({
     value: c,
     label: staleConf(c) ? <span style={strike}>{c}</span> : c,
-    disabled: selectedCats.has(confCategory(c)) && !selectedConfs.includes(c),
+    disabled: selectedCats.has(confCategory(c)),
   }))
   const spOptions = [
-    // R1.3 — `None` sits in the picker itself, as the user ruled it: an operator
-    // choosing it means "proceed with no serving-ports file", which suppresses
-    // generation and both validations and exposes nothing extra.
+    // T0/R8 — the sentinel is first, and is the shown value when nothing is
+    // selected. R1.3 — `None` remains a deliberate state beside it.
+    { value: GENERATE_NEW, label: GENERATE_NEW_LABEL },
     { value: SERVING_PORTS_NONE, label: 'None — proceed without a serving-ports file' },
     ...[...new Set([...(candidates.serving_ports || []), ...(sel.serving_ports ? [sel.serving_ports] : [])])]
       .map(c => ({
@@ -233,45 +290,74 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
           disabled={false}
           onOpenFile={onOpenFile}
         />
+        {/* S18/F3 — profiles are STACKED directly under the compose files they
+            derive from, inside the same section (the 640 px modal is too
+            cramped for a side-by-side split). The standalone generation panel
+            still hides this block (`showProfiles={false}`). */}
+        {showProfiles && (
+          <div style={{ marginTop: 8 }}>
+            <Typography.Text strong>Compose profiles</Typography.Text>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}> — gate optional services</Typography.Text>
+            {candidates.profiles.length === 0 ? (
+              <div style={{ fontSize: 12, color: '#999', marginTop: 4 }}>
+                No non-empty profiles found{sel.compose.length === 0 ? ' — select compose files first' : ''}.
+              </div>
+            ) : (
+              <Select
+                mode="multiple"
+                allowClear
+                placeholder="Select profiles…"
+                style={{ width: '100%', marginTop: 4 }}
+                value={sel.profiles}
+                onChange={(vals: string[]) => set({ profiles: vals.filter(p => !isStale('profiles', p)) })}
+                options={candidates.profiles.map(p => ({ value: p, label: p }))}
+              />
+            )}
+            {(st.profiles || []).map(p => (
+              <span key={p} style={{ marginTop: 4, display: 'inline-block', ...strike }}>{p}</span>
+            ))}
+          </div>
+        )}
       </div>
 
       <div>
         <Typography.Text strong>Serving ports</Typography.Text>
         <Typography.Text type="secondary" style={{fontSize:12}}> — declares what can be exposed (compose ports and kinds)</Typography.Text>
+        {/* F1 — the selected file is a ROW ABOVE the picker (like compose),
+            clickable to edit and clearable with a red cross back to
+            `generate new`. A stale selection is still rendered so it can be
+            inspected before it is cleared. */}
+        {sel.serving_ports && (
+          <SelectedFileRow
+            name={sel.serving_ports}
+            stale={isStale('serving_ports', sel.serving_ports)}
+            onOpen={onOpenFile}
+            onRemove={() => set({ serving_ports: null, serving_ports_none: false })}
+          />
+        )}
         <Select
           style={{ width: '100%', marginTop: 4 }}
-          placeholder="generate new (none selected)"
-          allowClear
-          value={sel.serving_ports_none ? SERVING_PORTS_NONE : (sel.serving_ports || undefined)}
+          placeholder="Select a file…"
+          // F1 — the selected file is the row above; the control is the
+          // CHOOSER (like the compose add-select), so the value is not shown
+          // twice. `None` and `generate new` remain explicit states.
+          value={sel.serving_ports_none
+            ? SERVING_PORTS_NONE
+            : (sel.serving_ports ? undefined : GENERATE_NEW)}
           onChange={(v) => {
             // Three states, all recorded: a file, the deliberate None, and "let
-            // the pipeline generate one" (cleared).
+            // the pipeline generate one" (the sentinel — no payload entry).
             if (v === SERVING_PORTS_NONE) set({ serving_ports: null, serving_ports_none: true })
+            else if (v === GENERATE_NEW) set({ serving_ports: null, serving_ports_none: false })
             else set({ serving_ports: (v as string) || null, serving_ports_none: false })
           }}
           options={spOptions}
         />
-        {!sel.serving_ports && !sel.serving_ports_none && (
-          <Tag color="blue" style={{ width: 'fit-content', marginTop: 4 }}>
-            generate new — the pipeline will create one
-          </Tag>
-        )}
+        {/* The sentinel lives in the picker now — no tag beside it. */}
         {/* R1.4/R1.3 — the rule, said where the choice is made. With no file and
             no `None`, the pipeline generates one; with `None` nothing is
             generated, both validations are skipped, and no stream row exists to
             expose — so the card will offer no exposure URL for this instance. */}
-        {/* R1.3 — the file itself, openable for view/edit. Saving forks into the
-            `.fix` variant and flips this picker (the same affordance the multi
-            categories have); without it the serving-ports artifact was the ONE
-            category that could not be edited from here at all. */}
-        {sel.serving_ports && onOpenFile && (
-          <div style={{ marginTop: 4 }}>
-            <Button type="link" size="small"
-              style={{ padding: 0, fontFamily: 'monospace', fontSize: 13,
-                ...(isStale('serving_ports', sel.serving_ports) ? strike : {}) }}
-              onClick={() => onOpenFile(sel.serving_ports as string)}>{sel.serving_ports}</Button>
-          </div>
-        )}
         {sel.serving_ports_none && (
           <Alert
             type="warning"
@@ -292,85 +378,96 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
             (deploy-panel-selection-and-generation-todo.md §1). Leaving it at
             `generate new` means the pipeline generates one. */}
         <Typography.Text type="secondary" style={{ fontSize: 12 }}> — or generate new</Typography.Text>
+        {/* F2 — selected confs are ROWS ABOVE the picker, each clickable to
+            edit with a per-category red cross. The picker is ADD-MODE: its
+            value is the sentinel only while nothing is selected, and a new pick
+            MERGES into the other categories rather than resetting them. */}
+        {selectedConfs.map(name => (
+          <SelectedFileRow
+            key={name}
+            name={name}
+            stale={staleConf(name)}
+            onOpen={onOpenFile}
+            onRemove={() => {
+              const cat = confCategory(name)
+              set(cat === 'stream'
+                ? { stream_conf: null }
+                : cat === 'mail'
+                ? { mail_conf: null }
+                : { nginx: null })
+            }}
+          />
+        ))}
         <Select
           mode="multiple"
           style={{ width: '100%', marginTop: 4 }}
-          placeholder="select one per category, or generate new"
-          allowClear
-          value={selectedConfs}
+          // T0/R8 — the sentinel is the first option and the shown value while
+          // nothing is selected. Choosing it clears every category slot.
+          // F2 — with rows above, the control holds only NEW picks, so its
+          // value is empty whenever a selection exists.
+          value={selectedConfs.length === 0 ? [GENERATE_NEW] : []}
+          placeholder={selectedConfs.length > 0 ? 'Add a config of another category…' : undefined}
           onChange={(vals: string[]) => {
-            // One file per category; a category can never hold two entries.
-            const next: Partial<FileSetSelectionData> = {
-              nginx: null, stream_conf: null, mail_conf: null,
+            const picked = (vals || []).filter((v) => v !== GENERATE_NEW)
+            // Choosing the sentinel is the explicit "generate everything"
+            // instruction; clearing an already-empty add control changes nothing.
+            if (picked.length === 0) {
+              if ((vals || []).includes(GENERATE_NEW)) {
+                set({ nginx: null, stream_conf: null, mail_conf: null })
+              }
+              return
             }
-            for (const v of vals) {
+            // MERGE, never reset: only the categories of the new picks change.
+            // One file per category; a category can never hold two entries.
+            const next: Partial<FileSetSelectionData> = {}
+            for (const v of picked) {
+              if (selectedConfs.includes(v)) continue
               const cat = confCategory(v)
               if (cat === 'stream') next.stream_conf = v
               else if (cat === 'mail') next.mail_conf = v
               else next.nginx = v
             }
-            set(next)
+            if (Object.keys(next).length > 0) set(next)
           }}
-          options={nginxOptions}
+          options={[
+            { value: GENERATE_NEW, label: GENERATE_NEW_LABEL },
+            ...nginxOptions,
+          ]}
           optionRender={(o) => (
             <span>
               {o.label}
-              <Tag color="blue" style={{ marginLeft: 8 }}>{confCategory(o.value as string)}</Tag>
+              {o.value !== GENERATE_NEW && (
+                <Tag color="blue" style={{ marginLeft: 8 }}>{confCategory(o.value as string)}</Tag>
+              )}
             </span>
           )}
         />
-        {selectedConfs.length === 0 && (
-          <Tag color="blue" style={{ width: 'fit-content', marginTop: 4 }}>
-            generate new — the pipeline will create one
-          </Tag>
-        )}
+        {/* The sentinel lives in the picker now — no tag beside it. */}
       </div>
 
       {showEnv && (
       <div>
-        <Typography.Text strong>Interpolation env files</Typography.Text>
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}> — later wins</Typography.Text>
-        {needsEnv ? (
-          <OrderedMulti
-            values={sel.env}
-            candidates={candidates.env}
-            staleMark={(v) => isStale('env', v)}
-            onOrderChange={(next) => set({ env: next })}
-            disabled={false}
-            onOpenFile={onOpenFile}
-          />
-        ) : (
-          <Alert
-            type="info"
-            style={{ marginTop: 4 }}
-            message="No ${VAR} interpolation detected in the selected compose — env section disabled"
-          />
-        )}
-      </div>
-      )}
-
-      {showProfiles && (
-      <div>
-        <Typography.Text strong>Compose profiles</Typography.Text>
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}> — gate optional services</Typography.Text>
-        {candidates.profiles.length === 0 ? (
+        <Typography.Text strong>Env files</Typography.Text>
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}> — later wins; None sends no env files</Typography.Text>
+        {/* S11 — `needs_env:false` is a HINT, not a lock: DeployForm auto-selects
+            `None` once for such a recipe, and the operator may still change it. */}
+        {!needsEnv && (
           <div style={{ fontSize: 12, color: '#999', marginTop: 4 }}>
-            No non-empty profiles found{sel.compose.length === 0 ? ' — select compose files first' : ''}.
+            No {'${VAR}'} interpolation detected in the selected compose — None is selected by default; you can still choose a file.
           </div>
-        ) : (
-          <Select
-            mode="multiple"
-            allowClear
-            placeholder="Select profiles…"
-            style={{ width: '100%', marginTop: 4 }}
-            value={sel.profiles}
-            onChange={(vals: string[]) => set({ profiles: vals.filter(p => !isStale('profiles', p)) })}
-            options={candidates.profiles.map(p => ({ value: p, label: p }))}
-          />
         )}
-        {(st.profiles || []).map(p => (
-          <span key={p} style={{ marginTop: 4, display: 'inline-block', ...strike }}>{p}</span>
-        ))}
+        <OrderedMulti
+          values={sel.env}
+          candidates={candidates.env}
+          staleMark={(v) => isStale('env', v)}
+          // S11 state machine: a real file clears `env_none`; empty + not None is
+          // `generate new`; None empties the list and records the flag.
+          onOrderChange={(next, none) => set({ env: next, env_none: !!none })}
+          disabled={false}
+          onOpenFile={onOpenFile}
+          noneSelected={!!sel.env_none}
+          noneLabel="None — send no env files"
+        />
       </div>
       )}
     </Space>

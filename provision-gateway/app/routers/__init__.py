@@ -10,6 +10,7 @@ from .pre_deploy import router as pre_deploy_router
 from .audit import router as audit_router
 from .stream import router as stream_router
 from .service_grants import router as service_grants_router
+from .alerts import router as alerts_router
 
 __all__ = [
     "auth_router",
@@ -22,4 +23,5 @@ __all__ = [
     "audit_router",
     "stream_router",
     "service_grants_router",
+    "alerts_router",
 ]

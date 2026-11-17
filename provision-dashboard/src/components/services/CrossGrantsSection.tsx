@@ -63,7 +63,26 @@ export default function CrossGrantsSection({
   if (!visible || !data) return null
 
   const effective: any[] = data.effective || []
-  const explicit: string[] = (data.explicit || []).map((r: any) => r.target_service_id)
+  // G95 R6 — a stale explicit row is VISIBLE and is not pre-selected: it can no
+  // longer hold a permission, so keeping it in the picker's value is exactly
+  // what stopped a valid target from being added (B4).
+  const explicitRows: any[] = data.explicit || []
+  const staleRows = explicitRows.filter((r: any) => r.stale)
+  const explicit: string[] = explicitRows
+    .filter((r: any) => !r.stale)
+    .map((r: any) => r.target_service_id)
+
+  const syncMessage = (sync: any) => {
+    // R4 — a durable grant can still be deferred; the click must say so.
+    if (!sync) return null
+    if (sync.outcome === 'deferred') {
+      return `Grant saved; the resolver sync was deferred — ${sync.reason || 'the next sync cycle retries it'}`
+    }
+    if (sync.outcome === 'error') {
+      return `Grant saved; the resolver sync failed — ${sync.reason || 'the global reconciler will retry'}`
+    }
+    return null
+  }
 
   // G86 — group the grantable candidates by owner account. Same-owner entries
   // are implicit (no row is ever taken for them), so they are not offered in
@@ -92,11 +111,31 @@ export default function CrossGrantsSection({
     // target and applies add/remove together (all-or-nothing).
     setSaving(true)
     try {
-      await client.put(`/service-grants/${serviceId}`, { target_service_ids: next })
-      message.success('Service grants updated')
+      const { data: body } = await client.put(
+        `/service-grants/${serviceId}`, { target_service_ids: next })
+      const warning = syncMessage(body.sync)
+      if (warning) message.warning(warning)
+      else message.success('Service grants updated')
       await load()
     } catch (e: any) {
       message.error(e.response?.data?.detail || 'Could not update the grants')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const removeStale = async (targetId: string) => {
+    // R6 — one action removes a row that no longer holds a permission.
+    setSaving(true)
+    try {
+      const { data: body } = await client.delete(
+        `/service-grants/${serviceId}/${targetId}`)
+      const warning = syncMessage(body.sync)
+      if (warning) message.warning(warning)
+      else message.success('Stale grant removed')
+      await load()
+    } catch (e: any) {
+      message.error(e.response?.data?.detail || 'Could not remove the stale grant')
     } finally {
       setSaving(false)
     }
@@ -145,6 +184,27 @@ export default function CrossGrantsSection({
             onChange={save}
             disabled={saving}
           />
+          {/* R6 — rows that no longer hold a permission stay visible, marked,
+              and are removed in one click. They are NOT in the Select's value,
+              so they never block a valid target from being added. */}
+          {staleRows.length > 0 && (
+            <div style={{ marginTop: 6 }}>
+              {staleRows.map((r: any) => (
+                <Space key={r.target_service_id} size={4} style={{ display: 'flex' }}>
+                  <Tag color="red">
+                    {r.target
+                      ? `${r.target.user_name}:${r.target.service_name}:${r.target.label}`
+                      : r.target_service_id}
+                    {' — '}{r.stale_message || 'no longer permitted'}
+                  </Tag>
+                  <Button size="small" danger loading={saving}
+                    onClick={() => removeStale(r.target_service_id)}>
+                    Remove
+                  </Button>
+                </Space>
+              ))}
+            </div>
+          )}
           <div style={{ fontSize: 12, color: '#999', marginTop: 4 }}>
             Only accounts this owner can reach are listed (own, an active
             account grant, or a public account). Same-owner targets are implicit

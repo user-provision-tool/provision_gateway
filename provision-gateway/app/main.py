@@ -17,6 +17,7 @@ from .config import settings
 from .database import init_db, SessionLocal
 from .models.gateway_setting import GatewaySetting
 from .routers import (
+    alerts_router,
     auth_router,
     audit_router,
     llm_router,
@@ -321,6 +322,16 @@ async def lifespan(app: FastAPI):
     from .services.task_queue import gateway_queue as _gateway_queue
     _queue_task = _gateway_queue.start()
     print("[gateway] Generation queue planner/scheduler started")
+
+    # Alerts Center — one lazy ingest/evaluation at startup (R1/R9). It is
+    # idempotent across the four uvicorn workers: the event source_key and the
+    # partial unique index on the active condition row are the dedupe.
+    try:
+        from .services.alert_service import refresh_once as _alerts_refresh_once
+        await _alerts_refresh_once()
+        print("[gateway] Alerts Center initial ingest/evaluation completed")
+    except Exception as exc:
+        print(f"[gateway] WARNING: alert initial pass failed: {exc}")
     yield
     # Shutdown
     if _reconcile_task:
@@ -384,6 +395,7 @@ app.include_router(pre_deploy_router)
 app.include_router(audit_router)
 app.include_router(stream_router)
 app.include_router(service_grants_router)
+app.include_router(alerts_router)
 
 
 # ---------------------------------------------------------------------------

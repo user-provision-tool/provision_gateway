@@ -290,3 +290,442 @@ def test_policy_refuses_missing_nginx_and_stream_without_tls():
             require_ready=True,
         )
     assert exc.value.code == "stream_requires_tls"
+
+
+# ---------------------------------------------------------------------------
+# S11/S17 — the env payload precedence and `env_none`
+# ---------------------------------------------------------------------------
+
+def _payload_intent():
+    return {
+        "service_name": "svc", "user_name": "u", "owner_api_user_id": "o",
+        "service_id": "s", "procedure_id": "p", "recipe_path": "",
+        "label": "3", "domain": "localhost", "tls": True,
+        "env_reference": ["reference.env"],
+        "llm_validate_env": True,
+    }
+
+
+def test_env_payload_prefers_the_generated_raw():
+    selection = {"compose": ["c.yml"], "nginx": "n.conf",
+                 "env": ["one.env", "two.env"], "env_none": False}
+    payload = deploy_workflow._api_payload(
+        _payload_intent(), selection, ".env.raw.u.3")
+    assert payload["env_files"] == [".env.raw.u.3"]
+
+
+def test_env_payload_sends_the_selected_ordered_list_verbatim():
+    selection = {"compose": ["c.yml"], "nginx": "n.conf",
+                 "env": ["first.env", "second.env"], "env_none": False}
+    payload = deploy_workflow._api_payload(_payload_intent(), selection, None)
+    assert payload["env_files"] == ["first.env", "second.env"]
+
+
+def test_env_payload_is_absent_for_env_none_and_for_an_empty_list():
+    payload = deploy_workflow._api_payload(
+        _payload_intent(),
+        {"compose": ["c.yml"], "nginx": "n.conf",
+         "env": ["ignored.env"], "env_none": True},
+        None)
+    assert "env_files" not in payload
+    payload = deploy_workflow._api_payload(
+        _payload_intent(),
+        {"compose": ["c.yml"], "nginx": "n.conf", "env": [], "env_none": False},
+        None)
+    assert "env_files" not in payload
+
+
+def test_env_reference_and_guard_flag_never_reach_the_api_payload():
+    selection = {"compose": ["c.yml"], "nginx": "n.conf",
+                 "env": ["selected.env"], "env_none": False}
+    payload = deploy_workflow._api_payload(_payload_intent(), selection, None)
+    assert payload["env_files"] == ["selected.env"]
+    assert "env_reference" not in payload
+    assert "llm_validate_env" not in payload
+    assert "env_none" not in payload
+
+
+def test_env_none_suppresses_env_generation_and_satisfies_readiness(monkeypatch):
+    from app.services.generation_jobs import generation_jobs as generation_manager
+
+    monkeypatch.setattr(generation_manager, "_recipe_missing", lambda req: [])
+    base = {"service_name": "svc", "recipe_path": "", "selection": {
+        "compose": ["c.yml"], "nginx": "n.conf",
+        "serving_ports": "ports.yml", "env": [], "env_none": True,
+    }}
+    assert deploy_workflow.generation_needed(base) is False
+    without_none = {"service_name": "svc", "recipe_path": "", "selection": {
+        "compose": ["c.yml"], "nginx": "n.conf",
+        "serving_ports": "ports.yml", "env": [], "env_none": False,
+    }}
+    assert deploy_workflow.generation_needed(without_none) is True
+
+    existing = {"selection": {
+        "compose": ["c.yml"], "nginx": "n.conf",
+        "serving_ports": "ports.yml", "env": [], "env_none": True,
+    }, "env_name": ""}
+    assert deploy_workflow._session_ready(existing, {"tls": False}) is True
+
+
+def test_recipe_missing_phase_does_not_override_a_filled_slot(monkeypatch):
+    """A recipe without serving-ports must still allow an explicit None.
+
+    §14.1/§14.2: `serving_ports_none` fills the slot, so the deploy is
+    validation-only. The recipe-presence scan must not force a generation run
+    over the operator's explicit choice (measured live: the S22 guard trace
+    entered a generation job for exactly this reason).
+    """
+    from app.services.generation_jobs import generation_jobs as generation_manager
+
+    monkeypatch.setattr(generation_manager, "_recipe_missing",
+                        lambda req: ["serving_ports"])
+    filled = {"service_name": "svc", "recipe_path": "", "selection": {
+        "compose": ["c.yml"], "nginx": "n.conf", "env": ["e.env"],
+        "serving_ports": None, "serving_ports_none": True,
+    }}
+    assert deploy_workflow.generation_needed(filled) is False
+
+    monkeypatch.setattr(generation_manager, "_recipe_missing",
+                        lambda req: ["docker-compose"])
+    no_compose = {"service_name": "svc", "recipe_path": "", "selection": {
+        "compose": [], "nginx": "n.conf", "env": ["e.env"],
+        "serving_ports": None, "serving_ports_none": True,
+    }}
+    assert deploy_workflow.generation_needed(no_compose) is True
+
+
+# ---------------------------------------------------------------------------
+# S12 — the validation-only mechanical pass
+# ---------------------------------------------------------------------------
+
+def _recipe(tmp_path, monkeypatch, *, env_files=("selected.env",)):
+    from app.config import settings
+    project = tmp_path / "source_projects" / "svc"
+    project.mkdir(parents=True)
+    monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path / "source_projects")
+    (project / "compose.yml").write_text("services:\n  app:\n    image: x\n")
+    (project / "nginx.conf").write_text(
+        "server {\n  server_name {{ hostname_stem }}--app.localhost;\n"
+        "  location / { proxy_pass http://app:8080; }\n}\n")
+    (project / "ports.yml").write_text(
+        "ports:\n  - sub_service: app\n    port: 8080\n    kind: http\n")
+    for name in env_files:
+        (project / name).write_text("TOKEN=value\n")
+    return project
+
+
+def _patch_validators(monkeypatch, *, env_result=None):
+    from app.services import config_validation, file_sets
+    from app.services import serving_ports as serving_ports_mod
+
+    calls: dict[str, object] = {}
+
+    def fake_compose(paths):
+        calls["compose"] = [str(p) for p in paths]
+        return {"valid": True, "errors": [], "skipped": False}
+
+    def fake_ports(content, paths):
+        calls["ports"] = content
+        return {"valid": True, "errors": [], "warnings": []}
+
+    async def fake_nginx(path, names):
+        calls.setdefault("nginx", []).append(str(path))
+        return {"valid": True, "errors": []}
+
+    def fake_env(content, paths):
+        calls["env"] = content
+        return env_result or {"valid": True, "errors": [], "missing": []}
+
+    def fake_agreement(*args, **kwargs):
+        calls.setdefault("agreement", 0)
+        calls["agreement"] += 1
+        return {"valid": True, "errors": [], "warnings": []}
+
+    monkeypatch.setattr(config_validation, "validate_compose", fake_compose)
+    monkeypatch.setattr(config_validation, "validate_serving_ports", fake_ports)
+    monkeypatch.setattr(config_validation, "validate_nginx", fake_nginx)
+    monkeypatch.setattr(config_validation, "validate_env", fake_env)
+    monkeypatch.setattr(file_sets, "compose_service_names", lambda paths: ["app"])
+    monkeypatch.setattr(serving_ports_mod, "validate_conf_agreement", fake_agreement)
+    return calls
+
+
+def _ready_selection(env=("selected.env",), env_none=False):
+    return {
+        "compose": ["compose.yml"], "nginx": "nginx.conf",
+        "serving_ports": "ports.yml", "env": list(env),
+        "env_none": env_none, "profiles": [],
+    }
+
+
+def test_validation_only_pass_runs_every_validator(tmp_path, monkeypatch):
+    import asyncio
+    _recipe(tmp_path, monkeypatch)
+    calls = _patch_validators(monkeypatch)
+    asyncio.run(deploy_workflow._validate_selected_artifacts(
+        {"service_name": "svc", "recipe_path": "", "tls": False},
+        _ready_selection(), None))
+    assert calls["compose"] and calls["ports"] and calls["nginx"]
+    assert calls["agreement"] == 1, "serving-port/nginx agreement ran"
+    assert "TOKEN=value" in calls["env"]
+
+
+def test_validation_only_failure_is_a_workflow_error(tmp_path, monkeypatch):
+    import asyncio
+    _recipe(tmp_path, monkeypatch)
+    _patch_validators(
+        monkeypatch,
+        env_result={"valid": False, "errors": ["missing TOKEN"], "missing": ["TOKEN"]},
+    )
+    with pytest.raises(deploy_workflow.WorkflowError) as exc:
+        asyncio.run(deploy_workflow._validate_selected_artifacts(
+            {"service_name": "svc", "recipe_path": "", "tls": False},
+            _ready_selection(), None))
+    assert exc.value.code == "env_invalid"
+    assert "missing TOKEN" in exc.value.detail
+
+
+def test_validation_only_env_none_skips_env_validation(tmp_path, monkeypatch):
+    import asyncio
+    _recipe(tmp_path, monkeypatch, env_files=())
+    calls = _patch_validators(monkeypatch)
+    asyncio.run(deploy_workflow._validate_selected_artifacts(
+        {"service_name": "svc", "recipe_path": "", "tls": False},
+        _ready_selection(env=(), env_none=True), None))
+    assert "env" not in calls, "env_none has nothing to validate"
+
+
+def test_validation_only_pass_happens_without_a_generation_job(tmp_path, monkeypatch):
+    """`_start` validates and goes straight to claim when every slot is filled."""
+    import asyncio
+    from app.services.generation_jobs import generation_jobs as generation_manager
+
+    _recipe(tmp_path, monkeypatch)
+    _patch_validators(monkeypatch)
+    monkeypatch.setattr(generation_manager, "_recipe_missing", lambda req: [])
+
+    def no_generation(*args, **kwargs):
+        raise AssertionError("a validation-only deploy must not create a job")
+
+    monkeypatch.setattr(generation_manager, "create_job", no_generation)
+
+    seen = {}
+
+    async def fake_claim(service_id, intent, selection, env_name):
+        seen.update(service_id=service_id, selection=selection, env_name=env_name)
+        return {"stage": "deploying"}
+
+    monkeypatch.setattr(deploy_workflow, "_claim_and_register", fake_claim)
+    owner = _make_api_user("validation-owner")
+    intent = {
+        "service_name": "svc", "recipe_path": "", "owner_api_user_id": owner,
+        "selection": _ready_selection(), "tls": False,
+    }
+    result = asyncio.run(deploy_workflow.start_deploy(intent))
+    assert result["stage"] == "deploying"
+    assert seen["env_name"] is None
+    assert seen["selection"]["env"] == ["selected.env"]
+
+
+# ---------------------------------------------------------------------------
+# S13 — the LLM env guard blocks on findings and call failures
+# ---------------------------------------------------------------------------
+
+def _guard_selection(env=("selected.env",), env_none=False):
+    return {"compose": ["compose.yml"], "nginx": "nginx.conf",
+            "env": list(env), "env_none": env_none}
+
+
+def test_llm_guard_blocks_on_findings(tmp_path, monkeypatch):
+    import asyncio
+    from app.services import llm_service as llm_mod
+
+    _recipe(tmp_path, monkeypatch)
+
+    async def fake_validate(db, **kwargs):
+        return {"valid": False, "findings": ["TOKEN is empty"],
+                "guide": "Set TOKEN in selected.env", "error": None}
+
+    monkeypatch.setattr(llm_mod.llm_service, "validate_env_selection", fake_validate)
+    with pytest.raises(deploy_workflow.WorkflowError) as exc:
+        asyncio.run(deploy_workflow._run_llm_env_guard(
+            {"service_name": "svc", "recipe_path": "", "llm_validate_env": True},
+            _guard_selection()))
+    assert exc.value.code == "llm_env_validation_blocked"
+    assert exc.value.findings == ["TOKEN is empty"]
+    assert "Set TOKEN" in exc.value.detail
+
+
+def test_llm_guard_blocks_when_the_llm_call_fails(tmp_path, monkeypatch):
+    import asyncio
+    from app.services import llm_service as llm_mod
+
+    _recipe(tmp_path, monkeypatch)
+
+    async def fake_validate(db, **kwargs):
+        return {"valid": False, "findings": [], "guide": "",
+                "error": "HTTP 500"}
+
+    monkeypatch.setattr(llm_mod.llm_service, "validate_env_selection", fake_validate)
+    with pytest.raises(deploy_workflow.WorkflowError) as exc:
+        asyncio.run(deploy_workflow._run_llm_env_guard(
+            {"service_name": "svc", "recipe_path": "", "llm_validate_env": True},
+            _guard_selection()))
+    assert exc.value.code == "llm_env_validation_blocked"
+    assert exc.value.llm_error == "HTTP 500"
+
+
+def test_llm_guard_never_sends_the_env_reference(tmp_path, monkeypatch):
+    import asyncio
+    from app.services import llm_service as llm_mod
+
+    _recipe(tmp_path, monkeypatch)
+    seen = {}
+
+    async def fake_validate(db, **kwargs):
+        seen.update(kwargs)
+        return {"valid": True, "findings": [], "guide": "", "error": None}
+
+    monkeypatch.setattr(llm_mod.llm_service, "validate_env_selection", fake_validate)
+    asyncio.run(deploy_workflow._run_llm_env_guard(
+        {"service_name": "svc", "recipe_path": "", "llm_validate_env": True,
+         "env_reference": ["reference.env"]},
+        _guard_selection()))
+    assert [name for name, _ in seen["env_files"]] == ["selected.env"]
+
+
+def test_llm_guard_is_skipped_for_env_none_and_unchecked(tmp_path, monkeypatch):
+    import asyncio
+    from app.services import llm_service as llm_mod
+
+    _recipe(tmp_path, monkeypatch)
+    calls = []
+
+    async def fake_validate(db, **kwargs):
+        calls.append(kwargs)
+        return {"valid": True, "findings": [], "guide": "", "error": None}
+
+    monkeypatch.setattr(llm_mod.llm_service, "validate_env_selection", fake_validate)
+    asyncio.run(deploy_workflow._run_llm_env_guard(
+        {"service_name": "svc", "recipe_path": "", "llm_validate_env": True},
+        _guard_selection(env=(), env_none=True)))
+    asyncio.run(deploy_workflow._run_llm_env_guard(
+        {"service_name": "svc", "recipe_path": "", "llm_validate_env": False},
+        _guard_selection()))
+    # A generated `.raw` is what will be sent; the generation path guards it.
+    asyncio.run(deploy_workflow._run_llm_env_guard(
+        {"service_name": "svc", "recipe_path": "", "llm_validate_env": True},
+        _guard_selection(), ".env.raw.u.0"))
+    assert calls == []
+
+
+def test_claim_and_register_pauses_on_a_guard_finding(monkeypatch):
+    """S22 — a finding pauses the session through the LLM-fix flow."""
+    import asyncio
+    from app.services.provision_service import provision_service
+
+    owner = _make_api_user("guard-owner")
+    sid = str(uuid.uuid4())
+    _session(sid, owner, state=STATE_GENERATED, operation="deploy",
+             selection=_guard_selection())
+    registered = []
+
+    async def fake_guard(intent, selection, env_name=None):
+        exc = deploy_workflow.WorkflowError(
+            "llm_env_validation_blocked", "TOKEN is empty")
+        exc.findings = ["TOKEN is empty"]
+        exc.guide = "Set TOKEN in selected.env"
+        raise exc
+
+    async def fake_register(**kwargs):
+        registered.append(kwargs)
+        return {"task_id": "t"}
+
+    monkeypatch.setattr(deploy_workflow, "_run_llm_env_guard", fake_guard)
+    monkeypatch.setattr(provision_service, "register_user", fake_register)
+    with pytest.raises(deploy_workflow.WorkflowError) as excinfo:
+        asyncio.run(deploy_workflow._claim_and_register(
+            sid, {"llm_validate_env": True}, _guard_selection(), None))
+    assert excinfo.value.code == "workflow_paused"
+    assert registered == [], "nothing may be registered after a guard pause"
+    sess = pdr.get_session(sid)
+    assert sess["state"] == "paused"
+    assert sess["reason"] == "llm_fix"
+    assert sess["slot"] == "env"
+    assert "Set TOKEN in selected.env" in sess["guide"]
+    assert "TOKEN is empty" in sess["guide"]
+
+
+def test_claim_and_register_fails_closed_on_a_guard_call_failure(monkeypatch):
+    """S22 — an LLM-call failure has no fixing prompt, so it fails closed."""
+    import asyncio
+    from app.services.provision_service import provision_service
+
+    owner = _make_api_user("guard-owner-2")
+    sid = str(uuid.uuid4())
+    _session(sid, owner, state=STATE_GENERATED, operation="deploy",
+             selection=_guard_selection())
+    registered = []
+
+    async def fake_guard(intent, selection, env_name=None):
+        raise deploy_workflow.WorkflowError(
+            "llm_env_validation_blocked", "LLM call failed: HTTP 500")
+
+    async def fake_register(**kwargs):
+        registered.append(kwargs)
+        return {"task_id": "t"}
+
+    monkeypatch.setattr(deploy_workflow, "_run_llm_env_guard", fake_guard)
+    monkeypatch.setattr(provision_service, "register_user", fake_register)
+    with pytest.raises(deploy_workflow.WorkflowError) as excinfo:
+        asyncio.run(deploy_workflow._claim_and_register(
+            sid, {"llm_validate_env": True}, _guard_selection(), None))
+    assert excinfo.value.code == "llm_env_validation_blocked"
+    assert registered == [], "nothing may be registered after a guard block"
+    assert pdr.get_session(sid)["state"] == "failed"
+
+
+def test_llm_env_validation_parses_findings_and_call_failures(monkeypatch):
+    """The reviewer method: findings block, transport/shape failures block."""
+    import asyncio
+    from app.services import llm_service as llm_mod
+
+    service = llm_mod.llm_service
+    monkeypatch.setattr(service, "_resolve_endpoint",
+                        lambda db: ("http://llm", "model", {}))
+
+    async def reply(content):
+        async def fake_chat(*args, **kwargs):
+            return {"choices": [{"message": {"content": content}}]}
+        return fake_chat
+
+    async def run(content):
+        monkeypatch.setattr(service, "_chat", await reply(content))
+        return await service.validate_env_selection(
+            None, env_files=[("a.env", "TOKEN=")], compose_files=[],
+            service_name="svc")
+
+    blocked = asyncio.run(run(
+        '{"valid": false, "findings": ["TOKEN is blank"], "guide": "set TOKEN"}'))
+    assert blocked["valid"] is False
+    assert blocked["findings"] == ["TOKEN is blank"]
+    assert blocked["guide"] == "set TOKEN"
+
+    # The model saying valid:true does not override a finding.
+    assert asyncio.run(run(
+        '{"valid": true, "findings": ["still wrong"]}'))["valid"] is False
+
+    clean = asyncio.run(run('{"valid": true, "findings": []}'))
+    assert clean == {"valid": True, "findings": [], "guide": "", "error": None}
+
+    no_json = asyncio.run(run("I cannot answer in JSON"))
+    assert no_json["valid"] is False and no_json["error"]
+
+    async def failing_chat(*args, **kwargs):
+        return {"_error": "HTTP 503"}
+
+    monkeypatch.setattr(service, "_chat", failing_chat)
+    failed = asyncio.run(service.validate_env_selection(
+        None, env_files=[("a.env", "TOKEN=")], compose_files=[],
+        service_name="svc"))
+    assert failed["valid"] is False and failed["error"] == "HTTP 503"

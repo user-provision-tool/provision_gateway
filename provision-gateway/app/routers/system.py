@@ -12,6 +12,7 @@ from ..config import settings
 from ..database import get_db
 from ..middleware import require_gateway_token, require_admin
 from ..models.system_config import SystemConfig
+from ..services.acl_state import acl_state
 from ..services.provision_service import provision_service
 
 router = APIRouter(prefix="/api/system", tags=["system"])
@@ -19,62 +20,95 @@ router = APIRouter(prefix="/api/system", tags=["system"])
 _start_time = time.time()
 
 
-def acl_state(edge_env: dict[str, str] | None) -> dict:
-    """The gateway-vs-edge ACL state.
-
-    G80 — fullset is ACL-on unconditionally and the ``ENABLE_ACL`` switch is
-    gone from the deployment (the edge template renders the gate by default).
-    An ABSENT value therefore means ACL-on; a PRESENT ``false`` still wins, so
-    a deployment that re-adds the switch keeps the drift check that exists
-    because of the 2026-08-28 gateway-on/edge-off outage. ``None`` (the edge env
-    unreadable) is unknown, never a fabricated mismatch of true-vs-false.
-    """
-    gateway = bool(settings.ENABLE_ACL)
-    if edge_env is None:
-        edge = None
-    else:
-        edge = edge_env.get("ENABLE_ACL", "true").lower() == "true"
-    return {"gateway": gateway, "edge": edge,
-            "enabled": bool(gateway and edge),
-            "consistent": edge is not None and gateway == edge}
+# T3/R5 — the status page must render in seconds even when the -api is down.
+# Each probe has a short per-call bound and the whole -api-dependent half has
+# ONE overall deadline; a timeout returns a degraded payload instead of holding
+# the request for 15 × 300 s. The registry-backed queue counts are computed
+# BEFORE this deadline and always survive.
+STATUS_PROBE_TIMEOUT_S = 2.0
+STATUS_DEGRADED_DEADLINE_S = 5.0
+STATUS_COMPONENT_NAMES = [
+    "subnet-acl-provision-api", "subnet-acl-nginx", "subnet-acl-gateway",
+    "subnet-acl-dashboard", "subnet-acl-nginx-acl",
+]
 
 
-@router.get("/status")
-async def system_status(
-    current_user: dict = Depends(require_gateway_token),
-    db: Session = Depends(get_db),
-):
-    """Get system health status including per-component Docker stats."""
+def _degraded_api_status() -> dict:
+    """The payload used when the -api does not answer within the deadline."""
+    return {
+        "provision_api": {"status": "unreachable", "latency_ms": 0,
+                          "version": "unknown"},
+        "subnet_acl_nginx": {"status": "unknown"},
+        "docker_host": {
+            "containers_total": 0, "containers_running": 0,
+            "cpu_percent": 0, "mem_percent": 0, "disk_percent": 0,
+        },
+        "components": {
+            name: {"running": False, "exists": False, "status": "unavailable"}
+            for name in STATUS_COMPONENT_NAMES
+        },
+        "services_count": 0,
+        "users_count": 0,
+        "service_stats": {},
+        "container_stats": {},
+        "acl": {**acl_state(None), "edge": None, "enabled": False},
+        "degraded": True,
+        "unavailable_sections": [
+            "provision_api", "components", "docker_host", "service_stats",
+            "container_stats", "users_count", "acl",
+        ],
+    }
+
+
+async def _collect_api_status() -> dict:
+    """The -api-dependent half of the status payload, within probe bounds."""
+    timeout = STATUS_PROBE_TIMEOUT_S
+    unavailable: list[str] = []
+
     provision_api_status = {"status": "unknown", "latency_ms": 0, "version": "unknown"}
     try:
         health = await provision_service.health()
         provision_api_status["status"] = health.get("status", "unknown")
+        if health.get("status") != "ok":
+            unavailable.append("provision_api")
     except Exception:
         provision_api_status["status"] = "unreachable"
+        unavailable.append("provision_api")
 
-    # Per-component status from Docker (via provision-api)
     components = {}
-    for name in ["subnet-acl-provision-api", "subnet-acl-nginx", "subnet-acl-gateway", "subnet-acl-dashboard", "subnet-acl-nginx-acl"]:
+    components_failed = False
+    for name in STATUS_COMPONENT_NAMES:
+        probe_failed = False
         try:
-            running = await provision_service.container_running(name)
-            exists = await provision_service.container_exists(name)
+            running = await provision_service.container_running(name, timeout=timeout)
+            exists = await provision_service.container_exists(name, timeout=timeout)
         except Exception:
-            running = False; exists = False
+            running = False
+            exists = False
+            probe_failed = True
+            components_failed = True
         components[name] = {
             "running": running,
             "exists": exists,
-            "status": "running" if running else ("stopped" if exists else "not found"),
+            # A failed PROBE is not "not found": the container may exist and the
+            # -api may simply be down. Say unavailable (R5) rather than lie.
+            "status": ("unavailable" if probe_failed
+                       else ("running" if running else ("stopped" if exists else "not found"))),
         }
+    if components_failed:
+        unavailable.append("components")
 
-    # Docker info + host stats (via provision-api)
     try:
-        host_stats = await provision_service.host_stats()
+        host_stats = await provision_service.host_stats(timeout=timeout)
     except Exception:
         host_stats = {}
+        unavailable.append("docker_host")
     try:
-        docker_info_data = await provision_service.docker_info()
+        docker_info_data = await provision_service.docker_info(timeout=timeout)
     except Exception:
         docker_info_data = {}
+        if "docker_host" not in unavailable:
+            unavailable.append("docker_host")
 
     docker_host = {
         "containers_total": docker_info_data.get("containers_total", 0),
@@ -84,12 +118,77 @@ async def system_status(
         "disk_percent": host_stats.get("disk_percent", 0),
     }
 
+    services_count = 0
+    users_count = 0
+    service_stats: dict = {}
+    container_stats: dict = {}
+
+    try:
+        cs = await provision_service.get_container_stats(timeout=timeout)
+        container_stats = cs.get("container_stats", {})
+    except Exception:
+        unavailable.append("container_stats")
+
+    try:
+        ss = await provision_service.get_service_stats(timeout=timeout)
+        service_stats = ss.get("service_stats", {})
+        services_count = service_stats.get("expected", 0)
+    except Exception:
+        unavailable.append("service_stats")
+
+    try:
+        users_result = await provision_service.list_users(timeout=timeout)
+        users_list = users_result.get("user_status", [])
+        users_count = len(users_list)
+    except Exception:
+        unavailable.append("users_count")
+
+    # ACL state: the gateway setting AND the edge container env must BOTH be on
+    # for ACL to be effective — a gateway-on/edge-off drift (the 2026-08-28 G3
+    # outage) silently exposes native Basic on the internal nginx. G80 removed
+    # the switch from the deployment, so an ABSENT value means on (see
+    # acl_state); only an explicit edge-off is a mismatch. An unreadable edge
+    # env is unknown, and marked unavailable.
+    try:
+        edge_env = await provision_service.container_env(
+            "subnet-acl-nginx-acl", timeout=timeout)
+    except Exception:
+        edge_env = None
+        unavailable.append("acl")
+    acl = acl_state(edge_env)
+
+    return {
+        "provision_api": provision_api_status,
+        "subnet_acl_nginx": {"status": components["subnet-acl-nginx"]["status"]},
+        "docker_host": docker_host,
+        "components": components,
+        "services_count": services_count,
+        "users_count": users_count,
+        "service_stats": service_stats,
+        "container_stats": container_stats,
+        "acl": acl,
+        "degraded": bool(unavailable),
+        "unavailable_sections": unavailable,
+    }
+
+
+@router.get("/status")
+async def system_status(
+    current_user: dict = Depends(require_gateway_token),
+    db: Session = Depends(get_db),
+):
+    """Get system health status including per-component Docker stats.
+
+    R5 — the -api-dependent probes run under ONE short deadline. Locally
+    available values (queue counts, proxy state, gateway uptime) are computed
+    first and never lost to an -api outage.
+    """
     gateway = {
         "version": "1.0.0",
         "uptime_sec": int(time.time() - _start_time),
     }
 
-    # Proxy status
+    # Proxy status (local DB)
     from ..services.proxy_service import has_active_proxy, get_active_config
     proxy_active = has_active_proxy(db)
     proxy_info = None
@@ -98,38 +197,10 @@ async def system_status(
         if cfg:
             proxy_info = {"url": cfg.get("url", ""), "reachable": cfg.get("reachable")}
 
-    # Compute counts for stat cards
-    services_count = 0
-    users_count = 0
-    tasks_running = 0
-    service_stats = {}
-    container_stats = {}
-
-    # Service & container stats from provision-api (registry-based, not docker ps)
-    try:
-        cs = await provision_service.get_container_stats()
-        container_stats = cs.get("container_stats", {})
-    except Exception:
-        pass
-
-    try:
-        ss = await provision_service.get_service_stats()
-        service_stats = ss.get("service_stats", {})
-        services_count = service_stats.get("expected", 0)
-    except Exception:
-        pass
-
-    try:
-        users_result = await provision_service.list_users()
-        users_list = users_result.get("user_status", [])
-        users_count = len(users_list)
-    except Exception:
-        pass
-
     # Queue counts come from the task rows (R9.2), not from an -api HTTP poll.
     # `tasks_*` are the OPERATOR lane (the cards' counts, R8); the maintenance
     # lane is reported separately (G94 R5.2).
-    tasks_queued = tasks_planned = 0
+    tasks_running = tasks_queued = tasks_planned = 0
     tasks_queued_maintenance = tasks_maintenance = 0
     try:
         from ..services.task_queue import gateway_queue
@@ -143,36 +214,25 @@ async def system_status(
     except Exception:
         pass
 
-    # ACL state: the gateway setting AND the edge container env must BOTH be on
-    # for ACL to be effective — a gateway-on/edge-off drift (the 2026-08-28 G3
-    # outage) silently exposes native Basic on the internal nginx. G80 removed
-    # the switch from the deployment, so an ABSENT value means on (see
-    # acl_state); only an explicit edge-off is a mismatch.
     try:
-        edge_env = await provision_service.container_env("subnet-acl-nginx-acl")
-    except Exception:
-        edge_env = None  # edge env unreadable → unknown
-    acl = acl_state(edge_env)
+        api_payload = await asyncio.wait_for(
+            _collect_api_status(), timeout=STATUS_DEGRADED_DEADLINE_S)
+    except asyncio.TimeoutError:
+        api_payload = _degraded_api_status()
+    except Exception:  # noqa: BLE001 — an unexpected probe bug must not blank the page
+        api_payload = _degraded_api_status()
 
     return {
-        "provision_api": provision_api_status,
-        "subnet_acl_nginx": {"status": components["subnet-acl-nginx"]["status"]},
-        "docker_host": docker_host,
+        **api_payload,
         "gateway": gateway,
-        "components": components,
         "proxy": {"active": proxy_active, "info": proxy_info},
-        "services_count": services_count,
-        "users_count": users_count,
         "tasks_running": tasks_running,
         "tasks_queued": tasks_queued,
         "tasks_planned": tasks_planned,
         "tasks_queued_maintenance": tasks_queued_maintenance,
         "tasks_maintenance": tasks_maintenance,
-        "service_stats": service_stats,
-        "container_stats": container_stats,
         "nginx_http_port": settings.NGINX_HTTP_PORT,
         "nginx_https_port": settings.NGINX_HTTPS_PORT,
-        "acl": acl,
     }
 
 

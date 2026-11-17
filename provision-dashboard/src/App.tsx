@@ -15,6 +15,7 @@ import UserManagementPage from './pages/UserManagementPage'
 import SSLPage from './pages/SSLPage'
 import ApiKeysPage from './pages/ApiKeysPage'
 import AlertPage from './pages/AlertPage'
+import AlertsPage from './pages/AlertsPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, isLoading } = useAuth()
@@ -102,6 +103,7 @@ export default function App() {
         <Route path="tasks" element={<AdminRoute><TasksPage /></AdminRoute>} />
         <Route path="settings" element={<AdminRoute><SettingsPage /></AdminRoute>} />
         <Route path="audit" element={<AdminRoute><AuditPage /></AdminRoute>} />
+        <Route path="alerts" element={<AdminRoute><AlertsPage /></AdminRoute>} />
         <Route path="users/manage" element={<AdminRoute><UserManagementPage /></AdminRoute>} />
         <Route path="ssl" element={<AdminRoute><SSLPage /></AdminRoute>} />
         <Route path="api-keys" element={<ApiKeysPage />} />

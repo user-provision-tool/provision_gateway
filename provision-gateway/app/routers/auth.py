@@ -22,7 +22,7 @@ from ..models.stream_exposure import StreamExposure
 from ..models.user import User
 from ..models.user_login import UserLogin
 from ..schemas.auth import LoginRequest, PasswordChangeRequest
-from ..services import acl_service, account_service, auth_service, audit_service
+from ..services import acl_service, account_service, auth_service, audit_service, service_grants
 from ..services import cross_verify as cross_verify_service
 from ..services.cross_orchestrator import schedule_sync, schedule_sync_threadsafe
 from ..services.api_users_client import ApiUsersClient, ApiUsersUnavailable, api_users
@@ -477,8 +477,12 @@ def set_user_grant(user_id: str, req: dict, current_admin: dict = Depends(requir
         detail={"shared_user_id": shared_id, "active": active,
                 "state": row["state"] if row else "none"}, status="success",
     )
-    # An account grant can turn an explicit cross-owner service grant on/off.
-    schedule_sync_threadsafe()
+    # R14 — an account grant can turn an explicit cross-owner service grant
+    # on/off. Refresh exactly the sources whose rows depend on it (the grantee's
+    # services with a row to the shared owner's services), not the whole stack.
+    source_ids = service_grants.affected_sources_for_account_change(
+        db, account_grant=(str(user_id), shared_id))
+    schedule_sync_threadsafe(source_ids)
     return {"updated": True, "grant": row}
 
 
@@ -584,9 +588,13 @@ def update_user(user_id: str, req: dict, current_admin: dict = Depends(require_a
             target_user=auth_service.username_for(db, user.id), detail=detail,
             status="success",
         )
-    # Deactivation inactivates the account's grants; the cross-path set follows.
+    # R14 — deactivation inactivates the account's grants; the cross-path set
+    # follows for the affected sources only (own explicit rows plus rows that
+    # target this account's services).
     if "is_active" in detail:
-        schedule_sync_threadsafe()
+        source_ids = service_grants.affected_sources_for_account_change(
+            db, changed_user_id=str(user.id))
+        schedule_sync_threadsafe(source_ids)
     row = _user_payload(db, user)
     row["grants"] = acl_service.list_for_grantee(db, user.id)
     return {"updated": True, "user": row}
@@ -687,6 +695,16 @@ async def delete_user(user_id: str, current_admin: dict = Depends(require_admin)
     finally:
         db.close()
 
+    # R14 — compute the affected sources while the account's services still
+    # exist (the soft delete tombstones them). Own explicit rows are skipped by
+    # the fan-out once they are gone; the inbound sources are the ones to clear.
+    db = SessionLocal()
+    try:
+        affected_source_ids = service_grants.affected_sources_for_account_change(
+            db, changed_user_id=str(user_id))
+    finally:
+        db.close()
+
     try:
         await asyncio.to_thread(api_users.soft_delete, api_user_id)
     except Exception as exc:  # noqa: BLE001 — stays pending; repair retries
@@ -726,8 +744,9 @@ async def delete_user(user_id: str, current_admin: dict = Depends(require_admin)
                     "stream_exposures_revoked": exposures},
             status="success",
         )
-        # The account's services are gone: refresh the cross-path derived state.
-        schedule_sync()
+        # R14 — the account's services are gone: refresh only the sources whose
+        # rows depended on it, never the whole stack.
+        schedule_sync(affected_source_ids)
         return {"deleted": True, "soft_deleted": True, "username": username}
     finally:
         db.close()

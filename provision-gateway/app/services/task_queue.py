@@ -452,10 +452,77 @@ class GatewayQueue:
             registry = self._stats_for(rd_db, "registry",
                                        "registry.tasks", "registry.queue_config",
                                        "registry.queue_state")
+            registry["hold_alerts"] = self._hold_alerts(rd_db)
         finally:
             rd_db.close()
         return {"gateway": gateway, "registry": registry,
                 "generated_at": _now().isoformat()}
+
+    @staticmethod
+    def _hold_alerts(db: Session, limit: int = 10) -> list[dict[str, Any]]:
+        """Recent stream-conf hold alerts, read from the registry task rows (S9).
+
+        A hold that used an index records ``result.hold`` on the -api task
+        (``index``, ``previous_paused_present``, ``alert``, plus the §15.3
+        evidence: the existing ``.paused`` copy path(s) with mtime/size, the
+        path the active conf was held as, and the active conf path). The
+        Services page renders these as a warning naming the service, the index
+        and the task; a normal hold records nothing, so it produces no
+        notification. The new fields are rendered defensively — an older -api
+        row simply has none of them.
+        """
+        rows = db.execute(
+            text(
+                "SELECT t.task_id, t.operation, t.finished_at, t.result, "
+                "       s.service_name, s.label, a.username AS user_name "
+                "FROM registry.tasks t "
+                "LEFT JOIN registry.services s ON s.id = t.service_id "
+                "LEFT JOIN registry.api_users a ON a.id = s.owner_api_user_id "
+                "WHERE t.deleted_at IS NULL "
+                "  AND t.result ? 'hold' "
+                "  AND t.result->'hold'->>'alert' IS NOT NULL "
+                "ORDER BY t.finished_at DESC NULLS LAST "
+                "LIMIT :n"
+            ),
+            {"n": int(limit)},
+        ).mappings().all()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            hold = (row["result"] or {}).get("hold") or {}
+            # `existing` is the held-over `.paused` copy list: [{path,mtime,size}].
+            existing: list[dict[str, Any]] = []
+            raw_existing = hold.get("existing")
+            if isinstance(raw_existing, dict):
+                raw_existing = [raw_existing]
+            if isinstance(raw_existing, list):
+                for item in raw_existing:
+                    if isinstance(item, dict):
+                        existing.append({
+                            "path": item.get("path"),
+                            "mtime": item.get("mtime"),
+                            "size": item.get("size"),
+                        })
+                    elif isinstance(item, str):
+                        existing.append(
+                            {"path": item, "mtime": None, "size": None})
+            out.append({
+                "task_id": row["task_id"],
+                "operation": row["operation"],
+                "user_name": row["user_name"],
+                "service_name": row["service_name"],
+                "label": row["label"],
+                "index": hold.get("index"),
+                "message": hold.get("alert"),
+                # §15.3 — the active conf and the indexed destination, plus
+                # the pre-existing `.paused` copies and their evidence.
+                "existing": existing,
+                "held_as": hold.get("held_as"),
+                "active": hold.get("active"),
+                "finished_at": (
+                    row["finished_at"].isoformat() if row["finished_at"] else None
+                ),
+            })
+        return out
 
     def _stats_for(self, db: Session, queue: str, tasks_table: str,
                    config_table: str, state_table: str) -> dict[str, Any]:

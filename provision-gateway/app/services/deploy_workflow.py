@@ -37,6 +37,9 @@ _GATEWAY_ONLY = {
     "selection", "prompt", "env_reference", "allowed_target_service_ids",
     "use_global_proxy", "fix", "job_type", "owner_username",
     "skip_env", "category", "service_value", "_actor_user_id",
+    # §14.3 — the LLM env guard flag travels with the deploy request/session
+    # but is never part of the -api register contract.
+    "llm_validate_env", "env_none",
 }
 # The replayable deploy request keeps the gateway-only fields the continuation
 # needs (`allowed_target_service_ids`, `use_global_proxy`, `_actor_user_id`);
@@ -78,6 +81,7 @@ def _selection(intent: dict) -> dict:
         "stream_conf": (intent.get("nginx_confs") or {}).get("stream"),
         "mail_conf": (intent.get("nginx_confs") or {}).get("mail"),
         "env": intent.get("env_files") or [],
+        "env_none": bool(intent.get("env_none")),
         "profiles": intent.get("profiles") or [],
         "serving_ports": intent.get("serving_ports"),
         "serving_ports_none": bool(intent.get("serving_ports_none")),
@@ -110,7 +114,10 @@ def _validate_selected_files(intent: dict, selection: dict) -> None:
     for key in ("nginx", "stream_conf", "mail_conf", "serving_ports"):
         if isinstance(selection.get(key), str) and selection[key]:
             names.append(selection[key])
-    names.extend(n for n in (selection.get("env") or []) if isinstance(n, str))
+    # `env_none` is the deliberate no-env state: a stale list alongside it is
+    # never sent, so it is not checked either.
+    if not selection.get("env_none"):
+        names.extend(n for n in (selection.get("env") or []) if isinstance(n, str))
     if not names:
         return
     try:
@@ -163,7 +170,18 @@ def generation_needed(intent: dict) -> bool:
         "service_name": intent.get("service_name") or "",
         "recipe_path": intent.get("recipe_path") or "",
     })
-    if missing:
+    # A phase the recipe lacks is a generation reason ONLY when the operator
+    # did not fill that slot. An explicit selection wins: `serving_ports_none`
+    # is a deliberate no-file state (§14.1), so a recipe that never had a
+    # serving-ports artifact must not force a generation run over it. Without
+    # this, a validation-only deploy (S12) could never be reached for such a
+    # recipe and the LLM env guard would run only after a generation job.
+    if "docker-compose" in missing and not (selection.get("compose") or []):
+        return True
+    if "nginx.conf" in missing and not selection.get("nginx"):
+        return True
+    if "serving_ports" in missing and not (
+            selection.get("serving_ports") or selection.get("serving_ports_none")):
         return True
     if not (selection.get("compose") or []):
         return True
@@ -178,7 +196,9 @@ def generation_needed(intent: dict) -> bool:
     if _https(intent) and not selection.get("stream_conf"):
         return True
     # The per-user env.raw is generated when no env is selected (R3/R6).
-    if not (selection.get("env") or []):
+    # `env_none` is the deliberate no-env state (§14.1) and suppresses it the
+    # same way a selected list does.
+    if not (selection.get("env") or []) and not selection.get("env_none"):
         return True
     return False
 
@@ -237,10 +257,17 @@ def _api_payload(intent: dict, selection: dict, env_name: str | None) -> dict:
     else:
         payload.pop("nginx_confs", None)
 
-    # The interpolation env handoff is ONLY the generated per-user env.raw; the
-    # selected env is generation context and is never forwarded (design §2).
+    # §14.1/S11/S17 — the deploy env payload, in precedence order:
+    #   1. the generated per-user `.raw` when one exists;
+    #   2. the SELECTED list (ordered; later files win) when non-empty and the
+    #      operator did not choose `None`;
+    #   3. nothing for an explicit `None` or an empty list.
+    # The env REFERENCE is generation context only and never appears here.
+    selected_env = [n for n in (selection.get("env") or []) if isinstance(n, str)]
     if env_name:
         payload["env_files"] = [env_name]
+    elif selected_env and not selection.get("env_none"):
+        payload["env_files"] = selected_env
     else:
         payload.pop("env_files", None)
     payload.pop("env_file_path", None)
@@ -330,6 +357,17 @@ async def _start(intent: dict, *, operation: str, actor_user_id=None) -> dict:
             owner_api_user_id=owner_id, service_name=intent["service_name"],
             service_id=service_id, requested_label=str(requested),
         )
+        # S12 — a reviewed/refused deploy skips generation, so the gateway
+        # runs the mechanical validators now. A failure fails the deploy task
+        # closed (no generation job, no popup).
+        try:
+            await _validate_selected_artifacts(
+                intent, seeded, existing.get("env_name"))
+        except WorkflowError as exc:
+            pdr.mark_deploy_failed(
+                service_id, f"{exc.code}: {exc.detail}", reason=exc.code)
+            label_reservations.release(service_id)
+            raise
         deploy_request, deploy_secrets = _record_deploy_intent(intent)
         pdr.create_or_replace(
             service_id=service_id, procedure_id=procedure_id,
@@ -350,6 +388,16 @@ async def _start(intent: dict, *, operation: str, actor_user_id=None) -> dict:
     intent["label"] = label
 
     need_generation = generation_needed(intent)
+    # S12 — validation-only deploy: every slot is filled, so no generation job
+    # exists. The gateway still validates exactly what it will register before
+    # writing a session or claiming the label. A failure is a structured
+    # refusal with the validator's message; the label is released.
+    if operation == pdr.OPERATION_DEPLOY and not need_generation:
+        try:
+            await _validate_selected_artifacts(intent, selection, None)
+        except WorkflowError:
+            label_reservations.release(service_id)
+            raise
     initial_state = pdr.STATE_GENERATING if need_generation else pdr.STATE_GENERATED
     deploy_request, deploy_secrets = (
         _record_deploy_intent(intent) if operation == pdr.OPERATION_DEPLOY else (None, None)
@@ -435,9 +483,212 @@ def _session_ready(existing: dict, intent: dict) -> bool:
         return False
     if _https(intent) and not selection.get("stream_conf"):
         return False
-    if not (selection.get("env") or existing.get("env_name")):
+    # S11 — an explicit `env_none` fills the env slot just like a selected
+    # list or a recorded generated name does.
+    if not (selection.get("env") or existing.get("env_name")
+            or selection.get("env_none")):
         return False
     return True
+
+
+def _validation_error(code: str, label: str, errors: list[str]) -> WorkflowError:
+    detail = "; ".join(e for e in errors if e) or f"{label} validation failed"
+    return WorkflowError(code, f"{label} validation failed: {detail}", 422)
+
+
+async def _validate_selected_artifacts(intent: dict, selection: dict,
+                                       env_name: str | None) -> None:
+    """S12 — the mechanical validator pass for a validation-only deploy.
+
+    When every slot is filled no generation job exists, but the gateway still
+    checks exactly what it is about to register: the compose (``docker compose
+    config``), the serving-ports artifact against that compose, every selected
+    nginx conf (proxy targets + ``nginx -t`` + serving-port agreement), and the
+    env content that will be sent (the selected ordered list, or the generated
+    per-user ``.raw``). The validation context is exactly the env list sent;
+    an explicit ``env_none`` has nothing to validate. The policy runs with
+    ``require_ready=True`` so a half-ready selection is refused too.
+    """
+    from . import config_validation, file_sets
+
+    _validate_policy(intent, selection, require_ready=True)
+
+    service_name = intent.get("service_name") or ""
+    recipe_path = intent.get("recipe_path") or ""
+    try:
+        recipe_dir = _recipe_dir(service_name, recipe_path)
+    except Exception as exc:  # noqa: BLE001 — map to the structured refusal
+        raise WorkflowError("invalid_recipe_path", str(exc)) from exc
+
+    # 1. Compose — resolved under the recipe dir, exactly what the -api reads.
+    compose_names = [n for n in (selection.get("compose") or []) if isinstance(n, str)]
+    compose_paths = [recipe_dir / n for n in compose_names]
+    composed = config_validation.validate_compose(compose_paths)
+    if not composed.get("valid"):
+        raise _validation_error(
+            "compose_invalid", "compose", composed.get("errors") or [])
+
+    # 2. Serving ports — the artifact as it will be sent, against that compose.
+    ports = None
+    sp_name = selection.get("serving_ports")
+    if isinstance(sp_name, str) and sp_name:
+        sp_path = recipe_dir / sp_name
+        try:
+            sp_text = sp_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise _validation_error(
+                "serving_ports_invalid", "serving_ports", [str(exc)]) from exc
+        res = config_validation.validate_serving_ports(sp_text, compose_paths)
+        if not res.get("valid"):
+            raise _validation_error(
+                "serving_ports_invalid", "serving_ports", res.get("errors") or [])
+        try:
+            import yaml
+            ports = yaml.safe_load(sp_text) if sp_text else None
+        except Exception:  # noqa: BLE001 — agreement alone cannot help
+            ports = None
+
+    # 3. Nginx — every selected conf in the category it will register under.
+    confs: list[tuple[str, str]] = []
+    if selection.get("nginx"):
+        confs.append(("http", selection["nginx"]))
+    if _https(intent) and selection.get("stream_conf"):
+        confs.append(("stream", selection["stream_conf"]))
+    if selection.get("mail_conf"):
+        confs.append(("mail", selection["mail_conf"]))
+    service_names = file_sets.compose_service_names(compose_paths)
+    from .serving_ports import validate_conf_agreement
+    nginx_errors: list[str] = []
+    for category, name in confs:
+        conf_path = recipe_dir / name
+        checked = await config_validation.validate_nginx(conf_path, service_names)
+        nginx_errors.extend(f"{name}: {e}" for e in (checked.get("errors") or []))
+        if ports is not None and conf_path.is_file():
+            text = conf_path.read_text(encoding="utf-8", errors="replace")
+            agreement = validate_conf_agreement(
+                ports, text,
+                service_name=service_name,
+                user_name=str(intent.get("user_name") or "x"),
+                label=str(intent.get("label") or "0"),
+                domain=str(intent.get("domain") or "localhost"),
+                category=category,
+            )
+            nginx_errors.extend(
+                f"{name}: {e}" for e in (agreement.get("errors") or []))
+    if nginx_errors:
+        raise _validation_error("nginx_invalid", "nginx", nginx_errors)
+
+    # 4. Env — the exact list that will be sent. `env_none` has nothing to
+    #    check; a generated `.raw` is validated as the file the -api receives.
+    if selection.get("env_none"):
+        return
+    if env_name:
+        env_path = recipe_dir / env_name
+        if env_path.is_file():
+            content = env_path.read_text(encoding="utf-8", errors="replace")
+            res = config_validation.validate_env(content, compose_paths)
+            if not res.get("valid"):
+                raise _validation_error("env_invalid", "env", res.get("errors") or [])
+        return
+    env_names = [n for n in (selection.get("env") or []) if isinstance(n, str)]
+    if not env_names:
+        return
+    try:
+        content = "\n".join(
+            (recipe_dir / n).read_text(encoding="utf-8", errors="replace")
+            for n in env_names
+        )
+    except OSError as exc:
+        raise _validation_error("env_invalid", "env", [str(exc)]) from exc
+    res = config_validation.validate_env(content, compose_paths)
+    if not res.get("valid"):
+        raise _validation_error("env_invalid", "env", res.get("errors") or [])
+
+
+async def _run_llm_env_guard(intent: dict, selection: dict,
+                             env_name: str | None = None) -> None:
+    """S13 — the opt-in LLM validation of the SELECTED env list.
+
+    Applies only when the operator checked ``llm_validate_env`` and a selected
+    env list exists. It never runs for `env_none`, for a generated `.raw`
+    (`env_name` — the generation path already guards it, and that file is what
+    is actually sent), or for the env REFERENCE. It blocks on findings *and*
+    on an LLM-call failure: the operator explicitly asked for this check, and
+    the only bypass is to uncheck the box. The guard never mutates a file.
+    """
+    if not intent.get("llm_validate_env") or env_name:
+        return
+    env_names = [n for n in (selection.get("env") or []) if isinstance(n, str)]
+    if selection.get("env_none") or not env_names:
+        return
+
+    service_name = intent.get("service_name") or ""
+    recipe_path = intent.get("recipe_path") or ""
+    try:
+        recipe_dir = _recipe_dir(service_name, recipe_path)
+    except Exception as exc:  # noqa: BLE001
+        raise WorkflowError("invalid_recipe_path", str(exc)) from exc
+
+    env_files: list[tuple[str, str]] = []
+    for name in env_names:
+        path = recipe_dir / name
+        try:
+            env_files.append(
+                (name, path.read_text(encoding="utf-8", errors="replace")))
+        except OSError as exc:
+            raise WorkflowError(
+                "llm_env_validation_blocked",
+                f"selected env file {name!r} cannot be read ({exc}); the deploy "
+                "is blocked because LLM validation was requested",
+            ) from exc
+
+    compose_files: list[tuple[str, str]] = []
+    for name in (selection.get("compose") or []):
+        if not isinstance(name, str):
+            continue
+        path = recipe_dir / name
+        if path.is_file():
+            compose_files.append(
+                (name, path.read_text(encoding="utf-8", errors="replace")))
+
+    from .llm_service import llm_service
+    db = SessionLocal()
+    try:
+        result = await llm_service.validate_env_selection(
+            db,
+            env_files=env_files,
+            compose_files=compose_files,
+            service_name=service_name,
+            profiles=list(selection.get("profiles") or []),
+        )
+    finally:
+        db.close()
+
+    if result.get("valid"):
+        return
+    findings = list(result.get("findings") or [])
+    guide = str(result.get("guide") or "")
+    if result.get("error"):
+        detail = (
+            "LLM env validation could not run: "
+            f"{result['error']}. The deploy is blocked because LLM validation "
+            "was requested; uncheck 'Run LLM validation before deploy' to "
+            "deploy without it."
+        )
+    else:
+        detail = (
+            "LLM env validation found issue(s): "
+            + "; ".join(findings or ["the env was rejected"])
+            + (f". Guided fix: {guide}" if guide else
+               ". Fix the selected env file(s) and deploy again, or uncheck "
+               "the LLM validation option.")
+        )
+    exc = WorkflowError("llm_env_validation_blocked", detail, 422)
+    # The structured half the caller (and the audit) can read.
+    exc.findings = findings
+    exc.guide = guide
+    exc.llm_error = result.get("error")
+    raise exc
 
 
 def _handle(service_id: str, intent: dict, label: str, stage: str,
@@ -464,9 +715,6 @@ async def _claim_and_register(service_id: str, intent: dict,
     record = pdr.session_record(service_id)
     if record is None:
         raise WorkflowError("session_missing", "the workflow record is gone", 409)
-    if not pdr.claim_for_deploy(service_id):
-        # Another completer owns it; a no-op, never a second deploy.
-        return _handle(service_id, intent, record.get("label") or "", "deploying")
 
     resolved = dict(record.get("deploy_request") or {})
     resolved.update(record.get("deploy_secrets") or {})
@@ -479,6 +727,42 @@ async def _claim_and_register(service_id: str, intent: dict,
         "recipe_path": record["recipe_path"],
         "label": record["label"],
     })
+
+    # S13 — the opt-in LLM env guard runs BEFORE the claim/register. A
+    # finding or an LLM-call failure blocks the deploy; the record fails
+    # closed so the operator can uncheck the box and deploy again.
+    try:
+        await _run_llm_env_guard(resolved, selection, env_name)
+    except WorkflowError as exc:
+        findings = list(getattr(exc, "findings", None) or [])
+        if findings:
+            # S22 — a finding pauses through the existing LLM-fix flow. The
+            # session keeps its label and replayable intent: the card shows the
+            # guard's guide, Check reopens the panel pre-filled, and the
+            # confirming restart (fix=true, env -> generate new) regenerates the
+            # env and resumes. A call failure carries no fixing prompt and
+            # still fails closed below; so does an unreadable selected file.
+            guide = (getattr(exc, "guide", "") or "").strip() or (
+                "Fix the selected env file(s) so they pass LLM validation.")
+            prompt = f"{guide}\n\nFindings: " + "; ".join(findings)
+            pdr.pause_for_fix(
+                service_id, guide=prompt, slot="env",
+                detail=f"{exc.code}: {exc.detail}")
+            raise WorkflowError(
+                "workflow_paused",
+                "the LLM env guard paused this deploy — open Check on the service "
+                "card, confirm the fixing prompt and deploy again",
+                409,
+            ) from exc
+        pdr.mark_deploy_failed(
+            service_id, f"{exc.code}: {exc.detail}", reason=exc.code)
+        label_reservations.release(service_id)
+        raise
+
+    if not pdr.claim_for_deploy(service_id):
+        # Another completer owns it; a no-op, never a second deploy.
+        return _handle(service_id, intent, record.get("label") or "", "deploying")
+
     payload = _api_payload(resolved, selection, env_name)
     from .provision_service import provision_service
     attempt_label = record["label"]
@@ -540,9 +824,9 @@ async def _claim_and_register(service_id: str, intent: dict,
 
 async def _after_deploy(source_service_id: str, task_id: str | None,
                         target_ids: list[str], actor_id) -> None:
-    """Grants after the task, then the cross-path sync (existing calls)."""
+    """Grants after the task, then the R13 sync for the deployed source."""
     from . import registry_tasks, service_grants
-    from .cross_orchestrator import cross_orchestrator
+    from .cross_orchestrator import OUTCOME_OK, cross_orchestrator
     if not task_id:
         return
     try:
@@ -554,6 +838,7 @@ async def _after_deploy(source_service_id: str, task_id: str | None,
             if status in ("completed", "failed", "cancelled", "unknown"):
                 break
             await asyncio.sleep(2.0)
+        added = 0
         if status == "completed" and target_ids:
             db = SessionLocal()
             try:
@@ -563,12 +848,24 @@ async def _after_deploy(source_service_id: str, task_id: str | None,
                             db, source_service_id, target_id,
                             actor_user_id=actor_id,
                         )
+                        added += 1
                     except ValueError as exc:
                         _log.warning("deploy-panel grant %s -> %s skipped: %s",
                                      source_service_id, target_id, exc)
             finally:
                 db.close()
-        await cross_orchestrator.sync_all()
+        if added:
+            # R13 — the panel wrote grant rows for ONE known source: refresh
+            # that source, never the whole stack. A no-grant deploy keeps the
+            # lifecycle all-source pass below.
+            action = await cross_orchestrator.sync_source(source_service_id)
+            if action.get("outcome") != OUTCOME_OK:
+                cross_orchestrator.schedule_retry_sync([source_service_id])
+                _log.info(
+                    "deploy-with-grants sync for %s is %s; targeted retry scheduled",
+                    source_service_id, action.get("outcome"))
+        else:
+            await cross_orchestrator.sync_all()
     except Exception:  # noqa: BLE001 — the deploy already succeeded
         _log.exception("deploy follow-ups failed for %s", source_service_id)
 
@@ -631,9 +928,10 @@ async def on_generation_completed(*, service_id: str, request: dict,
         await _claim_and_register(service_id, intent, final_selection, env_name)
     except WorkflowError as exc:
         # _claim_and_register already recorded a capacity refusal / failure;
-        # a policy failure here is a fail-closed deploy failure.
+        # a policy failure here is a fail-closed deploy failure. A guard pause
+        # is the same kind of already-recorded state: never overwrite it.
         if exc.code not in ("at_capacity", "queue_full", "queue_unavailable",
-                            "deploy_failed"):
+                            "deploy_failed", "workflow_paused"):
             pdr.mark_deploy_failed(service_id, f"{exc.code}: {exc.detail}")
             label_reservations.release(service_id)
 

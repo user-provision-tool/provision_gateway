@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Typography, Card, Row, Col, Statistic, Tag, Space, Table, Progress, Button, message } from 'antd'
+import { Typography, Card, Row, Col, Statistic, Tag, Space, Table, Progress, Button, message, Alert } from 'antd'
 import { GlobalOutlined, CheckCircleOutlined, CloseCircleOutlined, LoadingOutlined, ReloadOutlined, SyncOutlined } from '@ant-design/icons'
 import { useAuth } from '../hooks/useAuth'
 import { usePolling } from '../hooks/usePolling'
@@ -41,12 +41,20 @@ export default function DashboardPage() {
   const compColumns = [
     { title: 'Component', dataIndex: 'name', key: 'name', render: (n:string)=><Text strong>{n}</Text> },
     { title: 'Status', dataIndex: 'status', key: 'status',
-      render: (s:string) => s==='running' ? <Tag color="green">Running</Tag> : <Tag color="red">{s}</Tag> },
+      // R5 — a probe that could not run is "unavailable", never a red "not
+      // found" that reads as a broken container.
+      render: (s:string) => s==='running' ? <Tag color="green">Running</Tag>
+        : (s==='unavailable' || s==='unknown') ? <Tag>{s}</Tag> : <Tag color="red">{s}</Tag> },
   ]
 
-  const cpuPct = sysStatus?.docker_host?.cpu_percent ?? null
-  const ramPct = sysStatus?.docker_host?.mem_percent ?? null
-  const diskPct = sysStatus?.docker_host?.disk_percent ?? null
+  // R5 — the degraded payload names what could not be read; the queue counts
+  // (registry-backed) are deliberately NOT in this list.
+  const degraded = !!sysStatus?.degraded
+  const unavailableSections: string[] = sysStatus?.unavailable_sections || []
+
+  const cpuPct = degraded ? null : (sysStatus?.docker_host?.cpu_percent ?? null)
+  const ramPct = degraded ? null : (sysStatus?.docker_host?.mem_percent ?? null)
+  const diskPct = degraded ? null : (sysStatus?.docker_host?.disk_percent ?? null)
 
   // ACL indicator: enabled only when BOTH the gateway and the edge are on
   // (a gateway-on/edge-off mismatch was the 2026-08-28 outage).
@@ -77,20 +85,38 @@ export default function DashboardPage() {
         </Space>
       </div>
 
+      {degraded && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{marginBottom:16}}
+          message="Platform data unavailable — the provision API did not answer in time"
+          description={
+            `Unavailable: ${unavailableSections.join(', ') || 'platform probes'}. ` +
+            'The queue counts below are read from the registry and stay live.'
+          }
+        />
+      )}
+
       {/* Stat cards — consistent height, all stats always shown */}
       <Row gutter={[16, 16]}>
         <Col xs={24} sm={12} md={6}>
           <Card style={{height:110}}>
-            <Statistic title="Services" value={svcExpected}
-              suffix={svcExpected > 0 ? <span style={{fontSize:13,display:'block',marginTop:4}}>
-                <Tag color="green">{svcHealthy} healthy</Tag>
-                {svcUnhealthy > 0 && <Tag color="orange">{svcUnhealthy} unhealthy</Tag>}
-              </span> : <span style={{fontSize:12,color:'#999',display:'block',marginTop:4}}>No services yet</span>}
+            <Statistic title="Services" value={degraded ? '—' : svcExpected}
+              suffix={degraded
+                ? <span style={{fontSize:12,color:'#999',display:'block',marginTop:4}}>unavailable</span>
+                : svcExpected > 0 ? <span style={{fontSize:13,display:'block',marginTop:4}}>
+                    <Tag color="green">{svcHealthy} healthy</Tag>
+                    {svcUnhealthy > 0 && <Tag color="orange">{svcUnhealthy} unhealthy</Tag>}
+                  </span> : <span style={{fontSize:12,color:'#999',display:'block',marginTop:4}}>No services yet</span>}
             />
           </Card>
         </Col>
         <Col xs={24} sm={12} md={6}>
-          <Card style={{height:110}}><Statistic title="Users" value={sysStatus?.users_count ?? 0}/></Card>
+          <Card style={{height:110}}>
+            <Statistic title="Users" value={degraded ? '—' : (sysStatus?.users_count ?? 0)}
+              suffix={degraded ? <span style={{fontSize:12,color:'#999'}}>unavailable</span> : undefined}/>
+          </Card>
         </Col>
         <Col xs={24} sm={12} md={6}>
           {/* The running and queuing (queued + planned) operator counts in one
@@ -109,14 +135,16 @@ export default function DashboardPage() {
         </Col>
         <Col xs={24} sm={12} md={6}>
           <Card style={{height:110}}>
-            <Statistic title="Containers" value={cStats.total_expected ?? 0}
-              suffix={<span style={{fontSize:12,display:'block',marginTop:4}}>
-                <Tag color="green">{(cStats.healthy_running ?? 0)} up</Tag>
-                {(cStats.unhealthy_running ?? 0) > 0 && <Tag color="orange">{(cStats.unhealthy_running??0)} unhlth</Tag>}
-                {(cStats.restarting ?? 0) > 0 && <Tag color="purple">{(cStats.restarting??0)} rst</Tag>}
-                {(cStats.down ?? 0) > 0 && <Tag color="red">{(cStats.down??0)} down</Tag>}
-                {(cStats.missing ?? 0) > 0 && <Tag color="default">{(cStats.missing??0)} miss</Tag>}
-              </span>}
+            <Statistic title="Containers" value={degraded ? '—' : (cStats.total_expected ?? 0)}
+              suffix={degraded
+                ? <span style={{fontSize:12,color:'#999',display:'block',marginTop:4}}>unavailable</span>
+                : <span style={{fontSize:12,display:'block',marginTop:4}}>
+                    <Tag color="green">{(cStats.healthy_running ?? 0)} up</Tag>
+                    {(cStats.unhealthy_running ?? 0) > 0 && <Tag color="orange">{(cStats.unhealthy_running??0)} unhlth</Tag>}
+                    {(cStats.restarting ?? 0) > 0 && <Tag color="purple">{(cStats.restarting??0)} rst</Tag>}
+                    {(cStats.down ?? 0) > 0 && <Tag color="red">{(cStats.down??0)} down</Tag>}
+                    {(cStats.missing ?? 0) > 0 && <Tag color="default">{(cStats.missing??0)} miss</Tag>}
+                  </span>}
             />
           </Card>
         </Col>
@@ -126,17 +154,17 @@ export default function DashboardPage() {
       <Row gutter={[16, 16]} style={{marginTop:16}}>
         <Col xs={24} sm={8}>
           <Card size="small" title="CPU">
-            {cpuPct !== null ? <Progress type="dashboard" percent={Math.round(cpuPct)} size={120} status="normal" strokeColor={cpuPct>80?'#ff4d4f':undefined}/> : <Text type="secondary">Loading...</Text>}
+            {cpuPct !== null ? <Progress type="dashboard" percent={Math.round(cpuPct)} size={120} status="normal" strokeColor={cpuPct>80?'#ff4d4f':undefined}/> : <Text type="secondary">{degraded ? 'unavailable' : 'Loading...'}</Text>}
           </Card>
         </Col>
         <Col xs={24} sm={8}>
           <Card size="small" title="RAM">
-            {ramPct !== null ? <Progress type="dashboard" percent={Math.round(ramPct)} size={120} status="normal" strokeColor={ramPct>80?'#ff4d4f':undefined}/> : <Text type="secondary">Loading...</Text>}
+            {ramPct !== null ? <Progress type="dashboard" percent={Math.round(ramPct)} size={120} status="normal" strokeColor={ramPct>80?'#ff4d4f':undefined}/> : <Text type="secondary">{degraded ? 'unavailable' : 'Loading...'}</Text>}
           </Card>
         </Col>
         <Col xs={24} sm={8}>
           <Card size="small" title="Disk">
-            {diskPct !== null ? <Progress type="dashboard" percent={Math.round(diskPct)} size={120} status="normal" strokeColor={diskPct>80?'#ff4d4f':undefined}/> : <Text type="secondary">Loading...</Text>}
+            {diskPct !== null ? <Progress type="dashboard" percent={Math.round(diskPct)} size={120} status="normal" strokeColor={diskPct>80?'#ff4d4f':undefined}/> : <Text type="secondary">{degraded ? 'unavailable' : 'Loading...'}</Text>}
           </Card>
         </Col>
       </Row>
@@ -149,7 +177,7 @@ export default function DashboardPage() {
           }>
             {sysStatus?.components ? (
               <Table dataSource={Object.entries(sysStatus.components).map(([k,v]:[string,any])=>({name:k,status:v.status}))} columns={compColumns} rowKey="name" pagination={false} showHeader={false} size="small"/>
-            ) : <Text type="secondary">Loading...</Text>}
+            ) : <Text type="secondary">{degraded ? 'unavailable' : 'Loading...'}</Text>}
           </Card>
         </Col>
         <Col xs={24} md={12}>
@@ -160,7 +188,7 @@ export default function DashboardPage() {
               ) : (
                 <Tag color="default">No active proxy</Tag>
               )
-            ) : <Text type="secondary">Loading...</Text>}
+            ) : <Text type="secondary">{degraded ? 'unavailable' : 'Loading...'}</Text>}
           </Card>
         </Col>
       </Row>

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Modal, Form, Input, Select, Button, Switch, Space, Divider, message, Checkbox, Alert, Spin, Tag, Typography, Collapse } from 'antd'
 import { PlusOutlined, MinusCircleOutlined, GlobalOutlined, RobotOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
@@ -7,6 +8,7 @@ import { deriveProfiles, getComposePreview } from '../../api/services'
 import { useGenerationJob, isPaused } from '../../hooks/useGenerationJob'
 import PausePrompt from './PausePrompt'
 import FileSetSelection, {
+  SelectedFileRow,
   confCategory,
   fixVariantFor,
   phaseOfFile,
@@ -148,6 +150,7 @@ interface DeployFormProps {
 
 export default function DeployForm({ open, onClose, onDeployed, onDeployStarted, onDeployFailed, preselectedService, preselectedUser, preselectedLabel, initialOptions, regenerate, resumeJobId, fixingGuide, preselectedUseGlobalProxy }: DeployFormProps) {
   const [form] = Form.useForm()
+  const navigate = useNavigate()
   const [loading, setLoading] = useState(false)
   const [proxyEnabled, setProxyEnabled] = useState(false)
   const [httpsEnabled, setHttpsEnabled] = useState(false)
@@ -193,6 +196,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   const [envRefs, setEnvRefs] = useState<string[]>([])
   // Deploy-time per-user env generation (GAP-19): fresh SECRET_KEY per instance.
   const [perUserEnv, setPerUserEnv] = useState<string | null>(null)
+  // S13 — the LLM env guard. Enabled + checked by default when the LLM is
+  // configured; it applies ONLY to a selected env file (not `generate new`,
+  // not `None`) and never replaces the mechanical validators.
+  const [llmValidateEnv, setLlmValidateEnv] = useState(false)
   // Fixing mode (GRILLING G25) is derived from the `fixingGuide` PROP, not from
   // state: the guide is stable for the whole open session, whereas a state
   // boolean set at init would be invisible to the async loaders that run in the
@@ -412,8 +419,12 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         }
         try {
           const { data: cfg } = await client.get('/llm/config')
-          setLlmActive(!!(cfg && (cfg.is_active || cfg.byok_configured)))
-        } catch { setLlmActive(false) }
+          const active = !!(cfg && (cfg.is_active || cfg.byok_configured))
+          setLlmActive(active)
+          // S13 — checked by default exactly when the LLM is available; a
+          // no-LLM panel starts unchecked and the box is greyed.
+          setLlmValidateEnv(active)
+        } catch { setLlmActive(false); setLlmValidateEnv(false) }
         // Preselect service if provided
         if (initialOptions) {
           const f: Record<string, any> = {}
@@ -425,6 +436,8 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
             ? `${svc}@@${String(initialOptions.project_root).slice(String(svc).length + 1)}`
             : svc
           form.setFieldsValue(f)
+          // T8/R9 — the Domain's editability follows the TLS state; seed it.
+          if (f.https) setHttpsEnabled(true)
         }
         if (preselectedUser) {
           form.setFieldsValue({ user_name: preselectedUser })
@@ -463,6 +476,26 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
       setSslDomains(data.domains || [])
     } catch { /* ignore */ }
   }
+
+  // F4/S19 — a TLS Retry seeds `ssl_domain` from the certificate it was created
+  // with, matched by `initialOptions.fullchain` once the certificate list has
+  // loaded. Without this the new "TLS on + no certificate ⇒ Deploy disabled"
+  // clause would permanently block every TLS Retry (the form only carries
+  // `fullchain`/`privkey`, never `ssl_domain`).
+  useEffect(() => {
+    if (!open || !initialOptions?.https || !initialOptions?.fullchain) return
+    if (sslDomains.length === 0) return
+    if (form.getFieldValue('ssl_domain')) return
+    const cert = sslDomains.find(d => d.fullchain_path === initialOptions.fullchain)
+    if (!cert) return
+    setSelectedSslDomain(cert.domain)
+    form.setFieldsValue({
+      ssl_domain: cert.domain,
+      domain: cert.domain,
+      fullchain: cert.fullchain_path,
+      privkey: cert.privkey_path,
+    })
+  }, [open, sslDomains, initialOptions])
 
   const loadDeployableUsers = async () => {
     try {
@@ -559,7 +592,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
     } catch { /* a stale candidate list must not fail the generation path */ }
   }
 
-  const loadFileSets = async (baseName: string, recipePath: string) => {
+  // `noEnvHint` (S11): the recipe reported `needs_env:false`. It is a HINT that
+  // auto-selects the deliberate env `None` for an empty env slot — never a lock,
+  // and never an override of an env file the stored selection already names.
+  const loadFileSets = async (baseName: string, recipePath: string, noEnvHint = false) => {
     setFileSetLoading(true)
     try {
       const { data } = await client.get(`/projects/${baseName}/file-sets`)
@@ -578,6 +614,12 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         serving_ports: entry.serving_ports || null,
         serving_ports_none: entry.serving_ports_none || false,
         env: entry.env || [],
+        // S11 — with no stored env and a `needs_env:false` hint, the deliberate
+        // `None` (send no env files) is pre-selected once. A stored env list
+        // wins; the operator can change either afterwards.
+        env_none: Array.isArray(entry.env) && entry.env.length > 0
+          ? false
+          : !!noEnvHint,
         profiles: entry.profiles || [],
       })
       setPerUserEnv(null)
@@ -600,6 +642,9 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
           stream_conf: sentConfs.stream || prev.stream_conf,
           mail_conf: sentConfs.mail || prev.mail_conf,
           env: Array.isArray(sentEnv) && sentEnv.length ? sentEnv : prev.env,
+          // A SENT env list is a real selection — it clears the `needs_env:false`
+          // auto-None; otherwise keep whatever the stored file set decided.
+          env_none: Array.isArray(sentEnv) && sentEnv.length ? false : prev.env_none,
           profiles: initialOptions.profiles || prev.profiles,
         }))
       }
@@ -615,6 +660,8 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
           nginx: slot === 'nginx' ? null : prev.nginx,
           stream_conf: slot === 'stream_conf' ? null : prev.stream_conf,
           env: slot === 'env' ? [] : prev.env,
+          // Regenerating the env is `generate new`, never `None`.
+          env_none: slot === 'env' ? false : prev.env_none,
         }))
       }
     } catch { /* selection stays empty on failure */ }
@@ -664,8 +711,11 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
       const { data } = await client.get(`/projects/${baseName}/check-missing-files`, { params })
       setMissingFiles(data.missing || [])
       setCheckError(null)
-      setNeedsEnv(data.needs_env !== false)
-      loadFileSets(baseName, recipePath)
+      const recipeNeedsEnv = data.needs_env !== false
+      setNeedsEnv(recipeNeedsEnv)
+      // S11 — `needs_env:false` auto-selects the deliberate env `None` once for
+      // an empty env slot; it is only a hint (the operator can change it).
+      loadFileSets(baseName, recipePath, !recipeNeedsEnv)
     } catch (err: any) {
       setCheckError(err?.message || 'Check failed — try again')
       setMissingFiles([])
@@ -682,6 +732,7 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
 
   const effectiveSelection = (): FileSetSelectionData => {
     const st = fileSetStale || {}
+    const env = selection.env.filter(p => !(st.env || []).includes(p))
     return {
       compose: selection.compose.filter(p => !(st.compose || []).includes(p)),
       nginx: selection.nginx && !(st.nginx || []).includes(selection.nginx) ? selection.nginx : null,
@@ -692,7 +743,7 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
       mail_conf: selection.mail_conf
         && !(st.mail_conf || []).includes(selection.mail_conf)
         ? selection.mail_conf : null,
-      env: selection.env.filter(p => !(st.env || []).includes(p)),
+      env,
       profiles: selection.profiles.filter(p => !(st.profiles || []).includes(p)),
       // R2-F39 — the serving-ports slot MUST travel with the payload. It was
       // rebuilt here by hand and this function forgot it, so the deploy carried
@@ -708,39 +759,45 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         : null,
       // R1.3 — and the deliberate-None state goes with it, never both.
       serving_ports_none: !selection.serving_ports && !!selection.serving_ports_none,
+      // S11 — the env counterpart: `None` only when no (effective) env file is
+      // selected; a real list and the flag can never both be sent.
+      env_none: env.length === 0 && !!selection.env_none,
     }
   }
 
   // §6: the alert and the Generate button speak ONLY about this panel's
   // selections — never about what the recipe happens to contain. `generate new`
-  // is the absence of a selection, so "ready to deploy" means all three slots
-  // name a specific file.
-  //
-  // ...except the ENV slot, which has a THIRD way to be ready. The per-user
-  // `.raw` is the deploy's HANDOFF, not a selection (design §2), so a slot with
-  // no file picked is satisfied by a handoff this path already produced. This
-  // predicate is the single home for that rule because BOTH of its readers need
-  // it — the readiness alert and the deploy's own generation test. Written as
-  // `eff.env.length > 0` it made every recipe with no base env file look
-  // incomplete: the panel printed "Per-user env ready: …" and "Missing essential
-  // files" at the same time, and — measured 2026-10-14 on `bob|graphiti-local||0`
-  // — every Deploy re-ran the whole generation, so it asked again for the
-  // credentials the operator had just supplied at the pause.
+  // is the absence of a selection, so "ready to deploy" means every slot either
+  // names a specific file or is deliberately empty.
   const eff = effectiveSelection()
-  // The env slot is satisfied ONLY by the per-user HANDOFF (the generated
-  // `.env.raw.<user>.<label>`). A selected recipe env file is generation
-  // CONTEXT, never the deploy's env — treating it as satisfied skipped the env
-  // phase entirely and shipped whatever the file held. Measured 2026-10-24: the
-  // stored `.env` selection (empty OPENAI_API_KEY) made a no-TLS deploy skip
-  // generation, and the graph crash-looped on an empty key.
-  const envSatisfied = !!perUserEnv
+  // F5/S11 — the env slot is satisfied by ANY of:
+  //   - a selected env file / ordered list (it IS the deploy env now, §14.1),
+  //   - the deliberate `None` (send no env files), or
+  //   - the per-user `.raw` handoff this path already produced.
+  // `needs_env:false` is only a hint (it pre-selects `None`); it does not enter
+  // this predicate.
+  const envSatisfied = eff.env.length > 0 || !!eff.env_none || !!perUserEnv
   // G56 — with TLS on (and a serving-ports artifact in play), the stream conf is
   // a SLOT like the http one: a fully-configured deploy names both. `None` is
   // the deliberate no-stream state and demands nothing.
   const httpsOn = !!Form.useWatch('https', form)
+  // F4/S14 — the Deploy gate follows the FORM value, not the `httpsEnabled`
+  // state (which is never reset on a fresh open). With TLS on and no
+  // certificate selected there is no trusted domain, so Deploy is disabled.
+  const watchedSslDomain = Form.useWatch('ssl_domain', form)
   const streamSlotNeeded = httpsOn && !eff.serving_ports_none
   const slotsSpecified = eff.compose.length > 0 && !!eff.nginx && envSatisfied
     && (!streamSlotNeeded || !!eff.stream_conf)
+  // F5 — the readiness line names the ACTUAL missing slots/files, above the
+  // Generation prompt. It used to print "Missing essential files:" with an
+  // empty list whenever only the env slot was `generate new`, because that
+  // unmet item is a slot, not a file from `check-missing-files`.
+  const missingSlotLabels: string[] = []
+  if (eff.compose.length === 0) missingSlotLabels.push('compose')
+  if (!eff.nginx) missingSlotLabels.push('nginx config')
+  if (!envSatisfied) missingSlotLabels.push('env files')
+  if (streamSlotNeeded && !eff.stream_conf) missingSlotLabels.push('stream conf')
+  const missingLabels = [...new Set([...missingSlotLabels, ...missingFiles])]
 
   // Async generation job (ordered phases compose → nginx → env, one job).
   const genJob = useGenerationJob()
@@ -1066,6 +1123,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
     // Close the deploy panel immediately — the Deploying… popup is the UI from
     // here on (it lives in this component, which stays mounted).
     onClose()
+    // S22 — a SESSION pause (the LLM env guard) is answered from the service
+    // card's Check, not by this popup. Set when the poll below sees one, so the
+    // catch reports it as a pause instead of an error.
+    let pausedForCheck = false
     try {
       // Snapshot previously generated files; the Deploy auto-run below adds
       // anything generated during THIS call and returns it synchronously
@@ -1078,6 +1139,16 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
       // generation fills, so it must not stop the intent.
       if (sel.compose.length === 0 && !prompt && !genJob.jobState) {
         message.error('Cannot deploy: no compose file is selected.')
+        setLoading(false)
+        setGenPopupOpen(false)
+        deployAutoRunRef.current = false
+        return
+      }
+      // T8/R9 — with TLS on the Domain is certificate-driven; a deploy with no
+      // certificate has no trusted domain and is refused here as well as by the
+      // form rule.
+      if (snap.https && !snap.ssl_domain) {
+        message.error('Cannot deploy: select an SSL certificate first.')
         setLoading(false)
         setGenPopupOpen(false)
         deployAutoRunRef.current = false
@@ -1104,9 +1175,14 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         // A persisted stream conf is not applicable when TLS is off (the
         // gateway refuses exactly that intent: R6). The old panel dropped it
         // from the -api payload; the intent must drop it too.
+        // `env_none` travels inside the selection; the flag is effective only
+        // for a real selected env (never under `None`/`generate new`).
         selection: { ...sel, stream_conf: snap.https ? sel.stream_conf : null },
         prompt,
         env_reference: envRefs,
+        // S13 — the LLM env guard flag, top-level on the deploy payload. It
+        // applies only when a selected env list is actually being sent.
+        llm_validate_env: !!(llmActive && llmValidateEnv && sel.env.length > 0 && !sel.env_none),
         ...(fixingGuide ? { fix: true } : {}),
       }
       if (snap.https) {
@@ -1156,7 +1232,17 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         const { data: wf } = await client.get(`/services/workflows/${workflowId}`)
         const gen = wf.generation
         if (gen) genJob.adoptJob(gen, gen.task_id || gen.id || null)
-        if (wf.stage === 'paused') continue
+        if (wf.stage === 'paused') {
+          // A GENERATION-leg pause is answered by the inline PausePrompt in
+          // this popup, so keep polling. A SESSION pause (the LLM env guard,
+          // S22) has no job pause to answer: its surface is the service
+          // card's Check, so stop instead of polling a pause forever.
+          const genPaused = !!gen && (gen.status === 'paused'
+            || gen.status === 'awaiting_input')
+          if (genPaused) continue
+          pausedForCheck = true
+          throw new Error(wf.detail || 'The deploy is paused for a fix.')
+        }
         if (wf.stage === 'refused') {
           // A refusal accepted nothing: the placeholder must not linger and
           // claim a deployment that never started (R4.1).
@@ -1180,6 +1266,12 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
       // Every rejection removes the waiting card; the error toast below is the
       // page's existing one (R4.1).
       onDeployFailed(snap.user_name, baseName, deployLabel)
+      // S22 — a guard pause is not an error: the paused session card (with the
+      // guide and Check) is the surface, so report it as a notice and stop.
+      if (pausedForCheck) {
+        message.info('The deploy is paused for an env fix — open Check on the service card, confirm the fixing prompt and deploy again')
+        return
+      }
       const d = err.response?.data?.detail
       // A capacity refusal is NOT a failed deploy — nothing was accepted, and
       // the remedy is to cancel whatever is hanging. It gets a PERSISTENT
@@ -1358,6 +1450,75 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
     )
   }
 
+  // T9/R10 — the Generation prompt and the Env reference live INSIDE the same
+  // box as the `Generate Missing Files via LLM` button (the warning Alert; the
+  // success variant of the same container is green and carries them too).
+  const renderGenerationPrompt = () => (
+    <>
+      <Divider plain style={{ margin: '8px 0' }}>Generation prompt</Divider>
+      <Input.TextArea
+        rows={2}
+        disabled={!llmActive}
+        value={prompt}
+        onChange={(e) => setPrompt(e.target.value)}
+        placeholder="Prompt for the generation agent (missing-files generation + deploy-time per-user env). You may include doc URLs — the agent fetches them."
+      />
+      {/* §5/S21 — shown ONLY under `generate new` (empty env slot, not the
+          deliberate `None`). The per-user env is generated automatically, so
+          that note sits ABOVE the reference picker; the references are
+          generation CONTEXT only — never sent to the -api, never validated. */}
+      {eff.env.length === 0 && !eff.env_none && (
+        <div style={{ marginTop: 8 }}>
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 8 }}
+            message="The per-user env is generated automatically as the last step of the missing-files pipeline when you Deploy (or click Generate)."
+          />
+          {(fileSetCandidates.env || []).length > 0 && (
+            <div>
+              <Text strong>Env reference (generation context)</Text>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {' '}— base/example env files the model reads to produce the per-user env.
+                Not passed to the deployment.
+              </Text>
+              {/* F6/S21 — selected references as rows ABOVE the picker, each
+                  clickable to edit (saving forks to `.fix`) and removable. */}
+              {envRefs.map(ref => (
+                <SelectedFileRow
+                  key={ref}
+                  name={ref}
+                  onOpen={openSelectedFile}
+                  onRemove={() => setEnvRefs(prev => prev.filter(x => x !== ref))}
+                />
+              ))}
+              <Select
+                mode="multiple"
+                allowClear
+                style={{ width: '100%', marginTop: 4 }}
+                placeholder={envRefs.length
+                  ? 'Add another reference file…'
+                  : 'None — the model works from the compose alone'}
+                // F6 — the selected references are the rows above; the control
+                // is the CHOOSER, so they are not rendered twice. New picks are
+                // merged into the ordered list.
+                value={[]}
+                onChange={(v) => {
+                  const picked = (v as string[]).filter(Boolean)
+                  if (picked.length === 0) return
+                  setEnvRefs(prev => [...new Set([...prev, ...picked])])
+                }}
+                options={(fileSetCandidates.env || [])
+                  .filter(c => !envRefs.includes(c))
+                  .map(c => ({ value: c, label: c }))}
+              />
+            </div>
+          )}
+        </div>
+      )}
+    </>
+  )
+
   return (
     <>
     {/* §4d's persistent at-capacity alert lives at the ROOT, not in a modal.
@@ -1381,7 +1542,9 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
           first unannotated text input (the services-page Filter). */}
       <Form form={form} layout="vertical" onFinish={handleDeploy} preserve={false}
         autoComplete="off"
-        initialValues={{ label: '0', domain: 'localhost', https: false }}>
+        // F4/S14 — no default Domain: it is operator input with TLS off and
+        // certificate-driven with TLS on. `localhost` was a silent default.
+        initialValues={{ label: '0', https: false }}>
         
         {/* Hidden certificate fields live OUTSIDE the Space: as direct Space
             children they rendered zero-height rows, each adding a 16px gap
@@ -1450,8 +1613,11 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
               <Input disabled addonAfter={computingLabel ? <Spin size="small" /> : null} />
             </Form.Item>
             <Form.Item name="domain" label="Domain" style={{ flex: 2 }}>
-              <Input placeholder="example.com" name="deploy_domain" autoComplete="off"
-                disabled={!!selectedSslDomain} />
+              {/* T8/R9 — with TLS on the Domain is CERTIFICATE-DRIVEN: it is
+                  filled from the selected certificate and is not editable.
+                  With TLS off it stays free text. */}
+              <Input name="deploy_domain" autoComplete="off"
+                disabled={httpsOn} />
             </Form.Item>
             <Form.Item name="passwd" label="Password" style={{ flex: 1 }}>
               <Input.Password placeholder="secret" name="service_password"
@@ -1475,32 +1641,61 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                   if (!v) {
                     setSelectedSslDomain('')
                     form.setFieldsValue({ ssl_domain: undefined, fullchain: '', privkey: '' })
+                  } else {
+                    // T8/R9 — the Domain follows the certificate, never a
+                    // typed string: clear it until a certificate is chosen.
+                    setSelectedSslDomain('')
+                    form.setFieldsValue({
+                      ssl_domain: undefined, fullchain: '', privkey: '', domain: '',
+                    })
                   }
                 }} />
               </Form.Item>
             </Space>
           </Form.Item>
           {httpsEnabled && (
-            <Form.Item name="ssl_domain" label="SSL Certificate" style={{ marginTop: 12, marginBottom: 0 }}
-              rules={[{ required: true, message: 'Select an SSL certificate' }]}>
-              <Select
-                showSearch
-                placeholder="Select uploaded SSL certificate"
-                filterOption={(input, option) => (option?.label as string||'').toLowerCase().includes(input.toLowerCase())}
-                options={sslDomains.map(d => ({ value: d.domain, label: d.domain }))}
-                onChange={(domain) => {
-                  const cert = sslDomains.find(d => d.domain === domain)
-                  if (cert) {
-                    setSelectedSslDomain(domain)
-                    form.setFieldsValue({
-                      fullchain: cert.fullchain_path,
-                      privkey: cert.privkey_path,
-                      domain: domain,
-                    })
+            <>
+              <Form.Item name="ssl_domain" label="SSL Certificate" style={{ marginTop: 12, marginBottom: 0 }}
+                rules={[{ required: true, message: 'Select an SSL certificate' }]}>
+                <Select
+                  showSearch
+                  placeholder="Select uploaded SSL certificate"
+                  filterOption={(input, option) => (option?.label as string||'').toLowerCase().includes(input.toLowerCase())}
+                  options={sslDomains.map(d => ({ value: d.domain, label: d.domain }))}
+                  onChange={(domain) => {
+                    const cert = sslDomains.find(d => d.domain === domain)
+                    if (cert) {
+                      setSelectedSslDomain(domain)
+                      form.setFieldsValue({
+                        fullchain: cert.fullchain_path,
+                        privkey: cert.privkey_path,
+                        domain: domain,
+                      })
+                    }
+                  }}
+                />
+              </Form.Item>
+              {/* R9 — no certificates: TLS stays on, the certificate select is
+                  required, the deploy is blocked, and the panel says how to
+                  unblock it. */}
+              {sslDomains.length === 0 && (
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ marginTop: 8, marginBottom: 0 }}
+                  message="No certificates uploaded — upload a certificate first"
+                  description={
+                    <span>
+                      The Domain follows the selected certificate, so it cannot be
+                      typed while TLS is on. The deploy is blocked until a
+                      certificate is selected. <Button type="link" size="small"
+                        style={{ padding: 0 }}
+                        onClick={() => navigate('/ssl')}>Open the SSL page</Button>
+                    </span>
                   }
-                }}
-              />
-            </Form.Item>
+                />
+              )}
+            </>
           )}
           {/* ---- G83: allowed services (folded by default) ---- */}
           <Collapse ghost>
@@ -1541,65 +1736,52 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
           />
 
           {/* ---- Deploy-time per-user env (pipeline env phase, design §2) ---- */}
-          {needsEnv && (
-            <Space direction="vertical" style={{ width: '100%' }} size={4}>
-              {perUserEnv ? (
-                <Alert type="success" showIcon message={`Per-user env ready: ${perUserEnv} — this deployment will use it as its interpolation env`} />
-              ) : (
-                <div style={{ fontSize: 12, color: '#999' }}>
-                  The per-user env is generated automatically as the last step of the missing-files pipeline when you Deploy (or click Generate).
-                </div>
-              )}
-            </Space>
+          {perUserEnv && (
+            <Alert type="success" showIcon message={`Per-user env ready: ${perUserEnv} — this deployment will use it as its interpolation env`} />
           )}
-
-          {/* ---- Generation prompt (exists in BOTH panels) ---- */}
-          <Divider plain>Generation prompt</Divider>
-          <Input.TextArea
-            rows={2}
-            disabled={!llmActive}
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            placeholder="Prompt for the generation agent (missing-files generation + deploy-time per-user env). You may include doc URLs — the agent fetches them."
-          />
-
-          {/* §5: shown ONLY when env is `generate new` (an empty env slot). It
-              supplies the context the model reads to produce the per-user
-              `.raw`; selecting a handoff env above makes it irrelevant. */}
-          {eff.env.length === 0 && (fileSetCandidates.env || []).length > 0 && (
-            <div style={{ marginTop: 8 }}>
-              <Text strong>Env reference (generation context)</Text>
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                {' '}— base/example env files the model reads to produce the per-user env.
-                Not passed to the deployment.
-              </Text>
-              <Select
-                mode="multiple"
-                allowClear
-                style={{ width: '100%', marginTop: 4 }}
-                placeholder="None — the model works from the compose alone"
-                value={envRefs}
-                onChange={(v) => setEnvRefs(v as string[])}
-                options={(fileSetCandidates.env || []).map(c => ({ value: c, label: c }))}
-              />
+          {/* S13 — the LLM env guard. Under the env picker; enabled only while
+              a selected env file exists (not under `generate new`, not under
+              `None`). It adds a check, never replacing the mechanical ones. */}
+          <div>
+            <Checkbox
+              checked={llmActive && llmValidateEnv}
+              disabled={!llmActive || eff.env.length === 0 || !!eff.env_none}
+              onChange={(e) => setLlmValidateEnv(e.target.checked)}
+            >
+              Run LLM validation before deploy
+            </Checkbox>
+            <div style={{ fontSize: 12, color: '#999' }}>
+              {!llmActive
+                ? 'No LLM configured — LLM validation is unavailable.'
+                : eff.env_none
+                ? 'No env files are sent, so there is nothing to validate.'
+                : eff.env.length === 0
+                ? 'Available when a selected env file is chosen; under generate new the generation path guards the .raw.'
+                : 'Validates the selected env list before deploy; a finding blocks the deploy until it is fixed. Mechanical validation always runs.'}
             </div>
-          )}
+          </div>
 
           {/* ---- Missing Files / LLM Generation ---- */}
+          {/* T9/R10 — the prompt + env reference render inside this Alert's
+              description, together with the Generate button. */}
           {checkingMissing ? (
             <div style={{padding:'8px 0'}}><Spin size="small" /> <span style={{fontSize:12,color:'#999'}}>Checking deployment readiness...</span></div>
           ) : checkError ? (
-            <Alert type="error" message={`Deployment readiness check failed: ${checkError}`} style={{marginBottom:12}} />
+            <Alert type="error"
+              message={`Deployment readiness check failed: ${checkError}`}
+              description={renderGenerationPrompt()}
+              style={{marginBottom:12}} />
           ) : !slotsSpecified ? (
             <Alert
               type={Object.keys(generatedFiles).length > 0 ? 'success' : 'warning'}
               message={
                 Object.keys(generatedFiles).length === 0
-                  ? `Missing essential files: ${missingFiles.join(', ')}`
+                  ? `Missing essential files: ${missingLabels.join(', ')}`
                   : undefined
               }
               description={
                 <div style={{marginTop:4}}>
+                  {renderGenerationPrompt()}
                   {Object.keys(generatedFiles).length === 0 ? (
                     <>
                       <div style={{marginTop:8}}>
@@ -1687,7 +1869,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
               style={{marginBottom:12}}
             />
           ) : selectedServiceName ? (
-            <Alert type="success" message="All necessary files are specified, ready for deployment" style={{marginBottom:12}} />
+            <Alert type="success"
+              message="All necessary files are specified, ready for deployment"
+              description={renderGenerationPrompt()}
+              style={{marginBottom:12}} />
           ) : null}
 
           {/* ---- Generated File Editor Modal (Monaco) ---- */}
@@ -1856,6 +2041,12 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                 (the compose CLI default).
               </Text>
             )}
+            {/* F4/S14 — say WHY Deploy is disabled while TLS has no certificate. */}
+            {httpsOn && !watchedSslDomain && (
+              <Text type="warning" style={{ fontSize: 12 }}>
+                Select an SSL certificate to enable Deploy.
+              </Text>
+            )}
             <Button type="primary" htmlType="submit" loading={loading} icon={<span>🚀</span>}
               // `computingLabel` gates the submit too: the next-label call resolves through the
               // -api's status computation and was measured taking ~3–6s, during which the
@@ -1874,6 +2065,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
               // disabled with no way forward.
               disabled={!selectedUserName || !selectedServiceName || !!checkError || fileSetLoading
                 || computingLabel
+                // F4/S14 — TLS on with no certificate selected: no trusted
+                // domain, so Deploy is visibly disabled. Read from the FORM
+                // watcher, not the stale `httpsEnabled` state.
+                || (httpsOn && !watchedSslDomain)
                 || (!fixingGuide && !fileSetLoading && (fileSetCandidates.compose || []).length > 0 && effectiveSelection().compose.length === 0)
                 || (!fixingGuide && missingFiles.length > 0 && Object.keys(generatedFiles).length === 0 && effectiveSelection().compose.length === 0)}>
               Deploy

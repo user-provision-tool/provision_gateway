@@ -55,6 +55,8 @@ GATEWAY_TABLES = [
     "gateway.service_templates",
     "gateway.loop_leases",
     "gateway.import_state",
+    "gateway.alerts",
+    "gateway.grant_sync_state",
 ]
 
 REGISTRY_TABLES = [

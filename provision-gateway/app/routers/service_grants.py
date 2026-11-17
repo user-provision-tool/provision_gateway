@@ -12,10 +12,22 @@ from fastapi import APIRouter, Depends, HTTPException
 from ..database import SessionLocal
 from ..middleware import require_admin, require_gateway_token
 from ..services import audit_service, service_grants
-from ..services.cross_orchestrator import cross_orchestrator
+from ..services.cross_orchestrator import OUTCOME_OK, cross_orchestrator
 from ..services.registry import Registry
 
 router = APIRouter(prefix="/api/service-grants", tags=["service-grants"])
+
+
+def _retry_if_not_applied(sync: dict, source_id: str) -> None:
+    """R4/S15 — retry a deferred/failed grant sync for THIS source only.
+
+    The grant row is durable and the click still returns 2xx; the bounded
+    background retry continues the grant path for ``source_id`` with
+    ``sync_source`` (via the orchestrator's targeted id list) and never sweeps
+    the stack with ``sync_all``.
+    """
+    if sync.get("outcome") not in (None, OUTCOME_OK):
+        cross_orchestrator.schedule_retry_sync([source_id])
 
 
 def _entry_or_404(service_id: str) -> dict:
@@ -96,6 +108,7 @@ async def apply_service_grant_set(source_id: str, body: dict,
         db.close()
     # G94 R10.1 — the targeted grant sync: only this source is read/submitted.
     sync = await cross_orchestrator.sync_source(source_id)
+    _retry_if_not_applied(sync, source_id)
     return {"updated": True, **result, "sync": sync}
 
 
@@ -122,6 +135,7 @@ async def set_service_grant(source_id: str, target_id: str,
         db.close()
     # G94 R10.1 — the targeted grant sync: only this source is read/submitted.
     sync = await cross_orchestrator.sync_source(source_id)
+    _retry_if_not_applied(sync, source_id)
     return {"updated": True, **result, "sync": sync}
 
 
@@ -142,4 +156,5 @@ async def remove_service_grant(source_id: str, target_id: str,
     finally:
         db.close()
     sync = await cross_orchestrator.sync_source(source_id)
+    _retry_if_not_applied(sync, source_id)
     return {"removed": removed, **result, "sync": sync}

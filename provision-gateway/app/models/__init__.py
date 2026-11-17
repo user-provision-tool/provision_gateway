@@ -15,6 +15,7 @@ from .gateway_task import GatewayTask
 from .pre_deploy_session import PreDeploySession
 from .loop_lease import LoopLease
 from .stream_exposure import StreamExposure
+from .alert import Alert, GrantSyncState
 from .registry_ref import ApiUser, Service
 
 __all__ = [
@@ -32,6 +33,8 @@ __all__ = [
     "PreDeploySession",
     "LoopLease",
     "StreamExposure",
+    "Alert",
+    "GrantSyncState",
     "ApiUser",
     "Service",
 ]

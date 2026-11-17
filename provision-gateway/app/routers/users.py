@@ -451,7 +451,56 @@ async def delete_instance(service_id: str, scope: str = Query("service", pattern
         from ..services import pre_deploy_registry as pdr
         pdr.remove_session(service_id)
     _audit_short("remove", current_admin, {"service_id": service_id})
+    # G95 R7 — the service delete ends its relationships (grant rows in BOTH
+    # directions) and a source that loses its last one must be cleared, even
+    # while stopped. The -api's remove is queued, so wait for its task before
+    # removing the rows: until the tombstone is written the service is live.
+    task_id = result.get("task_id") if isinstance(result, dict) else None
+    if task_id:
+        asyncio.create_task(cross_orchestrator.sync_after_task(
+            str(task_id),
+            on_settled=_grant_cleanup_hook(service_id) if scope == "service" else None))
+    else:
+        # No task handle (an already-settled/refused remove): still converge.
+        if scope == "service":
+            _remove_service_grants(service_id)
+        asyncio.create_task(cross_orchestrator.sync_all())
     return result
+
+
+def _remove_service_grants(service_id: str) -> int:
+    """Delete the service's grant rows in both directions — ONLY once tombstoned.
+
+    R7's cleanup is for a COMPLETED delete. A remove whose stream-conf hold
+    failed stops before the disconnect, leaves the service live and marks the
+    task failed; its grant rows must survive (only the tombstone ends the
+    relationship). A post-tombstone reload failure is the R3 canary and DOES
+    end it, so the tombstone — not the task status — is the test.
+    """
+    from sqlalchemy import text
+    from ..database import ReaderSessionLocal
+
+    rd = ReaderSessionLocal()
+    try:
+        row = rd.execute(
+            text("SELECT deleted_at FROM registry.services WHERE id=:id"),
+            {"id": service_id},
+        ).mappings().first()
+    finally:
+        rd.close()
+    if not row or row["deleted_at"] is None:
+        return 0
+    db = SessionLocal()
+    try:
+        return service_grants.remove_grants_for_service(db, service_id)
+    finally:
+        db.close()
+
+
+def _grant_cleanup_hook(service_id: str):
+    def hook() -> None:
+        _remove_service_grants(service_id)
+    return hook
 
 
 @router.post("/instances/{service_id}/rebuild")

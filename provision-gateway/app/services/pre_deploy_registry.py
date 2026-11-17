@@ -403,6 +403,33 @@ def mark_deploy_failed(service_id: str, detail: str,
         db.close()
 
 
+def pause_for_fix(service_id: str, *, guide: str, slot: str,
+                  detail: str = "", reason: str = "llm_fix") -> bool:
+    """Pause the session with a fixing guide (S22, the LLM env guard).
+
+    Same shape the failed-deploy LLM-fix analysis writes: `paused` with the
+    guide and the faulty slot. Check then reopens the deploy panel pre-filled
+    and the confirming restart regenerates that slot. Only the pause fields are
+    written here — the task links, the section and the replayable deploy intent
+    stay, because the operator restarts THIS path, not a new one.
+    """
+    db = _sessions()
+    try:
+        row = db.query(PreDeploySession).filter_by(service_id=service_id).first()
+        if row is None:
+            return False
+        row.state = STATE_PAUSED
+        row.reason = reason
+        row.detail = detail or ""
+        row.guide = guide or ""
+        row.slot = slot or None
+        row.updated_at = _now()
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
 def session_record(service_id: str) -> dict[str, Any] | None:
     """All session fields, including the replayable intent and its credentials.
 

@@ -300,7 +300,7 @@ def test_targeted_sync_touches_only_the_affected_source(monkeypatch):
 
     async def fake_apply(service_id, present, *, resolver_ip=None):
         calls.append((service_id, present, resolver_ip))
-        return True
+        return {"ok": True, "outcome": "ok", "reason": None}
 
     monkeypatch.setattr(orch, "_apply", fake_apply)
     result = asyncio.run(orch.sync_source("source-1"))
@@ -309,6 +309,72 @@ def test_targeted_sync_touches_only_the_affected_source(monkeypatch):
     assert calls == [("source-1", True, "172.28.0.3")]
     # The other stale source is the global reconciler's job, not this click's.
     assert all(service_id != "other-1" for service_id, _p, _r in calls)
+
+
+def test_targeted_sync_surfaces_a_deferred_outcome(monkeypatch):
+    """T6/R4 — a deferred targeted sync says so, with a reason; the row is durable."""
+    import asyncio
+    from app.services import cross_orchestrator as co
+
+    orch = CrossOrchestrator()
+    entries = {
+        "source-1": {"service_id": "source-1", "status": "running",
+                     "extra_resolver": None, "extra_network": None},
+    }
+    monkeypatch.setattr(co, "SessionLocal", _FakeSession)
+    monkeypatch.setattr(co.cross_values, "current_cross_nginx_ip", lambda: "172.28.0.2")
+    monkeypatch.setattr(co.cross_values, "current_resolver_ip", lambda: "172.28.0.3")
+    monkeypatch.setattr(orch, "write_dnsmasq_config",
+                        lambda domains, cross_nginx_ip=None: False)
+    monkeypatch.setattr(co.service_grants, "reachable_domains", lambda db: {"localhost"})
+    monkeypatch.setattr(co.service_grants, "entries_by_id", lambda: entries)
+    monkeypatch.setattr(co.service_grants, "targets_for",
+                        lambda db, entry: [{"service_id": "target-1"}])
+
+    async def deferred_apply(service_id, present, *, resolver_ip=None):
+        return {"ok": False, "outcome": "deferred",
+                "reason": "the task queue refused the update (queue_unavailable); "
+                          "the next sync cycle retries it"}
+
+    monkeypatch.setattr(orch, "_apply", deferred_apply)
+    result = asyncio.run(orch.sync_source("source-1"))
+
+    assert result["outcome"] == "deferred"
+    assert "queue_unavailable" in result["reason"]
+    assert result["applied"] == 0
+
+
+def test_targeted_sync_clears_a_stopped_source_whose_relationship_ended(monkeypatch):
+    """T6/R7.4 — the clear is submitted even when the source is not running."""
+    import asyncio
+    from app.services import cross_orchestrator as co
+
+    orch = CrossOrchestrator()
+    entries = {
+        "source-1": {"service_id": "source-1", "status": "unknown",
+                     "extra_resolver": "172.28.0.3",
+                     "extra_network": settings.CROSS_NETWORK},
+    }
+    calls = []
+    monkeypatch.setattr(co, "SessionLocal", _FakeSession)
+    monkeypatch.setattr(co.cross_values, "current_cross_nginx_ip", lambda: "172.28.0.2")
+    monkeypatch.setattr(co.cross_values, "current_resolver_ip", lambda: "172.28.0.3")
+    monkeypatch.setattr(orch, "write_dnsmasq_config",
+                        lambda domains, cross_nginx_ip=None: False)
+    monkeypatch.setattr(co.service_grants, "reachable_domains", lambda db: set())
+    monkeypatch.setattr(co.service_grants, "entries_by_id", lambda: entries)
+    monkeypatch.setattr(co.service_grants, "targets_for", lambda db, entry: [])
+
+    async def fake_apply(service_id, present, *, resolver_ip=None):
+        calls.append((service_id, present))
+        return {"ok": True, "outcome": "ok", "reason": None}
+
+    monkeypatch.setattr(orch, "_apply", fake_apply)
+    result = asyncio.run(orch.sync_source("source-1"))
+
+    assert result["cleared"] == 1
+    assert result["outcome"] == "ok"
+    assert calls == [("source-1", False)]
 
 
 def test_global_reconciler_diffs_stored_pairs_without_http_reads(monkeypatch):
@@ -340,7 +406,7 @@ def test_global_reconciler_diffs_stored_pairs_without_http_reads(monkeypatch):
 
     async def fake_apply(service_id, present, *, resolver_ip=None):
         applied.append((service_id, present))
-        return True
+        return {"ok": True, "outcome": "ok", "reason": None}
 
     async def _no_http_read(service_id):
         raise AssertionError("the global reconciler must not GET each source")
@@ -354,3 +420,79 @@ def test_global_reconciler_diffs_stored_pairs_without_http_reads(monkeypatch):
     assert result["applied"] == 2
     assert result["cleared"] == 1
     assert result["failed"] == 0
+
+
+def test_a_non_ok_targeted_sync_schedules_a_targeted_retry(monkeypatch):
+    """R4/S15 — the grant click's retry is `sync_source(source)` only."""
+    from app.routers import service_grants as router
+
+    calls = []
+    monkeypatch.setattr(router.cross_orchestrator, "schedule_retry_sync",
+                        lambda ids=None, **kw: calls.append(ids))
+    router._retry_if_not_applied(
+        {"outcome": "deferred", "reason": "queue down"}, "source-1")
+    router._retry_if_not_applied({"outcome": "error"}, "source-1")
+    router._retry_if_not_applied({"outcome": "ok"}, "source-1")
+    assert calls == [["source-1"], ["source-1"]]
+    assert all(c != [] and c is not None for c in calls), "never sync_all"
+
+
+# ---------------------------------------------------------------------------
+# R13/R14 — the targeted fan-out and its retry
+# ---------------------------------------------------------------------------
+
+
+def test_sync_sources_fans_out_to_exactly_the_deduplicated_ids(monkeypatch):
+    import asyncio
+    from app.services import cross_orchestrator as co
+
+    orch = CrossOrchestrator()
+    calls = []
+
+    async def fake_sync(sid):
+        calls.append(sid)
+        return {"ok": True, "outcome": "ok", "reason": None}
+
+    monkeypatch.setattr(orch, "sync_source", fake_sync)
+    result = asyncio.run(orch.sync_sources(["a", "b", "a", ""]))
+
+    assert calls == ["a", "b"]
+    assert result["sources"] == ["a", "b"]
+    assert result["failed"] == []
+
+
+def test_sync_sources_reports_only_the_failed_ids(monkeypatch):
+    import asyncio
+    from app.services import cross_orchestrator as co
+
+    orch = CrossOrchestrator()
+
+    async def fake_sync(sid):
+        return {"ok": sid != "b", "outcome": "error" if sid == "b" else "ok"}
+
+    monkeypatch.setattr(orch, "sync_source", fake_sync)
+    result = asyncio.run(orch.sync_sources(["a", "b"]))
+
+    assert result["failed"] == ["b"]
+    assert result["results"]["a"]["outcome"] == "ok"
+
+
+def test_the_targeted_retry_never_calls_sync_all(monkeypatch):
+    import asyncio
+    from app.services import cross_orchestrator as co
+
+    orch = CrossOrchestrator()
+    calls = []
+
+    async def fake_sync_sources(ids):
+        calls.append(tuple(ids))
+        return {"failed": []}
+
+    async def no_global():
+        raise AssertionError("a targeted retry must not run sync_all")
+
+    monkeypatch.setattr(orch, "sync_sources", fake_sync_sources)
+    monkeypatch.setattr(orch, "sync_all", no_global)
+    asyncio.run(orch._retry_sync(0.01, 2, ["source-x"]))
+
+    assert calls == [("source-x",)]

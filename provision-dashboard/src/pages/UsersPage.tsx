@@ -9,6 +9,7 @@ import {
   pendingLabel, placeholderKey, queueLabel, reconcilePlaceholders, statusBadge,
 } from '../contracts'
 import client from '../api/client'
+import { AlertDto, alertTypeLabel, listAlerts, markRead } from '../api/alerts'
 import DeployForm from '../components/services/DeployForm'
 import ServiceCard from '../components/users/ServiceCard'
 import CrossGrantsSection from '../components/services/CrossGrantsSection'
@@ -19,6 +20,23 @@ const { Title, Text } = Typography
 // Basename of a server-side path ('' when unknown) — used to turn the -api's
 // per-instance file paths into the filenames the per-user-file API expects.
 const baseName = (p?: string) => (p ? p.split('/').pop() || '' : '')
+
+const formatHoldMtime = (m: any): string => {
+  if (m === undefined || m === null || m === '') return 'unknown'
+  const d = typeof m === 'number'
+    ? new Date(m < 1e12 ? m * 1000 : m)   // seconds vs milliseconds
+    : new Date(String(m))
+  return Number.isNaN(d.getTime()) ? String(m) : d.toLocaleString()
+}
+
+const formatHoldSize = (s: any): string => {
+  if (s === undefined || s === null || s === '') return 'unknown'
+  const n = Number(s)
+  if (!Number.isFinite(n)) return String(s)
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`
+  return `${(n / (1024 * 1024)).toFixed(1)} MiB`
+}
 
 interface ServiceInstance {
   service_id: string;
@@ -175,7 +193,7 @@ function SessionAlert({ sess }: { sess: any }) {
       <HeaderNote
         tone="info"
         text="the analysis found the fault — Check to confirm the fix and restart"
-        detail="Check opens the deploy panel with the fixing guide pre-filled. Confirming restarts the path, generating .fix files."
+        detail="Check opens the deploy panel with the fixing guide pre-filled. Confirming restarts the path and regenerates the faulty slot (the file the guide names)."
       />
     )
   }
@@ -457,6 +475,8 @@ export default function UsersPage() {
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
   // G92 — both queues' telemetry for the Services-page top bar (R7.3).
   const [queueStats, setQueueStats] = useState<any>(null)
+  // R4 — the latest unread active alert (hold or condition), from /api/alerts.
+  const [latestAlert, setLatestAlert] = useState<AlertDto | null>(null)
   const [batchLoading, setBatchLoading] = useState(false)
 
   // Rebuild confirmation modal
@@ -903,16 +923,29 @@ export default function UsersPage() {
     } catch { /* silent: the bar simply stays at its last values */ }
   }, [isAdmin])
 
+  // R4 — the Services banner is the latest unread ACTIVE alert of any type.
+  // Closing it marks it read, so the next poll shows the next unread active
+  // alert (or none). The old localStorage dismissal and the queue-derived
+  // hold_alerts list are no longer used by this page.
+  const loadLatestAlert = useCallback(async () => {
+    if (!isAdmin) return
+    try {
+      const { data } = await listAlerts({ status: 'active', read: 'unread', limit: 1 })
+      setLatestAlert((data.alerts || [])[0] || null)
+    } catch { /* silent: the banner keeps its last value */ }
+  }, [isAdmin])
+
   // Auto-poll every 10s — silent refresh, no loading spinner. Sessions and
   // analyses poll with it: `failed + analyzing` is a LIVE gateway-side state, and
   // a card that only learns about it on mount would show it never.
   useEffect(() => {
     loadQueueStats()
+    loadLatestAlert()
     const interval = setInterval(() => {
-      refreshServices(); loadSessions(); loadQueueStats()
+      refreshServices(); loadSessions(); loadQueueStats(); loadLatestAlert()
     }, 10000)
     return () => clearInterval(interval)
-  }, [refreshServices, loadQueueStats])
+  }, [refreshServices, loadQueueStats, loadLatestAlert])
 
   // ONE grouping, TWO card kinds. A pre-deploy session is NOT a separate
   // category: it is the same service card at an earlier point of the path, so it
@@ -1415,6 +1448,108 @@ export default function UsersPage() {
         />
       )}
 
+      {/* R4 — the Services banner shows ONLY the latest unread ACTIVE alert of
+          any type. A hold alert renders the S20 collision body from its
+          context; a condition alert renders its title/severity/message and a
+          link to its detail. Closing marks it read (POST /alerts/read), so the
+          next poll shows the next unread active alert, or none. */}
+      {isAdmin && latestAlert && (() => {
+        const a: any = latestAlert
+        const ctx: any = a.context || {}
+        const isHold = a.type === 'stream_conf_hold_collision'
+        const existing: any[] = Array.isArray(ctx?.existing)
+          ? ctx.existing
+          : (ctx?.existing && typeof ctx.existing === 'object' ? [ctx.existing] : [])
+        const close = async () => {
+          try { await markRead([a.id]) } catch { /* the next poll retries */ }
+          setLatestAlert(null)
+          loadLatestAlert()
+        }
+        return (
+          <Alert
+            type={a.severity === 'error' ? 'error' : 'warning'}
+            showIcon
+            closable
+            onClose={close}
+            style={{ marginBottom: 12 }}
+            message={isHold ? 'Stream conf .paused collision warning' : a.title}
+            description={
+              <Space direction="vertical" size={8} style={{ marginTop: 4, width: '100%' }}>
+                {isHold ? (
+                  <div style={{ width: '100%' }}>
+                    <div>
+                      <Text strong>{a.user_name || '?'}:{a.service_name || '?'}:{a.label ?? '?'}</Text>
+                      {ctx.index !== undefined && ctx.index !== null && (
+                        <>{' — hold index '}<Text code>{String(ctx.index)}</Text></>
+                      )}
+                    </div>
+                    {ctx.active && (
+                      <div style={{ fontSize: 12 }}>
+                        active conf: <Text code>{String(ctx.active)}</Text>
+                      </div>
+                    )}
+                    {ctx.held_as && (
+                      <div style={{ fontSize: 12 }}>
+                        indexed destination (held as): <Text code>{String(ctx.held_as)}</Text>
+                      </div>
+                    )}
+                    {existing.map((e: any, j: number) => (
+                      <div key={e?.path || j} style={{ fontSize: 12 }}>
+                        existing held copy: <Text code>{e?.path ? String(e.path) : '?'}</Text>
+                        {' — mtime '}{formatHoldMtime(e?.mtime)}
+                        {', size '}{formatHoldSize(e?.size)}
+                      </div>
+                    ))}
+                    <div style={{ fontSize: 12 }}>{a.message}</div>
+                    <div style={{ fontSize: 12, color: '#8c6e00' }}>
+                      A <Text code>.stream.conf.paused</Text> already existed when the hold ran,
+                      so the active conf was held as <Text code>.paused.&lt;n&gt;</Text>.
+                      Likely origins: a previous stop that never restarted, a previous remove
+                      that retained the held copy, a failed rebuild/start restore, a
+                      manual/external file, or a prior indexed hold. The hold never unlinks;
+                      the indexed copy was written successfully. Held copies are retained —
+                      automatic cleanup is a future feature.
+                    </div>
+                    {a.task_id && (
+                      <Button type="link" size="small" style={{ padding: 0 }}
+                        onClick={() => navigate(`/tasks?task=${a.task_id}`)}>
+                        View task {a.task_id}
+                      </Button>
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ width: '100%' }}>
+                    <Space size={8} wrap>
+                      <Tag color={a.severity === 'error' ? 'red' : 'orange'}>
+                        {alertTypeLabel(a.type)}
+                      </Tag>
+                      <Text>{a.title}</Text>
+                    </Space>
+                    <div style={{ fontSize: 12, marginTop: 4 }}>{a.message}</div>
+                    <Space size={12} style={{ marginTop: 4 }}>
+                      <Button type="link" size="small" style={{ padding: 0 }}
+                        onClick={() => navigate(`/alerts?alert=${encodeURIComponent(a.id)}`)}>
+                        View details
+                      </Button>
+                      {a.task_id && (
+                        <Button type="link" size="small" style={{ padding: 0 }}
+                          onClick={() => navigate(`/tasks?task=${a.task_id}`)}>
+                          View task {a.task_id}
+                        </Button>
+                      )}
+                    </Space>
+                  </div>
+                )}
+                <Button type="link" size="small" style={{ padding: 0 }}
+                  onClick={() => navigate('/alerts')}>
+                  View all alerts
+                </Button>
+              </Space>
+            }
+          />
+        )
+      })()}
+
       {isAdmin && orphans.length > 0 && (
         <Alert
           type="warning"
@@ -1522,7 +1657,23 @@ export default function UsersPage() {
                   <Tooltip title="Clone all to another user">
                     <Button size="small" icon={<SwapOutlined/>} onClick={()=>{setCloneSource(userName);setCloneTarget('');setCloneOpen(true)}}>Clone All</Button>
                   </Tooltip>
-                  <Button size="small" danger icon={<DeleteOutlined/>} disabled>Del</Button>
+                  {/* R11 — the dead per-user Del is replaced by Deploy, which
+                      opens the panel with this user pre-selected. Bulk delete
+                      stays select-then-Remove above. */}
+                  <Tooltip title={`Deploy a service for ${userName}`}>
+                    <Button size="small" type="primary" icon={<RocketOutlined/>}
+                      onClick={()=>{
+                        setPreselectedUser(userName)
+                        setPreselectedDeploy(undefined)
+                        setPreselectedLabel(undefined)
+                        setPreselectedUseGlobalProxy(null)
+                        setRetryOptions(null)
+                        setRetryRegenerate(false)
+                        setResumeJobId(null)
+                        setFixingGuide(null)
+                        setDeployOpen(true)
+                      }}>Deploy</Button>
+                  </Tooltip>
                 </>}
               </Space>
             </div>
@@ -2095,7 +2246,7 @@ export default function UsersPage() {
             refreshServices()
           })
         }}>
-        <p>This deletes {delBatch ? 'the selected services' : 'the service'}: containers are stopped, the service identity is tombstoned and the card disappears. <b>Generated files, user data and volumes are preserved</b> by the no-auto-delete rule; only the per-instance stream conf is removed. The tombstone cannot be undone.</p>
+        <p>This deletes {delBatch ? 'the selected services' : 'the service'}: containers are stopped, the service identity is tombstoned and the card disappears. <b>Generated files, user data and volumes are preserved</b> by the no-auto-delete rule; the per-instance stream conf is <b>held aside</b> (renamed <code>.paused</code>), not deleted. The tombstone cannot be undone.</p>
         <p>Type <Text code>{delToken}</Text> to confirm:</p>
         <Input value={delInput} onChange={(e)=>setDelInput(e.target.value)} placeholder="confirm string" />
       </Modal>

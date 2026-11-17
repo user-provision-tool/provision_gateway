@@ -11,6 +11,16 @@ source's resolv.conf/membership, and the gateway's `cross-verify`. It is
 **same-owner + explicit grants only** (G84): a public target enters no source's
 set unless it is explicitly granted, so a public target never makes a service a
 source.
+
+G95 R7 — the set has TWO consumers with DIFFERENT predicates, computed
+separately:
+
+* the **relationship set** (`targets_for`) drives the source's resolver pair and
+  cross-network membership. A target counts while an effective grant exists to
+  a **non-tombstoned** service; its instance status, and whether it has an
+  instance at all (instance-only removal keeps the service), do not matter.
+* the **reachable set** (`reachable_targets_for`) drives the dnsmasq wildcard:
+  both services must be live (`running`). This is unchanged from G83/G91.
 """
 
 from __future__ import annotations
@@ -18,6 +28,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ..models.service_grant import ServiceGrant
@@ -29,6 +40,14 @@ _log = logging.getLogger("gateway.service_grants")
 
 REASON_SAME_OWNER = "same_owner"
 REASON_GRANT = "grant"
+
+# T0/R6 — the stale-row reasons the editor shows. A stale row is an explicit
+# grant whose permission no longer holds; it is MARKED and removable in one
+# action, never silently dropped.
+STALE_TARGET_DELETED = "target_deleted"
+STALE_ACCOUNT_MISSING = "account_grant_missing"
+STALE_IMPLICIT = "same_owner_implicit"
+STALE_NOT_EFFECTIVE = "not_effective"
 
 
 def _now():
@@ -90,26 +109,31 @@ def _target_row(entry: dict, reason: str) -> dict:
         "label": str(entry.get("label")),
         "hostname": entry.get("hostname"),
         "domain": domain_of(entry),
+        "status": entry.get("status"),
         "reason": reason,
     }
 
 
 def targets_for(db: Session, source: dict, entries: list[dict] | None = None) -> list[dict]:
-    """The effective target set for *source*: same-owner + explicit only (G84).
+    """The effective grant RELATIONSHIP set for *source* (G84 + G95 R7).
 
-    A public target is NOT implicit: it appears only through an explicit row,
-    whose account prerequisite is waived while the target owner is public/live.
+    Same-owner is implicit; a public target enters only through an explicit
+    row, whose account prerequisite is waived while the target owner is public.
+    Membership depends on the GRANT RELATIONSHIP, never on the target's runtime
+    state: a `building`, `failed` or `stopped` target — or one whose instance
+    was removed while the service and its grant remain — is still a target. The
+    tombstone is the one exclusion (the reader already filters it out).
+
+    This set drives the resolver pair; the dnsmasq wildcard uses
+    :func:`reachable_targets_for`, which additionally requires both services to
+    be live.
     """
-    if not live(source):
-        return []
     all_entries = entries if entries is not None else live_entries()
     explicit = {str(r.target_service_id) for r in explicit_rows(db, str(source["service_id"]))}
     source_user = user_for(db, source)
     out: list[dict] = []
     for target in all_entries:
         if str(target["service_id"]) == str(source["service_id"]):
-            continue
-        if not live(target):
             continue
         if same_owner(source, target):
             out.append(_target_row(target, REASON_SAME_OWNER))
@@ -124,13 +148,29 @@ def targets_for(db: Session, source: dict, entries: list[dict] | None = None) ->
     return out
 
 
+def reachable_targets_for(db: Session, source: dict,
+                          entries: list[dict] | None = None) -> list[dict]:
+    """The WILDCARD set: relationship targets that are also reachable (G95 R7.6).
+
+    Both services must be live (`running`) — the unchanged G83/G91 rule. A
+    relationship target that is stopped/building/failed keeps the source's pair
+    but contributes no dnsmasq wildcard.
+    """
+    if not live(source):
+        return []
+    return [t for t in targets_for(db, source, entries) if live(t)]
+
+
 def sources_with_targets(db: Session) -> dict[str, list[dict]]:
-    """Every live source → its effective targets (empty sets omitted)."""
+    """Every source with a relationship → its targets (empty sets omitted).
+
+    The source's own runtime state is NOT an input: a stopped source still has
+    its relationships and its stored pair. A service with no instance at all
+    carries no pair to apply (the caller skips it).
+    """
     entries = live_entries()
     out: dict[str, list[dict]] = {}
     for entry in entries:
-        if not live(entry):
-            continue
         targets = targets_for(db, entry, entries)
         if targets:
             out[str(entry["service_id"])] = targets
@@ -141,13 +181,15 @@ def reachable_domains(db: Session) -> set[str]:
     """The service domains that currently contain at least one reachable target.
 
     A domain is present while SOME live source has a **same-owner or explicitly
-    granted** target in it (both services live). Publicness is not an input: an
-    ungranted public target contributes nothing, a granted one contributes
-    exactly like a granted private target (G84). This is what the dnsmasq
-    wildcard is written from.
+    granted** target in it and BOTH services are live. Publicness is not an
+    input: an ungranted public target contributes nothing, a granted one
+    contributes exactly like a granted private target (G84). This is what the
+    dnsmasq wildcard is written from — the reachable set, not the relationship
+    set (G95 R7.6).
     """
-    return {t["domain"] for targets in sources_with_targets(db).values() for t in targets
-            if t.get("domain")}
+    entries = live_entries()
+    return {t["domain"] for entry in entries if live(entry)
+            for t in reachable_targets_for(db, entry, entries) if t.get("domain")}
 
 
 def set_grant(db: Session, source_id: str, target_id: str,
@@ -199,22 +241,159 @@ def remove_grant(db: Session, source_id: str, target_id: str) -> bool:
     return True
 
 
+def _stale_reason(db: Session, source: dict, target: dict | None,
+                  source_user: User | None) -> str | None:
+    """Why an explicit row no longer holds a permission, or ``None`` when it does.
+
+    G95 R6 — a row is stale when its target is tombstoned, its account
+    prerequisite fails closed, or it is otherwise excluded from the effective
+    relationship set. The editor marks it; it is never silently dropped.
+    """
+    if target is None:
+        return STALE_TARGET_DELETED
+    if same_owner(source, target):
+        return STALE_IMPLICIT
+    if is_public_target(db, target):
+        return None
+    target_user = user_for(db, target)
+    if (source_user is None or target_user is None
+            or not acl_service.allows(db, source_user, target_user.id)):
+        return STALE_ACCOUNT_MISSING
+    return None
+
+
+_STALE_MESSAGES = {
+    STALE_TARGET_DELETED: "no longer permitted: the target service was deleted",
+    STALE_ACCOUNT_MISSING: "no longer permitted: the source owner has no active account grant",
+    STALE_IMPLICIT: "no longer permitted: same-owner targets are implicit",
+    STALE_NOT_EFFECTIVE: "no longer permitted: the grant is not effective",
+}
+
+
 def list_for_source(db: Session, source: dict) -> dict:
-    """The explicit rows plus the full effective set, for the card/panel UI."""
+    """The explicit rows (stale-marked) plus the effective relationship set."""
     entries = entries_by_id()
+    source_user = user_for(db, source)
+    effective = targets_for(db, source)
+    effective_ids = {str(t["service_id"]) for t in effective}
     explicit = []
     for row in explicit_rows(db, str(source["service_id"])):
-        target = entries.get(str(row.target_service_id))
+        target_id = str(row.target_service_id)
+        target = entries.get(target_id)
+        reason = _stale_reason(db, source, target, source_user)
+        if reason is None and target_id not in effective_ids:
+            reason = STALE_NOT_EFFECTIVE
         explicit.append({
             **row.to_dict(),
             "target": _target_row(target, REASON_GRANT) if target else None,
+            "stale": reason is not None,
+            "stale_reason": reason,
+            "stale_message": _STALE_MESSAGES.get(reason) if reason else None,
         })
-    effective = targets_for(db, source)
     return {
         "service_id": str(source["service_id"]),
         "explicit": explicit,
         "effective": effective,
     }
+
+
+def _api_user_id(db: Session, gateway_user_id) -> str | None:
+    """The registry api-user id behind a gateway user id, or ``None``."""
+    import uuid as _uuid
+    try:
+        uid = _uuid.UUID(str(gateway_user_id))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    user = db.query(User).filter(User.id == uid).first()
+    return str(user.api_user_id) if user else None
+
+
+def affected_sources_for_account_change(
+    db: Session, *, account_grant: tuple[str, str] | None = None,
+    changed_user_id: str | None = None,
+) -> list[str]:
+    """The sources whose pair depends on an account-level change (R14/S10).
+
+    ``account_grant=(grantee, shared)``: services owned by *grantee* that have
+    an explicit service grant to a service owned by *shared* — those rows' account
+    prerequisite is the grant being toggled.
+
+    ``changed_user_id``: an activation toggle or deletion of that account. The
+    sources are services owned by the account with at least one explicit row,
+    plus services with an explicit row to one of the account's services. Rows
+    whose two ends are same-owner are excluded: same-owner relationships do not
+    depend on the account prerequisite. Rows with a tombstoned/absent end are
+    excluded (they are not relationships).
+
+    The set is deduplicated and sorted; callers must not fall back to
+    `sync_all` when it is empty.
+    """
+    entries = entries_by_id()
+    out: set[str] = set()
+
+    if account_grant is not None:
+        grantee_id, shared_id = account_grant
+        grantee_api = _api_user_id(db, grantee_id)
+        shared_api = _api_user_id(db, shared_id)
+        if grantee_api and shared_api:
+            own = {sid for sid, e in entries.items()
+                   if str(e.get("owner_api_user_id")) == grantee_api}
+            targets = {sid for sid, e in entries.items()
+                       if str(e.get("owner_api_user_id")) == shared_api}
+            if own and targets:
+                import uuid as _uuid
+                rows = db.query(ServiceGrant).filter(
+                    ServiceGrant.source_service_id.in_(
+                        [_uuid.UUID(s) for s in own])
+                ).all()
+                for row in rows:
+                    src, tgt = str(row.source_service_id), str(row.target_service_id)
+                    if tgt not in targets or src not in entries:
+                        continue
+                    if same_owner(entries[src], entries[tgt]):
+                        continue
+                    out.add(src)
+
+    if changed_user_id is not None:
+        api = _api_user_id(db, changed_user_id)
+        if api:
+            own = {sid for sid, e in entries.items()
+                   if str(e.get("owner_api_user_id")) == api}
+            if own:
+                import uuid as _uuid
+                ids = [_uuid.UUID(s) for s in own]
+                rows = db.query(ServiceGrant).filter(
+                    or_(ServiceGrant.source_service_id.in_(ids),
+                        ServiceGrant.target_service_id.in_(ids))
+                ).all()
+                for row in rows:
+                    src, tgt = str(row.source_service_id), str(row.target_service_id)
+                    if src not in entries or tgt not in entries:
+                        continue
+                    if same_owner(entries[src], entries[tgt]):
+                        continue
+                    if src in own or tgt in own:
+                        out.add(src)
+
+    return sorted(out)
+
+
+def remove_grants_for_service(db: Session, service_id: str) -> int:
+    """Delete every grant row that names *service_id* in EITHER direction (R7).
+
+    A service delete ends its relationships: outbound rows (it as source) and
+    inbound rows (it as target) both go in one transaction. Existing
+    ``remove_grant`` only removes one direction.
+    """
+    sid = str(service_id)
+    rows = db.query(ServiceGrant).filter(
+        or_(ServiceGrant.source_service_id == sid,
+            ServiceGrant.target_service_id == sid)
+    ).all()
+    for row in rows:
+        db.delete(row)
+    db.commit()
+    return len(rows)
 
 
 def candidates(db: Session, source: dict) -> list[dict]:
