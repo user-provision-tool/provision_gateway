@@ -1608,101 +1608,109 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
             </Form.Item>
           </Space.Compact>
 
-          <Space.Compact block>
-            <Form.Item name="label" label="Label" style={{ flex: 1 }}>
-              <Input disabled addonAfter={computingLabel ? <Spin size="small" /> : null} />
-            </Form.Item>
-            <Form.Item name="domain" label="Domain" style={{ flex: 2 }}>
-              {/* T8/R9 — with TLS on the Domain is CERTIFICATE-DRIVEN: it is
-                  filled from the selected certificate and is not editable.
-                  With TLS off it stays free text. */}
-              <Input name="deploy_domain" autoComplete="off"
-                disabled={httpsOn} />
-            </Form.Item>
-            <Form.Item name="passwd" label="Password" style={{ flex: 1 }}>
-              <Input.Password placeholder="secret" name="service_password"
-                autoComplete="new-password"
-                data-lpignore="true" data-1p-ignore="true" data-bwignore="true" />
-            </Form.Item>
-          </Space.Compact>
-
-          {/* ---- HTTPS ---- */}
-          {/* Label + toggle on ONE line, no bottom margin (was a vertical
-              label row + switch row + 24px gap). */}
-          <Form.Item style={{ marginBottom: 0 }}>
-            <Space size={8} align="center">
-              {/* G41/G47 — the switch gates the instance's TLS vhost AND its
-                  stream confs (which are not https at all), so it is named for
-                  TLS, the same word the request, CLI and template use. */}
-              <Text>Enable TLS</Text>
-              <Form.Item name="https" valuePropName="checked" noStyle>
-                <Switch onChange={(v) => {
-                  setHttpsEnabled(v)
-                  if (!v) {
-                    setSelectedSslDomain('')
-                    form.setFieldsValue({ ssl_domain: undefined, fullchain: '', privkey: '' })
-                  } else {
-                    // T8/R9 — the Domain follows the certificate, never a
-                    // typed string: clear it until a certificate is chosen.
-                    setSelectedSslDomain('')
-                    form.setFieldsValue({
-                      ssl_domain: undefined, fullchain: '', privkey: '', domain: '',
-                    })
-                  }
-                }} />
-              </Form.Item>
-            </Space>
-          </Form.Item>
-          {httpsEnabled && (
+          {/* ---- Domain setting (identity of this deployment) ---- */}
+          {/* Hidden until a source project is chosen: label allocation, the
+              TLS certificate list and the service password all describe an
+              instance that does not exist yet. */}
+          {selectedServiceName && (
             <>
-              <Form.Item name="ssl_domain" label="SSL Certificate" style={{ marginTop: 12, marginBottom: 0 }}
-                rules={[{ required: true, message: 'Select an SSL certificate' }]}>
-                <Select
-                  showSearch
-                  placeholder="Select uploaded SSL certificate"
-                  filterOption={(input, option) => (option?.label as string||'').toLowerCase().includes(input.toLowerCase())}
-                  options={sslDomains.map(d => ({ value: d.domain, label: d.domain }))}
-                  onChange={(domain) => {
-                    const cert = sslDomains.find(d => d.domain === domain)
-                    if (cert) {
-                      setSelectedSslDomain(domain)
-                      form.setFieldsValue({
-                        fullchain: cert.fullchain_path,
-                        privkey: cert.privkey_path,
-                        domain: domain,
-                      })
-                    }
-                  }}
-                />
+              <Divider plain>Domain setting</Divider>
+              <Space.Compact block>
+                <Form.Item name="label" label="Label" style={{ flex: 1 }}>
+                  <Input disabled addonAfter={computingLabel ? <Spin size="small" /> : null} />
+                </Form.Item>
+                <Form.Item name="domain" label="Domain" style={{ flex: 2 }}>
+                  {/* T8/R9 — with TLS on the Domain is CERTIFICATE-DRIVEN: it is
+                      filled from the selected certificate and is not editable.
+                      With TLS off it stays free text. */}
+                  <Input name="deploy_domain" autoComplete="off"
+                    disabled={httpsOn} />
+                </Form.Item>
+                <Form.Item name="passwd" label="Password" style={{ flex: 1 }}>
+                  <Input.Password placeholder="secret" name="service_password"
+                    autoComplete="new-password"
+                    data-lpignore="true" data-1p-ignore="true" data-bwignore="true" />
+                </Form.Item>
+              </Space.Compact>
+
+              {/* ---- HTTPS ---- */}
+              {/* Label + toggle on ONE line, no bottom margin (was a vertical
+                  label row + switch row + 24px gap). */}
+              <Form.Item style={{ marginBottom: 0 }}>
+                <Space size={8} align="center">
+                  {/* G41/G47 — the switch gates the instance's TLS vhost AND its
+                      stream confs (which are not https at all), so it is named for
+                      TLS, the same word the request, CLI and template use. */}
+                  <Text>Enable TLS</Text>
+                  <Form.Item name="https" valuePropName="checked" noStyle>
+                    <Switch onChange={(v) => {
+                      setHttpsEnabled(v)
+                      if (!v) {
+                        setSelectedSslDomain('')
+                        form.setFieldsValue({ ssl_domain: undefined, fullchain: '', privkey: '' })
+                      } else {
+                        // T8/R9 — the Domain follows the certificate, never a
+                        // typed string: clear it until a certificate is chosen.
+                        setSelectedSslDomain('')
+                        form.setFieldsValue({
+                          ssl_domain: undefined, fullchain: '', privkey: '', domain: '',
+                        })
+                      }
+                    }} />
+                  </Form.Item>
+                </Space>
               </Form.Item>
-              {/* R9 — no certificates: TLS stays on, the certificate select is
-                  required, the deploy is blocked, and the panel says how to
-                  unblock it. */}
-              {sslDomains.length === 0 && (
-                <Alert
-                  type="warning"
-                  showIcon
-                  style={{ marginTop: 8, marginBottom: 0 }}
-                  message="No certificates uploaded — upload a certificate first"
-                  description={
-                    <span>
-                      The Domain follows the selected certificate, so it cannot be
-                      typed while TLS is on. The deploy is blocked until a
-                      certificate is selected. <Button type="link" size="small"
-                        style={{ padding: 0 }}
-                        onClick={() => navigate('/ssl')}>Open the SSL page</Button>
-                    </span>
-                  }
-                />
+              {httpsEnabled && (
+                <>
+                  <Form.Item name="ssl_domain" label="SSL Certificate" style={{ marginTop: 12, marginBottom: 0 }}
+                    rules={[{ required: true, message: 'Select an SSL certificate' }]}>
+                    <Select
+                      showSearch
+                      placeholder="Select uploaded SSL certificate"
+                      filterOption={(input, option) => (option?.label as string||'').toLowerCase().includes(input.toLowerCase())}
+                      options={sslDomains.map(d => ({ value: d.domain, label: d.domain }))}
+                      onChange={(domain) => {
+                        const cert = sslDomains.find(d => d.domain === domain)
+                        if (cert) {
+                          setSelectedSslDomain(domain)
+                          form.setFieldsValue({
+                            fullchain: cert.fullchain_path,
+                            privkey: cert.privkey_path,
+                            domain: domain,
+                          })
+                        }
+                      }}
+                    />
+                  </Form.Item>
+                  {/* R9 — no certificates: TLS stays on, the certificate select is
+                      required, the deploy is blocked, and the panel says how to
+                      unblock it. */}
+                  {sslDomains.length === 0 && (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      style={{ marginTop: 8, marginBottom: 0 }}
+                      message="No certificates uploaded — upload a certificate first"
+                      description={
+                        <span>
+                          The Domain follows the selected certificate, so it cannot be
+                          typed while TLS is on. The deploy is blocked until a
+                          certificate is selected. <Button type="link" size="small"
+                            style={{ padding: 0 }}
+                            onClick={() => navigate('/ssl')}>Open the SSL page</Button>
+                        </span>
+                      }
+                    />
+                  )}
+                </>
               )}
             </>
           )}
-          {/* ---- G83: allowed services (folded by default) ---- */}
-          <Collapse ghost>
-            <Collapse.Panel
-              header="Allowed services (cross-service calls)"
-              key="cross-grants"
-            >
+
+          {/* ---- Allowed services (own section, never folded) ---- */}
+          {selectedServiceName && (
+            <>
+              <Divider plain>Allowed services (cross-service calls)</Divider>
               <Form.Item name="allowed_target_service_ids" style={{ marginBottom: 8 }}>
                 <Select
                   mode="multiple"
@@ -1721,50 +1729,62 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                 one also needs the active account grant. The grant rows are
                 written after the deploy completes.
               </div>
-            </Collapse.Panel>
-          </Collapse>
+            </>
+          )}
 
           {/* ---- Base file selection (design §Selection & UI) ---- */}
-          <Divider plain>Base file selection <span style={{fontSize:12,color:'#999'}}>— stored default pre-selected; save happens on deploy</span></Divider>
-          <FileSetSelection
-            selection={selection}
-            candidates={fileSetCandidates}
-            stale={fileSetStale}
-            needsEnv={needsEnv}
-            onChange={setSelection}
-            onOpenFile={(name) => openSelectedFile(name)}
-          />
-
-          {/* ---- Deploy-time per-user env (pipeline env phase, design §2) ---- */}
-          {perUserEnv && (
-            <Alert type="success" showIcon message={`Per-user env ready: ${perUserEnv} — this deployment will use it as its interpolation env`} />
+          {/* Not until a source project is chosen: there is no recipe to list
+              candidates from, and an empty picker under every open panel read
+              as if files were missing before the operator had selected anything. */}
+          {selectedServiceName && (
+            <>
+              <Divider plain>Base file selection <span style={{fontSize:12,color:'#999'}}>— stored default pre-selected; save happens on deploy</span></Divider>
+              <FileSetSelection
+                selection={selection}
+                candidates={fileSetCandidates}
+                stale={fileSetStale}
+                needsEnv={needsEnv}
+                onChange={setSelection}
+                onOpenFile={(name) => openSelectedFile(name)}
+              />
+              {/* ---- Deploy-time per-user env (pipeline env phase, design §2) ---- */}
+              {perUserEnv && (
+                <Alert type="success" showIcon style={{ marginTop: 8 }} message={`Per-user env ready: ${perUserEnv} — this deployment will use it as its interpolation env`} />
+              )}
+              {/* S13 — the LLM env guard is part of the env selection: it is
+                  enabled only while a selected env file exists (not under
+                  `generate new`, not under `None`). It adds a check, never
+                  replacing the mechanical ones. */}
+              <div style={{ marginTop: 8 }}>
+                <Checkbox
+                  checked={llmActive && llmValidateEnv}
+                  disabled={!llmActive || eff.env.length === 0 || !!eff.env_none}
+                  onChange={(e) => setLlmValidateEnv(e.target.checked)}
+                >
+                  Run LLM validation before deploy
+                </Checkbox>
+                <div style={{ fontSize: 12, color: '#999' }}>
+                  {!llmActive
+                    ? 'No LLM configured — LLM validation is unavailable.'
+                    : eff.env_none
+                    ? 'No env files are sent, so there is nothing to validate.'
+                    : eff.env.length === 0
+                    ? 'Available when a selected env file is chosen; under generate new the generation path guards the .raw.'
+                    : 'Validates the selected env list before deploy; a finding blocks the deploy until it is fixed. Mechanical validation always runs.'}
+                </div>
+              </div>
+            </>
           )}
-          {/* S13 — the LLM env guard. Under the env picker; enabled only while
-              a selected env file exists (not under `generate new`, not under
-              `None`). It adds a check, never replacing the mechanical ones. */}
-          <div>
-            <Checkbox
-              checked={llmActive && llmValidateEnv}
-              disabled={!llmActive || eff.env.length === 0 || !!eff.env_none}
-              onChange={(e) => setLlmValidateEnv(e.target.checked)}
-            >
-              Run LLM validation before deploy
-            </Checkbox>
-            <div style={{ fontSize: 12, color: '#999' }}>
-              {!llmActive
-                ? 'No LLM configured — LLM validation is unavailable.'
-                : eff.env_none
-                ? 'No env files are sent, so there is nothing to validate.'
-                : eff.env.length === 0
-                ? 'Available when a selected env file is chosen; under generate new the generation path guards the .raw.'
-                : 'Validates the selected env list before deploy; a finding blocks the deploy until it is fixed. Mechanical validation always runs.'}
-            </div>
-          </div>
 
           {/* ---- Missing Files / LLM Generation ---- */}
           {/* T9/R10 — the prompt + env reference render inside this Alert's
               description, together with the Generate button. */}
-          {checkingMissing ? (
+          {/* Missing-files / generation UI exists only once a source project is
+              chosen. Before that the slots are empty for the trivial reason that
+              there is no recipe yet, so announcing "Missing essential files:
+              compose, nginx config, env files" and offering a generation prompt
+              is noise about a state the operator has not entered. */}
+          {!selectedServiceName ? null : checkingMissing ? (
             <div style={{padding:'8px 0'}}><Spin size="small" /> <span style={{fontSize:12,color:'#999'}}>Checking deployment readiness...</span></div>
           ) : checkError ? (
             <Alert type="error"
@@ -1868,12 +1888,11 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
               }
               style={{marginBottom:12}}
             />
-          ) : selectedServiceName ? (
+          ) : (
             <Alert type="success"
               message="All necessary files are specified, ready for deployment"
-              description={renderGenerationPrompt()}
               style={{marginBottom:12}} />
-          ) : null}
+          )}
 
           {/* ---- Generated File Editor Modal (Monaco) ---- */}
           <Modal
@@ -1906,7 +1925,117 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
             </div>
           </Modal>
 
-          {/* ---- Global Proxy ---- */}
+          {/* ---- Additional params (optional deploy inputs) ---- */}
+          {/* Hidden until a source project is chosen: both lists are derived
+              from that recipe's compose and mean nothing without one. */}
+          {selectedServiceName && (
+            <>
+              <Divider plain>Additional params</Divider>
+              <Collapse
+                size="small"
+                ghost
+                // Opening the section mounts its Form.List — fill the rows now,
+                // not only when the preview response arrived.
+                onChange={(keys) => {
+                  if ((keys as string[]).includes('volumes')) setTimeout(applyVolumeRows, 0)
+                }}
+                items={[
+                  {
+                    key: 'volumes',
+                    label: 'Volume Mapping (optional)',
+                    // The Form.List must exist BEFORE the auto-fill runs: a
+                    // collapsed Collapse does not mount its children, and the fill
+                    // effect then set values on a list that had no fields — the
+                    // section opened empty (measured 2026-10-24).
+                    forceRender: true,
+                    children: (
+                      !volumePreviewed ? (
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          Select a compose file to preview the mount table.
+                        </Text>
+                      ) : (
+                      <Form.List name="volumes">
+                        {(fields, { add }) => {
+                          volumeAddRef.current = add
+                          // A real mount TABLE: sub-service | host path : container
+                          // path. The key is the deploy's override-map entry and is
+                          // kept hidden; the operator edits only the host path.
+                          const COLS = '120px 1fr 16px 140px'
+                          return (
+                            <>
+                              <div style={{ display: 'grid', gridTemplateColumns: COLS, gap: 8, marginBottom: 4 }}>
+                                <Text type="secondary" style={{ fontSize: 12 }}>sub-service</Text>
+                                <Text type="secondary" style={{ fontSize: 12 }}>host path</Text>
+                                <span />
+                                <Text type="secondary" style={{ fontSize: 12 }}>container path</Text>
+                              </div>
+                              {fields.map(({ key, name, ...rest }) => (
+                                <div key={key} style={{ display: 'grid', gridTemplateColumns: COLS, gap: 8, alignItems: 'center', marginBottom: 8 }}>
+                                  <Form.Item {...rest} name={[name, 'key']} hidden><Input /></Form.Item>
+                                  <Form.Item noStyle shouldUpdate>
+                                    {() => {
+                                      const rows = form.getFieldValue('volumes') || []
+                                      return (
+                                        <Text code style={{ fontFamily: 'monospace' }}>
+                                          {(rows[name] || {}).service || '—'}
+                                        </Text>
+                                      )
+                                    }}
+                                  </Form.Item>
+                                  <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Host path' }]} style={{ marginBottom: 0 }}>
+                                    <Input placeholder="/srv/provision/user-data/alice/app" />
+                                  </Form.Item>
+                                  <span style={{ textAlign: 'center' }}>:</span>
+                                  <Form.Item noStyle shouldUpdate>
+                                    {() => {
+                                      const rows = form.getFieldValue('volumes') || []
+                                      return (
+                                        <Text code style={{ fontFamily: 'monospace' }}>
+                                          {(rows[name] || {}).target || '—'}
+                                        </Text>
+                                      )
+                                    }}
+                                  </Form.Item>
+                                </div>
+                              ))}
+                            </>
+                          )
+                        }}
+                      </Form.List>
+                      )
+                    ),
+                  },
+                  {
+                    key: 'build_args',
+                    label: 'Build Args (optional)',
+                    children: (
+                      <Form.List name="build_args">
+                        {(fields, { add, remove }) => (
+                          <>
+                            {fields.map(({ key, name, ...rest }) => (
+                              <Space key={key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
+                                <Form.Item {...rest} name={[name, 'key']} rules={[{ required: true, message: 'Arg name' }]}>
+                                  <Input placeholder="HTTP_PROXY" style={{ width: 180 }} />
+                                </Form.Item>
+                                <span>→</span>
+                                <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Arg value' }]}>
+                                  <Input placeholder="http://proxy:8080" style={{ width: 320 }} />
+                                </Form.Item>
+                                <Button type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(name)} />
+                              </Space>
+                            ))}
+                            <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>Add Build Arg</Button>
+                          </>
+                        )}
+                      </Form.List>
+                    ),
+                  },
+                ]}
+              />
+            </>
+          )}
+
+          {/* ---- Global Proxy (below Additional params) ---- */}
           <Form.Item name="use_global_proxy" valuePropName="checked">
             <Checkbox disabled={!proxyEnabled} onChange={() => { proxyTouchedRef.current = true }}>
               <GlobalOutlined /> Use global proxy for this deployment
@@ -1915,120 +2044,9 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
             </Checkbox>
           </Form.Item>
 
-          {/* Exactly ONE blank line above Volume Mapping: the hidden cert fields
-              now live outside this Space (they used to add zero-height Space
-              rows), so the Space's own 16px gap is the single separator. */}
-          <Collapse
-            size="small"
-            ghost
-            // Opening the section mounts its Form.List — fill the rows now,
-            // not only when the preview response arrived.
-            onChange={(keys) => {
-              if ((keys as string[]).includes('volumes')) setTimeout(applyVolumeRows, 0)
-            }}
-            items={[
-              {
-                key: 'volumes',
-                label: 'Volume Mapping (optional)',
-                // The Form.List must exist BEFORE the auto-fill runs: a
-                // collapsed Collapse does not mount its children, and the fill
-                // effect then set values on a list that had no fields — the
-                // section opened empty (measured 2026-10-24).
-                forceRender: true,
-                children: (
-                  !volumePreviewed ? (
-                    <Text type="secondary" style={{ fontSize: 12 }}>
-                      Select a compose file to preview the mount table.
-                    </Text>
-                  ) : (
-                  <Form.List name="volumes">
-                    {(fields, { add }) => {
-                      volumeAddRef.current = add
-                      // A real mount TABLE: sub-service | host path : container
-                      // path. The key is the deploy's override-map entry and is
-                      // kept hidden; the operator edits only the host path.
-                      const COLS = '120px 1fr 16px 140px'
-                      return (
-                        <>
-                          <div style={{ display: 'grid', gridTemplateColumns: COLS, gap: 8, marginBottom: 4 }}>
-                            <Text type="secondary" style={{ fontSize: 12 }}>sub-service</Text>
-                            <Text type="secondary" style={{ fontSize: 12 }}>host path</Text>
-                            <span />
-                            <Text type="secondary" style={{ fontSize: 12 }}>container path</Text>
-                          </div>
-                          {fields.map(({ key, name, ...rest }) => (
-                            <div key={key} style={{ display: 'grid', gridTemplateColumns: COLS, gap: 8, alignItems: 'center', marginBottom: 8 }}>
-                              <Form.Item {...rest} name={[name, 'key']} hidden><Input /></Form.Item>
-                              <Form.Item noStyle shouldUpdate>
-                                {() => {
-                                  const rows = form.getFieldValue('volumes') || []
-                                  return (
-                                    <Text code style={{ fontFamily: 'monospace' }}>
-                                      {(rows[name] || {}).service || '—'}
-                                    </Text>
-                                  )
-                                }}
-                              </Form.Item>
-                              <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Host path' }]} style={{ marginBottom: 0 }}>
-                                <Input placeholder="/srv/provision/user-data/alice/app" />
-                              </Form.Item>
-                              <span style={{ textAlign: 'center' }}>:</span>
-                              <Form.Item noStyle shouldUpdate>
-                                {() => {
-                                  const rows = form.getFieldValue('volumes') || []
-                                  return (
-                                    <Text code style={{ fontFamily: 'monospace' }}>
-                                      {(rows[name] || {}).target || '—'}
-                                    </Text>
-                                  )
-                                }}
-                              </Form.Item>
-                            </div>
-                          ))}
-                        </>
-                      )
-                    }}
-                  </Form.List>
-                  )
-                ),
-              },
-              {
-                key: 'build_args',
-                label: 'Build Args (optional)',
-                children: (
-                  <Form.List name="build_args">
-                    {(fields, { add, remove }) => (
-                      <>
-                        {fields.map(({ key, name, ...rest }) => (
-                          <Space key={key} style={{ display: 'flex', marginBottom: 8 }} align="baseline">
-                            <Form.Item {...rest} name={[name, 'key']} rules={[{ required: true, message: 'Arg name' }]}>
-                              <Input placeholder="HTTP_PROXY" style={{ width: 180 }} />
-                            </Form.Item>
-                            <span>→</span>
-                            <Form.Item {...rest} name={[name, 'value']} rules={[{ required: true, message: 'Arg value' }]}>
-                              <Input placeholder="http://proxy:8080" style={{ width: 320 }} />
-                            </Form.Item>
-                            <Button type="text" danger icon={<MinusCircleOutlined />} onClick={() => remove(name)} />
-                          </Space>
-                        ))}
-                        <Button type="dashed" onClick={() => add()} block icon={<PlusOutlined />}>Add Build Arg</Button>
-                      </>
-                    )}
-                  </Form.List>
-                ),
-              },
-            ]}
-          />
-
           <Space style={{ justifyContent: 'flex-end', width: '100%' }}>
-            <Button onClick={onClose}>Cancel</Button>
             {fileSetLoading && (
               <Text type="secondary" style={{ fontSize: 12 }}><Spin size="small" /> Loading file selection…</Text>
-            )}
-            {!fileSetLoading && (fileSetCandidates.compose || []).length > 0 && effectiveSelection().compose.length === 0 && (
-              <Text type="warning" style={{ fontSize: 12 }}>
-                Select at least one compose file — deploying with an empty selection skips env generation.
-              </Text>
             )}
             {/* G57 — profiles are OPTIONAL: no `--profile` is the compose CLI
                 default and a complete, legitimate deployment. Say which
@@ -2055,22 +2073,15 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
               // then fails with "already registered", which is the collision the label work exists
               // to prevent. The field already shows a spinner while computing; the button must
               // agree with it.
-              // Both "no compose" clauses are waived on a GUIDED RESTART
-              // (`fixingGuide`): there, a compose left at `generate new` is the
-              // OPERATOR'S INSTRUCTION to regenerate the very file the analysis
-              // found fault with. The clauses exist to catch a forgotten
-              // selection — applying them here blocks the one action the whole
-              // analysis step exists to enable. Found live in T13: `check`
-              // opened the panel with the guide pre-filled and Deploy sat
-              // disabled with no way forward.
+              // An empty compose slot is NOT a reason to disable Deploy: the
+              // gateway's generation path produces the compose (as it does for
+              // any other empty slot), so Deploy is how the operator asks for it.
               disabled={!selectedUserName || !selectedServiceName || !!checkError || fileSetLoading
                 || computingLabel
                 // F4/S14 — TLS on with no certificate selected: no trusted
                 // domain, so Deploy is visibly disabled. Read from the FORM
                 // watcher, not the stale `httpsEnabled` state.
-                || (httpsOn && !watchedSslDomain)
-                || (!fixingGuide && !fileSetLoading && (fileSetCandidates.compose || []).length > 0 && effectiveSelection().compose.length === 0)
-                || (!fixingGuide && missingFiles.length > 0 && Object.keys(generatedFiles).length === 0 && effectiveSelection().compose.length === 0)}>
+                || (httpsOn && !watchedSslDomain)}>
               Deploy
             </Button>
           </Space>
@@ -2084,31 +2095,23 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
             <Alert type="info" showIcon style={{ marginTop: 8 }}
               message="Select a user and a service to deploy." />
           )}
-          {/* GUIDED RESTART (`fixingGuide`) is WAIVED here exactly as it is on the
-              Deploy button (see the disabled condition above): the analysis
-              deliberately empties the faulty slot so the pipeline regenerates it,
-              and Deploy stays enabled for that to work. This alert's condition did
-              not carry the waiver, so a live `check` (G26 row 5) showed "No compose
-              file is selected … Pick a compose above to deploy" next to an ENABLED
-              Deploy — the message asserted the opposite of what the button does.
-              Found live in the consolidated round (deviation 4). Suppress it in
-              fixing mode; the (pre-filled) guide in the prompt is the real signal. */}
+          {/* Informational only: an empty compose slot does not block Deploy,
+              because the pipeline generates one. Say which empty-compose state
+              this is (stale files vs. nothing stored) so the operator knows
+              whether picking a file is a repair or just a preference. Suppressed
+              in fixing mode, where the pre-filled guide is the real signal. */}
           {!loading && selectedUserName && selectedServiceName && !fileSetLoading && !computingLabel && !fixingGuide
             && (fileSetCandidates.compose || []).length > 0 && effectiveSelection().compose.length === 0 && (
-            <Alert type="warning" showIcon style={{ marginTop: 8 }}
+            <Alert type="info" showIcon style={{ marginTop: 8 }}
               message="No compose file is selected for this deployment"
-              // Two very different causes reach this same alert, so it must not
-              // assert one of them. The condition is "candidates exist but none
-              // is selected", which covers BOTH a stored selection whose files
-              // vanished AND a recipe that simply has no stored selection yet.
-              // It used to claim the first unconditionally — telling the operator
-              // to hunt for "stale entries tagged in the picker" on a brand-new
-              // recipe where nothing is stale and none exist. Found live in
-              // Round 34 while deploying a fresh fixture (defect 12).
+              // An empty compose slot does not block Deploy: the gateway's
+              // generation path creates the compose. The two causes still read
+              // differently, because the remedy (a pick vs. a new generation)
+              // differs — but neither one is a reason the button is disabled.
               description={
                 ((fileSetStale || {}).compose || []).length > 0
-                  ? 'The stored selection names files that no longer exist (they may have been converted to .j2 templates or removed). Pick a compose above — the stale entries are tagged in the picker.'
-                  : 'This recipe has no stored selection yet. Pick a compose above to deploy.'
+                  ? 'The stored selection names files that no longer exist (they may have been converted to .j2 templates or removed). Deploy will generate a new compose with the pipeline; pick a file above to use an existing one instead.'
+                  : 'This recipe has no stored selection yet. Deploy will generate a compose with the pipeline; pick a file above to use an existing one instead.'
               } />
           )}
         </Space>
