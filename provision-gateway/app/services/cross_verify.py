@@ -108,7 +108,7 @@ def resolve_source(source_ip: str) -> dict | None:
                 "  JOIN registry.api_users a ON a.id = s.owner_api_user_id "
                 "  JOIN registry.service_instances i ON i.service_id = s.id "
                 " WHERE s.deleted_at IS NULL "
-                "   AND i.status = 'running' "
+                "   AND i.status IN ('running', 'building') "
                 "   AND i.container_names @> ARRAY[:name]::text[]"
             ),
             {"name": name},
@@ -144,19 +144,24 @@ def decide(db: Session, source: dict | None, target: dict | None) -> dict:
     if source_user is None or not acl_service.account_live(source_user):
         return {"allowed": False, "status": 403,
                 "reason": "source owner account is not active"}
-    if source_owner == target_owner:
-        return {"allowed": True, "reason": "same_owner"}
-    target_user = _gateway_user(db, target_owner)
-    if target_user is None:
-        return {"allowed": False, "status": 403, "reason": "owner account missing"}
-    # G84 — every cross-owner target, public or private, needs the explicit
-    # row. Public is never an implicit allow.
+    source_status = str(source.get("status") or "")
+    if source_status not in ("running", "building"):
+        return {"allowed": False, "status": 403, "reason": "source not live"}
+    # G102 — every allowance, same-owner included, needs the explicit row; a
+    # `building` source is authorized only by that row (R4.5/AC9).
     row = db.query(ServiceGrant).filter(
         ServiceGrant.source_service_id == source["service_id"],
         ServiceGrant.target_service_id == target["service_id"],
     ).first()
     if row is None:
         return {"allowed": False, "status": 403, "reason": "no service grant"}
+    if source_owner == target_owner:
+        return {"allowed": True, "reason": "same_owner"}
+    target_user = _gateway_user(db, target_owner)
+    if target_user is None:
+        return {"allowed": False, "status": 403, "reason": "owner account missing"}
+    # G84 — the explicit row was found above; the account prerequisite still
+    # applies to a private target (waived while the target owner is public).
     # G84 — the account prerequisite is waived for a public target (a public
     # functional user is reachable by every user at the user level). The waiver
     # is evaluated LIVE: an owner that stops being public/live falls through to

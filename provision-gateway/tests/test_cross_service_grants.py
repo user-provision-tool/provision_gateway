@@ -62,9 +62,23 @@ def _no_account_service(monkeypatch):
     cross_values.reset()
 
 
-def test_same_owner_is_allowed():
-    result = cross_verify.decide(_Db(), _source("o"), _target("o"))
+def test_same_owner_is_allowed_with_an_explicit_row():
+    result = cross_verify.decide(_Db(grant_row=object()), _source("o"), _target("o"))
     assert result["allowed"] and result["reason"] == "same_owner"
+
+
+def test_same_owner_without_a_row_is_denied():
+    result = cross_verify.decide(_Db(), _source("o"), _target("o"))
+    assert not result["allowed"] and result["status"] == 403
+    assert "no service grant" in result["reason"]
+
+
+def test_building_source_is_allowed_only_with_a_row():
+    building = _source("o")
+    building["status"] = "building"
+    assert cross_verify.decide(_Db(grant_row=object()), building, _target("o"))["allowed"]
+    denied = cross_verify.decide(_Db(), building, _target("o"))
+    assert not denied["allowed"] and "no service grant" in denied["reason"]
 
 
 def test_deactivated_source_owner_is_denied_even_for_same_owner(monkeypatch):
@@ -298,15 +312,15 @@ def test_targeted_sync_touches_only_the_affected_source(monkeypatch):
                            if entry and entry["service_id"] == "source-1" else []))
     monkeypatch.setattr(co.service_grants, "live", lambda entry: True)
 
-    async def fake_apply(service_id, present, *, resolver_ip=None):
-        calls.append((service_id, present, resolver_ip))
+    async def fake_apply(service_id, present, *, resolver_name=None):
+        calls.append((service_id, present, resolver_name))
         return {"ok": True, "outcome": "ok", "reason": None}
 
     monkeypatch.setattr(orch, "_apply", fake_apply)
     result = asyncio.run(orch.sync_source("source-1"))
 
     assert result["applied"] == 1
-    assert calls == [("source-1", True, "172.28.0.3")]
+    assert calls == [("source-1", True, settings.CROSS_RESOLVER_NAME)]
     # The other stale source is the global reconciler's job, not this click's.
     assert all(service_id != "other-1" for service_id, _p, _r in calls)
 
@@ -331,7 +345,7 @@ def test_targeted_sync_surfaces_a_deferred_outcome(monkeypatch):
     monkeypatch.setattr(co.service_grants, "targets_for",
                         lambda db, entry: [{"service_id": "target-1"}])
 
-    async def deferred_apply(service_id, present, *, resolver_ip=None):
+    async def deferred_apply(service_id, present, *, resolver_name=None):
         return {"ok": False, "outcome": "deferred",
                 "reason": "the task queue refused the update (queue_unavailable); "
                           "the next sync cycle retries it"}
@@ -365,7 +379,7 @@ def test_targeted_sync_clears_a_stopped_source_whose_relationship_ended(monkeypa
     monkeypatch.setattr(co.service_grants, "entries_by_id", lambda: entries)
     monkeypatch.setattr(co.service_grants, "targets_for", lambda db, entry: [])
 
-    async def fake_apply(service_id, present, *, resolver_ip=None):
+    async def fake_apply(service_id, present, *, resolver_name=None):
         calls.append((service_id, present))
         return {"ok": True, "outcome": "ok", "reason": None}
 
@@ -385,7 +399,7 @@ def test_global_reconciler_diffs_stored_pairs_without_http_reads(monkeypatch):
     orch = CrossOrchestrator()
     entries = {
         "s1": {"service_id": "s1", "status": "running",
-               "extra_resolver": "172.28.0.3",
+               "extra_resolver": settings.CROSS_RESOLVER_NAME,
                "extra_network": settings.CROSS_NETWORK},
         "s2": {"service_id": "s2", "status": "running",
                "extra_resolver": "old", "extra_network": "old"},
@@ -404,7 +418,7 @@ def test_global_reconciler_diffs_stored_pairs_without_http_reads(monkeypatch):
     monkeypatch.setattr(co.service_grants, "entries_by_id", lambda: entries)
     monkeypatch.setattr(co.service_grants, "live", lambda entry: True)
 
-    async def fake_apply(service_id, present, *, resolver_ip=None):
+    async def fake_apply(service_id, present, *, resolver_name=None):
         applied.append((service_id, present))
         return {"ok": True, "outcome": "ok", "reason": None}
 

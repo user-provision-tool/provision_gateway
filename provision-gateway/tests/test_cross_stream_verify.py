@@ -76,14 +76,29 @@ def _stream(db, entry=None, handle="handle.localhost"):
         "172.28.0.21", handle, db, _Registry(entry or _entry()))
 
 
-def test_same_owner_is_allowed_and_returns_the_hop_fields(monkeypatch):
+def test_same_owner_with_a_row_is_allowed_and_returns_the_hop_fields(monkeypatch):
     monkeypatch.setattr(cross_verify, "_stream_target",
                         lambda db, registry, handle: (_row(), _entry(owner="owner-a"), None))
-    result = _stream(_Db())
+
+    class _GrantDb(_Db):
+        def query(self, model):
+            from app.models.service_grant import ServiceGrant
+            if model is ServiceGrant:
+                return _Query(object())
+            return super().query(model)
+
+    result = _stream(_GrantDb())
     assert result["allowed"] and result["reason"] == "same_owner"
     assert result["canonical_name"] == "target--neo4j.localhost"
     assert result["port"] == 7687
     assert result["inner_port"] == 7687
+
+
+def test_same_owner_without_a_row_is_denied(monkeypatch):
+    monkeypatch.setattr(cross_verify, "_stream_target",
+                        lambda db, registry, handle: (_row(), _entry(owner="owner-a"), None))
+    result = _stream(_Db())
+    assert not result["allowed"] and "no service grant" in result["reason"]
 
 
 def test_public_target_with_a_row_is_allowed_without_an_account_grant(monkeypatch, tmp_path):

@@ -136,7 +136,10 @@ def targets_for(db: Session, source: dict, entries: list[dict] | None = None) ->
         if str(target["service_id"]) == str(source["service_id"]):
             continue
         if same_owner(source, target):
-            out.append(_target_row(target, REASON_SAME_OWNER))
+            # G102 — same-owner is no longer implicit: it enters the effective
+            # set only through an explicit row, exactly like a cross-owner one.
+            if str(target["service_id"]) in explicit:
+                out.append(_target_row(target, REASON_SAME_OWNER))
             continue
         if str(target["service_id"]) not in explicit:
             continue
@@ -204,12 +207,11 @@ def set_grant(db: Session, source_id: str, target_id: str,
         raise ValueError("a service cannot call itself")
     if not live(source) or not live(target):
         raise ValueError("both services must be running to grant the call")
-    if same_owner(source, target):
-        raise ValueError("same-owner targets are implicit — no grant row is needed")
     target_user = user_for(db, target)
     # G84 — a public target is grantable without the account prerequisite; a
-    # private target still needs the active account relation.
-    if not is_public_target(db, target):
+    # private target still needs the active account relation.  G102 — a
+    # same-owner target is an ordinary row and needs neither check.
+    if not same_owner(source, target) and not is_public_target(db, target):
         source_user = user_for(db, source)
         if source_user is None or target_user is None:
             raise ValueError("both owner accounts must have a gateway account")
@@ -232,6 +234,56 @@ def set_grant(db: Session, source_id: str, target_id: str,
     return row.to_dict()
 
 
+def ensure_grant(db: Session, source_id: str, target_id: str,
+                 actor_user_id=None) -> dict:
+    """The deploy's pre-start, add-only grant row (G102 R3.1/R3.6).
+
+    Unlike :func:`set_grant` this path has **no running check**: it is called
+    after registration and before the source's app containers start, when the
+    source is still ``building``.  The relationship follows the services, not
+    their runtime state, so a stopped target is still grantable.  It never
+    removes a row and is idempotent by the unique pair.
+
+    Accessibility is checked at write time: the target must exist (the reader
+    excludes tombstones) and be public or have an active account grant —
+    same-owner needs neither.  A refusal raises ``ValueError``; the caller
+    reports it without failing the deploy.
+    """
+    entries = entries_by_id()
+    source = entries.get(str(source_id))
+    target = entries.get(str(target_id))
+    if source is None:
+        raise ValueError("source service not found")
+    if target is None:
+        raise ValueError("target service not found")
+    if str(source_id) == str(target_id):
+        raise ValueError("a service cannot call itself")
+    if not same_owner(source, target) and not is_public_target(db, target):
+        source_user = user_for(db, source)
+        target_user = user_for(db, target)
+        if source_user is None or target_user is None:
+            raise ValueError("both owner accounts must have a gateway account")
+        if not acl_service.allows(db, source_user, target_user.id):
+            raise ValueError(
+                "the source owner has no active account grant for the target owner — "
+                "assign that account grant first"
+            )
+    row = explicit_row(db, str(source_id), str(target_id))
+    created = False
+    if row is None:
+        row = ServiceGrant(
+            source_service_id=source_id, target_service_id=target_id,
+            created_by=actor_user_id, created_at=_now(), updated_at=_now(),
+        )
+        db.add(row)
+        created = True
+    else:
+        row.updated_at = _now()
+    db.commit()
+    db.refresh(row)
+    return {"created": created, "row": row.to_dict()}
+
+
 def remove_grant(db: Session, source_id: str, target_id: str) -> bool:
     row = explicit_row(db, str(source_id), str(target_id))
     if row is None:
@@ -251,8 +303,10 @@ def _stale_reason(db: Session, source: dict, target: dict | None,
     """
     if target is None:
         return STALE_TARGET_DELETED
+    # G102 — a same-owner row is an ordinary, effective row: target existence
+    # is the only condition.  (The old STALE_IMPLICIT state no longer exists.)
     if same_owner(source, target):
-        return STALE_IMPLICIT
+        return None
     if is_public_target(db, target):
         return None
     target_user = user_for(db, target)
@@ -265,7 +319,6 @@ def _stale_reason(db: Session, source: dict, target: dict | None,
 _STALE_MESSAGES = {
     STALE_TARGET_DELETED: "no longer permitted: the target service was deleted",
     STALE_ACCOUNT_MISSING: "no longer permitted: the source owner has no active account grant",
-    STALE_IMPLICIT: "no longer permitted: same-owner targets are implicit",
     STALE_NOT_EFFECTIVE: "no longer permitted: the grant is not effective",
 }
 
@@ -425,9 +478,10 @@ def candidates(db: Session, source: dict) -> list[dict]:
         out.append({
             **_target_row(target, REASON_SAME_OWNER if same else ""),
             "explicit": str(target["service_id"]) in explicit,
-            # Same-owner is the ONLY implicit case now; a public target is a
-            # grantable candidate like a private one.
-            "implicit": same,
+            # G102 — no target is implicit any more; same-owner is an ordinary
+            # grantable candidate like a cross-owner one.
+            "implicit": False,
+            "same_owner": same,
             "is_public": public,
         })
     out.sort(key=lambda r: (r.get("user_name") or "", r.get("service_name") or "",
@@ -470,7 +524,9 @@ def account_candidates(db: Session, username: str) -> dict:
             group["reason"] = "public"
         group["services"].append({
             **_target_row(target, REASON_SAME_OWNER if same else ""),
-            "implicit": same,
+            # G102 — same-owner is shown as grantable, not implicit.
+            "implicit": False,
+            "same_owner": same,
             "is_public": public,
         })
     ordered = sorted(groups.values(),
@@ -507,7 +563,9 @@ def apply_set(db: Session, source_id: str, target_ids: list[str],
         if not live(target):
             raise ValueError(f"target service is not running: {target_id}")
         if same_owner(source, target):
-            continue  # implicit — no explicit row
+            # G102 — an ordinary row, written like any other.
+            desired.add(target_id)
+            continue
         if not is_public_target(db, target):
             target_user = user_for(db, target)
             source_user = user_for(db, source)

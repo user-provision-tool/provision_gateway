@@ -1,9 +1,9 @@
-"""G83/G84 — the service-grant matrix against the real (test) PostgreSQL store.
+"""G83/G84/G102 — the service-grant matrix against the real (test) PostgreSQL store.
 
-Same-owner is implicit. Every cross-owner target — public or private — needs an
-explicit grant (G84); a private one also needs an active account grant, a public
-one is waived. There is no transitivity; both services must be live. The
-effective/path set is same-owner + explicit only.
+Same-owner is explicit (G102): every target, same-owner included, needs a row.
+A cross-owner private target also needs an active account grant; a public one is
+waived. There is no transitivity; both services must be live for the admin
+editor. The effective/path set is explicit rows only.
 """
 
 from __future__ import annotations
@@ -95,17 +95,23 @@ def _account_grant(db, grantee: User, shared: User):
     db.commit()
 
 
-def test_same_owner_is_implicit():
+def test_same_owner_requires_an_explicit_row():
     db = SessionLocal()
     try:
         alice = _make_owner(db, "alice")
         _make_service(db, alice, "svc-a", "0")
-        _make_service(db, alice, "svc-b", "0")
+        b = _make_service(db, alice, "svc-b", "0")
         source = service_grants.entries_by_id()
         sid = next(s for s, e in source.items() if e["service_name"] == "svc-a")
+        # G102 — no row: the same-owner target is NOT in the effective set.
+        assert service_grants.targets_for(db, source[sid]) == []
+        result = service_grants.ensure_grant(db, sid, b)
+        assert result["created"] is True
         targets = service_grants.targets_for(db, source[sid])
         assert [t["service_name"] for t in targets] == ["svc-b"]
         assert targets[0]["reason"] == service_grants.REASON_SAME_OWNER
+        # Idempotent: a second write changes nothing.
+        assert service_grants.ensure_grant(db, sid, b)["created"] is False
     finally:
         db.close()
 
@@ -182,7 +188,7 @@ def test_no_transitivity_and_dead_target():
         db.close()
 
 
-def test_same_owner_never_takes_a_row_and_a_public_target_takes_one_without_account_grant():
+def test_same_owner_takes_an_ordinary_row_and_a_public_target_needs_no_account_grant():
     db = SessionLocal()
     try:
         alice = _make_owner(db, "alice")
@@ -190,11 +196,55 @@ def test_same_owner_never_takes_a_row_and_a_public_target_takes_one_without_acco
         a = _make_service(db, alice, "svc-a", "0")
         a2 = _make_service(db, alice, "svc-a2", "0")
         p = _make_service(db, pub, "public-svc", "0")
-        with pytest.raises(ValueError, match="same-owner"):
-            service_grants.set_grant(db, a, a2)
+        # G102 — same-owner is an ordinary row, accepted by set_grant.
+        row = service_grants.set_grant(db, a, a2)
+        assert row["target_service_id"] == a2
         # G84 — no ValueError for the public target; the row is created.
         row = service_grants.set_grant(db, a, p)
         assert row["target_service_id"] == p
+    finally:
+        db.close()
+
+
+def test_ensure_grant_does_not_require_the_target_to_run():
+    """G102 R3.1 — the pre-start write follows the relationship, not runtime."""
+    db = SessionLocal()
+    try:
+        alice = _make_owner(db, "alice")
+        a = _make_service(db, alice, "svc-a", "0")
+        b = _make_service(db, alice, "svc-b", "0", status="unknown")
+        result = service_grants.ensure_grant(db, a, b)
+        assert result["created"] is True
+        ids = {t["service_id"] for t in service_grants.targets_for(
+            db, service_grants.entries_by_id()[a])}
+        assert b in ids
+    finally:
+        db.close()
+
+
+def test_the_backfill_writes_ordinary_rows_both_directions():
+    """G102 R3.5/T7 — idempotent, no marker, stopped pairs included."""
+    from app.scripts.backfill_same_owner_grants import backfill
+
+    db = SessionLocal()
+    try:
+        alice = _make_owner(db, "alice")
+        _make_service(db, alice, "svc-a", "0")
+        _make_service(db, alice, "svc-b", "0", status="unknown")
+    finally:
+        db.close()
+    first = backfill()
+    assert first["created"] == 2 and not first["refused"]
+    second = backfill()
+    assert second["created"] == 0
+    db = SessionLocal()
+    try:
+        entries = service_grants.entries_by_id()
+        ids = list(entries)
+        a = next(s for s in ids if entries[s]["service_name"] == "svc-a")
+        b = next(s for s in ids if entries[s]["service_name"] == "svc-b")
+        assert service_grants.explicit_row(db, a, b) is not None
+        assert service_grants.explicit_row(db, b, a) is not None
     finally:
         db.close()
 
@@ -203,8 +253,12 @@ def test_reachable_domains_follow_the_effective_set():
     db = SessionLocal()
     try:
         alice = _make_owner(db, "alice")
-        _make_service(db, alice, "svc-a", "0", domain="localhost")
-        _make_service(db, alice, "svc-b", "0", domain="snaprovision.com")
+        a = _make_service(db, alice, "svc-a", "0", domain="localhost")
+        b = _make_service(db, alice, "svc-b", "0", domain="snaprovision.com")
+        # G102 — both directions need an ordinary row; only then do the
+        # domains enter the wildcard set.
+        service_grants.ensure_grant(db, a, b)
+        service_grants.ensure_grant(db, b, a)
         assert service_grants.reachable_domains(db) == {"localhost", "snaprovision.com"}
     finally:
         db.close()

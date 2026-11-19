@@ -159,9 +159,9 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   const [atCapacity, setAtCapacity] = useState<{ code: string; detail: string } | null>(null)
   const [sources, setSources] = useState<{ name: string; files: string[]; has_compose_template?: boolean; recipes?: { path: string; label: string; is_root: boolean; template_files: string[] }[] }[]>([])
   const [deployableUsers, setDeployableUsers] = useState<{id:string,username:string,label:string}[]>([])
-  // G86 — the folded allowed-services selector: services grouped by OWNER
-  // ACCOUNT, and only the accounts the deploying user can reach (own + active
-  // account grant + public). Same-owner is implicit and is not listed.
+  // G102 — the dependency picker: services grouped by OWNER ACCOUNT, and only
+  // the accounts the deploying user can reach (own + active account grant +
+  // public). Same-owner is listed like any other dependency.
   const [crossTargets, setCrossTargets] = useState<
     {key:string,label:string,options:{value:string,label:string}[]}[]
   >([])
@@ -506,11 +506,11 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
     } catch { /* ignore */ }
   }
 
-  // G86 — the deploy panel's allowed-services picker, grouped by owner account
-  // and guarded exactly like the service card's `Can call` picker: only the
-  // deploying user's own account (same-owner, implicit — never listed), accounts
-  // with an active account grant, and public accounts. The grant rows are
-  // written after the deploy completes; the gateway validates the same rule.
+  // G102 — the deploy panel's dependency picker, grouped by owner account and
+  // guarded exactly like the service card's `Can call` picker: the deploying
+  // user's own account (same-owner is included), accounts with an active
+  // account grant, and public accounts. The selection is the deploy's
+  // dependency intent; the gateway writes the grant rows before the app starts.
   const loadCrossTargets = async (usernameArg?: string) => {
     const username = usernameArg || form.getFieldValue('user_name')
     if (!username) { setCrossTargets([]); return }
@@ -532,9 +532,9 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
       const groups: {key:string,label:string,options:{value:string,label:string}[]}[] = []
       for (const group of (servicesData.users || [])) {
         const owner = group.user_name || group.owner_username || ''
-        // Same-owner targets are implicit — no row is ever taken for them.
-        if (!owner || owner === username) continue
-        if (!(activeShared.has(owner) || group.is_public === true)) continue
+        // G102 — same-owner targets are listed like any other dependency.
+        if (!owner) continue
+        if (!(owner === username || activeShared.has(owner) || group.is_public === true)) continue
         const options: {value:string,label:string}[] = []
         for (const bucket of ['healthy_services','unhealthy_services','missing_services','failed_services']) {
           for (const svc of (group[bucket] || [])) {
@@ -1203,10 +1203,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
           if (a.key && a.value) payload.build_args[a.key] = a.value
         }
       }
-      // G83 — the folded allowed-services selector; the gateway writes the
-      // grant rows after the deploy task finishes.
-      if (snap.allowed_target_service_ids && snap.allowed_target_service_ids.length > 0) {
-        payload.allowed_target_service_ids = snap.allowed_target_service_ids
+      // G102 — the dependency selection; the gateway writes the pre-start
+      // grant rows and starts the app after the resolver sync.
+      if (snap.dependency_service_ids && snap.dependency_service_ids.length > 0) {
+        payload.dependency_service_ids = snap.dependency_service_ids
       }
 
       const { data } = await client.post('/services/deploy', payload)
@@ -1707,27 +1707,27 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
             </>
           )}
 
-          {/* ---- Allowed services (own section, never folded) ---- */}
+          {/* ---- Dependencies (own section, never folded) ---- */}
           {selectedServiceName && (
             <>
-              <Divider plain>Allowed services (cross-service calls)</Divider>
-              <Form.Item name="allowed_target_service_ids" style={{ marginBottom: 8 }}>
+              <Divider plain>Dependencies (services this one calls)</Divider>
+              <Form.Item name="dependency_service_ids" style={{ marginBottom: 8 }}>
                 <Select
                   mode="multiple"
                   allowClear
                   showSearch
                   optionFilterProp="label"
-                  placeholder="None — same-owner targets are implicit"
+                  placeholder="None"
                   options={crossTargets}
                 />
               </Form.Item>
               <div style={{ fontSize: 12, color: '#999' }}>
-                The new service may call the selected services. Only accounts
-                this user can reach are listed (an active account grant, or a
-                public account); same-owner targets are implicit and never
-                listed. A cross-owner target always needs this row; a private
-                one also needs the active account grant. The grant rows are
-                written after the deploy completes.
+                The services this deploy depends on. Only accounts this user can
+                reach are listed (their own, an active account grant, or a
+                public account). Each selected dependency gets an ordinary grant
+                row before the app starts; a private target also needs the
+                active account grant. The env-generation model uses the
+                selection to classify which env vars point at which service.
               </div>
             </>
           )}

@@ -29,21 +29,26 @@ stop_dnsmasq() {
 
 trap 'stop_dnsmasq; exit 0' TERM INT
 
-last=""
+conf_hash() {
+    if [ -f "$CONF" ]; then
+        md5sum "$CONF" 2>/dev/null | awk '{print $1}'
+    else
+        echo missing
+    fi
+}
+
 start_dnsmasq
-last=$(stat -c %Y "$CONF" 2>/dev/null || echo missing)
-last_exists=0
-[ -f "$CONF" ] && last_exists=1
+last=$(conf_hash)
 
 while true; do
     sleep 1
-    exists=0
-    [ -f "$CONF" ] && exists=1
-    current=$(stat -c %Y "$CONF" 2>/dev/null || echo missing)
-    if [ "$current" != "$last" ] || [ "$exists" != "$last_exists" ]; then
+    current=$(conf_hash)
+    # G101/C67 — compare the config CONTENT, not the whole-second mtime: two
+    # writes inside one second must both be seen, and an atomic replace with
+    # identical content is a no-op.
+    if [ "$current" != "$last" ]; then
         last="$current"
-        last_exists="$exists"
-        echo "[cross-resolver] config changed; restarting dnsmasq" >&2
+        echo "[cross-resolver] config content changed; restarting dnsmasq" >&2
         stop_dnsmasq
         start_dnsmasq
     fi

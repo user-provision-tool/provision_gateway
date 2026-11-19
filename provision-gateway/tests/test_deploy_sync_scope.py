@@ -15,15 +15,24 @@ class _FakeSession:
 def _patch(monkeypatch):
     from app.services import cross_orchestrator as co
     from app.services import deploy_workflow as dw
+    from app.services import provision_service as ps_mod
     from app.services import registry_tasks, service_grants
 
-    calls = {"sync_source": [], "sync_all": 0, "retry": [], "grants": []}
+    calls = {"sync_source": [], "sync_all": 0, "retry": [], "grants": [],
+             "start": []}
     monkeypatch.setattr(dw, "SessionLocal", lambda: _FakeSession())
+    monkeypatch.setattr(dw, "PRE_START_SYNC_WAIT_S", 0)
     monkeypatch.setattr(
         registry_tasks, "get", lambda task_id: {"status": "completed"})
     monkeypatch.setattr(
-        service_grants, "set_grant",
-        lambda db, source, target, actor_user_id=None: calls["grants"].append((source, target)))
+        service_grants, "ensure_grant",
+        lambda db, source, target, actor_user_id=None:
+            calls["grants"].append((source, target)) or {"created": True})
+
+    async def fake_start(service_id):
+        calls["start"].append(service_id)
+
+    monkeypatch.setattr(ps_mod.provision_service, "start_instance", fake_start)
 
     async def fake_sync_source(sid):
         calls["sync_source"].append(sid)

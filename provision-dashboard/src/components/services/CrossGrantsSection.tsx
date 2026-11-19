@@ -84,13 +84,12 @@ export default function CrossGrantsSection({
     return null
   }
 
-  // G86 — group the grantable candidates by owner account. Same-owner entries
-  // are implicit (no row is ever taken for them), so they are not offered in
-  // the editor; the effective list above still shows them.
+  // G102 — group the grantable candidates by owner account.  Same-owner entries
+  // are ordinary, grantable rows too: they are offered in the editor like any
+  // cross-owner candidate.
   const groups: { key: string; label: string; options: { value: string; label: string }[] }[] = []
   const byAccount = new Map<string, { key: string; label: string; options: { value: string; label: string }[] }>()
   for (const c of candidates) {
-    if (c.implicit) continue
     const key = c.user_name || '(unknown)'
     let group = byAccount.get(key)
     if (!group) {
@@ -207,9 +206,9 @@ export default function CrossGrantsSection({
           )}
           <div style={{ fontSize: 12, color: '#999', marginTop: 4 }}>
             Only accounts this owner can reach are listed (own, an active
-            account grant, or a public account). Same-owner targets are implicit
-            and are never listed here. A cross-owner target always needs this
-            row; a private one also needs an active account grant.
+            account grant, or a public account). Every target, same-owner
+            included, needs this row; a private target also needs an active
+            account grant.
           </div>
         </div>
       )}

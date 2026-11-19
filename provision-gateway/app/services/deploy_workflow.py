@@ -35,6 +35,7 @@ _log = logging.getLogger("gateway.deploy_workflow")
 # (the follow-up grants need it) and stripped by `_api_payload`.
 _GATEWAY_ONLY = {
     "selection", "prompt", "env_reference", "allowed_target_service_ids",
+    "dependency_service_ids",
     "use_global_proxy", "fix", "job_type", "owner_username",
     "skip_env", "category", "service_value", "_actor_user_id",
     # §14.3 — the LLM env guard flag travels with the deploy request/session
@@ -50,6 +51,11 @@ _RECORD_STRIP = {
 }
 
 LIVE_JOB_STATUSES = ("queued", "running", "unknown")
+
+# G101/C67 — the cross-resolver supervisor compares the config content on a
+# one-second poll; the start waits this long after the grant-driven sync so the
+# app's first call sees the new wildcard.
+PRE_START_SYNC_WAIT_S = 1.2
 
 
 class WorkflowError(ValueError):
@@ -231,6 +237,11 @@ def _generation_request(intent: dict, selection: dict) -> dict:
         "use_global_proxy": bool(intent.get("use_global_proxy")),
         "service_id": intent.get("service_id"),
         "owner_api_user_id": intent.get("owner_api_user_id"),
+        # G102 — the classifier's context travels with the generation request.
+        "dependency_service_ids": [
+            str(x) for x in (intent.get("dependency_service_ids")
+                             or intent.get("allowed_target_service_ids") or []) if x
+        ],
         **({"fix": True} if intent.get("fix") else {}),
     }
 
@@ -275,6 +286,21 @@ def _api_payload(intent: dict, selection: dict, env_name: str | None) -> dict:
     payload["profiles"] = list(selection.get("profiles") or [])
     if not payload["profiles"]:
         payload.pop("profiles", None)
+
+    # G101/G102 — a deploy with dependencies is prepared in one step and
+    # started in another: the register payload carries the cross resolver
+    # NAME/network so the -api configures the proxy before the app starts; the
+    # deploy workflow writes the pre-start grant rows and then calls start.
+    dep_ids = [str(x) for x in (intent.get("dependency_service_ids")
+                                or intent.get("allowed_target_service_ids") or []) if x]
+    if dep_ids:
+        payload["extra_resolver"] = settings.CROSS_RESOLVER_NAME
+        payload["extra_network"] = settings.CROSS_NETWORK
+        payload["prepare"] = True
+    else:
+        payload.pop("extra_resolver", None)
+        payload.pop("extra_network", None)
+        payload["prepare"] = False
     return payload
 
 
@@ -811,7 +837,8 @@ async def _claim_and_register(service_id: str, intent: dict,
     # Add-then-remove: the -api has the instance (202) before the record goes.
     pdr.remove_session(service_id)
     label_reservations.release(service_id)
-    target_ids = [str(t) for t in (resolved.get("allowed_target_service_ids") or []) if t]
+    target_ids = [str(t) for t in (resolved.get("dependency_service_ids")
+                                   or resolved.get("allowed_target_service_ids") or []) if t]
     actor_id = resolved.get("_actor_user_id") or record.get("_actor_user_id")
     asyncio.create_task(_after_deploy(service_id, task_id, target_ids, actor_id))
     return {"workflow_id": service_id, "service_id": service_id,
@@ -824,9 +851,19 @@ async def _claim_and_register(service_id: str, intent: dict,
 
 async def _after_deploy(source_service_id: str, task_id: str | None,
                         target_ids: list[str], actor_id) -> None:
-    """Grants after the task, then the R13 sync for the deployed source."""
+    """Pre-start grants, the resolver sync, then start (G102/G101).
+
+    With dependencies the register task ran in *prepare* mode: the containers
+    exist (stopped), the proxy is up and configured.  This follow-up writes one
+    ordinary add-only grant row per selected dependency, triggers the
+    grant-driven cross sync (the dnsmasq wildcard and the proxy membership),
+    waits out the resolver supervisor's one-second content poll, and only then
+    starts the app.  Without dependencies the register task already started the
+    app and the old lifecycle pass runs.
+    """
     from . import registry_tasks, service_grants
     from .cross_orchestrator import OUTCOME_OK, cross_orchestrator
+    from .provision_service import provision_service
     if not task_id:
         return
     try:
@@ -838,34 +875,40 @@ async def _after_deploy(source_service_id: str, task_id: str | None,
             if status in ("completed", "failed", "cancelled", "unknown"):
                 break
             await asyncio.sleep(2.0)
-        added = 0
-        if status == "completed" and target_ids:
-            db = SessionLocal()
-            try:
-                for target_id in target_ids:
-                    try:
-                        service_grants.set_grant(
-                            db, source_service_id, target_id,
-                            actor_user_id=actor_id,
-                        )
-                        added += 1
-                    except ValueError as exc:
-                        _log.warning("deploy-panel grant %s -> %s skipped: %s",
-                                     source_service_id, target_id, exc)
-            finally:
-                db.close()
-        if added:
-            # R13 — the panel wrote grant rows for ONE known source: refresh
-            # that source, never the whole stack. A no-grant deploy keeps the
-            # lifecycle all-source pass below.
-            action = await cross_orchestrator.sync_source(source_service_id)
-            if action.get("outcome") != OUTCOME_OK:
-                cross_orchestrator.schedule_retry_sync([source_service_id])
-                _log.info(
-                    "deploy-with-grants sync for %s is %s; targeted retry scheduled",
-                    source_service_id, action.get("outcome"))
-        else:
+        if status != "completed":
+            return
+        if not target_ids:
             await cross_orchestrator.sync_all()
+            return
+        db = SessionLocal()
+        try:
+            for target_id in target_ids:
+                try:
+                    service_grants.ensure_grant(
+                        db, source_service_id, target_id, actor_user_id=actor_id,
+                    )
+                except ValueError as exc:
+                    _log.warning("deploy-panel grant %s -> %s skipped: %s",
+                                 source_service_id, target_id, exc)
+        finally:
+            db.close()
+        # R13 — the panel wrote rows for ONE known source: refresh that source,
+        # never the whole stack.  The sync writes the dnsmasq wildcard and
+        # re-ensures the proxy membership; the app starts after it lands.
+        action = await cross_orchestrator.sync_source(source_service_id)
+        if action.get("outcome") != OUTCOME_OK:
+            cross_orchestrator.schedule_retry_sync([source_service_id])
+            _log.info(
+                "deploy-with-dependencies sync for %s is %s; targeted retry scheduled",
+                source_service_id, action.get("outcome"))
+        # The resolver's supervisor compares content on a one-second poll
+        # (G101/C67); the first call must see the new wildcard.
+        await asyncio.sleep(PRE_START_SYNC_WAIT_S)
+        try:
+            await provision_service.start_instance(source_service_id)
+        except Exception:  # noqa: BLE001 — the instance stays `building` and is visible
+            _log.exception("start after pre-start grants failed for %s",
+                           source_service_id)
     except Exception:  # noqa: BLE001 — the deploy already succeeded
         _log.exception("deploy follow-ups failed for %s", source_service_id)
 

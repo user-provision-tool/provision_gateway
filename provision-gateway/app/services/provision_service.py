@@ -162,11 +162,11 @@ class ProvisionService:
     async def get_extra_resolver(self, service_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/instances/{service_id}/extra-resolver")
 
-    async def set_extra_resolver(self, service_id: str, *, resolver_ip: str,
+    async def set_extra_resolver(self, service_id: str, *, resolver_name: str,
                                  network: str) -> dict[str, Any]:
         return await self._request(
             "POST", f"/instances/{service_id}/extra-resolver",
-            json_data={"resolver_ip": resolver_ip, "network": network},
+            json_data={"resolver_name": resolver_name, "network": network},
         )
 
     async def clear_extra_resolver(self, service_id: str) -> dict[str, Any]:

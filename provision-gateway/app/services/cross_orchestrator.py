@@ -103,7 +103,7 @@ class CrossOrchestrator:
         raise TimeoutError(f"the -api task {task_id} did not finish in time")
 
     async def _pair_matches(
-        self, service_id: str, present: bool, resolver_ip: str | None,
+        self, service_id: str, present: bool, resolver_name: str | None,
     ) -> bool:
         """The stored pair after a deduplicated task (R4.2/G94).
 
@@ -117,7 +117,7 @@ class CrossOrchestrator:
             return False
         if not present:
             return not current.get("extra_resolver")
-        return (current.get("extra_resolver") == resolver_ip
+        return (current.get("extra_resolver") == resolver_name
                 and current.get("extra_network") == settings.CROSS_NETWORK)
 
     @staticmethod
@@ -125,7 +125,7 @@ class CrossOrchestrator:
         return {"ok": ok, "outcome": outcome, "reason": reason}
 
     async def _apply(
-        self, service_id: str, present: bool, *, resolver_ip: str | None = None,
+        self, service_id: str, present: bool, *, resolver_name: str | None = None,
     ) -> dict:
         """Submit + poll, with the ruling's timeout/retry, and an explicit outcome.
 
@@ -149,12 +149,12 @@ class CrossOrchestrator:
         for attempt in range(1, settings.CROSS_TASK_RETRIES + 1):
             try:
                 if present:
-                    if not resolver_ip:
+                    if not resolver_name:
                         return self._outcome(
                             False, OUTCOME_ERROR,
-                            "the cross resolver address is not resolved")
+                            "the cross resolver name is not configured")
                     data = await provision_service.set_extra_resolver(
-                        service_id, resolver_ip=resolver_ip,
+                        service_id, resolver_name=resolver_name,
                         network=settings.CROSS_NETWORK,
                     )
                 else:
@@ -162,7 +162,7 @@ class CrossOrchestrator:
                 task_id = str(data.get("task_id") or "")
                 await self._poll_task(str(data["task_id"]))
                 if data.get("deduplicated"):
-                    if await self._pair_matches(service_id, present, resolver_ip):
+                    if await self._pair_matches(service_id, present, resolver_name):
                         out = self._outcome(True, OUTCOME_OK)
                         out["task_id"] = task_id
                         return out
@@ -200,7 +200,7 @@ class CrossOrchestrator:
         _log.error("cross-path update for %s gave up: %s", service_id, last)
         return self._outcome(False, OUTCOME_ERROR, str(last) if last else "unknown error")
 
-    async def _sync_source(self, entry: dict, *, resolver_ip: str) -> dict:
+    async def _sync_source(self, entry: dict, *, resolver_name: str) -> dict:
         """Compare the STORED pair from the entries query; submit only if stale.
 
         No per-source HTTP GET: the global reconciler reads the pairs in the
@@ -210,10 +210,10 @@ class CrossOrchestrator:
         service_id = str(entry["service_id"])
         if entry.get("status") is None:
             return self._outcome(True, OUTCOME_OK, "the source has no instance")
-        if (entry.get("extra_resolver") == resolver_ip
+        if (entry.get("extra_resolver") == resolver_name
                 and entry.get("extra_network") == settings.CROSS_NETWORK):
             return self._outcome(True, OUTCOME_OK)
-        return await self._apply(service_id, present=True, resolver_ip=resolver_ip)
+        return await self._apply(service_id, present=True, resolver_name=resolver_name)
 
     async def _clear_source(self, entry: dict) -> dict:
         if not entry.get("extra_resolver"):
@@ -229,7 +229,7 @@ class CrossOrchestrator:
         read-only entries query — never one HTTP GET per source (R10.3).
         """
         cross_ip = cross_values.current_cross_nginx_ip()
-        resolver_ip = cross_values.current_resolver_ip()
+        resolver_name = settings.CROSS_RESOLVER_NAME
         db = SessionLocal()
         try:
             domains = service_grants.reachable_domains(db)
@@ -241,19 +241,11 @@ class CrossOrchestrator:
             entries = service_grants.entries_by_id()
         finally:
             db.close()
-        if not resolver_ip:
-            _log.error(
-                "cross resolver address is not resolved; the resolver pair is not applied"
-            )
-            return {"domains": sorted(domains), "config_changed": changed,
-                    "sources": len(sources), "applied": 0, "failed": len(sources),
-                    "cleared": 0, "clear_failed": 0,
-                    "error": "cross resolver address not resolved"}
         applied = 0
         for service_id in list(sources):
             entry = entries.get(str(service_id))
             if entry is not None and (await self._sync_source(
-                    entry, resolver_ip=resolver_ip))["ok"]:
+                    entry, resolver_name=resolver_name))["ok"]:
                 applied += 1
         # G95 R7 — a source that lost its LAST relationship must release the
         # pair even while it is stopped: the stored fields are cleared and the
@@ -298,7 +290,7 @@ class CrossOrchestrator:
         global reconciler's job (startup/address/lifecycle).
         """
         cross_ip = cross_values.current_cross_nginx_ip()
-        resolver_ip = cross_values.current_resolver_ip()
+        resolver_name = settings.CROSS_RESOLVER_NAME
         db = SessionLocal()
         try:
             domains = service_grants.reachable_domains(db)
@@ -321,12 +313,8 @@ class CrossOrchestrator:
             result.update(outcome=OUTCOME_OK,
                           reason="the source service is absent (skipped)")
             return result
-        if not resolver_ip:
-            result.update(outcome=OUTCOME_ERROR,
-                          reason="the cross resolver address is not resolved")
-            return result
         if targets:
-            action = await self._sync_source(entry, resolver_ip=resolver_ip)
+            action = await self._sync_source(entry, resolver_name=resolver_name)
             if action["ok"]:
                 result["applied"] = 1
         elif entry.get("extra_resolver"):
@@ -414,10 +402,9 @@ class CrossOrchestrator:
                         _log.info("cross nginx address changed to %s",
                                   result["cross_nginx_ip"])
                         await self._refresh_dnsmasq(result["cross_nginx_ip"])
-                    if result["resolver_changed"]:
-                        _log.info("cross resolver address changed to %s; "
-                                  "running the re-apply pass", result["resolver_ip"])
-                        await self.sync_all()
+                    # G101/R4.2 — the proxy resolves the cross resolver by
+                    # container NAME; a resolver IP change no longer re-applies
+                    # the pair, so the resolver-change branch is retired.
             except Exception:  # noqa: BLE001 — the next tick retries
                 _log.exception("cross-path address watch failed")
             await asyncio.sleep(interval)

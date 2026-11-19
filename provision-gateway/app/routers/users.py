@@ -629,6 +629,195 @@ async def test_curl(user_name: str, service_name: str, label: str,
             "error": result.error}
 
 
+def _source_services(source: dict) -> dict[str, dict]:
+    """Flatten the -api's user_status buckets into ``old key -> service``."""
+    out: dict[str, dict] = {}
+    for group in source.get("user_status", []) if isinstance(source, dict) else []:
+        for bucket in ("healthy_services", "unhealthy_services", "missing_services",
+                       "failed_services"):
+            for svc in group.get(bucket) or []:
+                key = f"{source.get('user_name')}/{svc.get('service_name')}/{svc.get('label')}"
+                out[key] = svc
+    return out
+
+
+def _artifact_path(svc: dict, user_name: str) -> Path | None:
+    """The source artifact beside the service's recipe (G102)."""
+    from ..services.file_sets import FileSetError, _recipe_dir
+    try:
+        base = Path(settings.SOURCE_PROJECTS_DIR) / str(svc.get("service_name"))
+        recipe = _recipe_dir(base, svc.get("recipe_path") or "")
+    except FileSetError:
+        return None
+    return recipe / f"dependencies.{user_name}.{svc.get('label')}.json"
+
+
+async def _wait_task(task_id: str, *, timeout_s: float = 600.0) -> dict:
+    import time as _time
+    deadline = _time.monotonic() + timeout_s
+    while _time.monotonic() < deadline:
+        data = await provision_service.get_task(task_id)
+        status = str(data.get("status") or "")
+        if status in ("completed", "failed", "cancelled", "unknown"):
+            return data
+        await asyncio.sleep(2.0)
+    raise TimeoutError(f"clone registration task {task_id} did not finish")
+
+
+async def _new_label(target_user: str, service_id: str) -> str | None:
+    target = await provision_service.get_user(target_user)
+    for key, svc in _source_services({"user_name": target_user,
+                                      **target}).items():
+        if str(svc.get("service_id")) == str(service_id):
+            return str(svc.get("label"))
+    return None
+
+
+async def _clone_user_impl(source_user: str, target_user: str, req: dict) -> dict:
+    """G102 R5 — clone with dependency artifacts and mapped grants.
+
+    Registration order is dependency-first; the new label is resolved from the
+    target user's status by the returned service_id (the register response
+    carries no label); the mapped grants are written only after every
+    registration completed (both services must be running); the artifacts are
+    remapped and rewritten for the target user.
+    """
+    import json as _json
+    try:
+        source = await provision_service.get_user(source_user)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"provision-api error: {e}")
+    services = _source_services({"user_name": source_user, **source})
+    artifacts: dict[str, dict] = {}
+    deps_of: dict[str, set[str]] = {}
+    for key, svc in services.items():
+        path = _artifact_path(svc, source_user)
+        if path and path.is_file():
+            try:
+                data = _json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            artifacts[key] = data
+            deps_of[key] = {k for k in (data.get("services") or {}) if k != key}
+
+    tasks: list[dict] = []
+    key_map: dict[str, str] = {}  # old key -> new key
+    sid_map: dict[str, str] = {}  # old key -> new service id
+    pending = dict(services)
+    while pending:
+        ready = [k for k in pending if not (deps_of.get(k, set()) & set(pending))]
+        if not ready:
+            # A cycle (or a dependency outside the source set): register the
+            # remainder in a stable order and report the broken edge.
+            ready = sorted(pending)[:1]
+        for old_key in ready:
+            svc = pending.pop(old_key)
+            payload = {
+                "user_name": target_user,
+                "service_name": svc.get("service_name"),
+                "label": None,
+                "compose_template_path": svc.get("compose_template_path"),
+                "nginx_conf_template_path": svc.get("nginx_conf_template_path"),
+                "recipe_path": svc.get("recipe_path", ""),
+                "domain": req.get("domain", "localhost"),
+                "passwd": req.get("passwd", ""),
+            }
+            if svc.get("profiles"):
+                payload["profiles"] = svc["profiles"]
+            try:
+                result = await provision_service.register_user(**payload)
+                task_id = result.get("task_id")
+                service_id = result.get("service_id")
+                tasks.append({"service": svc.get("service_name"), "service_id": service_id,
+                              "task_id": task_id})
+                if task_id:
+                    task = await _wait_task(str(task_id))
+                    if str(task.get("status")) != "completed":
+                        tasks[-1]["error"] = (
+                            f"registration {task.get('status')}: {task.get('error') or ''}")
+                        continue
+                label = await _new_label(target_user, str(service_id))
+                if label is None:
+                    tasks[-1]["error"] = "the target label could not be resolved"
+                    continue
+                new_key = f"{target_user}/{svc.get('service_name')}/{label}"
+                key_map[old_key] = new_key
+                sid_map[old_key] = str(service_id)
+                tasks[-1]["label"] = label
+            except Exception as e:  # noqa: BLE001
+                tasks.append({"service": svc.get("service_name"), "error": str(e)})
+
+    # Mapped grants only after every registration (both ends are running).
+    db = SessionLocal()
+    try:
+        written: set[tuple[str, str]] = set()
+        for old_key, data in artifacts.items():
+            src = sid_map.get(old_key)
+            if not src:
+                continue
+            for dep_old in (data.get("services") or {}):
+                if dep_old == old_key:
+                    continue
+                tgt = sid_map.get(dep_old)
+                if not tgt or (src, tgt) in written:
+                    continue
+                try:
+                    service_grants.set_grant(db, src, tgt)
+                    written.add((src, tgt))
+                except ValueError as exc:
+                    tasks.append({"service": f"{old_key} -> {dep_old}",
+                                  "error": f"grant not written: {exc}"})
+    finally:
+        db.close()
+
+    # Rewrite each artifact for the target user, remapping the keys.
+    for old_key, data in artifacts.items():
+        new_source = key_map.get(old_key)
+        if not new_source:
+            continue
+        source_svc = services[old_key]
+        new_key = new_source
+        new_services: dict[str, dict] = {}
+        source_record = dict((data.get("services") or {}).get(old_key) or {})
+        env: dict[str, dict] = {}
+        for var, ref in (source_record.get("env") or {}).items():
+            dep_old = str((ref or {}).get("depends_on") or "")
+            if dep_old in key_map:
+                env[str(var)] = {"depends_on": key_map[dep_old]}
+        for svc_key, record in (data.get("services") or {}).items():
+            if svc_key == old_key:
+                continue
+            if svc_key not in key_map:
+                tasks.append({"service": svc_key,
+                              "error": "dependency has no clone counterpart; omitted"})
+                continue
+            new_svc_key = key_map[svc_key]
+            new_services[new_svc_key] = {
+                "user": target_user,
+                "service": record.get("service"),
+                "label": new_svc_key.rsplit("/", 1)[-1],
+                "env": {},
+            }
+        new_services[new_key] = {
+            "user": target_user,
+            "service": source_svc.get("service_name"),
+            "label": new_key.rsplit("/", 1)[-1],
+            "env": env,
+        }
+        path = _artifact_path(source_svc, target_user)
+        if path is None:
+            continue
+        path.write_text(_json.dumps({
+            "version": 1,
+            "generated_at": __import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc).isoformat().replace("+00:00", "Z"),
+            "source": new_key,
+            "services": new_services,
+        }, indent=2) + "\n")
+        Path(str(path) + ".generated").write_text("")
+    return {"tasks": tasks, "total": len(tasks)}
+
+
 @router.post("/clone", status_code=202)
 async def clone_user(req: dict[str, Any],
                      current_admin: dict = Depends(require_admin)):
@@ -636,30 +825,7 @@ async def clone_user(req: dict[str, Any],
     target_user = req.get("target_user")
     if not source_user or not target_user:
         raise HTTPException(400, "source_user and target_user are required")
-    try:
-        source = await provision_service.get_user(source_user)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"provision-api error: {e}")
-    tasks = []
-    for group in source.get("user_status", []) if isinstance(source, dict) else []:
-        for bucket in ("healthy_services", "unhealthy_services", "missing_services",
-                       "failed_services"):
-            for svc in group.get(bucket) or []:
-                payload = {
-                    "user_name": target_user, "service_name": svc.get("service_name"),
-                    "label": None, "compose_file_path": svc.get("compose_template_path"),
-                    "nginx_conf_file_path": svc.get("nginx_conf_template_path"),
-                    "recipe_path": svc.get("recipe_path", ""),
-                    "domain": req.get("domain", "localhost"), "passwd": req.get("passwd", ""),
-                }
-                try:
-                    result = await provision_service.register_user(**payload)
-                    tasks.append({"service": svc.get("service_name"),
-                                  "service_id": result.get("service_id"),
-                                  "task_id": result.get("task_id")})
-                except Exception as e:  # noqa: BLE001
-                    tasks.append({"service": svc.get("service_name"), "error": str(e)})
-    return {"tasks": tasks, "total": len(tasks)}
+    return await _clone_user_impl(str(source_user), str(target_user), req)
 
 
 # ---------------------------------------------------------------------------

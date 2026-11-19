@@ -863,6 +863,24 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             "scopes cookies to a domain, anything that activates compose "
             "profiles, and anything that configures obtaining a TLS certificate."
         )
+        # G102 — dependencies are part of the instance's reachable identity too:
+        # a URL/base/host that names a selected dependency must be identified
+        # and filled from that dependency's serving URL, even when the base file
+        # carries a placeholder (e.g. http://localhost:8000).
+        deps = context.get("dependencies") or []
+        if deps:
+            dep_lines = "\n".join(
+                f"- {d.get('key')}: {d.get('service_name')}:{d.get('label')} at "
+                f"{d.get('serving_url') or d.get('hostname') or '(not live)'}"
+                for d in deps
+            )
+            parts.append(
+                "Selected dependencies — this deploy calls these services. A "
+                "variable whose meaning is a URL/base/host of one of them is "
+                "NECESSARY under rule 1 and is filled from that dependency's "
+                "serving URL, overriding any placeholder (e.g. localhost):\n"
+                + dep_lines
+            )
         base_files = context.get("base_files") or {}
         blocks = []
         for fname, content in base_files.items():
@@ -964,6 +982,26 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             f"- {n}" + (f"   [{categories[n]}]" if categories and categories.get(n) else "")
             for n in var_list
         )
+        # G102 — the selected dependencies are the classification context: the
+        # model records which generated env var points at which dependency.
+        deps = context.get("dependencies") or []
+        deps_block = ""
+        if deps:
+            dep_lines = []
+            for d in deps:
+                dep_lines.append(
+                    f"- {d.get('key')}: service {d.get('service_name')}:"
+                    f"{d.get('label')} served at "
+                    f"{d.get('serving_url') or d.get('hostname') or '(not live)'}"
+                )
+            deps_block = (
+                "\n\nSelected dependencies (the services this deploy may call):\n"
+                + "\n".join(dep_lines)
+                + "\nWhen a variable's MEANING is a call to one of these services, "
+                "record it under \"_depends_on\": an object mapping that variable "
+                "to the dependency key EXACTLY as listed. Only these keys; at "
+                "most one key per variable; use {} when none."
+            )
         operator_block = ""
         if operator_prompt and operator_prompt.strip():
             operator_block = (
@@ -981,8 +1019,12 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             f"{handoff}\n\n"
             "Now assign the final value for each variable you identified. Recall "
             "each variable's meaning from the base files you read.\n"
-            f"Variables to fill:\n{names}\n{operator_block}\n\n"
+            f"Variables to fill:\n{names}{deps_block}\n{operator_block}\n\n"
             "Rules (defaults — overridden only by the operator prompt above):\n"
+            "- A variable that points at a SELECTED DEPENDENCY (the list above) "
+            "gets that dependency's serving_url EXACTLY as given, and is "
+            "recorded in `_depends_on` under the dependency's key. Do not use "
+            "localhost or the source instance's own hostname for it.\n"
             "- A variable whose meaning is the instance's externally-reachable "
             "identity (URL/origin/host, or an API/console/web/ws BASE) gets its "
             "value FROM deployment_meta: a BASE variable equals serving_url "
@@ -1047,6 +1089,10 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             'instance on"}}. Use {} when you removed nothing. That key is the '
             "audit trail for the removal step — the reason must be specific "
             "enough that a reviewer can disagree with your judgement. "
+            'Plus a "_depends_on" object mapping each variable whose meaning '
+            "calls a selected dependency to that dependency's key exactly as "
+            'listed (e.g. {"GRAPHITI_API_URL":"alice/graphiti-local/0"}); use '
+            "{} when none. "
             "No markdown fences, no comments, no other extra keys."
         )
 
@@ -1293,6 +1339,7 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             warnings.append("env turn 1 returned no variables — falling back to mechanical env")
             _log({"stage": "env.turn1", "ok": False, "vars": []})
             return {"vars": [], "kvs": {}, "categories": {}, "external": [],
+                    "dependency_refs": {},
                     "warnings": warnings, "usage": dict(usage_total)}
 
         # assistant continuity into turn 2
@@ -1325,6 +1372,11 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             _add(resp2b)
             c2 = ((resp2b.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
             kvs = self._json_first(c2, want_object=True)
+        # G102 — the classifier's dependency map. Pull it out before the
+        # env_type filter (it is not a value entry).
+        depends_on_raw: dict = {}
+        if isinstance(kvs, dict):
+            depends_on_raw = kvs.pop("_depends_on", {}) or {}
         # Turn 2 self-reports what its adversarial pass removed, under a
         # `_removed` key. Pull it out BEFORE the filter below (which would drop
         # it anyway — it carries no env_type) so the reasons are recorded
@@ -1347,6 +1399,24 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
         external_vars = sorted(
             name for name, v in kvs.items() if v.get("env_type") == "external"
         )
+        # G102 — validate the classification against the selected set: an
+        # unknown key is dropped with a warning; only vars in the generated map
+        # are eligible; one key per var.
+        allowed_keys = {str(d.get("key")) for d in (context.get("dependencies") or [])
+                        if d.get("key")}
+        dependency_refs: dict[str, str] = {}
+        for var, key in (depends_on_raw or {}).items():
+            var_s, key_s = str(var), str(key)
+            if key_s not in allowed_keys:
+                warnings.append(
+                    f"env: dropped dependency ref {var_s} -> {key_s} "
+                    "(not a selected dependency)")
+                continue
+            if var_s not in kvs:
+                continue
+            dependency_refs[var_s] = key_s
+        if dependency_refs:
+            _log({"stage": "env.dependencies", "refs": dependency_refs})
         if not kvs:
             warnings.append("env turn 2 returned no JSON map — falling back to mechanical env")
         if progress:
@@ -1374,6 +1444,7 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
         return {
             "vars": var_list, "kvs": kvs, "removed": _removed_report,
             "categories": categories, "external": external_vars,
+            "dependency_refs": dependency_refs,
             "warnings": warnings, "usage": dict(usage_total),
         }
 

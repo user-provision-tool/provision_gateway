@@ -245,6 +245,55 @@ def _unfilled_externals(kvs: dict[str, Any], external_values: dict[str, str] | N
     return sorted(out)
 
 
+def _write_dependencies_artifact(
+    recipe_dir, *, user: str, service: str, label: str,
+    deps: list[dict], refs: dict | None,
+) -> "Path | None":
+    """Write ``dependencies.{user}.{label}.json`` beside the per-user env (G102).
+
+    The source's ``env`` map records each classified variable's
+    ``{"depends_on": <service key>}``; every selected dependency gets its own
+    record with an empty env map.  A generated artifact: identified by pattern,
+    never auto-deleted.  Written only when at least one dependency was selected
+    (a deploy with no dependency surface has nothing to persist).
+    """
+    if not deps:
+        return None
+    import json as _json
+    from datetime import datetime, timezone
+
+    source_key = f"{user}/{service}/{label}"
+    allowed = {str(d.get("key")) for d in deps if d.get("key")}
+    env: dict[str, dict] = {}
+    for var, key in (refs or {}).items():
+        if str(key) in allowed:
+            env[str(var)] = {"depends_on": str(key)}
+    services: dict[str, dict] = {
+        source_key: {"user": user, "service": service, "label": str(label),
+                     "env": env},
+    }
+    for d in deps:
+        key = str(d.get("key") or "")
+        if not key:
+            continue
+        services[key] = {
+            "user": d.get("user"),
+            "service": d.get("service"),
+            "label": str(d.get("label")),
+            "env": {},
+        }
+    payload = {
+        "version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "source": source_key,
+        "services": services,
+    }
+    path = Path(recipe_dir) / f"dependencies.{user}.{label}.json"
+    path.write_text(_json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    Path(str(path) + ".generated").write_text("")
+    return path
+
+
 def _apply_env_kvs(
     mech: str, kvs: dict[str, Any], external_values: dict[str, str] | None = None
 ) -> str:
@@ -1644,6 +1693,17 @@ class GenerationJobManager:
                             _name = _re.get("env_name") or ".env"
                             (_rd / _name).write_text(_content, encoding="utf-8")
                             (_rd / f"{_name}.generated").write_text("")
+                            _ru = (request.get("user_name")
+                                   or (request.get("deploy_metadata") or {}).get("user_name")
+                                   or "user")
+                            _rl = str(request.get("label")
+                                      or (request.get("deploy_metadata") or {}).get("label")
+                                      or "0")
+                            _write_dependencies_artifact(
+                                _rd, user=_ru, service=service_name, label=_rl,
+                                deps=_re.get("dependencies") or [],
+                                refs=_re.get("dependency_refs") or {},
+                            )
                             result_files[_name] = _content
                             env_name = _name
                             warnings.extend(
@@ -1680,6 +1740,41 @@ class GenerationJobManager:
 
                             context = self._build_context(service_name, recipe_path, phase, request)
                             context["base_files"]["__mechanical_env__.txt"] = mech
+                            # G102 — resolve the selected dependency identities
+                            # for the classifier.  The registry is the
+                            # gateway's read-only view of the same services.
+                            _deps: list[dict] = []
+                            try:
+                                from .registry import Registry as _Registry
+                                _reg = _Registry()
+                                for _dep_id in (request.get("dependency_service_ids") or []):
+                                    _e = _reg.get_by_id(str(_dep_id))
+                                    if not _e:
+                                        continue
+                                    # The dependency is addressed by its
+                                    # SERVED endpoint (the hostname index and
+                                    # the cross nginx's server_name use the
+                                    # `--<service>` name), falling back to the
+                                    # instance hostname for a single-service
+                                    # recipe with no endpoint row.
+                                    _served = ((_e.get("http_endpoints") or [])
+                                               or [_e.get("hostname") or ""])[0]
+                                    _deps.append({
+                                        "key": f"{_e.get('user_name')}/"
+                                               f"{_e.get('service_name')}/"
+                                               f"{_e.get('label')}",
+                                        "user": _e.get("user_name"),
+                                        "service": _e.get("service_name"),
+                                        "label": str(_e.get("label")),
+                                        "hostname": _served,
+                                        "serving_url": (
+                                            ("https://" if _e.get("tls") else "http://")
+                                            + str(_served)
+                                            + f":{settings.NGINX_HTTPS_PORT if _e.get('tls') else settings.NGINX_HTTP_PORT}"),
+                                    })
+                            except Exception:  # noqa: BLE001 — context is best-effort
+                                _deps = []
+                            context["dependencies"] = _deps
                             # LLM fill = two-turn conversation (design §2 env
                             # redesign): turn 1 identifies the vars needing
                             # values, turn 2 (same conversation) maps them to
@@ -1772,6 +1867,8 @@ class GenerationJobManager:
                                                 "mech": mech,
                                                 "kvs": kvs,
                                                 "compose_paths": context.get("compose_paths") or [],
+                                                "dependencies": context.get("dependencies") or [],
+                                                "dependency_refs": (gen or {}).get("dependency_refs") or {},
                                             },
                                         },
                                         "warnings": warnings,
@@ -1834,6 +1931,11 @@ class GenerationJobManager:
                                 fpath = recipe_dir / env_name
                                 fpath.write_text(content, encoding="utf-8")
                                 (recipe_dir / f"{fpath.name}.generated").write_text("")
+                                _write_dependencies_artifact(
+                                    recipe_dir, user=uname, service=service_name,
+                                    label=ulabel, deps=_deps,
+                                    refs=(gen or {}).get("dependency_refs") or {},
+                                )
                                 result_files[env_name] = content
                                 await _event(env_name, "done", {
                                     "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
