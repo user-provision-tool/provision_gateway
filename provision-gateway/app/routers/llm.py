@@ -382,12 +382,26 @@ async def _enrich_fix_request(req: dict[str, Any]) -> tuple[str, str, dict[str, 
     except Exception:
         selection = {}
 
+    # G103/T17 — the ANALYSIS gets the selected dependency IDENTITIES and
+    # serving URLs (no live-state check). It is enough to say whether the
+    # failure is rooted in a dependency; it is not a diagnosis of why.
+    deps: list[dict] = []
+    try:
+        from ..services.dependency_model import (
+            dependency_entries, target_identity,
+        )
+        deps = [target_identity(e) for e in
+                dependency_entries(str(entry.get("service_id") or ""))]
+    except Exception:  # noqa: BLE001 — context is best-effort
+        deps = []
+
     request: dict[str, Any] = {
         **req,
         "fix": True,
         "task_id": task_id,
         "task_log": log_payload.get("log") or "",
         "failure": entry.get("failure") or {},
+        "dependencies": deps,
         "selection": req.get("selection") or selection,
         "user_name": user_name,
         "label": label,

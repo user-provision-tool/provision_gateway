@@ -59,6 +59,18 @@ interface ServiceInstance {
   // nothing that the deployment did not create.
   http_endpoints?: string[]
   nginx_conf_paths?: string[]
+  // G93/C3.1 — the DEPLOY SELECTION recorded by the -api: the plain sources
+  // the operator picked, not the converted `.j2`. The card lists the fix
+  // artifacts of this selection and shows its nginx source. Absent on a
+  // legacy instance, which then shows no fix line rather than scanning the
+  // recipe.
+  selected_compose_paths?: string[]
+  selected_nginx_paths?: Record<string, string> | null
+  selected_env_paths?: string[]
+  // G103/T9/T10 — the gateway's per-instance snapshot names, present only when
+  // the file exists. Exact paths, never guessed.
+  serving_ports_snapshot?: string
+  dependency_snapshots?: { target_service: string; path: string }[]
   healthy_containers?: Record<string,string>
   unhealthy_containers?: Record<string,string>
   missing_containers?: Record<string,string>
@@ -381,34 +393,22 @@ export default function UsersPage() {
   // replays it instead of registering `build_args: {}`. Mirrors how the label is
   // carried — it is the session's own value, not a fresh default.
   const [preselectedUseGlobalProxy, setPreselectedUseGlobalProxy] = useState<boolean | null>(null)
-  // `.fix` artifacts found in the card's own RECIPE, keyed `service@@recipe` —
-  // shown alongside the deployed files so a fix is visible as PRESENT without
-  // opening the deploy panel (llm-based-fix-todo.md §6). They are already
-  // selectable in the panel's pickers, since the candidate scans match them.
-  //
-  // SCOPED TO THE RECIPE, not the service: these artifacts are recipe-level by
-  // design (GRILLING G33 — compose and nginx are user-agnostic names in the
-  // recipe dir; only env is per-user), so per-(user, label) isolation is not the
-  // right unit, but asking per SERVICE made a card list another recipe's fix
-  // file — a card on `recipes/conflict` showed `recipes/interp`'s.
-  const [fixFiles, setFixFiles] = useState<Record<string, string[]>>({})
-
-  // Load ONE recipe's `.fix` candidates (cached per service@@recipe).
-  const loadFixFiles = async (service: string, recipePath: string) => {
-    const cacheKey = recipePath ? `${service}@@${recipePath}` : service
-    if (!service || fixFiles[cacheKey]) return
-    try {
-      const { data } = await client.get(`/projects/${service}/file-sets`)
-      // `.` is the root recipe's key, as everywhere else this payload is read.
-      const cands = (data.candidates || {})[recipePath || '.'] || {}
-      const found = new Set<string>()
-      for (const kind of ['compose', 'nginx', 'env']) {
-        for (const n of ((cands as any)[kind] || [])) {
-          if (typeof n === 'string' && /\.fix(\.|$)/.test(n)) found.add(n)
-        }
-      }
-      setFixFiles(prev => ({ ...prev, [cacheKey]: Array.from(found).sort() }))
-    } catch { /* candidates are a nicety — never block the card */ }
+  // G93/C3.2 — the card's LLM-fix line comes from the recorded DEPLOY
+  // SELECTION (the `.fix` sources the operator actually used), never from a
+  // recipe-wide scan: a scan lists historical jobs and conversions that this
+  // deployment did not use. `selectionFixNames` is the single reader.
+  const selectionFixNames = (svc: ServiceInstance): string[] => {
+    const all = [
+      ...(svc.selected_compose_paths || []),
+      ...Object.values(svc.selected_nginx_paths || {}),
+      ...(svc.selected_env_paths || []),
+    ]
+    const names = new Set<string>()
+    for (const p of all) {
+      const name = baseName(String(p))
+      if (name && /\.fix(\.|$)/.test(name)) names.add(name)
+    }
+    return Array.from(names).sort()
   }
   const [search, setSearch] = useState('')
   const [visiblePwds, setVisiblePwds] = useState<Record<string,boolean>>({})
@@ -532,18 +532,6 @@ export default function UsersPage() {
       if (!expandedPanels.includes(k)) { clearInterval(timers[k]); delete timers[k] }
     }
     for (const key of expandedPanels) {
-      // A session's panel key is namespaced and belongs to no instance — it has
-      // no fix files of its own to show.
-      if (!key.startsWith('session:')) {
-        const svc = key.startsWith('svc:')
-          ? servicesRef.current.find(s => s.service_id === key.slice(4))
-          : (() => {
-              const { user, service, label } = parseServiceKey(key)
-              return servicesRef.current.find(s =>
-                s.user_name === user && s.service_name === service && String(s.label) === String(label))
-            })()
-        loadFixFiles(svc?.service_name || '', svc?.recipe_path || '')
-      }
       if (timers[key]) continue
       timers[key] = setInterval(() => {
         refreshServices()
@@ -2005,6 +1993,7 @@ export default function UsersPage() {
                         isAdmin={isAdmin}
                         isOwner={!!myUsername && svc.user_name === myUsername}
                         onPeek={setPeekServiceId}
+                        refreshKey={svc.status}
                       />
                       {(svc as any).subnet && (
                         <div><Text strong>Subnet: </Text><Tag color="purple">{(svc as any).subnet}</Tag></div>
@@ -2061,16 +2050,20 @@ export default function UsersPage() {
                           // (e.g. a compose with no ${VAR} surface) — say so.
                           const envFile = baseName(svc.env_file_path)
                           const composeFile = baseName(svc.compose_file_path) || `docker-compose.user-${svc.user_name}.${svc.label}.yml`
-                          // nginx is one of the three deployed paths (G13) and
-                          // the -api records its path on the entry — the card
-                          // simply never read it. It sits beside the fix list that
-                          // already names `nginx.fix.conf`.
-                          const nginxFile = baseName(svc.nginx_conf_template_path)
+                          // G93/C3.4 — nginx shows the SELECTED source from
+                          // the deploy selection (the plain conf the operator
+                          // picked). The converted `.j2` is the -api's render
+                          // source and is never presented as the selection; a
+                          // legacy instance with no recorded selection shows
+                          // none rather than the internal `.j2`.
+                          const selNginx = svc.selected_nginx_paths || {}
+                          const selectedNginxPath =
+                            selNginx.http || Object.values(selNginx)[0] || ''
+                          const nginxFile = baseName(selectedNginxPath)
                           const recipeHint = `PROVISION/source_projects/${svc.service_name}${recipePath ? '/' + recipePath : ''}`
-                          // ONE line, THIS recipe's own fix artifacts (§9). A
-                          // `.fix` is rare and specific, so an empty one renders
-                          // nothing at all rather than a `none` note.
-                          const recipeFixes = fixFiles[recipePath ? `${svc.service_name}@@${recipePath}` : svc.service_name] || []
+                          // C3.2/C3.3 — only the SELECTION's `.fix` artifacts
+                          // (compose, nginx, `.env.fix`). No fix used → no line.
+                          const recipeFixes = selectionFixNames(svc)
                           return <>
                             <div style={{marginBottom:4}}>
                               <Text>.env: </Text>
@@ -2091,9 +2084,34 @@ export default function UsersPage() {
                               {nginxFile
                                 ? <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
                                     onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'nginx', nginxFile, recipePath)}>{nginxFile}</Text>
-                                : <Text type="secondary">none — this deployment records no nginx conf</Text>}
+                                : <Text type="secondary">none — this deployment recorded no nginx selection</Text>}
                               {nginxFile && <Text type="secondary" style={{fontSize:11}}> (in {recipeHint} dir)</Text>}
                             </div>
+                            {/* G103/T10 — the per-instance SNAPSHOTS the
+                                gateway took at deploy. One row per relation,
+                                only when the snapshot exists. */}
+                            {svc.serving_ports_snapshot && (
+                              <div style={{marginBottom:4}}>
+                                <Text>Serving ports: </Text>
+                                <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
+                                  onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label,
+                                    'serving_ports', svc.serving_ports_snapshot as string, recipePath)}>
+                                  {svc.serving_ports_snapshot}
+                                </Text>
+                                <Text type="secondary" style={{fontSize:11}}> (snapshot)</Text>
+                              </div>
+                            )}
+                            {(svc.dependency_snapshots || []).map(d => (
+                              <div key={d.path} style={{marginBottom:4}}>
+                                <Text>Dependencies: </Text>
+                                <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
+                                  onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label,
+                                    'dependency', d.path, recipePath)}>
+                                  {d.path}
+                                </Text>
+                                <Text type="secondary" style={{fontSize:11}}> ({d.target_service})</Text>
+                              </div>
+                            ))}
                             {recipeFixes.length > 0 && (
                               <div style={{marginBottom:4}}>
                                 <Text>LLM fix: </Text>

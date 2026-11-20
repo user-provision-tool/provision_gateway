@@ -5995,13 +5995,24 @@ class TestDeployPanelSemantics:
             assert ".base" in PHASE_FILENAME[phase]
             assert ".fix" in FIX_FILENAME[phase]
 
-    def test_env_phase_never_returns_none(self):
-        """§4: the phase always produces the `.raw`, even when it is empty."""
-        import inspect
+    def test_env_phase_never_returns_none(self, tmp_path, monkeypatch):
+        """§4: the phase always produces the `.raw`, even when it is empty.
+
+        Behaviour, not source text: no compose surface and no reference gives
+        the empty string (never None); a reference gives its variables (T7).
+        """
+        from app.config import settings
         from app.services.generation_jobs import GenerationJobManager
-        src = inspect.getsource(GenerationJobManager._mechanical_env)
-        assert "return \"\"" in src
-        assert "return None" not in src
+        root = tmp_path / "sp" / "svc"
+        root.mkdir(parents=True)
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path / "sp")
+        (root / "compose.yml").write_text("services:\n  app:\n    image: x\n")
+        m = GenerationJobManager()
+        req = {"selection": {"compose": ["compose.yml"], "env": []}}
+        assert m._mechanical_env("svc", "", req) == ""
+        (root / "ref.env").write_text("A=1\n")
+        req["env_reference"] = ["ref.env"]
+        assert m._mechanical_env("svc", "", req) == "A=1\n"
 
 
 class TestComposeValidationPause:
@@ -6068,7 +6079,9 @@ class TestEnvReferencePicker:
 
     def test_dashboard_renders_the_picker_only_for_generate_new(self):
         src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
-        assert "Env reference (generation context)" in src
+        # 2026-11-19 / O3 — the reference is the BASE of the generated env, not
+        # mere context; the heading says so.
+        assert "Env reference (generation base)" in src
         assert "eff.env.length === 0" in src, "shown only when env is `generate new`"
         assert "env_reference: envRefs" in src
 
@@ -6126,6 +6139,21 @@ class TestEnvReferencePicker:
         assert "GENERATE_NEW) set(" in src or "v === GENERATE_NEW" in src
         # The old side-tag renderings are gone.
         assert "!sel.serving_ports && !sel.serving_ports_none" not in src
+
+    def test_the_nginx_picker_empty_state_matches_the_other_pickers(self):
+        """T0/R8 alignment — the sentinel is plain field text everywhere.
+
+        The nginx picker is a multi-select in ADD mode once a conf is chosen,
+        but while nothing is selected it must behave like the compose /
+        serving-ports / env pickers: a SINGLE select whose value is the
+        sentinel. The old `mode="multiple"` + `value={[GENERATE_NEW]}` rendered
+        the sentinel as a removable tag chip with a dead ×, unlike every other
+        picker.
+        """
+        src = (_DASH / "src" / "components" / "services" / "FileSetSelection.tsx").read_text()
+        assert "mode={selectedConfs.length === 0 ? undefined : 'multiple'}" in src
+        assert "value={selectedConfs.length === 0 ? GENERATE_NEW : []}" in src
+        assert "value={selectedConfs.length === 0 ? [GENERATE_NEW] : []}" not in src
 
     def test_the_source_projects_robot_is_clickable_when_base_files_exist(self):
         src = (_DASH / "src" / "pages" / "ServicesPage.tsx").read_text()
@@ -6860,14 +6888,17 @@ class TestServiceCardsAndTaskLifecycle:
         assert "nginx_conf_template_path" in src
 
     def test_the_fix_field_is_recipe_scoped_and_hidden_when_empty(self):
-        """§9: ONE clickable `LLM fix:` line, this recipe's own artifacts only,
-        and nothing at all when it has none."""
+        """§9 / G93/C3.2: ONE clickable `LLM fix:` line from the recorded DEPLOY
+        SELECTION, and nothing at all when the path used no fix artifact."""
         src = self._page("pages/UsersPage.tsx")
         assert "recipeFixes" in src
         assert "recipeFixes.length > 0 &&" in src
-        # The cache key carries the recipe; the scan reads THAT recipe's entry.
-        assert "loadFixFiles = async (service: string, recipePath: string)" in src
-        assert "(data.candidates || {})[recipePath || '.']" in src
+        # G93 — the list is the selection's, never a recipe-wide scan.
+        assert "selectionFixNames" in src
+        assert "selected_compose_paths" in src
+        assert "selected_nginx_paths" in src
+        assert "selected_env_paths" in src
+        assert "loadFixFiles" not in src
         assert "LLM fix" in src
 
     def test_answering_a_pause_consumes_the_leg_it_answered(self):
@@ -7143,12 +7174,16 @@ class TestEnvPhaseEmptySurface:
         k = src.index("if not content:", j)
         assert i < j < k, "`content` must be bound before both arms"
 
-    def test_mechanical_env_returns_empty_string_not_none(self):
-        import inspect
+    def test_mechanical_env_returns_empty_string_not_none(self, tmp_path, monkeypatch):
+        from app.config import settings
         from app.services.generation_jobs import GenerationJobManager
-        src = inspect.getsource(GenerationJobManager._mechanical_env)
-        assert "return \"\"" in src
-        assert "return None" not in src
+        root = tmp_path / "sp" / "svc"
+        root.mkdir(parents=True)
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path / "sp")
+        (root / "compose.yml").write_text("services:\n  app:\n    image: x\n")
+        out = GenerationJobManager()._mechanical_env(
+            "svc", "", {"selection": {"compose": ["compose.yml"], "env": []}})
+        assert out == "" and out is not None
 
 
 class TestCapacityAlertOnTheGenerationPath:

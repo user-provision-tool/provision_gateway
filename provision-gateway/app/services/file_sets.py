@@ -152,6 +152,11 @@ def _is_serving_ports_candidate(name: str) -> bool:
     """
     if name.endswith(".generated") or name.endswith(".j2"):
         return False
+    # G103/T9 — `serving_ports.user-<u>.<l>.yml` is the per-instance SNAPSHOT,
+    # never a selectable source (the picker must not offer what the gateway
+    # copied for the card).
+    if ".user-" in name:
+        return False
     if not (name.endswith(".yml") or name.endswith(".yaml")):
         return False
     return name.startswith(_SERVING_PORTS_STEMS)

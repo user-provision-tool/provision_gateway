@@ -26,7 +26,19 @@ from typing import Any
 from ..config import settings
 from ..database import SessionLocal
 from . import artifact_finalize, label_reservations, pre_deploy_registry as pdr
+from .dependency_model import (
+    dependency_entries as _dependency_entries,
+    duplicate_target_services,
+    entries_for_ids as _entries_for_ids,
+    read_relation,
+    relation_env,
+    relation_snapshot_filename,
+    serving_ports_snapshot_name,
+    snapshot_used_artifacts,
+    serving_url,
+)
 from .generation_jobs import GenerationCapacityError, GenerationJobError, generation_jobs
+from .stream_conf import artifact_has_stream_rows
 
 _log = logging.getLogger("gateway.deploy_workflow")
 
@@ -169,6 +181,24 @@ def _validate_policy(intent: dict, selection: dict, *, require_ready: bool) -> N
         )
 
 
+def _selection_stream_rows(intent: dict, selection: dict) -> bool:
+    """Whether the SELECTED serving-ports artifact declares stream rows.
+
+    Selection values are recipe-relative names (an absolute path is honoured
+    for a caller that supplies one); the artifact is read from the source
+    project's recipe dir, which is where the panel's candidates live.
+    """
+    name = selection.get("serving_ports")
+    if not isinstance(name, str) or not name:
+        return False
+    path = Path(name)
+    if not path.is_absolute():
+        path = (settings.SOURCE_PROJECTS_DIR
+                / (intent.get("service_name") or "")
+                / (intent.get("recipe_path") or "") / name)
+    return artifact_has_stream_rows(str(path))
+
+
 def generation_needed(intent: dict) -> bool:
     """The gateway decides, never the client (R1)."""
     selection = _selection(intent)
@@ -199,7 +229,12 @@ def generation_needed(intent: dict) -> bool:
     # no-file state and is honoured.
     if not selection.get("serving_ports") and not selection.get("serving_ports_none"):
         return True
-    if _https(intent) and not selection.get("stream_conf"):
+    # 2026-11-19 — TLS alone no longer demands a stream slot: the requirement
+    # is derived from the SELECTED artifact's rows (T4). An HTTP-only artifact
+    # (or a missing/unreadable one) declares none, so the stream term never
+    # starts a generation run for a conf that cannot be produced.
+    if (_https(intent) and not selection.get("stream_conf")
+            and _selection_stream_rows(intent, selection)):
         return True
     # The per-user env.raw is generated when no env is selected (R3/R6).
     # `env_none` is the deliberate no-env state (§14.1) and suppresses it the
@@ -238,7 +273,12 @@ def _generation_request(intent: dict, selection: dict) -> dict:
         "service_id": intent.get("service_id"),
         "owner_api_user_id": intent.get("owner_api_user_id"),
         # G102 — the classifier's context travels with the generation request.
-        "dependency_service_ids": [
+        # G103 — the duplicate / None modes remove the dependencies from the
+        # GENERATION context only (the grants still use the intent's ids). A
+        # guided deploy restart KEEPS them: its `.env.raw` is the deploy env.
+        "dependency_service_ids": [] if (
+            intent.get("_dependency_env_disabled")
+        ) else [
             str(x) for x in (intent.get("dependency_service_ids")
                              or intent.get("allowed_target_service_ids") or []) if x
         ],
@@ -304,6 +344,176 @@ def _api_payload(intent: dict, selection: dict, env_name: str | None) -> dict:
     return payload
 
 
+def _selected_env_values(recipe_dir: Path, selection: dict) -> dict[str, str]:
+    """Merge the selected env files (order preserved, later wins)."""
+    vals: dict[str, str] = {}
+    for name in selection.get("env") or []:
+        if not isinstance(name, str):
+            continue
+        path = recipe_dir / name
+        if not path.is_file():
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            vals[k.strip()] = v
+    return vals
+
+
+def _dependency_precheck(intent: dict, selection: dict) -> str:
+    """G103/T15 — decide the env-picker mode at intake.
+
+    The modes (T15):
+      * no deps → normal;
+      * any missing relation + env file/generate new → forced generate-new
+        (a selected env is refused here — the modal disables it);
+      * distinct, all relations present + selected env → every classified var
+        must be present and non-empty (else the deploy is BLOCKED); all
+        present → substitution is marked for `_claim_and_register`;
+      * `None` and duplicate target service names → dependencies removed from
+        the env context (grants only, normal env pickers).
+    """
+    ids = [str(x) for x in (intent.get("dependency_service_ids")
+                            or intent.get("allowed_target_service_ids") or []) if x]
+    if not ids:
+        return "normal"
+    entries = _entries_for_ids(ids)
+    if not entries:
+        return "normal"
+    recipe_dir = _recipe_dir(intent.get("service_name") or "",
+                             intent.get("recipe_path") or "")
+    source = intent.get("service_name") or ""
+    if duplicate_target_services(entries):
+        intent["_dependency_env_disabled"] = True
+        return "duplicate"
+    if selection.get("env_none"):
+        intent["_dependency_env_disabled"] = True
+        return "none"
+    missing = sorted({
+        str(e.get("service_name") or "") for e in entries
+        if read_relation(recipe_dir, source, str(e.get("service_name") or "")) is None
+    } - {""})
+    if missing:
+        if selection.get("env"):
+            raise WorkflowError(
+                "dependency_relations_missing",
+                "missing dependency relation file(s): " + ", ".join(missing)
+                + " — choose generate new (or None) and deploy again",
+                409,
+            )
+        return "force_new"
+    if selection.get("env"):
+        needed: dict[str, str] = {}
+        for e in entries:
+            rel = read_relation(recipe_dir, source, str(e.get("service_name") or ""))
+            needed.update(relation_env(rel))
+        present = _selected_env_values(recipe_dir, selection)
+        absent = sorted(v for v in needed if not str(present.get(v) or "").strip())
+        if absent:
+            raise WorkflowError(
+                "dependency_env_incomplete",
+                "the selected env is missing classified variable(s): "
+                + ", ".join(absent)
+                + " — fill them, choose another env, or generate new",
+                409,
+            )
+        intent["_dependency_substitute"] = True
+        return "substitute"
+    return "generate"
+
+
+def _snapshot_rows(entry: dict) -> dict:
+    """T10 — the card's snapshot rows: exact names, only when the file exists."""
+    service = str(entry.get("service_name") or "")
+    user = str(entry.get("user_name") or "")
+    label = str(entry.get("label") or "")
+    if not service or not user:
+        return {}
+    try:
+        recipe_dir = _recipe_dir(service, entry.get("recipe_path") or "")
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, Any] = {}
+    sp_name = serving_ports_snapshot_name(user, label)
+    if (recipe_dir / sp_name).is_file():
+        out["serving_ports_snapshot"] = sp_name
+    deps: list[dict] = []
+    if entry.get("service_id"):
+        for target_entry in _dependency_entries(str(entry["service_id"])):
+            target = str(target_entry.get("service_name") or "")
+            if not target:
+                continue
+            name = relation_snapshot_filename(service, target, user, label)
+            if (recipe_dir / name).is_file():
+                deps.append({"target_service": target, "path": name})
+    if deps:
+        out["dependency_snapshots"] = deps
+    return out
+
+
+def _snapshot_for_deploy(intent: dict, selection: dict, label: str) -> None:
+    """T9 — per-instance copies of the used serving-ports / relation files."""
+    service = intent.get("service_name") or ""
+    user = str(intent.get("user_name") or intent.get("owner_username") or "user")
+    try:
+        recipe_dir = _recipe_dir(service, intent.get("recipe_path") or "")
+        sp = None if selection.get("serving_ports_none") else selection.get("serving_ports")
+        targets: list[str] = []
+        if not intent.get("_dependency_env_disabled"):
+            ids = [str(x) for x in (intent.get("dependency_service_ids")
+                                    or intent.get("allowed_target_service_ids") or []) if x]
+            entries = _entries_for_ids(ids)
+            targets = sorted({str(e.get("service_name") or "") for e in entries} - {""})
+        snapshot_used_artifacts(
+            recipe_dir, source_service=service, user=user, label=str(label),
+            serving_ports=sp if isinstance(sp, str) else None,
+            target_services=targets,
+        )
+    except Exception:  # noqa: BLE001 — a snapshot failure never blocks the deploy
+        _log.exception("dependency snapshot failed for %s/%s", service, label)
+
+
+def _substitute_dependency_env(intent: dict, selection: dict,
+                               label: str) -> str | None:
+    """T15 — write the substituted `.env.raw` (the selected file is NOT sent).
+
+    The base is the SELECTED env merged in order (later wins); every classified
+    variable is overwritten with its target's serving URL. Everything else is
+    preserved, exactly as the reference-base rule preserves it.
+    """
+    ids = [str(x) for x in (intent.get("dependency_service_ids")
+                            or intent.get("allowed_target_service_ids") or []) if x]
+    entries = _entries_for_ids(ids)
+    if not entries:
+        return None
+    recipe_dir = _recipe_dir(intent.get("service_name") or "",
+                             intent.get("recipe_path") or "")
+    source = intent.get("service_name") or ""
+    user = (intent.get("user_name") or intent.get("owner_username") or "user")
+    vals = _selected_env_values(recipe_dir, selection)
+    by_service = {str(e.get("service_name") or ""): e for e in entries}
+    for e in entries:
+        rel = read_relation(recipe_dir, source, str(e.get("service_name") or ""))
+        for var, target in relation_env(rel).items():
+            target_entry = by_service.get(target) or by_service.get(
+                str(e.get("service_name") or ""))
+            if target_entry:
+                vals[var] = serving_url(target_entry)
+    name = f".env.raw.{user}.{label}"
+    path = recipe_dir / name
+    path.write_text(
+        "\n".join(f"{k}={v}" for k, v in vals.items()) + ("\n" if vals else ""),
+        encoding="utf-8")
+    (recipe_dir / f"{name}.generated").write_text("")
+    return name
+
+
 def _record_deploy_intent(intent: dict) -> tuple[dict, dict]:
     """Split the deploy intent into its non-secret half and encrypted secrets."""
     secrets = pdr.secret_option_values(intent)
@@ -334,6 +544,9 @@ async def _start(intent: dict, *, operation: str, actor_user_id=None) -> dict:
     selection = _selection(intent)
     _validate_selected_files(intent, selection)
     _validate_policy(intent, selection, require_ready=False)
+    # G103/T15 — the dependency-aware env mode is decided once, here; a selected
+    # env missing a classified variable (or a relation) is a structured refusal.
+    _dependency_precheck(intent, selection)
 
     owner_id = intent.get("owner_api_user_id")
     if not owner_id:
@@ -507,7 +720,8 @@ def _session_ready(existing: dict, intent: dict) -> bool:
         return False
     if not selection.get("serving_ports") and not selection.get("serving_ports_none"):
         return False
-    if _https(intent) and not selection.get("stream_conf"):
+    if (_https(intent) and not selection.get("stream_conf")
+            and _selection_stream_rows(intent, selection)):
         return False
     # S11 — an explicit `env_none` fills the env slot just like a selected
     # list or a recorded generated name does.
@@ -753,6 +967,18 @@ async def _claim_and_register(service_id: str, intent: dict,
         "recipe_path": record["recipe_path"],
         "label": record["label"],
     })
+
+    # G103/T15 — the selected-env substitution: a `.env.raw` built from the
+    # selected env plus the targets' serving URLs. The selected file is never
+    # sent. (The duplicate/None modes carry no substitution flag.)
+    if resolved.get("_dependency_substitute") and not env_name:
+        env_name = _substitute_dependency_env(
+            resolved, selection, str(record["label"]))
+
+    # G103/T9 — snapshot the USED serving-ports artifact and relation files
+    # per (user, service, label) on every deploy. A later edit of the shared
+    # recipe artifact cannot change what the instance records.
+    _snapshot_for_deploy(resolved, selection, str(record["label"]))
 
     # S13 — the opt-in LLM env guard runs BEFORE the claim/register. A
     # finding or an LLM-call failure blocks the deploy; the record fails
@@ -1166,6 +1392,9 @@ async def stages(user_name: str | None = None) -> dict:
                     "source": "instance",
                     "job_live": False,
                     "session": None,
+                    # T9/T10 — the exact per-instance snapshot paths, present
+                    # only when the snapshot exists (never a guessed name).
+                    **_snapshot_rows({**svc, "user_name": uname}),
                 })
         for sid, sess in sessions.items():
             if sess.get("user_name") != uname:

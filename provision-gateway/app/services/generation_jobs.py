@@ -245,53 +245,41 @@ def _unfilled_externals(kvs: dict[str, Any], external_values: dict[str, str] | N
     return sorted(out)
 
 
-def _write_dependencies_artifact(
-    recipe_dir, *, user: str, service: str, label: str,
-    deps: list[dict], refs: dict | None,
-) -> "Path | None":
-    """Write ``dependencies.{user}.{label}.json`` beside the per-user env (G102).
+def _write_relation_files(
+    recipe_dir, *, service: str, deps: list[dict], refs: dict | None,
+) -> list["Path"]:
+    """G103/T14 — fill the MISSING per-relation files, mechanically.
 
-    The source's ``env`` map records each classified variable's
-    ``{"depends_on": <service key>}``; every selected dependency gets its own
-    record with an empty env map.  A generated artifact: identified by pattern,
-    never auto-deleted.  Written only when at least one dependency was selected
-    (a deploy with no dependency surface has nothing to persist).
+    One ``dependency.<source-service>.<target-service>.json`` per distinct
+    target service, user/label-agnostic. The LLM's classification supplies the
+    env map (var → dependency key); this function groups it by target SERVICE
+    and writes only relations that do not exist yet — an existing file is the
+    reusable classification and is never overwritten by a generation. A target
+    with no classified vars still gets its file (an empty env map), because the
+    file's existence is what marks the relation as classified.
     """
-    if not deps:
-        return None
-    import json as _json
-    from datetime import datetime, timezone
+    from .dependency_model import read_relation, write_relation
 
-    source_key = f"{user}/{service}/{label}"
-    allowed = {str(d.get("key")) for d in deps if d.get("key")}
-    env: dict[str, dict] = {}
-    for var, key in (refs or {}).items():
-        if str(key) in allowed:
-            env[str(var)] = {"depends_on": str(key)}
-    services: dict[str, dict] = {
-        source_key: {"user": user, "service": service, "label": str(label),
-                     "env": env},
-    }
+    if not deps:
+        return []
+    by_key = {str(d.get("key")): d for d in deps if d.get("key")}
+    targets: dict[str, dict] = {}
     for d in deps:
-        key = str(d.get("key") or "")
-        if not key:
-            continue
-        services[key] = {
-            "user": d.get("user"),
-            "service": d.get("service"),
-            "label": str(d.get("label")),
-            "env": {},
-        }
-    payload = {
-        "version": 1,
-        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "source": source_key,
-        "services": services,
-    }
-    path = Path(recipe_dir) / f"dependencies.{user}.{label}.json"
-    path.write_text(_json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    Path(str(path) + ".generated").write_text("")
-    return path
+        svc = str(d.get("service") or "")
+        if svc:
+            targets.setdefault(svc, d)
+    written: list[Path] = []
+    for target_service in targets:
+        if read_relation(recipe_dir, service, target_service) is not None:
+            continue  # reuse — the classification is already recorded
+        env_map: dict[str, str] = {}
+        for var, key in (refs or {}).items():
+            dep = by_key.get(str(key))
+            if dep and str(dep.get("service")) == target_service:
+                env_map[str(var)] = target_service
+        written.append(write_relation(
+            recipe_dir, service, target_service, env_map))
+    return written
 
 
 def _apply_env_kvs(
@@ -716,29 +704,46 @@ class GenerationJobManager:
         compose_paths = [recipe_dir / p for p in sel_compose if (recipe_dir / p).is_file()]
 
         scan = scan_compose_files(compose_paths) if compose_paths else None
-        if scan is None or not scan.refs:
-            # No compose ${VAR} surface → an EMPTY per-user env, not "no file".
-            # The phase no longer skips (deploy-panel-selection-and-generation-
-            # todo.md §4): the gateway is the single producer of the per-user
-            # env in every case, and the empty file is what keeps compose's
-            # auto-read of the recipe `.env` overridden at deploy time.
-            return ""
 
-        lines: dict[str, str] = {}
-        for p in sel_env:
-            fp = recipe_dir / p
+        def _merge_env_file(path: str) -> None:
+            fp = recipe_dir / path
             if not fp.is_file():
-                continue
+                return
             try:
                 raw = fp.read_text(encoding="utf-8", errors="replace")
             except OSError:
-                continue
+                return
             for line in raw.splitlines():
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, _, v = line.partition("=")
                 lines[k] = v
+
+        lines: dict[str, str] = {}
+        for p in sel_env:
+            _merge_env_file(p)
+        # 2026-11-19 / O3 (T7) — the env REFERENCE is the BASE of the
+        # generated `.raw`: every variable it carries is preserved, in order,
+        # later files winning; only the ESSENTIAL variables are filled or
+        # overridden (by the LLM's kvs / the mint above). The reference files
+        # themselves are never sent to the deployment. This runs for the
+        # generate-new path (no selected env); a selected env is the deploy
+        # env and suppresses generation entirely.
+        if not sel_env:
+            for p in (request.get("env_reference") or []):
+                if isinstance(p, str):
+                    _merge_env_file(p)
+
+        if scan is None or not scan.refs:
+            # No compose ${VAR} surface. The reference base still stands: the
+            # phase produces the preserved reference variables (or an EMPTY
+            # per-user env when there is no reference either) — never "no
+            # file", so compose's auto-read of the recipe `.env` stays
+            # overridden at deploy time.
+            return "\n".join(f"{k}={v}" for k, v in lines.items()) + (
+                "\n" if lines else "")
+
         for ref in scan.refs:
             if not ref.has_default:
                 continue
@@ -1520,6 +1525,9 @@ class GenerationJobManager:
                                 "recipe_path": recipe_path,
                                 "task_log": request.get("task_log") or "",
                                 "failure": request.get("failure") or {},
+                                # T17 — identities + serving URLs only; no
+                                # live-state query, no root-cause claim.
+                                "dependencies": request.get("dependencies") or [],
                                 "deploy_metadata": request.get("deploy_metadata") or {},
                                 "user_name": request.get("user_name") or "",
                                 "label": str(request.get("label") or "0"),
@@ -1699,11 +1707,12 @@ class GenerationJobManager:
                             _rl = str(request.get("label")
                                       or (request.get("deploy_metadata") or {}).get("label")
                                       or "0")
-                            _write_dependencies_artifact(
-                                _rd, user=_ru, service=service_name, label=_rl,
-                                deps=_re.get("dependencies") or [],
-                                refs=_re.get("dependency_refs") or {},
-                            )
+                            if not _recipe_level_env:
+                                _write_relation_files(
+                                    _rd, service=service_name,
+                                    deps=_re.get("dependencies") or [],
+                                    refs=_re.get("dependency_refs") or {},
+                                )
                             result_files[_name] = _content
                             env_name = _name
                             warnings.extend(
@@ -1774,6 +1783,12 @@ class GenerationJobManager:
                                     })
                             except Exception:  # noqa: BLE001 — context is best-effort
                                 _deps = []
+                            # G103/T18 — the `.env.fix` repair is
+                            # dependency-BLIND: a genuine `fix` job gets no
+                            # structured dependency context, so its output is
+                            # identical with or without dep ids in the intent.
+                            if request.get("fix") and job.job_type == "fix":
+                                _deps = []
                             context["dependencies"] = _deps
                             # LLM fill = two-turn conversation (design §2 env
                             # redesign): turn 1 identifies the vars needing
@@ -1796,11 +1811,37 @@ class GenerationJobManager:
                                     )
                                     if gen and gen.get("kvs"):
                                         break
+                            # 2026-11-19/T12 — the two-turn result's warnings are
+                            # ALWAYS surfaced, including the zero-variable
+                            # fallback. They used to be extended only when kvs
+                            # was non-empty, which swallowed exactly the warning
+                            # that explains the mechanical fallback.
+                            if gen:
+                                warnings.extend(gen.get("warnings") or [])
                             if gen and gen.get("kvs"):
                                 kvs = gen["kvs"]
-                                warnings.extend(gen.get("warnings") or [])
                                 u = gen.get("usage") or {}
                                 # (_usage_sync already folded these into the totals)
+
+                            # T14 — mechanical cross-check: a value that IS a
+                            # selected dependency's serving URL is that
+                            # dependency's variable, even when the model left it
+                            # out of `_depends_on`. Without this the relation
+                            # file misses the variable, and the selected-env
+                            # substitution cannot replace a stale URL.
+                            dep_refs = dict((gen or {}).get("dependency_refs") or {})
+                            if kvs and _deps:
+                                for _var, _v in kvs.items():
+                                    if _var in dep_refs:
+                                        continue
+                                    _val = _v.get("value") if isinstance(_v, dict) else _v
+                                    if not _val:
+                                        continue
+                                    for _d in _deps:
+                                        _url = str(_d.get("serving_url") or "").rstrip("/")
+                                        if _url and str(_val).rstrip("/") == _url:
+                                            dep_refs[_var] = str(_d.get("key"))
+                                            break
 
                             # ---- PAUSE for operator-supplied credentials -------
                             # Turn 1 classified these as third-party credentials:
@@ -1868,7 +1909,7 @@ class GenerationJobManager:
                                                 "kvs": kvs,
                                                 "compose_paths": context.get("compose_paths") or [],
                                                 "dependencies": context.get("dependencies") or [],
-                                                "dependency_refs": (gen or {}).get("dependency_refs") or {},
+                                                "dependency_refs": dep_refs,
                                             },
                                         },
                                         "warnings": warnings,
@@ -1931,11 +1972,12 @@ class GenerationJobManager:
                                 fpath = recipe_dir / env_name
                                 fpath.write_text(content, encoding="utf-8")
                                 (recipe_dir / f"{fpath.name}.generated").write_text("")
-                                _write_dependencies_artifact(
-                                    recipe_dir, user=uname, service=service_name,
-                                    label=ulabel, deps=_deps,
-                                    refs=(gen or {}).get("dependency_refs") or {},
-                                )
+                                if not _recipe_level_env:
+                                    _write_relation_files(
+                                        recipe_dir, service=service_name,
+                                        deps=_deps,
+                                        refs=dep_refs,
+                                    )
                                 result_files[env_name] = content
                                 await _event(env_name, "done", {
                                     "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",

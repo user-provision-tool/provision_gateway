@@ -1,0 +1,230 @@
+"""The dependency-aware env model (GRILLING G103; 2026-11-19 rev 3).
+
+One ``dependency.<source-service>.<target-service>.json`` per service→service
+RELATION, user- and label-agnostic, in the source recipe dir, gateway-written.
+The file holds the relation's env map (source variable → target service); it is
+reused across labels and owners, and the selected target's label only enters at
+deploy, when its serving URL is substituted.
+
+The deploy's per-instance snapshots are separate, per-(user, service, label)
+COPIES — ``serving_ports.user-<u>.<l>.yml`` and
+``dependency.<source>.<target>.user-<u>.<l>.json`` — so a later edit of the
+shared artifact cannot change what the instance records.
+
+This module is the single definition of the names, the relation JSON, and the
+serving-URL derivation; the deploy workflow, the generation phase and the fix
+analysis all read it.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+RELATION_RE = re.compile(
+    r"^dependency\.(?P<source>[^.]+)\.(?P<target>[^.]+)\.json$")
+
+
+def _stamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def relation_filename(source_service: str, target_service: str) -> str:
+    return f"dependency.{source_service}.{target_service}.json"
+
+
+def relation_snapshot_filename(source_service: str, target_service: str,
+                               user: str, label: str) -> str:
+    return (f"dependency.{source_service}.{target_service}"
+            f".user-{user}.{label}.json")
+
+
+def serving_ports_snapshot_name(user: str, label: str) -> str:
+    return f"serving_ports.user-{user}.{label}.yml"
+
+
+def serving_url(entry: dict) -> str:
+    """The target's serving URL, exactly as the env fill uses it.
+
+    The served name (the ``--<sub>`` endpoint) is preferred over the instance
+    hostname; the scheme and the external port follow the target's TLS flag.
+    """
+    hosts = entry.get("http_endpoints") or []
+    host = (hosts[0] if hosts else entry.get("hostname")) or ""
+    scheme = "https" if entry.get("tls") else "http"
+    # The gateway's settings are the same ports the edge serves on.
+    from ..config import settings
+    port = settings.NGINX_HTTPS_PORT if entry.get("tls") else settings.NGINX_HTTP_PORT
+    std = (scheme == "http" and int(port) == 80) or (
+        scheme == "https" and int(port) == 443)
+    return f"{scheme}://{host}" if std else f"{scheme}://{host}:{port}"
+
+
+def target_identity(entry: dict) -> dict:
+    return {
+        "key": f"{entry.get('user_name')}/{entry.get('service_name')}/"
+               f"{entry.get('label')}",
+        "user": entry.get("user_name"),
+        "service": entry.get("service_name"),
+        "label": str(entry.get("label")),
+        "hostname": (entry.get("http_endpoints") or [entry.get("hostname") or ""])[0],
+        "serving_url": serving_url(entry),
+    }
+
+
+def entries_for_ids(ids: list[str]) -> list[dict]:
+    """Resolve SELECTED dependency ids to registry entries.
+
+    The deploy intent's ids are the targets themselves — NOT a source whose
+    grants are read. Used at intake / generation / snapshot time, before the
+    grant rows exist.
+    """
+    from .registry import Registry
+    reg = Registry()
+    out: list[dict] = []
+    for sid in ids:
+        try:
+            entry = reg.get_by_id(str(sid))
+        except Exception:  # noqa: BLE001
+            entry = None
+        if entry and service_grants_live(entry):
+            out.append(entry)
+    return out
+
+
+def service_grants_live(entry: dict) -> bool:
+    """A tombstoned entry is not a deployable dependency."""
+    return not (entry.get("service_deleted_at") or entry.get("deleted_at"))
+
+
+def dependency_entries(service_id: str) -> list[dict]:
+    """The deployed relations of *service_id*: its explicit grant targets.
+
+    Read from the gateway's own grant rows + the read-only registry view; no
+    live-state query, no -api call. A missing/stale target is skipped.
+    """
+    from ..database import SessionLocal
+    from . import service_grants
+    from .registry import Registry
+
+    db = SessionLocal()
+    try:
+        rows = service_grants.explicit_rows(db, service_id)
+        ids = [str(r.target_service_id) for r in rows]
+    except Exception:  # noqa: BLE001 — context is best-effort
+        ids = []
+    finally:
+        db.close()
+    reg = Registry()
+    out: list[dict] = []
+    for sid in ids:
+        try:
+            entry = reg.get_by_id(sid)
+        except Exception:  # noqa: BLE001
+            entry = None
+        if entry and service_grants.live(entry):
+            out.append(entry)
+    return out
+
+
+def read_relation(recipe_dir: str | Path, source_service: str,
+                  target_service: str) -> dict | None:
+    """The relation file's parsed content, or None when missing/unreadable."""
+    path = Path(recipe_dir) / relation_filename(source_service, target_service)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def relation_env(data: dict | None) -> dict[str, str]:
+    """ ``{variable: target-service}`` from a relation's ``env`` map.
+
+    Both the decision-4 object form (``{"depends_on": target}``) and a plain
+    string target are accepted; anything else is ignored.
+    """
+    out: dict[str, str] = {}
+    env = (data or {}).get("env")
+    if not isinstance(env, dict):
+        return out
+    for var, value in env.items():
+        if not isinstance(var, str) or not var:
+            continue
+        if isinstance(value, dict):
+            target = value.get("depends_on")
+        else:
+            target = value
+        if isinstance(target, str) and target:
+            out[var] = target
+    return out
+
+
+def write_relation(recipe_dir: str | Path, source_service: str,
+                   target_service: str, env_map: dict[str, str]) -> Path:
+    """Write one relation file mechanically (and its marker).
+
+    Existing files are NOT overwritten by generation — the caller checks
+    :func:`read_relation` first. This writer is for the missing relation only.
+    """
+    path = Path(recipe_dir) / relation_filename(source_service, target_service)
+    payload = {
+        "version": 1,
+        "source_service": source_service,
+        "target_service": target_service,
+        "env": {var: {"depends_on": target_service} for var in sorted(env_map)},
+        "generated_at": _stamp(),
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    Path(str(path) + ".generated").write_text("")
+    return path
+
+
+def duplicate_target_services(entries: list[dict]) -> bool:
+    """True when two selected dependencies are the SAME service name.
+
+    The duplicate fallback removes the dependencies from the env context; the
+    env pickers/ref behave normally and the dependencies are grants only.
+    """
+    names = [str(e.get("service_name") or "") for e in entries]
+    return len(names) != len(set(names))
+
+
+def copy_snapshot(src: Path, dest: Path) -> Path:
+    """Copy a used artifact to its per-instance snapshot name (+ marker)."""
+    dest.write_text(src.read_text(encoding="utf-8", errors="replace"),
+                    encoding="utf-8")
+    Path(str(dest) + ".generated").write_text("")
+    return dest
+
+
+def snapshot_used_artifacts(recipe_dir: str | Path, *, source_service: str,
+                            user: str, label: str,
+                            serving_ports: str | None,
+                            target_services: list[str]) -> dict:
+    """T9 — snapshot the used serving-ports artifact and relation files.
+
+    Called on EVERY deploy. A missing source is skipped (the card shows only
+    rows whose snapshot exists). Returns the exact snapshot names.
+    """
+    rdir = Path(recipe_dir)
+    out: dict[str, Any] = {"serving_ports": None, "dependencies": []}
+    if serving_ports:
+        src = rdir / serving_ports
+        if src.is_file():
+            name = serving_ports_snapshot_name(user, label)
+            copy_snapshot(src, rdir / name)
+            out["serving_ports"] = name
+    for target in target_services:
+        src = rdir / relation_filename(source_service, target)
+        if not src.is_file():
+            continue
+        name = relation_snapshot_filename(source_service, target, user, label)
+        copy_snapshot(src, rdir / name)
+        out["dependencies"].append({"target_service": target, "path": name})
+    return out

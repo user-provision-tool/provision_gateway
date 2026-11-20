@@ -196,6 +196,21 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
     }
   }
 
+  // T6 — the job result carries `{name, sha256, size}` METADATA, never
+  // content. Review/edit fetches the file by name (the metadata object must
+  // never reach the editor, and must never be written back).
+  const openReviewFile = async (name: string) => {
+    const path = recipePath ? `${recipePath}/${name}` : name
+    try {
+      const { data } = await client.get(`/projects/${serviceName}/files/${path}`)
+      setEditorFile(name)
+      setEditorContent(typeof data?.content === 'string' ? data.content : '')
+      setEditorFromPicker(false)
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || `Could not open ${name}`)
+    }
+  }
+
   const saveEditor = async () => {
     if (!editorFile) return
     if (editorFromPicker) {
@@ -360,7 +375,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
                             {ok ? '✓ valid' : '✗ invalid'}
                           </Tag>
                           <span style={{ fontFamily: 'monospace', fontSize: 13 }}>{fn}</span>
-                          <Button size="small" onClick={() => { setEditorFile(fn); setEditorContent(reviewFiles[fn] || ''); setEditorFromPicker(false) }}>Edit</Button>
+                          <Button size="small" onClick={() => { void openReviewFile(fn) }}>Edit</Button>
                           {!ok && (
                             <Text type="danger" style={{ fontSize: 12, flex: 1 }}>
                               {((v && v.errors) || []).join('; ').slice(0, 200)}

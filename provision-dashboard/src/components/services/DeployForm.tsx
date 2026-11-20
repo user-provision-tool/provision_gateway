@@ -785,7 +785,63 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   // state (which is never reset on a fresh open). With TLS on and no
   // certificate selected there is no trusted domain, so Deploy is disabled.
   const watchedSslDomain = Form.useWatch('ssl_domain', form)
-  const streamSlotNeeded = httpsOn && !eff.serving_ports_none
+  // 2026-11-19/T3 — the stream slot is derived from the SELECTED artifact's
+  // rows, never the TLS toggle alone. The summary is fetched whenever the
+  // selection/service changes; a missing, unreadable or malformed artifact
+  // reads as "no rows", so the line never demands a conf it cannot produce.
+  const [streamRowCount, setStreamRowCount] = useState<number | null>(null)
+  useEffect(() => {
+    if (!open || !watchedService || !eff.serving_ports || eff.serving_ports_none) {
+      setStreamRowCount(null)
+      return
+    }
+    const { baseName, recipePath } = parseServiceValue(watchedService)
+    if (!baseName) { setStreamRowCount(null); return }
+    let cancelled = false
+    client.get(`/projects/${baseName}/serving-ports/summary`, {
+      params: { path: eff.serving_ports, recipe_path: recipePath },
+    }).then(({ data }) => {
+      if (!cancelled) {
+        setStreamRowCount(data?.readable ? (Number(data.stream_rows) || 0) : null)
+      }
+    }).catch(() => { if (!cancelled) setStreamRowCount(null) })
+    return () => { cancelled = true }
+  }, [open, watchedService, eff.serving_ports, eff.serving_ports_none])
+  const streamSlotNeeded =
+    httpsOn && !eff.serving_ports_none && (streamRowCount ?? 0) > 0
+  // G103/T16 — the dependency-aware env mode. The endpoint is the read-only
+  // twin of the gateway's intake check: it names the mode, the classified
+  // variables and the ones a selected env is missing.
+  const watchedDeps = Form.useWatch('dependency_service_ids', form)
+  const depKey = ((watchedDeps as string[] | undefined) || []).filter(Boolean).join(',')
+  const envKey = eff.env.join(',')
+  const [depMode, setDepMode] = useState<any>(null)
+  useEffect(() => {
+    if (!open || !watchedService || !depKey) { setDepMode(null); return }
+    const { baseName, recipePath } = parseServiceValue(watchedService)
+    if (!baseName) { setDepMode(null); return }
+    const envNames = eff.env_none ? [] : envKey.split(',').filter(Boolean)
+    let cancelled = false
+    client.get(`/projects/${baseName}/dependencies/mode`, {
+      params: {
+        dependency_service_ids: depKey,
+        env: envNames.join(','),
+        recipe_path: recipePath,
+      },
+    }).then(({ data }) => {
+      if (cancelled) return
+      setDepMode(data)
+      // A missing relation forces generate-new: drop a selected env once.
+      if (data?.mode === 'force_new' && envNames.length > 0) {
+        setSelection(prev => ({ ...prev, env: [] }))
+      }
+    }).catch(() => { if (!cancelled) setDepMode(null) })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, watchedService, depKey, envKey, eff.env_none])
+  const depDuplicate = depMode?.mode === 'duplicate'
+  const depForceNew = depMode?.mode === 'force_new' && !eff.env_none
+  const depEnvBlocked = (depMode?.missing_vars || []).length > 0
   const slotsSpecified = eff.compose.length > 0 && !!eff.nginx && envSatisfied
     && (!streamSlotNeeded || !!eff.stream_conf)
   // F5 — the readiness line names the ACTUAL missing slots/files, above the
@@ -1005,7 +1061,7 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   // Save an edited generated file back to state + disk
   // §5b: open a SELECTED file for view/edit. Fetch it from the recipe through
   // the same project-files endpoint the generated-file editor uses.
-  const openSelectedFile = async (name: string) => {
+  const openSelectedFile = async (name: string, fork = true) => {
     const svcVal = form.getFieldValue('service_name') || ''
     const { baseName, recipePath } = parseServiceValue(svcVal)
     const path = recipePath ? `${recipePath}/${name}` : name
@@ -1013,7 +1069,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
       const { data } = await client.get(`/projects/${baseName}/files/${path}`)
       setEditorFileName(name)
       setEditorContent(typeof data?.content === 'string' ? data.content : '')
-      setEditorFork(true)
+      // T6 — a generated file is edited IN PLACE; only a picker-selected
+      // source forks to `.fix` on save. The job result is metadata only, so
+      // the content always comes from this fetch, never from the result.
+      setEditorFork(fork)
       setEditorModalOpen(true)
     } catch (err: any) {
       message.error(err.response?.data?.detail || `Could not open ${name}`)
@@ -1477,10 +1536,12 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
           />
           {(fileSetCandidates.env || []).length > 0 && (
             <div>
-              <Text strong>Env reference (generation context)</Text>
+              <Text strong>Env reference (generation base)</Text>
               <Text type="secondary" style={{ fontSize: 12 }}>
-                {' '}— base/example env files the model reads to produce the per-user env.
-                Not passed to the deployment.
+                {' '}— base/example env files the model reads. The generated
+                per-user env PRESERVES every variable and value from them and
+                fills only the essential ones; the reference files themselves
+                are never sent to the deployment.
               </Text>
               {/* F6/S21 — selected references as rows ABOVE the picker, each
                   clickable to edit (saving forks to `.fix`) and removable. */}
@@ -1512,6 +1573,21 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                   .filter(c => !envRefs.includes(c))
                   .map(c => ({ value: c, label: c }))}
               />
+              {/* 2026-11-19/T8 — `None` is a deliberate, valid state: the
+                  model works from the compose alone. It must read as a CHOICE,
+                  not as an empty grey placeholder; Deploy/Generate stay
+                  enabled. */}
+              {envRefs.length === 0 && (
+                <div style={{ marginTop: 6 }}>
+                  <Tag color="orange" style={{ fontWeight: 600 }}>
+                    None — the model works from the compose alone
+                  </Tag>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    No reference is used; generation reads only the compose's
+                    {' '}<Text code>$&#123;VAR&#125;</Text> surface.
+                  </Text>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1721,6 +1797,11 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                   options={crossTargets}
                 />
               </Form.Item>
+              {depDuplicate && (
+                <Alert type="warning" showIcon style={{ marginBottom: 8 }}
+                  message="The same service is selected more than once — the dependencies are removed from the env context"
+                  description="They are applied as s2s grants only. The env file and reference pickers behave normally, and no dependency rows are listed." />
+              )}
               <div style={{ fontSize: 12, color: '#999' }}>
                 The services this deploy depends on. Only accounts this user can
                 reach are listed (their own, an active account grant, or a
@@ -1746,7 +1827,28 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                 needsEnv={needsEnv}
                 onChange={setSelection}
                 onOpenFile={(name) => openSelectedFile(name)}
+                forceEnvGenerate={depForceNew}
               />
+              {!!depKey && eff.env_none && (
+                <Alert type="info" showIcon style={{ marginTop: 8 }}
+                  message="None — no env is sent"
+                  description="The dependencies are applied as s2s grants only: no classification, no generation, no dependency rows." />
+              )}
+              {depForceNew && (
+                <Alert type="warning" showIcon style={{ marginTop: 8 }}
+                  message="A dependency relation file is missing — the env is forced to generate new"
+                  description="The pipeline classifies the missing relation(s), writes their files and generates the per-user env. None remains selectable." />
+              )}
+              {depMode?.mode === 'substitute' && (
+                <Alert type="info" showIcon style={{ marginTop: 8 }}
+                  message={`Selected env: ${(depMode.classified_vars || []).join(', ') || 'no classified variables'}`}
+                  description="Every classified variable must be present. When all are, this deploy writes a new per-user .env.raw with the targets' serving URLs; the selected file itself is not sent." />
+              )}
+              {depEnvBlocked && (
+                <Alert type="error" showIcon style={{ marginTop: 8 }}
+                  message={`The selected env is missing classified variable(s): ${(depMode.missing_vars || []).join(', ')}`}
+                  description="The deploy is blocked. Fill them, choose another env, or generate new." />
+              )}
               {/* ---- Deploy-time per-user env (pipeline env phase, design §2) ---- */}
               {perUserEnv && (
                 <Alert type="success" showIcon style={{ marginTop: 8 }} message={`Per-user env ready: ${perUserEnv} — this deployment will use it as its interpolation env`} />
@@ -1863,11 +1965,7 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                             <div key={fn} style={{marginTop:4, display:'flex', alignItems:'center', gap: 8}}>
                               <Tag color={ok ? 'green' : 'red'} style={{margin:0}}>{ok ? '✓' : '✗'}</Tag>
                               <Tag color="blue" style={{cursor:'pointer', margin:0}}
-                                onClick={() => {
-                                  setEditorFileName(fn)
-                                  setEditorContent(String(generatedFiles[fn]))
-                                  setEditorModalOpen(true)
-                                }}>
+                                onClick={() => { void openSelectedFile(fn, false) }}>
                                 📄 {fn} — click to view/edit
                               </Tag>
                               {!ok && (
@@ -2077,7 +2175,7 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
               // gateway's generation path produces the compose (as it does for
               // any other empty slot), so Deploy is how the operator asks for it.
               disabled={!selectedUserName || !selectedServiceName || !!checkError || fileSetLoading
-                || computingLabel
+                || computingLabel || depEnvBlocked
                 // F4/S14 — TLS on with no certificate selected: no trusted
                 // domain, so Deploy is visibly disabled. Read from the FORM
                 // watcher, not the stale `httpsEnabled` state.

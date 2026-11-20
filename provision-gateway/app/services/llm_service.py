@@ -1135,6 +1135,22 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
                 meta.get("domain") or "localhost",
             )
         )
+        deps = context.get("dependencies") or []
+        if deps:
+            lines = []
+            for d in deps:
+                lines.append(
+                    "- %s (user=%s service=%s label=%s) serving URL: %s"
+                    % (d.get("key"), d.get("user"), d.get("service"),
+                       d.get("label"), d.get("serving_url")))
+            parts.append(
+                "Selected dependencies (identities and serving URLs only — no "
+                "live-state check was made):\n" + "\n".join(lines) + "\n\n"
+                "If the failure is rooted in one of these dependencies, say so "
+                "plainly in the guide and name the dependency. Do not diagnose "
+                "WHY the dependency failed — the log + identities are the "
+                "evidence; anything beyond that is a guess."
+            )
         if failure:
             parts.append(
                 "Failure stage: %s\nFailure message:\n%s"

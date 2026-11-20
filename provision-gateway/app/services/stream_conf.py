@@ -32,6 +32,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from .serving_ports import category_of
 
 # The internal listener's container port (task-doc R5.1: the port the compose
@@ -83,6 +85,23 @@ def stream_rows(serving_ports: Any) -> list[dict[str, Any]]:
             continue
         out.append(row)
     return out
+
+
+def artifact_has_stream_rows(path: Any) -> bool:
+    """True iff the serving-ports artifact at *path* declares >=1 stream row.
+
+    The 2026-11-19 ruling: the stream-conf requirement is derived from the
+    SELECTED artifact's rows, never from the TLS toggle alone. Any failure —
+    a missing path, an unreadable file, malformed YAML — reads as "no rows",
+    so the readiness line never demands a conf the artifact cannot produce.
+    """
+    if not isinstance(path, str) or not path:
+        return False
+    try:
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except (OSError, yaml.YAMLError):
+        return False
+    return bool(stream_rows(data))
 
 
 def canonical_name(*, service_name: str, user_name: str, label: str, domain: str,

@@ -26,10 +26,17 @@ export interface CrossGrantsSectionProps {
   isAdmin: boolean
   isOwner: boolean
   onPeek?: (serviceId: string) => void
+  /**
+   * 2026-11-19/T11 — the card's STAGE. The grant rows are written by the
+   * gateway's pre-start follow-up, so they may not exist when the card first
+   * mounts; when the stage changes (building → running) this reloads. An
+   * unchanged stage never refetches, so the 10-second status poll is silent.
+   */
+  refreshKey?: string | number
 }
 
 export default function CrossGrantsSection({
-  serviceId, isAdmin, isOwner, onPeek,
+  serviceId, isAdmin, isOwner, onPeek, refreshKey,
 }: CrossGrantsSectionProps) {
   const [data, setData] = useState<any>(null)
   const [candidates, setCandidates] = useState<any[]>([])
@@ -58,7 +65,7 @@ export default function CrossGrantsSection({
   useEffect(() => {
     load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serviceId, visible, isAdmin])
+  }, [serviceId, visible, isAdmin, refreshKey])
 
   if (!visible || !data) return null
 

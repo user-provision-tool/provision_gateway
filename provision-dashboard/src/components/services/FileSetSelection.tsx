@@ -107,6 +107,9 @@ interface Props {
   // into the `.fix` variant rather than writing back over the selection, so a
   // repo-original is never rewritten by an edit made here.
   onOpenFile?: (name: string) => void
+  // G103/T16 — a missing dependency relation forces the env slot to generate
+  // new; the env file options are hidden, `None` remains.
+  forceEnvGenerate?: boolean
 }
 
 export function phaseOfFile(filename: string): string {
@@ -177,7 +180,7 @@ export function SelectedFileRow({ name, onOpen, onRemove, stale, disabled }: {
   )
 }
 
-function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled, onOpenFile, noneSelected, noneLabel }: {
+function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled, onOpenFile, noneSelected, noneLabel, forceGenerate }: {
   values: string[]
   candidates: string[]
   staleMark: (v: string) => boolean
@@ -189,6 +192,9 @@ function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled, 
   onOpenFile?: (name: string) => void
   noneSelected?: boolean
   noneLabel?: string
+  // G103/T16 — a missing dependency relation FORCES generate-new: the file
+  // options are not offered, while `None` stays selectable.
+  forceGenerate?: boolean
 }) {
   const remaining = candidates.filter(c => !values.includes(c))
   return (
@@ -228,7 +234,7 @@ function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled, 
         options={[
           { value: GENERATE_NEW, label: GENERATE_NEW_LABEL },
           ...(noneLabel ? [{ value: ENV_NONE, label: noneLabel }] : []),
-          ...remaining.map(c => ({ value: c, label: c })),
+          ...(forceGenerate ? [] : remaining.map(c => ({ value: c, label: c }))),
         ]}
       />
       {/* All options are in the picker; the previous tag beside it is gone. */}
@@ -236,7 +242,7 @@ function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled, 
   )
 }
 
-export default function FileSetSelection({ selection, candidates, stale, needsEnv, showEnv = true, showProfiles = true, onChange, onOpenFile }: Props) {
+export default function FileSetSelection({ selection, candidates, stale, needsEnv, showEnv = true, showProfiles = true, onChange, onOpenFile, forceEnvGenerate = false }: Props) {
   const sel = selection
   const st = stale || {}
   const isStale = (cat: keyof FileSetStale, name: string) => (st[cat] || []).includes(name)
@@ -398,21 +404,29 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
             }}
           />
         ))}
+        {/* The sentinel must LOOK like the sentinel in the other pickers.
+            While no conf is selected this control is a SINGLE select, so
+            "generate new" renders as plain field text (no tag chip, no dead
+            ×); with a conf selected it becomes the ADD-MODE multi-select whose
+            value is empty and whose picks MERGE per category. */}
         <Select
-          mode="multiple"
+          mode={selectedConfs.length === 0 ? undefined : 'multiple'}
           style={{ width: '100%', marginTop: 4 }}
           // T0/R8 — the sentinel is the first option and the shown value while
           // nothing is selected. Choosing it clears every category slot.
           // F2 — with rows above, the control holds only NEW picks, so its
           // value is empty whenever a selection exists.
-          value={selectedConfs.length === 0 ? [GENERATE_NEW] : []}
+          value={selectedConfs.length === 0 ? GENERATE_NEW : []}
           placeholder={selectedConfs.length > 0 ? 'Add a config of another category…' : undefined}
-          onChange={(vals: string[]) => {
-            const picked = (vals || []).filter((v) => v !== GENERATE_NEW)
+          onChange={(vals) => {
+            const arr: string[] = Array.isArray(vals)
+              ? vals
+              : (vals ? [String(vals)] : [])
+            const picked = arr.filter((v) => v !== GENERATE_NEW)
             // Choosing the sentinel is the explicit "generate everything"
             // instruction; clearing an already-empty add control changes nothing.
             if (picked.length === 0) {
-              if ((vals || []).includes(GENERATE_NEW)) {
+              if (arr.includes(GENERATE_NEW)) {
                 set({ nginx: null, stream_conf: null, mail_conf: null })
               }
               return
@@ -467,6 +481,7 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
           onOpenFile={onOpenFile}
           noneSelected={!!sel.env_none}
           noneLabel="None — send no env files"
+          forceGenerate={forceEnvGenerate}
         />
       </div>
       )}

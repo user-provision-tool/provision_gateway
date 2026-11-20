@@ -574,6 +574,127 @@ def get_file_sets(
         raise HTTPException(400, str(e))
 
 
+@router.get("/{name}/serving-ports/summary")
+def serving_ports_summary(
+    name: str,
+    path: str = Query(..., description="selected serving-ports file (recipe-relative)"),
+    recipe_path: str = Query("", description="recipe subdir ('' = project root)"),
+    current_admin: dict = Depends(require_admin),
+):
+    """T2 — the selected artifact's stream-row count.
+
+    The panel's readiness line and the gateway's two predicates read the same
+    definition (`stream_conf.stream_rows`): a conf is required only when the
+    artifact declares at least one stream row. This endpoint never echoes the
+    file's content — only whether it is readable and how many stream rows it
+    has. Traversal, an absolute path and a name that is not a candidate are all
+    400s; an unknown service/recipe is a 404.
+    """
+    from ..services.file_sets import (
+        FileSetError, _is_serving_ports_candidate, _recipe_dir,
+        _validate_paths, list_file_sets,
+    )
+    from ..services.stream_conf import stream_rows
+    try:
+        sets = list_file_sets(name)
+    except FileSetError as e:
+        raise HTTPException(404, str(e))
+    rp = recipe_path or "."
+    if rp not in (sets.get("candidates") or {}):
+        raise HTTPException(404, f"unknown recipe: {recipe_path!r}")
+    project_dir = settings.SOURCE_PROJECTS_DIR / name
+    try:
+        rel = _validate_paths(project_dir, recipe_path, [path])[0]
+    except FileSetError as e:
+        raise HTTPException(400, str(e))
+    # By CONVENTION, not by live candidacy: a selected artifact that was
+    # removed between selection and this call is `readable: false`, not a 400.
+    if not _is_serving_ports_candidate(rel.split("/")[-1]):
+        raise HTTPException(400, f"not a serving-ports candidate: {path!r}")
+    target = _recipe_dir(project_dir, recipe_path) / rel
+    if not target.is_file():
+        return {"path": rel, "readable": False, "stream_rows": 0}
+    try:
+        import yaml as _yaml
+        data = _yaml.safe_load(target.read_text(encoding="utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001 — unreadable/malformed reads as zero rows
+        return {"path": rel, "readable": False, "stream_rows": 0}
+    return {"path": rel, "readable": True, "stream_rows": len(stream_rows(data))}
+
+
+@router.get("/{name}/dependencies/mode")
+def dependency_env_mode(
+    name: str,
+    dependency_service_ids: str = Query("", description="comma-separated target ids"),
+    env: str = Query("", description="comma-separated selected env names"),
+    recipe_path: str = Query("", description="recipe subdir ('' = project root)"),
+    current_admin: dict = Depends(require_admin),
+):
+    """T15/T16 — the dependency-aware env mode for the panel.
+
+    Read-only: resolves the selected targets, checks the per-relation files
+    mechanically, and (for a selected env) lists the classified variables and
+    those the env is missing. The gateway's deploy intake enforces the same
+    decisions; this endpoint exists so the panel can show the alerts and force
+    the generate-new state BEFORE the operator clicks Deploy.
+    """
+    from ..services.dependency_model import (
+        duplicate_target_services, entries_for_ids, read_relation,
+        relation_env, serving_url,
+    )
+    from ..services.file_sets import _recipe_dir
+    ids = [x for x in dependency_service_ids.split(",") if x]
+    env_names = [x for x in env.split(",") if x]
+    entries = entries_for_ids(ids)
+    try:
+        rdir = _recipe_dir(settings.SOURCE_PROJECTS_DIR / name, recipe_path)
+    except Exception as exc:  # noqa: BLE001 — traversal-invalid recipe path
+        raise HTTPException(400, str(exc))
+    targets = [{
+        "service": e.get("service_name"),
+        "user": e.get("user_name"),
+        "label": str(e.get("label")),
+        "serving_url": serving_url(e),
+    } for e in entries]
+    relations = [{
+        "target_service": e.get("service_name"),
+        "present": read_relation(rdir, name, str(e.get("service_name") or "")) is not None,
+    } for e in entries]
+    classified: dict[str, str] = {}
+    for e in entries:
+        rel = read_relation(rdir, name, str(e.get("service_name") or ""))
+        classified.update(relation_env(rel))
+    missing_vars: list[str] = []
+    if env_names and entries:
+        present: dict[str, str] = {}
+        for env_name in env_names:
+            path = rdir / env_name
+            if not path.is_file():
+                continue
+            try:
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, _, v = line.partition("=")
+                        present[k.strip()] = v
+            except OSError:
+                continue
+        missing_vars = sorted(v for v in classified if not str(present.get(v) or "").strip())
+    if not entries:
+        mode = "normal"
+    elif duplicate_target_services(entries):
+        mode = "duplicate"
+    elif not env_names:
+        mode = "generate" if all(r["present"] for r in relations) else "force_new"
+    elif any(not r["present"] for r in relations):
+        mode = "force_new"
+    else:
+        mode = "substitute"
+    return {"mode": mode, "targets": targets, "relations": relations,
+            "classified_vars": sorted(classified),
+            "missing_vars": missing_vars}
+
+
 @router.put("/{name}/file-sets")
 def put_file_sets(
     name: str,
