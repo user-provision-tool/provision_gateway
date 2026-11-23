@@ -89,19 +89,70 @@ def test_the_fingerprint_is_order_insensitive_and_empty_profiles_is_a_list(tmp_p
     assert not ec.fingerprint_matches(left, empty)
 
 
-def test_the_artefact_round_trips_with_its_marker(tmp_path):
+def test_the_artefact_round_trips_as_a_yaml_fingerprint_variant(tmp_path):
+    fingerprint = {"compose": [], "profiles": [], "env_bases": []}
     path = ec.write_artifact(
         tmp_path, source_service="graphiti-mcp", recipe_path="",
-        fingerprint={"compose": [], "profiles": [], "env_bases": []},
+        fingerprint=fingerprint,
         variables={"A": {"category": "defaulted", "source": {"kind": "file"}}},
         dependencies={"graphiti-local": ["A"]})
-    assert path.name == ec.ARTIFACT_NAME
+    assert path.name == ec.variant_filename(fingerprint)
+    assert path.name.startswith("env.classification.")
+    assert path.name.endswith(".yaml")
     assert Path(str(path) + ".generated").is_file()
-    data = ec.read_artifact(tmp_path)
+    data = ec.read_variant(tmp_path, path.name)
     assert data["version"] == 1
     assert data["dependencies"] == {"graphiti-local": ["A"]}
+    assert ec.matched_variant(tmp_path, fingerprint)[0] == path.name
+    assert ec.matched_variant(
+        tmp_path, {"compose": ["sha256:x"], "profiles": [], "env_bases": []}) is None
+    # The legacy JSON name is read but never written by a generation.
     _write(tmp_path / ec.ARTIFACT_NAME, "{not json")
     assert ec.read_artifact(tmp_path) is None
+
+
+def test_two_fingerprint_variants_coexist_and_only_the_matched_one_lists(tmp_path):
+    fp_a = {"compose": ["sha256:a"], "profiles": [], "env_bases": []}
+    fp_b = {"compose": ["sha256:b"], "profiles": [], "env_bases": []}
+    ec.write_artifact(tmp_path, source_service="s", recipe_path="",
+                      fingerprint=fp_a,
+                      variables={"A": {"category": "defaulted",
+                                       "source": {"kind": "file"}}})
+    name_b = ec.write_artifact(
+        tmp_path, source_service="s", recipe_path="", fingerprint=fp_b,
+        variables={"B": {"category": "defaulted", "source": {"kind": "file"}}}).name
+    before = (tmp_path / name_b).read_bytes()
+    ec.write_artifact(tmp_path, source_service="s", recipe_path="",
+                      fingerprint=fp_b,
+                      variables={"B": {"category": "required",
+                                       "source": {"kind": "file"}}})
+    # Only the matched variant is a candidate; the other fingerprint's bytes
+    # are untouched by a generation for this one (R29).
+    assert ec.matched_variant(tmp_path, fp_b)[0] == name_b
+    assert ec.matched_variant(tmp_path, fp_a)[0] == ec.variant_filename(fp_a)
+    assert (tmp_path / ec.variant_filename(fp_a)).is_file()
+    assert before != (tmp_path / name_b).read_bytes()
+
+
+def test_coverage_and_the_target_allowlist_make_a_variant_red(tmp_path):
+    artifact = {"version": 1,
+                "fingerprint": {"compose": [], "profiles": [], "env_bases": []},
+                "variables": {
+                    "KEYS": {"category": "defaulted", "source": {"kind": "file"}},
+                    "DEP": {"category": "dependency",
+                            "source": {"kind": "dependency_target",
+                                       "target": "target-a"}}}}
+    assert ec.coverage_missing(artifact, ["KEYS", "MISSING"]) == ["MISSING"]
+    assert ec.coverage_missing(artifact, ["KEYS"]) == []
+    assert ec.projection(artifact, "target-a") == ["DEP"]
+    assert ec.projection(artifact, "target-b") == []
+    assert ec.target_allowlist_violations(artifact, ["target-a"]) == []
+    assert ec.target_allowlist_violations(artifact, ["target-b"]) == [
+        {"variable": "DEP", "target": "target-a"}]
+    assert ec.artifact_errors(artifact) == []
+    broken = {"version": 1, "fingerprint": {}, "variables": {
+        "X": {"category": "nonsense", "source": {"kind": "file"}}}}
+    assert any("unknown category" in e for e in ec.artifact_errors(broken))
 
 
 def test_a_template_renders_metadata_and_a_missing_key_is_an_error():
@@ -203,14 +254,18 @@ def test_a_variable_only_in_a_reference_is_not_copied(tmp_path):
     assert "TEMPLATE=1" in text
 
 
-def test_the_classification_snapshot_is_an_exact_copy_with_a_marker(tmp_path):
-    ec.write_artifact(
-        tmp_path, source_service="s", recipe_path="",
-        fingerprint={"compose": [], "profiles": [], "env_bases": []},
+def test_the_classification_snapshot_copies_the_used_variant_with_a_marker(tmp_path):
+    fingerprint = {"compose": [], "profiles": [], "env_bases": []}
+    source = ec.write_artifact(
+        tmp_path, source_service="s", recipe_path="", fingerprint=fingerprint,
         variables={"A": {"category": "defaulted", "source": {"kind": "file"}}})
-    name = ec.snapshot_classification(tmp_path, user="alice", label="30")
-    assert name == "env.classification.user-alice.30.json"
+    name = ec.snapshot_classification(
+        tmp_path, user="alice", label="30", source_name=source.name)
+    assert name == "env.classification.user-alice.30.yaml"
     assert (tmp_path / name).is_file()
     assert (tmp_path / f"{name}.generated").is_file()
     assert ec.snapshot_exists(tmp_path, user="alice", label="30")
     assert ec.classification_snapshot_name("alice", "30") == name
+    # Nothing to copy ⇒ no snapshot, never a stale one.
+    assert ec.snapshot_classification(
+        tmp_path, user="bob", label="1", source_name="missing.yaml") is None

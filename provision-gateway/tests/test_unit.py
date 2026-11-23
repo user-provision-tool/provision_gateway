@@ -6096,7 +6096,12 @@ class TestEnvReferencePicker:
         deploy = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
         assert "base_refs: effectiveBaseRefs" in deploy
         assert "context: additionalContext" in deploy
-        assert "force: forceAvailable && forceReclassify" in deploy
+        # R26–R28/C21 — the classification/relation selections replaced the
+        # retired force control.
+        assert "classification: effectiveClassification" in deploy
+        assert "relations: relationsPayload" in deploy
+        assert "forceReclassify" not in deploy
+        assert "Force env re-classification" not in deploy
 
     def test_the_source_projects_modal_has_three_slots_and_no_env_slot(self):
         src = (_DASH / "src" / "components" / "services" / "GenerateMissingPanel.tsx").read_text()

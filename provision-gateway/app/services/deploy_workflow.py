@@ -30,14 +30,20 @@ from .dependency_model import (
     dependency_entries as _dependency_entries,
     duplicate_target_services,
     entries_for_ids as _entries_for_ids,
-    read_relation,
-    relation_env,
     relation_snapshot_filename,
     serving_ports_snapshot_name,
     snapshot_used_artifacts,
     serving_url,
 )
-from .generation_jobs import GenerationCapacityError, GenerationJobError, generation_jobs
+from .generation_jobs import (
+    CLASSIFICATION_GENERATE_NEW,
+    CLASSIFICATION_NONE,
+    GenerationCapacityError,
+    GenerationJobError,
+    classification_mode,
+    generation_jobs,
+    relation_mode,
+)
 from .stream_conf import artifact_has_stream_rows
 
 _log = logging.getLogger("gateway.deploy_workflow")
@@ -50,9 +56,11 @@ _GATEWAY_ONLY = {
     "dependency_service_ids",
     "use_global_proxy", "fix", "job_type", "owner_username",
     "skip_env", "category", "service_value", "_actor_user_id",
-    # R5 — generation-only context and the per-deploy force control travel on
-    # the gateway request but are never part of the -api register contract.
-    "base_refs", "context", "force", "classification_fingerprint",
+    # R5/R26–R28 — generation-only context and the classification/relation
+    # selections travel on the gateway request but are never part of the -api
+    # register contract. The per-deploy force control is retired (C21).
+    "base_refs", "context", "classification", "relations",
+    "classification_fingerprint", "classify_only",
     # §14.3 — the LLM env guard flag travels with the deploy request/session
     # but is never part of the -api register contract.
     "llm_validate_env", "env_none",
@@ -63,7 +71,8 @@ _GATEWAY_ONLY = {
 _RECORD_STRIP = {
     "selection", "prompt", "env_reference", "fix", "job_type", "owner_username",
     "skip_env", "category", "service_value",
-    "base_refs", "context", "force", "classification_fingerprint",
+    "base_refs", "context", "classification", "relations",
+    "classification_fingerprint", "classify_only",
 }
 
 LIVE_JOB_STATUSES = ("queued", "running", "unknown")
@@ -118,16 +127,6 @@ def _recipe_dir(service_name: str, recipe_path: str) -> Path:
 def _base_refs(intent: dict) -> dict:
     refs = intent.get("base_refs")
     return refs if isinstance(refs, dict) else {}
-
-
-def _force_effective(intent: dict, selection: dict) -> bool:
-    """R23 table 1 — force exists only on the generate-new env path.
-
-    A sent env, the deliberate None, or a fix job makes the control
-    unavailable; the gateway never honours a stale tick.
-    """
-    return (bool(intent.get("force")) and not intent.get("fix")
-            and not selection.get("env") and not selection.get("env_none"))
 
 
 def _context(intent: dict) -> dict:
@@ -243,11 +242,12 @@ def _validate_context(intent: dict) -> None:
 
 
 def _classification_fingerprint(intent: dict, selection: dict) -> dict:
-    """R17 — hash the structural inputs once, at intake.
+    """R17/R29 — hash the structural inputs once, at intake.
 
-    The Env base used by the classifier: the explicit Env refs, or the recipe's
-    own env files when the slot is `generate new` with no refs. Deploy-varying
-    values and the selected dependency identities are deliberately excluded.
+    The Env base used by the classifier is the ROOT TEMPLATE (R27): a SELECTED
+    env file, else the explicit Env refs, else the recipe's own env files.
+    Deploy-varying values and the selected dependency identities are
+    deliberately excluded.
     """
     from .env_classification import implicit_env_names, structural_fingerprint
 
@@ -257,7 +257,10 @@ def _classification_fingerprint(intent: dict, selection: dict) -> dict:
     except Exception:  # noqa: BLE001 — the caller's own validation names this
         return {}
     refs = _base_refs(intent)
-    env_bases = [p for p in (refs.get("env") or []) if isinstance(p, str)]
+    env_bases = [] if selection.get("env_none") else [
+        p for p in (selection.get("env") or []) if isinstance(p, str)]
+    if not env_bases:
+        env_bases = [p for p in (refs.get("env") or []) if isinstance(p, str)]
     if not env_bases:
         env_bases = [p for p in (intent.get("env_reference") or []) if isinstance(p, str)]
     if not env_bases:
@@ -265,6 +268,16 @@ def _classification_fingerprint(intent: dict, selection: dict) -> dict:
     compose = [p for p in (selection.get("compose") or []) if isinstance(p, str)]
     if not compose:
         compose = [p for p in (refs.get("compose") or []) if isinstance(p, str)]
+    if not compose:
+        # The env build reads the recipe's compose candidates when the slot is
+        # `generate new` with no ref (`_env_compose_paths`); the fingerprint
+        # must hash the same inputs.
+        from .file_sets import _is_compose_candidate
+        try:
+            compose = [f.name for f in sorted(recipe_dir.iterdir())
+                       if f.is_file() and _is_compose_candidate(f.name)]
+        except OSError:
+            compose = []
     return structural_fingerprint(
         recipe_dir,
         compose_names=compose,
@@ -403,6 +416,14 @@ def generation_needed(intent: dict) -> bool:
     # same way a selected list does.
     if not (selection.get("env") or []) and not selection.get("env_none"):
         return True
+    # R26–R28 — a classification on a selected env builds the injected
+    # `.env.raw`; for an existing variant that phase is model-free, but it is
+    # still the only writer of the handoff. `cls None` sends the env as-is.
+    if not selection.get("env_none"):
+        cls = classification_mode(intent)
+        if cls != CLASSIFICATION_NONE and (selection.get("env")
+                                           or cls == CLASSIFICATION_GENERATE_NEW):
+            return True
     return False
 
 
@@ -423,7 +444,12 @@ def _generation_request(intent: dict, selection: dict) -> dict:
         "base_refs": _base_refs(intent),
         "context": _context(intent),
         "profiles": list(selection.get("profiles") or []),
-        "force": _force_effective(intent, selection),
+        # R26–R28 — the explicit classification/relation selections; the force
+        # control is retired (C21). They never reach the -api.
+        "classification": classification_mode(intent),
+        "relations": (intent.get("relations") if isinstance(intent.get("relations"), dict)
+                      else {}),
+        "classify_only": bool(intent.get("classify_only")),
         # R17 — computed once at intake so reuse and regeneration agree.
         "classification_fingerprint": intent.get("classification_fingerprint") or {},
         "selection": gen_selection,
@@ -514,97 +540,148 @@ def _api_payload(intent: dict, selection: dict, env_name: str | None) -> dict:
     return payload
 
 
-def _selected_env_values(recipe_dir: Path, selection: dict) -> dict[str, str]:
-    """Merge the selected env files (order preserved, later wins)."""
-    vals: dict[str, str] = {}
-    for name in selection.get("env") or []:
-        if not isinstance(name, str):
-            continue
-        path = recipe_dir / name
-        if not path.is_file():
-            continue
-        try:
-            raw = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            vals[k.strip()] = v
-    return vals
+def _validate_env_selection(intent: dict, selection: dict) -> None:
+    """R26–R28 — validate the classification/relation selections at intake.
 
-
-def _dependency_precheck(intent: dict, selection: dict,
-                         fingerprint: dict | None = None) -> str:
-    """G103/T15 — decide the env-picker mode at intake.
-
-    The modes (T15):
-      * no deps → normal;
-      * any missing/stale relation + env file/generate new → forced generate-new
-        (a selected env is refused here — the modal disables it);
-      * distinct, all relations current + selected env → every classified var
-        must be present and non-empty (else the deploy is BLOCKED); all
-        present → substitution is marked for `_claim_and_register`;
-      * `None` and duplicate target service names → dependencies removed from
-        the env context (grants only, normal env pickers).
+    Unknown modes and unknown targets are 4xx (T0). The classification state
+    pins the relation pickers: `cls None` means every relation is `None`,
+    `cls generate new` means every relation is `generate new`. With
+    `cls existing` the per-target pickers are live; `None` is refused for a
+    non-empty projection, and a selected relation variant must be a readable,
+    matched file for its own target. A red classification is NOT refused here:
+    Generate/Deploy regenerates it (R26).
     """
-    from .dependency_model import relation_is_current
+    from .dependency_model import (
+        RELATION_VARIANT_RE,
+        duplicate_target_services,
+        matched_relation_variant,
+        read_relation_variant,
+        relation_filename,
+    )
+    from .env_classification import (
+        ARTIFACT_PREFIX,
+        projection,
+        read_variant_any,
+        target_allowlist_violations,
+    )
 
     ids = [str(x) for x in (intent.get("dependency_service_ids")
                             or intent.get("allowed_target_service_ids") or []) if x]
-    if not ids:
-        return "normal"
-    entries = _entries_for_ids(ids)
-    if not entries:
-        return "normal"
-    recipe_dir = _recipe_dir(intent.get("service_name") or "",
-                             intent.get("recipe_path") or "")
-    source = intent.get("service_name") or ""
-    if duplicate_target_services(entries):
+    entries = _entries_for_ids(ids) if ids else []
+    targets = sorted({str(e.get("service_name") or "") for e in entries} - {""})
+    # G103 — two selected dependencies with the SAME service name are removed
+    # from the env context (grants only); the classification may not point at
+    # them (M-B9/M-B13).
+    if entries and duplicate_target_services(entries):
         intent["_dependency_env_disabled"] = True
-        return "duplicate"
+        targets = []
     if selection.get("env_none"):
         intent["_dependency_env_disabled"] = True
-        return "none"
-    missing: list[str] = []
-    for e in entries:
-        target = str(e.get("service_name") or "")
-        if not target:
+        intent["classification"] = CLASSIFICATION_NONE
+        intent["relations"] = {}
+        return
+
+    cls = classification_mode(intent)
+    if cls == CLASSIFICATION_NONE:
+        intent["classification"] = CLASSIFICATION_NONE
+        intent["relations"] = {}
+        return
+    if cls == CLASSIFICATION_GENERATE_NEW:
+        intent["classification"] = CLASSIFICATION_GENERATE_NEW
+        intent["relations"] = {}
+        return
+    if not cls.startswith(ARTIFACT_PREFIX):
+        raise WorkflowError(
+            "unknown_classification_mode",
+            f"unknown classification mode {cls!r}: expected none, generate new, "
+            "or a matched env.classification.<fingerprint>.yaml variant",
+        )
+    recipe_dir = _recipe_dir(intent.get("service_name") or "",
+                             intent.get("recipe_path") or "")
+    data = read_variant_any(recipe_dir, cls)
+    if data is None:
+        raise WorkflowError(
+            "classification_variant_missing",
+            f"classification variant is missing or unreadable: {cls}",
+        )
+    violations = target_allowlist_violations(data, targets)
+    if violations:
+        # R26 — a target-allowlist failure is regenerated on Generate/Deploy
+        # when an LLM is active; with no LLM there is no way to repair it, so
+        # the intake refuses with the same named cause.
+        llm_on = False
+        try:
+            from ..database import SessionLocal
+            db = SessionLocal()
+            try:
+                llm_on = generation_jobs._llm_active(db)
+            finally:
+                db.close()
+        except Exception:  # noqa: BLE001 — an unreadable config is "no LLM"
+            llm_on = False
+        if not llm_on:
+            raise WorkflowError(
+                "classification_target_not_selected",
+                "the classification points dependency variable(s) at target(s) that "
+                "are not selected: "
+                + ", ".join(f"{v['variable']}->{v['target']}" for v in violations)
+                + " — reclassify or edit the classification",
+                409,
+            )
+    relations = intent.get("relations")
+    if relations is not None and not isinstance(relations, dict):
+        raise WorkflowError("invalid_relations", "'relations' must be a mapping")
+    out: dict[str, str] = {}
+    for key, raw in (relations or {}).items():
+        target = str(key)
+        if target not in targets:
+            raise WorkflowError(
+                "unknown_relation_target",
+                f"relation target is not a selected dependency: {target!r}",
+            )
+        mode = relation_mode(intent, target)
+        if mode is None:
             continue
-        rel = read_relation(recipe_dir, source, target)
-        if rel is None or (fingerprint is not None
-                           and not relation_is_current(rel, fingerprint)):
-            missing.append(target)
-    missing = sorted(set(missing))
-    if missing:
-        if selection.get("env"):
+        if mode == CLASSIFICATION_NONE:
+            expected = projection(data, target)
+            if expected:
+                raise WorkflowError(
+                    "relation_none_not_allowed",
+                    "relation 'None' is not allowed for target "
+                    f"'{target}': the classification assigns "
+                    + ", ".join(expected)
+                    + " — choose generate new, a valid relation, or edit the classification",
+                )
+            out[target] = CLASSIFICATION_NONE
+            continue
+        if mode == CLASSIFICATION_GENERATE_NEW:
+            out[target] = CLASSIFICATION_GENERATE_NEW
+            continue
+        source = intent.get("service_name") or ""
+        match = RELATION_VARIANT_RE.match(mode)
+        legacy_accepted = False
+        if not match and mode == relation_filename(source, target):
+            # R29 back-compat: a rev-1 relation file is a candidate only when
+            # its recorded fingerprint matches; its name is never rewritten.
+            matched = matched_relation_variant(
+                recipe_dir, source, target, intent.get("classification_fingerprint"))
+            legacy_accepted = bool(matched and matched[0] == mode)
+        if not legacy_accepted and (
+                not match or match.group("source") != source
+                or match.group("target") != target):
             raise WorkflowError(
-                "dependency_relations_missing",
-                "missing or stale dependency relation file(s): " + ", ".join(missing)
-                + " — choose generate new (or None) and deploy again",
-                409,
+                "unknown_relation_mode",
+                f"unknown relation mode for target '{target}': {mode!r}",
             )
-        return "force_new"
-    if selection.get("env"):
-        needed: dict[str, str] = {}
-        for e in entries:
-            rel = read_relation(recipe_dir, source, str(e.get("service_name") or ""))
-            needed.update(relation_env(rel))
-        present = _selected_env_values(recipe_dir, selection)
-        absent = sorted(v for v in needed if not str(present.get(v) or "").strip())
-        if absent:
+        if read_relation_variant(recipe_dir, intent.get("service_name") or "",
+                                 target, mode) is None:
             raise WorkflowError(
-                "dependency_env_incomplete",
-                "the selected env is missing classified variable(s): "
-                + ", ".join(absent)
-                + " — fill them, choose another env, or generate new",
-                409,
+                "relation_variant_missing",
+                f"relation variant is missing or unreadable: {mode}",
             )
-        intent["_dependency_substitute"] = True
-        return "substitute"
-    return "generate"
+        out[target] = mode
+    intent["classification"] = cls
+    intent["relations"] = out
 
 
 def _snapshot_rows(entry: dict) -> dict:
@@ -642,17 +719,15 @@ def _snapshot_rows(entry: dict) -> dict:
 
 
 def _env_meta_for_substitution(intent: dict) -> dict:
-    """The used set for a sent-env+dependencies deploy (matrix rows 3–4)."""
-    targets: list[str] = []
-    if intent.get("_dependency_substitute") and not intent.get("_dependency_env_disabled"):
-        ids = [str(x) for x in (intent.get("dependency_service_ids")
-                                or intent.get("allowed_target_service_ids") or []) if x]
-        targets = sorted({str(e.get("service_name") or "")
-                          for e in _entries_for_ids(ids)} - {""})
+    """The used set when no generation job carried one (rev-1 record replay).
+
+    Rev 7 has no deploy-time substitution: a path without a job's env_meta read
+    or wrote nothing, so it snapshots nothing (R27).
+    """
     return {
         "classification_read": False,
         "classification_written": False,
-        "relations": {t: "read" for t in targets},
+        "relations": {},
     }
 
 
@@ -671,7 +746,8 @@ def _snapshot_for_deploy(intent: dict, selection: dict, label: str,
         recipe_dir = _recipe_dir(service, intent.get("recipe_path") or "")
         sp = None if selection.get("serving_ports_none") else selection.get("serving_ports")
         meta = env_meta if isinstance(env_meta, dict) else _env_meta_for_substitution(intent)
-        targets = sorted(meta.get("relations") or {})
+        targets = sorted(t for t, status in (meta.get("relations") or {}).items()
+                         if status in ("read", "written"))
         classification_used = bool(
             meta.get("classification_read") or meta.get("classification_written"))
         snapshot_used_artifacts(
@@ -679,44 +755,11 @@ def _snapshot_for_deploy(intent: dict, selection: dict, label: str,
             serving_ports=sp if isinstance(sp, str) else None,
             target_services=targets,
             include_classification=classification_used,
+            relation_variants=meta.get("relation_variants") or {},
+            classification_name=meta.get("classification_name"),
         )
     except Exception:  # noqa: BLE001 — a snapshot failure never blocks the deploy
         _log.exception("dependency snapshot failed for %s/%s", service, label)
-
-
-def _substitute_dependency_env(intent: dict, selection: dict,
-                               label: str) -> str | None:
-    """T15 — write the substituted `.env.raw` (the selected file is NOT sent).
-
-    The base is the SELECTED env merged in order (later wins); every classified
-    variable is overwritten with its target's serving URL. Everything else is
-    preserved, exactly as the reference-base rule preserves it.
-    """
-    ids = [str(x) for x in (intent.get("dependency_service_ids")
-                            or intent.get("allowed_target_service_ids") or []) if x]
-    entries = _entries_for_ids(ids)
-    if not entries:
-        return None
-    recipe_dir = _recipe_dir(intent.get("service_name") or "",
-                             intent.get("recipe_path") or "")
-    source = intent.get("service_name") or ""
-    user = (intent.get("user_name") or intent.get("owner_username") or "user")
-    vals = _selected_env_values(recipe_dir, selection)
-    by_service = {str(e.get("service_name") or ""): e for e in entries}
-    for e in entries:
-        rel = read_relation(recipe_dir, source, str(e.get("service_name") or ""))
-        for var, target in relation_env(rel).items():
-            target_entry = by_service.get(target) or by_service.get(
-                str(e.get("service_name") or ""))
-            if target_entry:
-                vals[var] = serving_url(target_entry)
-    name = f".env.raw.{user}.{label}"
-    path = recipe_dir / name
-    path.write_text(
-        "\n".join(f"{k}={v}" for k, v in vals.items()) + ("\n" if vals else ""),
-        encoding="utf-8")
-    (recipe_dir / f"{name}.generated").write_text("")
-    return name
 
 
 def _record_deploy_intent(intent: dict) -> tuple[dict, dict]:
@@ -756,13 +799,10 @@ async def _start(intent: dict, *, operation: str, actor_user_id=None) -> dict:
     # R17 — the structural fingerprint is computed ONCE, before any reuse
     # decision, so "reuse" and "regenerate" cannot disagree.
     intent["classification_fingerprint"] = _classification_fingerprint(intent, selection)
-    # The force control exists only on the generate-new env path (R23); a stale
-    # tick on another path is never honoured.
-    intent["force"] = _force_effective(intent, selection)
-    # G103/T15 — the dependency-aware env mode is decided once, here; a selected
-    # env missing a classified variable (or a missing/stale relation) is a
-    # structured refusal.
-    _dependency_precheck(intent, selection, intent.get("classification_fingerprint"))
+    # R26–R28 — the classification/relation selections are validated once, at
+    # intake: unknown modes/targets, a selected variant that is unreadable, and
+    # a relation `None` over a non-empty projection are structured refusals.
+    _validate_env_selection(intent, selection)
 
     owner_id = intent.get("owner_api_user_id")
     if not owner_id:
@@ -1188,12 +1228,10 @@ async def _claim_and_register(service_id: str, intent: dict,
         "label": record["label"],
     })
 
-    # G103/T15 — the selected-env substitution: a `.env.raw` built from the
-    # selected env plus the targets' serving URLs. The selected file is never
-    # sent. (The duplicate/None modes carry no substitution flag.)
-    if resolved.get("_dependency_substitute") and not env_name:
-        env_name = _substitute_dependency_env(
-            resolved, selection, str(record["label"]))
+    # R27 — there is no deploy-time substitution path any more: the env phase
+    # writes the injected `.env.raw` from the classification (or the selected
+    # env is sent as-is under `cls None`). `env_name` is that handoff when one
+    # was built.
 
     # C12 — snapshot exactly what the env build used or wrote: the artefact
     # iff read/written, each relation iff read/written, and the serving-ports

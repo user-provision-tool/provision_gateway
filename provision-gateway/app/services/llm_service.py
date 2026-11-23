@@ -1563,6 +1563,18 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
                     f"- {d.get('key')}: {d.get('service_name') or d.get('service')}"
                     f":{d.get('label')} served at {d.get('serving_url') or '(not live)'}"
                     for d in deps))
+        else:
+            # R26/R28 — the target allowlist rejects a `dependency` variable
+            # whose target is not selected. With no dependency selected the
+            # classifier must not invent one from a stale relation record.
+            parts.append(
+                "NO DEPENDENCIES ARE SELECTED for this deploy. Do NOT classify "
+                "any variable as `dependency` — the target allowlist would "
+                "reject it. A value that would point at another service is "
+                "`defaulted` (keep the template value) or `external` "
+                "(operator-supplied), per its own meaning. Any `dependency.*.json` "
+                "file in the project is a STALE record of another deploy, never "
+                "a selected dependency.")
         relations = context.get("dependency_relations") or {}
         if relations:
             parts.append(

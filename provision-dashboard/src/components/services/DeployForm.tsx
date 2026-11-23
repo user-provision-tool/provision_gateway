@@ -198,12 +198,17 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   const [selection, setSelection] = useState<FileSetSelectionData>(EMPTY_SELECTION)
   const [needsEnv, setNeedsEnv] = useState(true)
   const [prompt, setPrompt] = useState('')
-  // R1/R3/R23 — the per-slot base refs, the arbitrary context and the
-  // per-deploy force control. The refs and context are operator state; the
-  // force is never stored and resets after every deploy.
+  // R1/R3/R26–R28 — the per-slot base refs, the arbitrary context, and the
+  // classification/relation selections. The force control is retired (C21):
+  // the classification picker's `generate new` and the per-target relation
+  // pickers are the explicit controls.
   const [baseRefs, setBaseRefs] = useState<BaseRefs>(EMPTY_BASE_REFS)
   const [additionalContext, setAdditionalContext] = useState<AdditionalContext>(EMPTY_CONTEXT)
-  const [forceReclassify, setForceReclassify] = useState(false)
+  // '' means "the picker's default" (a matched valid variant, else generate
+  // new). Resets with the panel, like the other per-deploy controls.
+  const [classificationChoice, setClassificationChoice] = useState('')
+  const [relationChoices, setRelationChoices] = useState<Record<string, string>>({})
+  const [classificationState, setClassificationState] = useState<any>(null)
   const [basePopupOpen, setBasePopupOpen] = useState(false)
   const [contextPopupOpen, setContextPopupOpen] = useState(false)
   // Deploy-time per-user env generation (GAP-19): fresh SECRET_KEY per instance.
@@ -410,7 +415,9 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         setPrompt('')
         setBaseRefs(EMPTY_BASE_REFS)
         setAdditionalContext(EMPTY_CONTEXT)
-        setForceReclassify(false)
+        setClassificationChoice('')
+        setRelationChoices({})
+        setClassificationState(null)
         setBasePopupOpen(false)
         setContextPopupOpen(false)
         setPerUserEnv(null)
@@ -798,9 +805,6 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   // `needs_env:false` is only a hint (it pre-selects `None`); it does not enter
   // this predicate.
   const envSatisfied = eff.env.length > 0 || !!eff.env_none || !!perUserEnv
-  // R23 table 1 — the force control exists only on `generate new` with an
-  // active LLM. Everywhere else it is disabled, unticked and not sent.
-  const forceAvailable = llmActive && eff.env.length === 0 && !eff.env_none
   const effectiveBaseRefs = activeBaseRefs(baseRefs, eff)
   // G56 — with TLS on (and a serving-ports artifact in play), the stream conf is
   // a SLOT like the http one: a fully-configured deploy names both. `None` is
@@ -834,39 +838,65 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   }, [open, watchedService, eff.serving_ports, eff.serving_ports_none])
   const streamSlotNeeded =
     httpsOn && !eff.serving_ports_none && (streamRowCount ?? 0) > 0
-  // G103/T16 — the dependency-aware env mode. The endpoint is the read-only
-  // twin of the gateway's intake check: it names the mode, the classified
-  // variables and the ones a selected env is missing.
+  // R26–R29 — the classification/relation picker state. The endpoint is the
+  // read-only twin of the gateway's intake check: the matched variants, the
+  // coverage/target checks, the 1:1 projection and the overwrite preview.
   const watchedDeps = Form.useWatch('dependency_service_ids', form)
   const depKey = ((watchedDeps as string[] | undefined) || []).filter(Boolean).join(',')
   const envKey = eff.env.join(',')
-  const [depMode, setDepMode] = useState<any>(null)
+  const composeKey = eff.compose.join(',')
+  const profileKey = (eff.profiles || []).join(',')
   useEffect(() => {
-    if (!open || !watchedService || !depKey) { setDepMode(null); return }
+    if (!open || !watchedService) { setClassificationState(null); return }
     const { baseName, recipePath } = parseServiceValue(watchedService)
-    if (!baseName) { setDepMode(null); return }
+    if (!baseName) { setClassificationState(null); return }
     const envNames = eff.env_none ? [] : envKey.split(',').filter(Boolean)
+    const currentRelations = Object.entries(relationChoices)
+      .map(([t, m]) => `${t}=${m}`).join(',')
     let cancelled = false
-    client.get(`/projects/${baseName}/dependencies/mode`, {
+    client.get(`/projects/${baseName}/classification-state`, {
       params: {
         dependency_service_ids: depKey,
         env: envNames.join(','),
+        env_none: !!eff.env_none,
+        compose: composeKey,
+        profiles: profileKey,
         recipe_path: recipePath,
+        current: classificationChoice,
+        current_relations: currentRelations,
       },
     }).then(({ data }) => {
-      if (cancelled) return
-      setDepMode(data)
-      // A missing relation forces generate-new: drop a selected env once.
-      if (data?.mode === 'force_new' && envNames.length > 0) {
-        setSelection(prev => ({ ...prev, env: [] }))
-      }
-    }).catch(() => { if (!cancelled) setDepMode(null) })
+      if (!cancelled) setClassificationState(data)
+    }).catch(() => { if (!cancelled) setClassificationState(null) })
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, watchedService, depKey, envKey, eff.env_none])
-  const depDuplicate = depMode?.mode === 'duplicate'
-  const depForceNew = depMode?.mode === 'force_new' && !eff.env_none
-  const depEnvBlocked = (depMode?.missing_vars || []).length > 0
+  }, [open, watchedService, depKey, envKey, eff.env_none, composeKey, profileKey,
+      classificationChoice])
+  const clsState = classificationState
+  const clsVariants: any[] = clsState?.classification?.variants || []
+  const clsDefault: string = clsState?.classification?.default || 'generate_new'
+  const envIsNone = !!eff.env_none
+  // The picker's effective value: the operator's choice, else the default the
+  // gateway computed (a matched valid variant, else generate new). Under the
+  // deliberate env `None` there is no classification at all.
+  const effectiveClassification = envIsNone
+    ? 'none'
+    : (classificationChoice || clsDefault)
+  const clsIsExisting = effectiveClassification.startsWith('env.classification.')
+  const relationStates: any[] = clsState?.relations || []
+  const relationModeFor = (target: string) =>
+    relationChoices[target] || relationStates.find(r => r.target === target)?.default
+      || 'generate_new'
+  const relationsPayload: Record<string, string> = Object.fromEntries(
+    relationStates.map(r => [r.target, relationModeFor(r.target)]))
+  const clsCoverageMissing: string[] =
+    clsIsExisting ? (clsState?.classification?.coverage_missing || []) : []
+  const clsTargetViolations: any[] =
+    clsIsExisting ? (clsState?.classification?.target_violations || []) : []
+  const overwritePreview: string[] =
+    clsIsExisting && eff.env.length > 0
+      ? (clsState?.classification?.overwrite || []) : []
+  const depDuplicate = !!clsState?.classification?.duplicate_targets
   const slotsSpecified = eff.compose.length > 0 && !!eff.nginx && envSatisfied
     && (!streamSlotNeeded || !!eff.stream_conf)
   // F5 — the readiness line names the ACTUAL missing slots/files, above the
@@ -970,12 +1000,13 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         // path already sends them. Without this a dependency-only run fails the
         // category check with an unmapped variable.
         dependency_service_ids: form.getFieldValue('dependency_service_ids') || [],
-        force: forceAvailable && forceReclassify,
+        // R26–R28 — the picker selections; the force control is retired (C21).
+        classification: effectiveClassification,
+        relations: relationsPayload,
         // G25 — the NAMING follows the TRIGGER: on a guided restart the
         // generation emits `.fix` files, not `.base`.
         ...(fixingGuide ? { fix: true } : {}),
       })
-      setForceReclassify(false)
       if (data.generation_task_id) {
         genJob.resumeJob(data.generation_task_id)
       }
@@ -1291,7 +1322,9 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         prompt,
         base_refs: effectiveBaseRefs,
         context: additionalContext,
-        force: forceAvailable && forceReclassify,
+        // R26–R28 — the classification/relation selections; no force (C21).
+        classification: effectiveClassification,
+        relations: relationsPayload,
         // S13 — the LLM env guard flag, top-level on the deploy payload. It
         // applies only when a selected env list is actually being sent.
         llm_validate_env: !!(llmActive && llmValidateEnv && sel.env.length > 0 && !sel.env_none),
@@ -1322,8 +1355,6 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
       }
 
       const { data } = await client.post('/services/deploy', payload)
-      // R23/B7 — the force is per-deploy: it is not stored and never survives.
-      setForceReclassify(false)
       const workflowId = data.workflow_id || data.service_id
       if (!workflowId) throw new Error('the gateway did not return a workflow handle')
 
@@ -1608,7 +1639,8 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         base_refs: effectiveBaseRefs,
         context: additionalContext,
         prompt,
-        force: forceAvailable && forceReclassify,
+        classification: effectiveClassification,
+        relations: relationsPayload,
         llm_active: llmActive,
         llm_validate_env: !!llmValidateEnv,
         volumes: Array.isArray(fields.volumes) ? fields.volumes : [],
@@ -1975,27 +2007,113 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                 needsEnv={needsEnv}
                 onChange={setSelection}
                 onOpenFile={(name) => openSelectedFile(name)}
-                forceEnvGenerate={depForceNew}
+                forceEnvGenerate={false}
               />
               {!!depKey && eff.env_none && (
                 <Alert type="info" showIcon style={{ marginTop: 8 }}
                   message="None — no env is sent"
                   description="The dependencies are applied as s2s grants only: no classification, no generation, no dependency rows." />
               )}
-              {depForceNew && (
-                <Alert type="warning" showIcon style={{ marginTop: 8 }}
-                  message="A dependency relation file is missing — the env is forced to generate new"
-                  description="The pipeline classifies the missing relation(s), writes their files and generates the per-user env. None remains selectable." />
-              )}
-              {depMode?.mode === 'substitute' && (
-                <Alert type="info" showIcon style={{ marginTop: 8 }}
-                  message={`Selected env: ${(depMode.classified_vars || []).join(', ') || 'no classified variables'}`}
-                  description="Every classified variable must be present. When all are, this deploy writes a new per-user .env.raw with the targets' serving URLs; the selected file itself is not sent." />
-              )}
-              {depEnvBlocked && (
-                <Alert type="error" showIcon style={{ marginTop: 8 }}
-                  message={`The selected env is missing classified variable(s): ${(depMode.missing_vars || []).join(', ')}`}
-                  description="The deploy is blocked. Fill them, choose another env, or generate new." />
+              {/* R26–R29 — the classification picker. Under the env `None` it
+                  is the disabled `None`; otherwise it offers `None`, `generate
+                  new` and the fingerprint-matched variants. A red variant is
+                  selectable for inspection/editing; Generate/Deploy
+                  regenerates it. */}
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontSize: 13, marginBottom: 4 }}>Env classification</div>
+                <Select
+                  style={{ width: '100%' }}
+                  value={effectiveClassification}
+                  disabled={envIsNone}
+                  onChange={(v) => setClassificationChoice(String(v))}
+                  options={envIsNone
+                    ? [{ value: 'none', label: 'None' }]
+                    : [
+                        { value: 'none', label: 'None — no classification' },
+                        { value: 'generate_new', label: 'generate new' },
+                        ...clsVariants.map((v) => ({
+                          value: v.value,
+                          label: `${v.value}${v.red ? ' — red (regenerate)' : ''}`,
+                        })),
+                      ]}
+                />
+                <div style={{ fontSize: 12, color: '#999' }}>
+                  {envIsNone
+                    ? 'No env is sent, so no classification exists.'
+                    : effectiveClassification === 'none'
+                      ? 'The selected env is sent as-is; no classification injection happens.'
+                      : eff.env.length > 0
+                        ? 'The selected env is the root template; the classification is the overwrite plan. Missing env keys make the variant red; Generate/Deploy regenerates it.'
+                        : 'A generated classification drives the per-user .env.raw. Only variants matched to the current structural inputs are listed.'}
+                </div>
+                {clsCoverageMissing.length > 0 && (
+                  <Alert type="error" showIcon style={{ marginTop: 8 }}
+                    message={`The selected env has key(s) the classification does not name: ${clsCoverageMissing.join(', ')}`}
+                    description="Generate/Deploy regenerates the classification over the selected env's keys." />
+                )}
+                {clsTargetViolations.length > 0 && (
+                  <Alert type="error" showIcon style={{ marginTop: 8 }}
+                    message="The classification points at target(s) that are not selected"
+                    description={clsTargetViolations.map(v => `${v.variable} → ${v.target}`).join(', ')} />
+                )}
+                {overwritePreview.length > 0 && (
+                  <Alert type="info" showIcon style={{ marginTop: 8 }}
+                    message={`Overwrite preview: ${overwritePreview.join(', ')}`}
+                    description="These variables are replaced in the injected .env.raw. The selected env file itself is not modified and is not sent. Secret and external values are not printed." />
+                )}
+              </div>
+              {/* R28 — one relation picker per selected target. `cls None`
+                  fixes `None`, `cls generate new` fixes `generate new`, both
+                  disabled; `cls existing` enables the 1:1 check. */}
+              {relationStates.length > 0 && (
+                <div style={{ marginTop: 10 }}>
+                  <div style={{ fontSize: 13, marginBottom: 4 }}>Dependency relations</div>
+                  {relationStates.map((r) => {
+                    const disabled = !clsIsExisting
+                    const mode = disabled
+                      ? (effectiveClassification === 'generate_new' ? 'generate_new' : 'none')
+                      : relationModeFor(r.target)
+                    // The classification state pins the picker: `cls None` is
+                    // exactly `None`, `cls generate new` exactly `generate
+                    // new`, both disabled (R28).
+                    const opts = disabled
+                      ? [{ value: mode, label: mode === 'generate_new' ? 'generate new' : 'None' }]
+                      : [
+                          ...(r.allowed_none ? [{ value: 'none', label: 'None' }] : []),
+                          { value: 'generate_new', label: 'generate new' },
+                          ...(r.options || []).map((o: any) => ({
+                            value: o.value,
+                            label: `${o.value}${o.red ? ' — red (regenerate)' : ''}`,
+                          })),
+                        ]
+                    const chosen = (r.options || []).find((o: any) => o.value === mode)
+                    return (
+                      <div key={r.target} style={{ marginBottom: 8 }}>
+                        <div style={{ fontSize: 12, marginBottom: 3 }}>{r.target}
+                          {r.projection?.length ? ` — 1:1: ${r.projection.join(', ')}` : ' — empty projection'}
+                        </div>
+                        <Select
+                          style={{ width: '100%' }}
+                          value={mode}
+                          disabled={disabled}
+                          onChange={(v) => setRelationChoices(prev => ({
+                            ...prev, [r.target]: String(v) }))}
+                          options={opts}
+                        />
+                        {chosen?.red && (
+                          <Alert type="warning" showIcon style={{ marginTop: 6 }}
+                            message="This relation is not 1:1 with the classification"
+                            description={`missing: ${(chosen.missing || []).join(', ') || 'none'}; extra: ${(chosen.extra || []).join(', ') || 'none'}. Generate/Deploy regenerates it.`} />
+                        )}
+                        {clsIsExisting && !r.allowed_none && (
+                          <div style={{ fontSize: 12, color: '#999' }}>
+                            `None` is disabled: the classification assigns variables to this target.
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
               )}
               {/* ---- Deploy-time per-user env (pipeline env phase, design §2) ---- */}
               {perUserEnv && (
@@ -2021,23 +2139,6 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                     : eff.env.length === 0
                     ? 'Available when a selected env file is chosen; under generate new the generation path guards the .raw.'
                     : 'Validates the selected env list before deploy; a finding blocks the deploy until it is fixed. Mechanical validation always runs.'}
-                </div>
-              </div>
-              {/* R23 — the per-deploy force control. Available ONLY on the
-                  generate-new env path with an active LLM; unticked by default,
-                  never stored, reset after every deploy. */}
-              <div style={{ marginTop: 8 }}>
-                <Checkbox
-                  checked={forceAvailable && forceReclassify}
-                  disabled={!forceAvailable}
-                  onChange={(e) => setForceReclassify(e.target.checked)}
-                >
-                  Force env re-classification for this deploy
-                </Checkbox>
-                <div style={{ fontSize: 12, color: '#999' }}>
-                  {forceAvailable
-                    ? 'Re-runs the classification and rewrites the shared artefact and every relation in the env context. Existing instances keep their snapshots.'
-                    : 'Available only under generate new with an active LLM.'}
                 </div>
               </div>
             </>
@@ -2345,7 +2446,12 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
               // gateway's generation path produces the compose (as it does for
               // any other empty slot), so Deploy is how the operator asks for it.
               disabled={!selectedUserName || !selectedServiceName || !!checkError || fileSetLoading
-                || computingLabel || depEnvBlocked
+                || computingLabel
+                // R26 — a classification pointing at an unselected target is
+                // regenerated on Generate/Deploy when an LLM is active; with no
+                // LLM there is no way to repair it, so the deploy is blocked
+                // with the same named reason.
+                || (clsTargetViolations.length > 0 && !llmActive)
                 // F4/S14 — TLS on with no certificate selected: no trusted
                 // domain, so Deploy is visibly disabled. Read from the FORM
                 // watcher, not the stale `httpsEnabled` state.

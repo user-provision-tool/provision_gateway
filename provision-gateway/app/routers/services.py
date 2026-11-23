@@ -695,6 +695,176 @@ def dependency_env_mode(
             "missing_vars": missing_vars}
 
 
+@router.get("/{name}/classification-state")
+def classification_state(
+    name: str,
+    recipe_path: str = Query("", description="recipe subdir ('' = project root)"),
+    env: str = Query("", description="comma-separated selected env names"),
+    env_none: bool = Query(False, description="the deliberate env None"),
+    compose: str = Query("", description="comma-separated selected compose names"),
+    profiles: str = Query("", description="comma-separated selected profiles"),
+    dependency_service_ids: str = Query("", description="comma-separated target ids"),
+    current: str = Query("", description="the panel's current classification mode"),
+    current_relations: str = Query("", description="target=mode pairs, comma-separated"),
+    current_admin: dict = Depends(require_admin),
+):
+    """R26–R29 — the classification and relation picker state for the panel.
+
+    Read-only and model-free: the fingerprint, the matched variants, the
+    coverage/target checks, the per-target 1:1 projection and the overwrite
+    preview. The gateway's intake enforces the same contract.
+    """
+    from ..services import env_classification as ec
+    from ..services.dependency_model import (
+        duplicate_target_services,
+        entries_for_ids,
+        list_relation_variants,
+        read_relation_variant,
+        relation_is_current,
+        relation_projection_errors,
+    )
+    from ..services.file_sets import _recipe_dir
+
+    env_names = [x for x in env.split(",") if x]
+    compose_names = [x for x in compose.split(",") if x]
+    profile_names = [x for x in profiles.split(",") if x]
+    ids = [x for x in dependency_service_ids.split(",") if x]
+    entries = entries_for_ids(ids) if ids else []
+    duplicate = bool(entries) and duplicate_target_services(entries)
+    targets = sorted({str(e.get("service_name") or "") for e in entries} - {""}) \
+        if not duplicate else []
+    try:
+        rdir = _recipe_dir(settings.SOURCE_PROJECTS_DIR / name, recipe_path)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, str(exc))
+
+    if not compose_names:
+        from ..services.file_sets import _is_compose_candidate
+        try:
+            compose_names = [f.name for f in sorted(rdir.iterdir())
+                             if f.is_file() and _is_compose_candidate(f.name)]
+        except OSError:
+            compose_names = []
+    env_bases = [] if env_none else list(env_names)
+    if not env_bases:
+        env_bases = ec.implicit_env_names(rdir)
+
+    fingerprint = ec.structural_fingerprint(
+        rdir, compose_names=compose_names, profiles=profile_names,
+        env_base_names=env_bases)
+    fp_id = ec.fingerprint_id(fingerprint)
+
+    def _selected_values() -> dict[str, str]:
+        text = ec.read_env_template(rdir, env_names) if env_names else ""
+        return ec.parse_env_text(text)
+
+    selected_values = _selected_values()
+    env_keys = sorted(selected_values)
+    variants: list[dict] = []
+    for item in ec.list_variants(rdir):
+        data = ec.read_variant_any(rdir, item["name"])
+        if data is None:
+            continue
+        if not ec.fingerprint_matches(data.get("fingerprint"), fingerprint):
+            continue
+        errors = ec.artifact_errors(data)
+        missing = ec.coverage_missing(data, env_keys) if env_names else []
+        violations = ec.target_allowlist_violations(data, targets)
+        variants.append({
+            "value": item["name"],
+            "legacy": bool(item["legacy"]),
+            "red": bool(errors or missing or violations),
+            "errors": errors,
+            "missing_env_keys": missing,
+            "target_violations": violations,
+        })
+    matched = ec.matched_variant(rdir, fingerprint)
+    default = matched[0] if matched and not any(
+        v["value"] == matched[0] and v["red"] for v in variants) else "generate_new"
+
+    chosen = current.strip() or default
+    chosen_data = ec.read_variant_any(rdir, chosen) if chosen not in (
+        "none", "generate_new") else None
+    overwrite: list[str] = []
+    if chosen_data and env_names:
+        relations: dict[str, str] = {}
+        for pair in (current_relations or "").split(","):
+            if "=" in pair:
+                t, _, mode = pair.partition("=")
+                relations[t.strip()] = mode.strip()
+        projection_by_target = {t: ec.projection(chosen_data, t) for t in targets}
+        rel_vars: dict[str, str] = {}
+        for t in targets:
+            mode = relations.get(t)
+            if mode and mode not in ("none", "generate_new"):
+                data = read_relation_variant(rdir, name, t, mode)
+                from ..services.dependency_model import relation_env
+                for var, mapped in relation_env(data).items():
+                    rel_vars[var] = mapped
+        for var, entry in (chosen_data.get("variables") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            category = entry.get("category")
+            value = selected_values.get(var)
+            if category in ("deploy_value", "dependency"):
+                overwrite.append(var)
+            elif category == "secret" and ec.is_empty_value(value):
+                overwrite.append(var)
+            elif category == "external" and ec.is_empty_value(value):
+                overwrite.append(var)
+            elif category in ("required", "defaulted") and ec.is_empty_value(value):
+                overwrite.append(var)
+        # A projected relation var absent from the selected env is appended by
+        # the injection; the preview names it too (M-B18).
+        for t in targets:
+            for var in projection_by_target.get(t, []):
+                if var not in selected_values and var not in overwrite:
+                    overwrite.append(var)
+
+    relation_states: list[dict] = []
+    for target in targets:
+        expected = ec.projection(chosen_data, target) if chosen_data else []
+        options: list[dict] = []
+        for item in list_relation_variants(rdir, name, target):
+            data = read_relation_variant(rdir, name, target, item["name"])
+            if data is None or not relation_is_current(data, fingerprint):
+                continue
+            missing, extra = relation_projection_errors(data, expected)
+            options.append({
+                "value": item["name"], "legacy": bool(item["legacy"]),
+                "red": bool(missing or extra),
+                "missing": missing, "extra": extra,
+            })
+        matched_rel = next((o for o in options if not o["red"]), None)
+        relation_states.append({
+            "target": target,
+            "projection": expected,
+            "allowed_none": not expected,
+            "options": options,
+            "default": matched_rel["value"] if matched_rel else "generate_new",
+        })
+
+    return {
+        "fingerprint_id": fp_id,
+        "env_slot": ("none" if env_none else
+                     ("selected" if env_names else "generate_new")),
+        "classification": {
+            "variants": variants,
+            # R27 — the deliberate env `None` has no classification at all.
+            "default": "none" if env_none else default,
+            "matched": bool(matched),
+            "env_keys": env_keys,
+            "coverage_missing": (ec.coverage_missing(chosen_data, env_keys)
+                                 if chosen_data and env_names else []),
+            "target_violations": (ec.target_allowlist_violations(
+                chosen_data, targets) if chosen_data else []),
+            "overwrite": sorted(set(overwrite)),
+            "duplicate_targets": duplicate,
+        },
+        "relations": [] if env_none else relation_states,
+    }
+
+
 @router.put("/{name}/file-sets")
 def put_file_sets(
     name: str,

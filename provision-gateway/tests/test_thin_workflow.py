@@ -379,7 +379,8 @@ def test_recipe_missing_phase_does_not_override_a_filled_slot(monkeypatch):
 
     monkeypatch.setattr(generation_manager, "_recipe_missing",
                         lambda req: ["serving_ports"])
-    filled = {"service_name": "svc", "recipe_path": "", "selection": {
+    filled = {"service_name": "svc", "recipe_path": "",
+              "classification": "none", "selection": {
         "compose": ["c.yml"], "nginx": "n.conf", "env": ["e.env"],
         "serving_ports": None, "serving_ports_none": True,
     }}
@@ -387,7 +388,8 @@ def test_recipe_missing_phase_does_not_override_a_filled_slot(monkeypatch):
 
     monkeypatch.setattr(generation_manager, "_recipe_missing",
                         lambda req: ["docker-compose"])
-    no_compose = {"service_name": "svc", "recipe_path": "", "selection": {
+    no_compose = {"service_name": "svc", "recipe_path": "",
+                  "classification": "none", "selection": {
         "compose": [], "nginx": "n.conf", "env": ["e.env"],
         "serving_ports": None, "serving_ports_none": True,
     }}
@@ -519,6 +521,7 @@ def test_validation_only_pass_happens_without_a_generation_job(tmp_path, monkeyp
     owner = _make_api_user("validation-owner")
     intent = {
         "service_name": "svc", "recipe_path": "", "owner_api_user_id": owner,
+        "classification": "none",
         "selection": _ready_selection(), "tls": False,
     }
     result = asyncio.run(deploy_workflow.start_deploy(intent))

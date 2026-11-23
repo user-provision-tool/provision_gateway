@@ -62,6 +62,9 @@ def project(tmp_path, monkeypatch):
 def _intent(serving_ports, *, tls=True):
     return {
         "service_name": "svc", "recipe_path": "", "tls": tls,
+        # R27 — `cls None` sends the selected env as-is, so these slot tests
+        # never start an env generation job.
+        "classification": "none",
         "selection": {
             "compose": ["c.yml"], "nginx": "n.conf",
             "serving_ports": serving_ports,

@@ -26,6 +26,9 @@ from typing import Any
 
 RELATION_RE = re.compile(
     r"^dependency\.(?P<source>[^.]+)\.(?P<target>[^.]+)\.json$")
+# R28/R29 — `dependency.<source>.<target>.<fingerprint-id>.json`.
+RELATION_VARIANT_RE = re.compile(
+    r"^dependency\.(?P<source>[^.]+)\.(?P<target>[^.]+)\.(?P<fpid>[0-9a-f]{16})\.json$")
 
 
 def _stamp() -> str:
@@ -33,7 +36,15 @@ def _stamp() -> str:
 
 
 def relation_filename(source_service: str, target_service: str) -> str:
+    """The legacy (rev 1) relation name; snapshots keep this shape."""
     return f"dependency.{source_service}.{target_service}.json"
+
+
+def relation_variant_filename(source_service: str, target_service: str,
+                              fingerprint: dict | None) -> str:
+    from .env_classification import fingerprint_id
+    return (f"dependency.{source_service}.{target_service}."
+            f"{fingerprint_id(fingerprint)}.json")
 
 
 def relation_snapshot_filename(source_service: str, target_service: str,
@@ -130,10 +141,7 @@ def dependency_entries(service_id: str) -> list[dict]:
     return out
 
 
-def read_relation(recipe_dir: str | Path, source_service: str,
-                  target_service: str) -> dict | None:
-    """The relation file's parsed content, or None when missing/unreadable."""
-    path = Path(recipe_dir) / relation_filename(source_service, target_service)
+def _read_relation_file(path: Path) -> dict | None:
     if not path.is_file():
         return None
     try:
@@ -141,6 +149,77 @@ def read_relation(recipe_dir: str | Path, source_service: str,
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def read_relation(recipe_dir: str | Path, source_service: str,
+                  target_service: str) -> dict | None:
+    """The legacy relation file's parsed content, or None.
+
+    Kept for rev-1 readers (snapshots, old sessions). A rev 7 caller reads a
+    named fingerprint variant with `read_relation_variant`.
+    """
+    return _read_relation_file(
+        Path(recipe_dir) / relation_filename(source_service, target_service))
+
+
+def read_relation_variant(recipe_dir: str | Path, source_service: str,
+                          target_service: str, name: str) -> dict | None:
+    """One named relation variant (a bare file name), parsed or None."""
+    if not isinstance(name, str) or not name or "/" in name or "\\" in name:
+        return None
+    return _read_relation_file(Path(recipe_dir) / name)
+
+
+def list_relation_variants(recipe_dir: str | Path, source_service: str,
+                           target_service: str) -> list[dict]:
+    """Every relation file for this source→target pair, legacy included."""
+    rdir = Path(recipe_dir)
+    try:
+        names = sorted(e.name for e in rdir.iterdir() if e.is_file())
+    except OSError:
+        return []
+    out: list[dict] = []
+    legacy = relation_filename(source_service, target_service)
+    for name in names:
+        if name == legacy:
+            out.append({"name": name, "fingerprint_id": "", "legacy": True})
+            continue
+        match = RELATION_VARIANT_RE.match(name)
+        if match and match.group("source") == source_service \
+                and match.group("target") == target_service:
+            out.append({"name": name, "fingerprint_id": match.group("fpid"),
+                        "legacy": False})
+    return out
+
+
+def matched_relation_variant(recipe_dir: str | Path, source_service: str,
+                             target_service: str,
+                             fingerprint: dict | None) -> tuple[str, dict] | None:
+    """The relation variant whose stored fingerprint matches, or None."""
+    if not isinstance(fingerprint, dict):
+        return None
+    expected = relation_variant_filename(source_service, target_service, fingerprint)
+    for item in list_relation_variants(recipe_dir, source_service, target_service):
+        data = read_relation_variant(recipe_dir, source_service, target_service,
+                                     item["name"])
+        if data is None or not relation_is_current(data, fingerprint):
+            continue
+        if item["legacy"] or item["name"] == expected:
+            return item["name"], data
+    return None
+
+
+def relation_projection_errors(data: dict | None,
+                               expected: list[str]) -> tuple[list[str], list[str]]:
+    """The 1:1 check (R28): ``(missing, extra)`` for one target.
+
+    ``expected`` is the classification's projection for the target. A relation
+    variable outside the project, or a projected variable the relation omits,
+    is red.
+    """
+    present = set(relation_env(data))
+    wanted = set(expected or [])
+    return sorted(wanted - present), sorted(present - wanted)
 
 
 def relation_env(data: dict | None) -> dict[str, str]:
@@ -168,14 +247,14 @@ def relation_env(data: dict | None) -> dict[str, str]:
 def write_relation(recipe_dir: str | Path, source_service: str,
                    target_service: str, env_map: dict[str, str],
                    fingerprint: dict | None = None) -> Path:
-    """Write one relation file mechanically (and its marker).
+    """Write the current fingerprint's relation variant (+ marker) mechanically.
 
-    The caller owns the staleness decision (C11): a missing or stale relation
-    is re-filled, a current one is reused. ``fingerprint`` is the same
-    structural fingerprint the classification records, so a later deploy can
-    tell whether the map still matches the inputs it was derived from.
+    Only the matched variant is overwritten — never another fingerprint's file
+    (R29). The caller owns the selection decision: `generate new`, a red
+    variant's regeneration, or a missing 1:1 relation all land here.
     """
-    path = Path(recipe_dir) / relation_filename(source_service, target_service)
+    path = Path(recipe_dir) / relation_variant_filename(
+        source_service, target_service, fingerprint)
     payload = {
         "version": 1,
         "source_service": source_service,
@@ -225,14 +304,18 @@ def snapshot_used_artifacts(recipe_dir: str | Path, *, source_service: str,
                             serving_ports: str | None,
                             target_services: list[str],
                             include_classification: bool = False,
-                            classification_used: bool = False) -> dict:
+                            classification_used: bool = False,
+                            relation_variants: dict[str, str] | None = None,
+                            classification_name: str | None = None) -> dict:
     """Snapshot what the env build actually used or wrote.
 
     Serving ports keep their independent rule (copied whenever the selected or
     generated artifact is sent). A dependency relation is copied only when the
-    env build read or wrote it — ``target_services`` is the caller's used-or-
-    written set, never "every selected target" (C12). The classification is
-    copied iff the artefact was read or written.
+    env build read or wrote it — the used set, never "every selected target"
+    (C12). ``relation_variants`` names the exact selected/written variant per
+    target; without it the legacy file name is tried (rev-1 sessions). The
+    classification is copied iff the artefact was read or written, from the
+    named variant it used.
     """
     rdir = Path(recipe_dir)
     out: dict[str, Any] = {"serving_ports": None, "dependencies": [],
@@ -243,8 +326,10 @@ def snapshot_used_artifacts(recipe_dir: str | Path, *, source_service: str,
             name = serving_ports_snapshot_name(user, label)
             copy_snapshot(src, rdir / name)
             out["serving_ports"] = name
+    variants = relation_variants or {}
     for target in target_services:
-        src = rdir / relation_filename(source_service, target)
+        src_name = variants.get(target) or relation_filename(source_service, target)
+        src = rdir / str(src_name)
         if not src.is_file():
             continue
         name = relation_snapshot_filename(source_service, target, user, label)
@@ -253,5 +338,5 @@ def snapshot_used_artifacts(recipe_dir: str | Path, *, source_service: str,
     if include_classification or classification_used:
         from .env_classification import snapshot_classification
         out["env_classification"] = snapshot_classification(
-            rdir, user=user, label=label)
+            rdir, user=user, label=label, source_name=classification_name)
     return out

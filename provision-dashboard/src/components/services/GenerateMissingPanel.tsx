@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button, Divider, Input, Modal, Progress, Space, Spin, Tag, Typography, message } from 'antd'
+import { Alert, Button, Divider, Input, Modal, Progress, Select, Space, Spin, Tag, Typography, message } from 'antd'
 import Editor from '@monaco-editor/react'
 import client from '../../api/client'
 import { deriveProfiles } from '../../api/services'
@@ -59,6 +59,15 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
   const [selection, setSelection] = useState<FileSetSelectionData>(EMPTY_SELECTION)
   const [needsEnv, setNeedsEnv] = useState(true)
   const [prompt, setPrompt] = useState('')
+  // R26/R29 — this panel's classification picker is CLASSIFY-ONLY: `generate
+  // new` runs the recipe classification (no `.env.raw`, no deploy identity);
+  // an existing variant is selectable/editable for inspection and is used by a
+  // later deploy.
+  const [classificationChoice, setClassificationChoice] = useState('')
+  const [classificationState, setClassificationState] = useState<any>(null)
+  const clsVariants: any[] = classificationState?.classification?.variants || []
+  const clsDefault: string = classificationState?.classification?.default || 'generate_new'
+  const effectiveClassification = classificationChoice || clsDefault
   // R1/R3/C5 — the Source Projects modal mirrors its THREE sent-file pickers
   // and has no Env slot; the arbitrary context is shared with the deploy panel.
   const [baseRefs, setBaseRefs] = useState<BaseRefs>(EMPTY_BASE_REFS)
@@ -156,6 +165,25 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
       })
     return () => { cancelled = true }
   }, [open, serviceName, recipePath, selection.compose])
+
+  // R26/R29 — the classify-only picker state, recomputed with the compose
+  // selection (the structural fingerprint's compose input).
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    client.get(`/projects/${serviceName}/classification-state`, {
+      params: {
+        recipe_path: recipePath,
+        compose: selection.compose.join(','),
+        env: '',
+        env_none: false,
+        current: classificationChoice,
+      },
+    }).then(({ data }) => {
+      if (!cancelled) setClassificationState(data)
+    }).catch(() => { if (!cancelled) setClassificationState(null) })
+    return () => { cancelled = true }
+  }, [open, serviceName, recipePath, selection.compose.join(','), classificationChoice])
 
   // Job completed → open the review gate with the result + per-phase validation.
   useEffect(() => {
@@ -273,6 +301,11 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
         recipe_path: recipePath,
         job_type: 'generate_missing',
         skip_env: true,  // env is generated per-user at deploy time (§8.7)
+        // R26/R29 — classify-only: the env phase runs the classification but
+        // writes no `.env.raw` and no deploy identity. Under `None` it does
+        // nothing at all.
+        classification: effectiveClassification,
+        classify_only: true,
         prompt,
         // C5 — three slots, no Env slot on this surface.
         base_refs: { ...activeBaseRefs(baseRefs, effectiveSelection()), env: [] },
@@ -343,7 +376,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
             type="info"
             showIcon
             message="Env files are NOT generated here"
-            description="Per-user env files are generated automatically at deploy time (last step of the deploy pipeline). This panel generates the recipe-level artifacts: compose, serving_ports and nginx."
+            description="Per-user env files are generated automatically at deploy time (last step of the deploy pipeline). This panel generates the recipe-level artifacts — compose, serving_ports and nginx — and can run a classify-only env classification (no .env.raw, no deploy identity)."
           />
           {!llmActive && (
             <Alert
@@ -364,6 +397,31 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
             onChange={setSelection}
             onOpenFile={openSelectedFile}
           />
+
+          {/* R26/R29 — the classify-only classification picker. It runs the
+              recipe classification with no `.env.raw`; a later deploy uses the
+              selected variant. */}
+          <div>
+            <div style={{ fontSize: 13, marginBottom: 4 }}>Env classification (classify only)</div>
+            <Select
+              style={{ width: '100%' }}
+              value={effectiveClassification}
+              onChange={(v) => setClassificationChoice(String(v))}
+              options={[
+                { value: 'none', label: 'None — no classification' },
+                { value: 'generate_new', label: 'generate new' },
+                ...clsVariants.map((v) => ({
+                  value: v.value,
+                  label: `${v.value}${v.red ? ' — red' : ''}`,
+                })),
+              ]}
+            />
+            <div style={{ fontSize: 12, color: '#999' }}>
+              `generate new` classifies the recipe over its own env files; no
+              per-user `.env.raw` is written here. An existing variant is
+              selectable and editable; Generate regenerates only red ones.
+            </div>
+          </div>
 
           <Divider plain style={{ margin: '8px 0' }}>Generation prompt</Divider>
           <Input.TextArea

@@ -24,8 +24,11 @@ from typing import Any
 # Frozen contract (T0)
 # ---------------------------------------------------------------------------
 
-ARTIFACT_NAME = "env.classification.json"
+ARTIFACT_NAME = "env.classification.json"  # legacy, read but never written
+ARTIFACT_SUFFIX = ".yaml"
 MARKER_SUFFIX = ".generated"
+ARTIFACT_PREFIX = "env.classification."
+_VARIANT_RE = re.compile(r"^env\.classification\.([0-9a-f]{16})\.yaml$")
 
 CATEGORIES = (
     "required", "external", "secret", "deploy_value", "dependency", "defaulted",
@@ -119,6 +122,28 @@ def fingerprint_matches(left: dict | None, right: dict | None) -> bool:
         if list(left.get(key) or []) != list(right.get(key) or []):
             return False
     return True
+
+
+def _canonical_fingerprint(fingerprint: dict | None) -> dict[str, list[str]]:
+    return {
+        key: sorted({str(x) for x in ((fingerprint or {}).get(key) or [])})
+        for key in ("compose", "profiles", "env_bases")
+    }
+
+
+def fingerprint_id(fingerprint: dict | None) -> str:
+    """The short, stable variant id (R29).
+
+    Only the structural fingerprint enters it — no classifier, prompt or model
+    version — so reverting the structural inputs re-exposes the same variant.
+    """
+    canonical = json.dumps(_canonical_fingerprint(fingerprint), sort_keys=True,
+                           separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def variant_filename(fingerprint: dict | None) -> str:
+    return f"{ARTIFACT_PREFIX}{fingerprint_id(fingerprint)}{ARTIFACT_SUFFIX}"
 
 
 # ---------------------------------------------------------------------------
@@ -385,18 +410,25 @@ def dependencies_map(variables: dict[str, Any]) -> dict[str, list[str]]:
 # ---------------------------------------------------------------------------
 
 def artifact_path(recipe_dir: str | Path) -> Path:
+    """The legacy JSON artefact's path (read for back-compat, never written)."""
     return Path(recipe_dir) / ARTIFACT_NAME
 
 
-def read_artifact(recipe_dir: str | Path) -> dict | None:
-    """The artefact, or None when absent/unreadable/incomplete."""
-    path = artifact_path(recipe_dir)
-    if not path.is_file():
-        return None
+def variant_path(recipe_dir: str | Path, fingerprint: dict | None) -> Path:
+    return Path(recipe_dir) / variant_filename(fingerprint)
+
+
+def _load_yaml(path: Path) -> Any:
+    import yaml
+
     try:
-        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        return yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, ValueError):
         return None
+
+
+def _basic_artifact(data: Any) -> dict | None:
+    """A parseable artefact with the required top-level shape, or None."""
     if not isinstance(data, dict) or data.get("version") != 1:
         return None
     if not isinstance(data.get("variables"), dict):
@@ -404,6 +436,197 @@ def read_artifact(recipe_dir: str | Path) -> dict | None:
     if not isinstance(data.get("fingerprint"), dict):
         return None
     return data
+
+
+def read_artifact_file(path: str | Path) -> dict | None:
+    """One YAML variant (or the legacy JSON artefact), parsed and shape-checked."""
+    p = Path(path)
+    if not p.is_file():
+        return None
+    if p.suffix == ".json":
+        try:
+            data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            return None
+    else:
+        data = _load_yaml(p)
+    return _basic_artifact(data)
+
+
+def read_artifact(recipe_dir: str | Path) -> dict | None:
+    """The legacy JSON artefact, or None — kept for back-compat readers."""
+    return read_artifact_file(artifact_path(recipe_dir))
+
+
+def read_variant(recipe_dir: str | Path, name: str) -> dict | None:
+    """One named variant from the recipe dir (a bare file name)."""
+    if not isinstance(name, str) or not name or "/" in name or "\\" in name:
+        return None
+    return read_artifact_file(Path(recipe_dir) / name)
+
+
+def read_variant_any(recipe_dir: str | Path, name: str) -> dict | None:
+    """One variant as raw data, WITHOUT the version/shape gate.
+
+    The panel lists a schema-invalid variant as RED (selectable for inspection
+    and editing) rather than hiding it; the engine still uses the strict
+    reader, so a red variant is never injected (R26/R29).
+    """
+    if not isinstance(name, str) or not name or "/" in name or "\\" in name:
+        return None
+    path = Path(recipe_dir) / name
+    if not path.is_file():
+        return None
+    if path.suffix == ".json":
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            return None
+    else:
+        data = _load_yaml(path)
+    return data if isinstance(data, dict) else None
+
+
+def list_variants(recipe_dir: str | Path) -> list[dict[str, Any]]:
+    """Every classification artefact in the recipe, legacy included.
+
+    Returns ``[{name, fingerprint_id, legacy}]`` sorted by name. A custom
+    fingerprint id that does not match the file's own fingerprint is still
+    listed; the caller compares the stored fingerprint before offering it.
+    """
+    rdir = Path(recipe_dir)
+    out: list[dict[str, Any]] = []
+    try:
+        names = sorted(e.name for e in rdir.iterdir() if e.is_file())
+    except OSError:
+        return out
+    for name in names:
+        if name == ARTIFACT_NAME:
+            out.append({"name": name, "fingerprint_id": "", "legacy": True})
+            continue
+        match = _VARIANT_RE.match(name)
+        if match:
+            out.append({"name": name, "fingerprint_id": match.group(1),
+                        "legacy": False})
+    return out
+
+
+def matched_variant(recipe_dir: str | Path,
+                    fingerprint: dict | None) -> tuple[str, dict] | None:
+    """The variant whose stored fingerprint matches, or None.
+
+    A variant is a candidate only when BOTH its file name's id and its stored
+    fingerprint match the current structural inputs. The legacy JSON artefact
+    is read when its fingerprint matches (it is never overwritten).
+    """
+    if not isinstance(fingerprint, dict):
+        return None
+    expected = variant_filename(fingerprint)
+    for item in list_variants(recipe_dir):
+        data = read_variant(recipe_dir, item["name"])
+        if data is None:
+            continue
+        if not fingerprint_matches(data.get("fingerprint"), fingerprint):
+            continue
+        if item["legacy"]:
+            return item["name"], data
+        if item["name"] == expected:
+            return item["name"], data
+    return None
+
+
+def artifact_errors(data: dict | None) -> list[str]:
+    """The schema check that makes a variant RED (R26/R29).
+
+    A red variant is still selectable for inspection and editing; it is never
+    injected. Returning the errors (rather than None) is what lets the panel
+    name what is wrong.
+    """
+    if not isinstance(data, dict):
+        return ["the artefact is unreadable or not an object"]
+    errors: list[str] = []
+    if data.get("version") != 1:
+        errors.append("version must be 1")
+    fingerprint = data.get("fingerprint")
+    if not isinstance(fingerprint, dict):
+        errors.append("fingerprint is missing")
+    else:
+        for key in ("compose", "profiles", "env_bases"):
+            if not isinstance(fingerprint.get(key), list):
+                errors.append(f"fingerprint.{key} must be a list")
+    variables = data.get("variables")
+    if not isinstance(variables, dict):
+        return errors + ["variables must be a map keyed by env var"]
+    if not variables:
+        errors.append("variables is empty")
+    for name, entry in variables.items():
+        if not isinstance(name, str) or not name.strip():
+            errors.append("a variable name is empty")
+            continue
+        if not isinstance(entry, dict):
+            errors.append(f"{name}: the entry is not an object")
+            continue
+        category = str(entry.get("category") or "").strip().lower()
+        if category not in CATEGORIES:
+            errors.append(f"{name}: unknown category {category!r}")
+        source = entry.get("source")
+        if isinstance(source, str):
+            source = {"kind": source}
+        if not isinstance(source, dict):
+            source = {}
+        kind = str(source.get("kind") or "").strip().lower()
+        if kind and kind not in SOURCE_KINDS:
+            errors.append(f"{name}: unknown source kind {kind!r}")
+        if category == "dependency" and not dependency_target(entry):
+            errors.append(f"{name}: a dependency variable has no target")
+    return errors
+
+
+def coverage_missing(data: dict | None, env_keys: list[str] | None) -> list[str]:
+    """Env keys the classification does not name (R26).
+
+    Extra classification keys are allowed; a missing env key is red.
+    """
+    variables = (data or {}).get("variables")
+    if not isinstance(variables, dict):
+        return sorted({str(k) for k in (env_keys or []) if k})
+    return sorted({str(k) for k in (env_keys or []) if k and str(k) not in variables})
+
+
+def target_allowlist_violations(data: dict | None,
+                                targets: list[str] | None) -> list[dict[str, str]]:
+    """Dependency variables pointing at a target that is not selected (R26)."""
+    allowed = {str(t) for t in (targets or []) if t}
+    out: list[dict[str, str]] = []
+    for name, entry in ((data or {}).get("variables") or {}).items():
+        if not isinstance(entry, dict) or entry.get("category") != "dependency":
+            continue
+        target = dependency_target(entry)
+        if target and target not in allowed:
+            out.append({"variable": str(name), "target": target})
+    return sorted(out, key=lambda v: v["variable"])
+
+
+def dependency_target(entry: dict | None) -> str:
+    """The target service named by a dependency variable's source."""
+    source = (entry or {}).get("source")
+    if isinstance(source, str):
+        source = {"kind": source}
+    if not isinstance(source, dict):
+        return ""
+    target = source.get("target") or source.get("service") or source.get("key")
+    if not isinstance(target, str) or not target:
+        return ""
+    return target.split("/")[1] if target.count("/") == 2 else target
+
+
+def projection(data: dict | None, target: str) -> list[str]:
+    """``{var | cls.variables[var].category == dependency and target == T}``."""
+    return sorted(
+        str(name) for name, entry in ((data or {}).get("variables") or {}).items()
+        if isinstance(entry, dict) and entry.get("category") == "dependency"
+        and dependency_target(entry) == target
+    )
 
 
 def write_artifact(
@@ -415,19 +638,29 @@ def write_artifact(
     variables: dict[str, Any],
     dependencies: dict[str, list[str]] | None = None,
 ) -> Path:
-    path = artifact_path(recipe_dir)
+    """Write the current fingerprint's YAML variant (+ marker).
+
+    Only the matched variant is overwritten — never another fingerprint's file
+    (R29). ``generate new`` calls this for the current structural inputs.
+    """
+    import yaml
+
+    path = variant_path(recipe_dir, fingerprint)
     payload = {
         "version": 1,
         "source_service": source_service,
         "recipe_path": recipe_path or "",
-        "fingerprint": fingerprint,
+        "fingerprint": _canonical_fingerprint(fingerprint),
         "variables": variables,
         "dependencies": dependencies if dependencies is not None
         else dependencies_map(variables),
         "generated_at": _stamp(),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    path.write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
     Path(str(path) + MARKER_SUFFIX).write_text("", encoding="utf-8")
     return path
 
@@ -556,22 +789,29 @@ def check_assembled(
 # ---------------------------------------------------------------------------
 
 def classification_snapshot_name(user: str, label: str) -> str:
-    return f"env.classification.user-{user}.{label}.json"
+    return f"env.classification.user-{user}.{label}.yaml"
 
 
 def snapshot_classification(
-    recipe_dir: str | Path, *, user: str, label: str
+    recipe_dir: str | Path, *, user: str, label: str,
+    source_name: str | None = None,
 ) -> str | None:
-    """Copy the artefact to its per-instance snapshot (+ marker).
+    """Copy the USED variant to its per-instance snapshot (+ marker).
 
-    Returns the snapshot name, or None when there is no artefact to copy. A
-    write failure propagates to the caller, which logs it and never blocks the
-    deploy (the existing snapshot contract).
+    ``source_name`` is the selected or written variant's file name; without one
+    there is nothing to copy (the legacy JSON artefact is accepted as a source
+    for a rev-1 session). Returns the snapshot name, or None. A write failure
+    propagates to the caller, which logs it and never blocks the deploy.
     """
-    src = artifact_path(recipe_dir)
-    if not src.is_file():
-        return None
     name = classification_snapshot_name(user, str(label))
+    candidates: list[Path] = []
+    if source_name:
+        candidates.append(Path(recipe_dir) / str(source_name))
+    if not candidates:
+        return None
+    src = next((p for p in candidates if p.is_file()), None)
+    if src is None:
+        return None
     dest = Path(recipe_dir) / name
     dest.write_text(src.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
     Path(str(dest) + MARKER_SUFFIX).write_text("", encoding="utf-8")

@@ -283,19 +283,25 @@ def _write_relation_files(
 
 
 def _env_template_inputs(recipe_dir, request: dict) -> tuple[list[str], list[str], str]:
-    """The Env base = the explicit refs, or the recipe env files when absent.
+    """The Env root template for this env build.
 
-    Returns ``(template_names, reference_names, template_text)``. With an
-    explicit Env base the implicit recipe env files become REFERENCES (read by
-    the classifier, never copied); with no explicit base they ARE the template.
+    Three sources, in order (R27): a SELECTED env file (Option B: it is the
+    root template for the injected `.env.raw`), the explicit Env base refs, or
+    the recipe's own env files. With a selected env or an explicit base, the
+    implicit recipe env files become references (read by the classifier, never
+    copied); with no base they ARE the template.
     """
     from .env_classification import implicit_env_names, read_env_template
 
+    selection = request.get("selection") or {}
+    selected = [] if selection.get("env_none") else [
+        p for p in (selection.get("env") or []) if isinstance(p, str)]
     base_refs = request.get("base_refs") or {}
     explicit = [p for p in (base_refs.get("env") or []) if isinstance(p, str)]
     implicit = implicit_env_names(recipe_dir)
-    template_names = explicit or implicit
-    reference_names = [n for n in implicit if n not in template_names] if explicit else []
+    chosen = selected or explicit
+    template_names = chosen or implicit
+    reference_names = [n for n in implicit if n not in template_names] if chosen else []
     return template_names, reference_names, read_env_template(recipe_dir, template_names)
 
 
@@ -338,55 +344,92 @@ def _normalize_target_service(key: str) -> str:
     return key.split("/")[1] if key.count("/") == 2 else key
 
 
+CLASSIFICATION_NONE = "none"
+CLASSIFICATION_GENERATE_NEW = "generate_new"
+
+
+def classification_mode(request: dict) -> str:
+    """The request's classification selection (R26).
+
+    ``none`` / ``generate_new`` / a matched variant's file name. Absent means
+    ``generate_new`` — the rev 1 generate-new behaviour — except under the
+    deliberate env ``None``, where no classification exists.
+    """
+    raw = request.get("classification")
+    if isinstance(raw, dict):
+        raw = raw.get("mode") or raw.get("variant") or raw.get("value")
+    mode = str(raw).strip() if isinstance(raw, str) else ""
+    if not mode:
+        return (CLASSIFICATION_NONE if (request.get("selection") or {}).get("env_none")
+                else CLASSIFICATION_GENERATE_NEW)
+    return mode
+
+
+def relation_mode(request: dict, target: str) -> str | None:
+    """The request's relation selection for one target, or None when absent."""
+    relations = request.get("relations")
+    if not isinstance(relations, dict):
+        return None
+    raw = relations.get(target)
+    if isinstance(raw, dict):
+        raw = raw.get("mode") or raw.get("variant") or raw.get("value")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return raw.strip()
+
+
+def ensure_classification_coverage(
+    artifact: dict, env_keys: list[str], base_values: dict[str, str],
+) -> dict:
+    """Make the classification name every selected-env key (R26).
+
+    A generated classification is asked to cover the selected env's keys; the
+    mechanical fill here is the fail-closed backstop for a model that misses
+    one. A filled key keeps the selected env's value and is `defaulted` (a
+    non-empty template value wins, which is exactly this case).
+    """
+    import copy
+
+    from .env_classification import coverage_missing
+
+    missing = coverage_missing(artifact, env_keys)
+    if not missing:
+        return artifact
+    data = copy.deepcopy(artifact)
+    variables = data.setdefault("variables", {})
+    for key in missing:
+        variables[key] = {
+            "category": "defaulted",
+            "source": {"kind": "file"},
+            "value": str(base_values.get(key, "") or ""),
+            "reason": "selected env key (coverage fill)",
+        }
+    from .env_classification import dependencies_map
+    data["dependencies"] = dependencies_map(variables)
+    return data
+
+
 def _fill_relations(
     recipe_dir, *, source: str, entries: list[dict],
-    mapping: dict[str, list[str]], fingerprint: dict, force: bool,
+    mapping: dict[str, list[str]], fingerprint: dict,
 ) -> list[str]:
-    """Re-fill the stale/missing relations in the env context (C11).
+    """Write the current fingerprint's relation variant for every target.
 
-    A current relation is reused; with ``force`` every relation in the context
-    is rewritten from the new map. The written file records the same structural
-    fingerprint as the classification.
+    Mechanical, no LLM: the classification's dependency map is the projection,
+    and only the matched variant is written (R28/R29). This is the shared
+    implementation of `generate new` and of a red relation's regeneration.
     """
-    from .dependency_model import read_relation, relation_is_current, write_relation
+    from .dependency_model import write_relation
 
     written: list[str] = []
     for entry in entries:
         target = _target_service(entry)
         if not target:
             continue
-        current = read_relation(recipe_dir, source, target)
-        if not force and relation_is_current(current, fingerprint):
-            continue
         env_map = {str(var): target for var in (mapping.get(target) or [])}
         write_relation(recipe_dir, source, target, env_map, fingerprint)
         written.append(target)
     return sorted(set(written))
-
-
-def _relation_values(recipe_dir, *, source: str, entries: list[dict]) -> tuple[dict[str, str], list[str]]:
-    """Resolve the current relation maps to var -> target serving URL.
-
-    A relation file is the pointing authority; the target's own serving URL is
-    what the variable receives. Returns ``(values, used_targets)``.
-    """
-    from .dependency_model import read_relation, relation_env
-
-    by_service = {_target_service(e): e for e in entries if _target_service(e)}
-    values: dict[str, str] = {}
-    used: list[str] = []
-    for entry in entries:
-        target = _target_service(entry)
-        relation = read_relation(recipe_dir, source, target)
-        if relation is None:
-            continue
-        used.append(target)
-        for var, mapped in relation_env(relation).items():
-            pointed = by_service.get(str(mapped)) or by_service.get(target)
-            if pointed is not None:
-                from .dependency_model import serving_url
-                values[var] = serving_url(pointed)
-    return values, sorted(set(used))
 
 
 def _assemble_classified_env(
@@ -769,8 +812,9 @@ class GenerationJobManager:
                          or _gen_stream_conf or sel.get("stream_conf"))):
                 phases.append("validate_conf")
             # The Source Projects panel passes skip_env (env is deploy-time
-            # only — design §8.7).
-            if not request.get("skip_env"):
+            # only — design §8.7) — EXCEPT for a classify-only request, whose
+            # whole purpose is the classification (R26/R29).
+            if not request.get("skip_env") or request.get("classify_only"):
                 # env always last — the env phase itself short-circuits when
                 # the compose references no ${VAR}s (empty pass).
                 phases.append("env")
@@ -2013,6 +2057,17 @@ class GenerationJobManager:
                                 })
                                 continue
 
+                            # R27 — the deliberate env `None`: nothing is
+                            # classified, injected or written. (A fix job's
+                            # `.env.fix` took its own branch above.)
+                            if bool((request.get("selection") or {}).get("env_none")):
+                                await _event("env", "done", {
+                                    "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
+                                    "step": f"{phase}#final",
+                                    "skipped": "env None — no env sent",
+                                })
+                                continue
+
                             template_names, reference_names, template_text = _env_template_inputs(
                                 recipe_dir, request)
 
@@ -2131,73 +2186,233 @@ class GenerationJobManager:
                                     profiles=list((request.get("selection") or {}).get("profiles") or []),
                                     env_base_names=template_names,
                                 )
-                            _force = bool(request.get("force")) and not request.get("fix")
-                            _artifact = None if _force else _ec.read_artifact(recipe_dir)
-                            _reuse = bool(_artifact) and _ec.fingerprint_matches(
-                                (_artifact or {}).get("fingerprint"), _fingerprint)
+                            _selection = request.get("selection") or {}
+                            _selected_env = [] if _selection.get("env_none") else [
+                                p for p in (_selection.get("env") or [])
+                                if isinstance(p, str)]
+                            _classify_only = bool(request.get("classify_only"))
+                            _env_keys = sorted(_ec.parse_env_text(template_text))
+                            _base_values = _ec.parse_env_text(template_text)
+                            _targets = sorted({
+                                _target_service(_e) for _e in _deps
+                                if _target_service(_e)})
                             _values: dict[str, Any] = {}
 
-                            if _reuse:
-                                # Model-free reuse: inject the current metadata
-                                # and re-fill only the stale/missing relations.
-                                env_meta["classification_read"] = True
-                                _mapping = {
-                                    _normalize_target_service(k): list(v or [])
-                                    for k, v in ((_artifact or {}).get("dependencies") or {}).items()
-                                }
-                                _written = _fill_relations(
-                                    recipe_dir, source=service_name, entries=_deps,
-                                    mapping=_mapping, fingerprint=_fingerprint, force=_force,
-                                )
-                                for _t in _written:
-                                    env_meta["relations"][_t] = "written"
-                            elif _llm_on:
-                                def _persist_classification(cls):
-                                    _ec.write_artifact(
-                                        recipe_dir,
-                                        source_service=service_name,
-                                        recipe_path=recipe_path,
-                                        fingerprint=_fingerprint,
-                                        variables=cls["variables"],
-                                        dependencies=cls["dependencies"],
-                                    )
-                                    env_meta["classification_written"] = True
+                            # R26/R29 — resolve the classification selection:
+                            # `none`, `generate new`, or a matched variant.
+                            _cls_mode = classification_mode(request)
+                            _artifact: dict | None = None
+                            _variant_name: str | None = None
 
+                            def _write_classification(cls: dict) -> dict:
+                                _ec.write_artifact(
+                                    recipe_dir, source_service=service_name,
+                                    recipe_path=recipe_path,
+                                    fingerprint=_fingerprint,
+                                    variables=cls["variables"],
+                                    dependencies=cls["dependencies"],
+                                )
+                                env_meta["classification_written"] = True
+                                return (_ec.read_variant(
+                                    recipe_dir, _ec.variant_filename(_fingerprint))
+                                    or cls)
+
+                            def _classification_red(data: dict | None) -> bool:
+                                if data is None:
+                                    return True
+                                if _ec.artifact_errors(data):
+                                    return True
+                                if _ec.coverage_missing(data, _env_keys):
+                                    return True
+                                return bool(
+                                    not _classify_only
+                                    and _ec.target_allowlist_violations(data, _targets))
+
+                            async def _classify() -> dict | None:
                                 _gen = await llm_service.generate_env_classified(
                                     db, context,
-                                    classification_cb=_persist_classification,
+                                    classification_cb=_write_classification,
                                     progress=progress, session_log=session_log,
                                     usage_cb=_usage_sync, on_delta=_live_est,
                                 )
                                 warnings.extend(_gen.get("warnings") or [])
-                                if _gen.get("classification"):
-                                    _values = _gen.get("values") or {}
-                                    _artifact = _ec.read_artifact(recipe_dir)
-                                    if _artifact:
-                                        _mapping = {
-                                            _normalize_target_service(k): list(v or [])
-                                            for k, v in (_artifact.get("dependencies") or {}).items()
-                                        }
-                                        _written = _fill_relations(
-                                            recipe_dir, source=service_name, entries=_deps,
-                                            mapping=_mapping, fingerprint=_fingerprint,
-                                            force=_force,
+                                if not _gen.get("classification"):
+                                    return None
+                                _values.update(_gen.get("values") or {})
+                                _name = _ec.variant_filename(_fingerprint)
+                                data = _ec.read_variant(recipe_dir, _name)
+                                if data is not None:
+                                    filled = ensure_classification_coverage(
+                                        data, _env_keys, _base_values)
+                                    if filled is not data:
+                                        _ec.write_artifact(
+                                            recipe_dir, source_service=service_name,
+                                            recipe_path=recipe_path,
+                                            fingerprint=_fingerprint,
+                                            variables=filled["variables"],
+                                            dependencies=filled.get("dependencies") or {},
                                         )
-                                        for _t in _written:
-                                            env_meta["relations"][_t] = "written"
+                                        data = _ec.read_variant(recipe_dir, _name)
+                                return data
+
+                            if _cls_mode == CLASSIFICATION_NONE:
+                                _artifact = None
+                            elif _cls_mode == CLASSIFICATION_GENERATE_NEW:
+                                if _llm_on:
+                                    _artifact = await _classify()
+                                    _variant_name = (_ec.variant_filename(_fingerprint)
+                                                     if _artifact else None)
                                 else:
-                                    _artifact = None
+                                    warnings.append(
+                                        "no active LLM — mechanical env from the template "
+                                        "(no artefact)")
                             else:
-                                warnings.append(
-                                    "no active LLM — mechanical env from the template (no artefact)")
+                                _variant_name = _cls_mode
+                                _artifact = _ec.read_variant(recipe_dir, _variant_name)
+                                if _classification_red(_artifact):
+                                    if _llm_on:
+                                        warnings.append(
+                                            f"classification {_variant_name} is not valid for "
+                                            "this env — regenerating it over the selected env's keys")
+                                        _artifact = await _classify()
+                                        _variant_name = (_ec.variant_filename(_fingerprint)
+                                                         if _artifact else None)
+                                    else:
+                                        _viol_off = ([] if _classify_only else
+                                                     _ec.target_allowlist_violations(
+                                                         _artifact, _targets))
+                                        if _viol_off:
+                                            raise GenerationJobError(
+                                                "the classification is invalid (it points at "
+                                                "unselected target(s): "
+                                                + ", ".join(f"{v['variable']}->{v['target']}"
+                                                            for v in _viol_off)
+                                                + ") and no LLM is active to reclassify it")
+                                        warnings.append(
+                                            f"classification {_variant_name} is not valid and no "
+                                            "LLM is active — falling back to the mechanical env")
+                                        _artifact = None
 
-                            _rel_values, _used = _relation_values(
-                                recipe_dir, source=service_name, entries=_deps)
-                            for _t in _used:
-                                env_meta["relations"].setdefault(_t, "read")
-
-                            if _artifact:
+                            if _artifact is not None:
                                 env_meta["classification_read"] = True
+                                env_meta["classification_name"] = _variant_name
+                                _viol = ([] if _classify_only else
+                                         _ec.target_allowlist_violations(_artifact, _targets))
+                                if _viol:
+                                    raise GenerationJobError(
+                                        "the classification points dependency variable(s) at "
+                                        "target(s) that are not selected: "
+                                        + ", ".join(f"{v['variable']}->{v['target']}"
+                                                    for v in _viol)
+                                        + " — reclassify or edit the classification")
+
+                            # R28 — per-target relation variants. `cls None` and
+                            # `cls generate new` are fixed by the classification
+                            # state; `cls existing` enables the pickers and the
+                            # 1:1 check (a red relation regenerates mechanically).
+                            _rel_names: dict[str, str] = {}
+                            _rel_values: dict[str, str] = {}
+                            if _artifact is not None and _targets:
+                                from .dependency_model import (
+                                    matched_relation_variant as _matched_rel,
+                                    read_relation_variant as _read_rel,
+                                    relation_env as _relation_env,
+                                    relation_projection_errors as _rel_errors,
+                                    serving_url as _serving_url,
+                                    write_relation as _write_relation,
+                                )
+                                _by_service = {_target_service(e): e for e in _deps
+                                               if _target_service(e)}
+                                for _t in _targets:
+                                    _expected = _ec.projection(_artifact, _t)
+                                    _mode = relation_mode(request, _t)
+                                    if _cls_mode == CLASSIFICATION_GENERATE_NEW:
+                                        _mode = CLASSIFICATION_GENERATE_NEW
+                                    elif _cls_mode == CLASSIFICATION_NONE:
+                                        _mode = CLASSIFICATION_NONE
+                                    if _mode is None:
+                                        _m = _matched_rel(
+                                            recipe_dir, service_name, _t, _fingerprint)
+                                        _mode = (_m[0] if _m and not any(
+                                            _rel_errors(_m[1], _expected))
+                                            else CLASSIFICATION_GENERATE_NEW)
+                                    if _mode == CLASSIFICATION_NONE:
+                                        if _expected:
+                                            raise GenerationJobError(
+                                                "relation 'None' is not allowed for target "
+                                                f"'{_t}': the classification assigns "
+                                                + ", ".join(_expected))
+                                        env_meta["relations"][_t] = "none"
+                                        continue
+                                    if _mode == CLASSIFICATION_GENERATE_NEW:
+                                        _name = _write_relation(
+                                            recipe_dir, service_name, _t,
+                                            {v: _t for v in _expected}, _fingerprint).name
+                                        env_meta["relations"][_t] = "written"
+                                    else:
+                                        _name = _mode
+                                        _data = _read_rel(recipe_dir, service_name, _t, _name)
+                                        _missing_rel, _extra_rel = _rel_errors(
+                                            _data, _expected)
+                                        if _data is None or _missing_rel or _extra_rel:
+                                            warnings.append(
+                                                f"relation {_name} for '{_t}' is not 1:1 with "
+                                                "the classification — regenerating it")
+                                            _name = _write_relation(
+                                                recipe_dir, service_name, _t,
+                                                {v: _t for v in _expected},
+                                                _fingerprint).name
+                                            env_meta["relations"][_t] = "written"
+                                        else:
+                                            env_meta["relations"][_t] = "read"
+                                    _rel_names[_t] = _name
+                                for _t, _name in _rel_names.items():
+                                    for _var, _mapped in _relation_env(
+                                            _read_rel(recipe_dir, service_name, _t, _name)).items():
+                                        _pointed = _by_service.get(_mapped) or _by_service.get(_t)
+                                        if _pointed is not None:
+                                            _rel_values[_var] = _serving_url(_pointed)
+                                if _rel_names:
+                                    env_meta["relation_variants"] = dict(_rel_names)
+
+                            # R29 — the written classification and relation
+                            # variants are part of the generated-file review
+                            # (name, status, content), like the other generated
+                            # files. They are never sent to the -api.
+                            if _variant_name:
+                                _vp = recipe_dir / _variant_name
+                                if _vp.is_file():
+                                    result_files[_variant_name] = _vp.read_text(
+                                        encoding="utf-8", errors="replace")
+                            for _rel_name in _rel_names.values():
+                                _rp = recipe_dir / _rel_name
+                                if _rp.is_file() and _rel_name not in result_files:
+                                    result_files[_rel_name] = _rp.read_text(
+                                        encoding="utf-8", errors="replace")
+
+                            # R27 — with `cls None` a selected env is sent AS-IS:
+                            # no injection, no `.env.raw`, nothing substituted.
+                            if _artifact is None and _selected_env \
+                                    and _cls_mode == CLASSIFICATION_NONE:
+                                await _event("env", "done", {
+                                    "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
+                                    "step": f"{phase}#final",
+                                    "skipped": "selected env sent as-is (cls None)",
+                                })
+                                continue
+
+                            # The Source Projects panel is classify-only: it has
+                            # no env phase, no deploy identity and no injection.
+                            if _classify_only:
+                                await _event("env", "done", {
+                                    "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
+                                    "step": f"{phase}#final",
+                                    "classification_only": bool(_artifact),
+                                })
+                                continue
+
+                            content = ""
+                            if _artifact:
                                 content, _assembled, _missing, _externals = _assemble_classified_env(
                                     template_text, values=_values, artifact=_artifact,
                                     base_metadata=metadata,
@@ -2249,6 +2464,15 @@ class GenerationJobManager:
                                     return
                                 validations[phase] = validate_env(
                                     content, [str(p) for p in composition_paths])
+                            elif _selected_env:
+                                # `generate new` with no LLM: the selected env
+                                # is the handoff, as-is (M-A18).
+                                await _event("env", "done", {
+                                    "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
+                                    "step": f"{phase}#final",
+                                    "skipped": "selected env sent as-is (no LLM)",
+                                })
+                                continue
                             else:
                                 content = _ec.apply_compose_defaults(template_text, defaults)
                                 _present = _ec.parse_env_text(content)

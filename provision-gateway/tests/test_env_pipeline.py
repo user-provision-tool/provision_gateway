@@ -11,9 +11,10 @@ from app.config import settings
 from app.services import deploy_workflow, generation_jobs
 from app.services.deploy_workflow import WorkflowError, _api_payload
 from app.services.dependency_model import (
-    read_relation, relation_filename, relation_is_current, write_relation)
+    matched_relation_variant, read_relation_variant, relation_is_current,
+    relation_variant_filename, write_relation)
 from app.services.env_classification import (
-    structural_fingerprint, write_artifact)
+    matched_variant, structural_fingerprint, variant_filename, write_artifact)
 
 
 def test_a_per_user_env_with_a_non_numeric_label_is_not_a_candidate():
@@ -128,32 +129,81 @@ def test_the_register_payload_carries_no_generation_context():
     intent = _intent(
         base_refs={"compose": [], "serving_ports": None, "nginx": None, "env": [".env"]},
         context={"files": ["auth.md"], "links": ["https://x"]},
-        force=True, classification_fingerprint={"compose": []})
+        classification="generate_new",
+        relations={"graphiti-local": "generate_new"},
+        classification_fingerprint={"compose": []})
     payload = _api_payload(intent, _selection(env=[".env"]), None)
-    for key in ("base_refs", "context", "force", "classification_fingerprint"):
+    for key in ("base_refs", "context", "force", "classification", "relations",
+                "classification_fingerprint"):
         assert key not in payload
     # Profiles remain the deployment option, never dropped.
     assert payload["profiles"] == ["dev"]
 
 
-def test_the_generation_request_carries_refs_context_profiles_and_force():
-    intent = _intent(force=True, base_refs={"env": [".env"]},
+def test_the_generation_request_carries_refs_context_profiles_and_selections():
+    intent = _intent(classification="generate_new",
+                     relations={"graphiti-local": "none"},
+                     base_refs={"env": [".env"]},
                      context={"files": ["auth.md"], "links": []})
     req = deploy_workflow._generation_request(intent, _selection())
     assert req["base_refs"]["env"] == [".env"]
     assert req["context"]["files"] == ["auth.md"]
     assert req["profiles"] == ["dev"]
-    assert req["force"] is True
+    assert req["classification"] == "generate_new"
+    assert req["relations"] == {"graphiti-local": "none"}
+    # C21 — the force control is retired from the request entirely.
+    assert "force" not in req
 
 
-def test_force_is_ignored_on_a_selected_env_and_on_a_fix_job():
-    assert deploy_workflow._force_effective(
-        _intent(force=True), _selection(env=[".env"])) is False
-    assert deploy_workflow._force_effective(
-        _intent(force=True), _selection(env_none=True)) is False
-    assert deploy_workflow._force_effective(
-        _intent(force=True, fix=True), _selection()) is False
-    assert deploy_workflow._force_effective(_intent(force=True), _selection()) is True
+def test_env_none_pins_the_classification_and_relations_to_none():
+    intent = _intent(classification="generate_new",
+                     relations={"graphiti-local": "generate_new"})
+    deploy_workflow._validate_env_selection(intent, _selection(env_none=True))
+    assert intent["classification"] == "none"
+    assert intent["relations"] == {}
+
+
+def test_an_unknown_classification_mode_is_refused():
+    with pytest.raises(WorkflowError) as exc:
+        deploy_workflow._validate_env_selection(
+            _intent(classification="some-file.yaml"), _selection())
+    assert exc.value.code == "unknown_classification_mode"
+
+
+def test_relation_none_is_refused_over_a_non_empty_projection(project, monkeypatch):
+    fp = structural_fingerprint(
+        project, compose_names=["docker-compose.yml"], profiles=["dev"],
+        env_base_names=[".env"])
+    name = write_artifact(
+        project, source_service="graphiti-mcp", recipe_path="", fingerprint=fp,
+        variables={"DEP": {"category": "dependency",
+                           "source": {"kind": "dependency_target",
+                                      "target": "graphiti-local"}}}).name
+    monkeypatch.setattr(deploy_workflow, "_entries_for_ids",
+                        lambda ids: [_dep("graphiti-local")])
+    intent = _intent(classification=name,
+                     relations={"graphiti-local": "none"},
+                     dependency_service_ids=["a"])
+    with pytest.raises(WorkflowError) as exc:
+        deploy_workflow._validate_env_selection(intent, _selection(env=[".env"]))
+    assert exc.value.code == "relation_none_not_allowed"
+    assert "DEP" in exc.value.detail
+
+
+def test_an_unknown_relation_target_is_refused(project, monkeypatch):
+    fp = structural_fingerprint(
+        project, compose_names=["docker-compose.yml"], profiles=["dev"],
+        env_base_names=[".env"])
+    name = write_artifact(
+        project, source_service="graphiti-mcp", recipe_path="", fingerprint=fp,
+        variables={"A": {"category": "defaulted", "source": {"kind": "file"}}}).name
+    monkeypatch.setattr(deploy_workflow, "_entries_for_ids",
+                        lambda ids: [_dep("graphiti-local")])
+    intent = _intent(classification=name, relations={"other": "none"},
+                     dependency_service_ids=["a"])
+    with pytest.raises(WorkflowError) as exc:
+        deploy_workflow._validate_env_selection(intent, _selection())
+    assert exc.value.code == "unknown_relation_target"
 
 
 # ---------------------------------------------------------------------------
@@ -166,60 +216,83 @@ def _fingerprint(project, compose=("docker-compose.yml",), env=(".env",), profil
         env_base_names=list(env))
 
 
-def test_a_relation_records_its_structural_fingerprint(project):
+def test_a_relation_is_a_fingerprint_variant_with_its_fingerprint(project):
     fp = _fingerprint(project)
-    write_relation(project, "graphiti-mcp", "graphiti-local",
-                   {"GRAPHITI_API_URL": "graphiti-local"}, fp)
-    data = read_relation(project, "graphiti-mcp", "graphiti-local")
+    path = write_relation(project, "graphiti-mcp", "graphiti-local",
+                          {"GRAPHITI_API_URL": "graphiti-local"}, fp)
+    assert path.name == relation_variant_filename(
+        "graphiti-mcp", "graphiti-local", fp)
+    assert (project / f"{path.name}.generated").is_file()
+    data = read_relation_variant(
+        project, "graphiti-mcp", "graphiti-local", path.name)
     assert data["fingerprint"] == fp
     for key in ("version", "source_service", "target_service", "env", "generated_at"):
         assert key in data
     assert relation_is_current(data, fp)
     changed = _fingerprint(project, compose=())
     assert not relation_is_current(data, changed)
+    # Only the matched fingerprint's variant is a candidate.
+    assert matched_relation_variant(
+        project, "graphiti-mcp", "graphiti-local", fp)[0] == path.name
+    assert matched_relation_variant(
+        project, "graphiti-mcp", "graphiti-local", changed) is None
 
 
-def test_fill_relations_reuses_current_and_rewrites_stale_or_missing(project):
+def test_fill_relations_writes_the_current_variant_for_every_target(project):
     fp = _fingerprint(project)
-    write_relation(project, "graphiti-mcp", "current", {"A": "current"}, fp)
-    write_relation(project, "graphiti-mcp", "stale", {"OLD": "stale"},
-                   _fingerprint(project, compose=()))
     mapping = {"current": ["A"], "stale": ["NEW"], "missing": ["B"]}
     entries = [_dep("current"), _dep("stale"), _dep("missing")]
     written = generation_jobs._fill_relations(
         project, source="graphiti-mcp", entries=entries,
-        mapping=mapping, fingerprint=fp, force=False)
-    assert sorted(written) == ["missing", "stale"]
-    assert read_relation(project, "graphiti-mcp", "current")["fingerprint"] == fp
-    assert read_relation(project, "graphiti-mcp", "stale")["env"] == {
-        "NEW": {"depends_on": "stale"}}
-    assert read_relation(project, "graphiti-mcp", "missing")["env"] == {
-        "B": {"depends_on": "missing"}}
+        mapping=mapping, fingerprint=fp)
+    assert sorted(written) == ["current", "missing", "stale"]
+    for target, expected in (("current", {"A": "current"}),
+                             ("stale", {"NEW": "stale"}),
+                             ("missing", {"B": "missing"})):
+        name = relation_variant_filename("graphiti-mcp", target, fp)
+        data = read_relation_variant(project, "graphiti-mcp", target, name)
+        assert data["env"] == {v: {"depends_on": target} for v in expected}
 
 
-def test_force_rewrites_every_relation_in_the_env_context(project):
-    fp = _fingerprint(project)
-    write_relation(project, "graphiti-mcp", "a", {"A": "a"}, fp)
-    write_relation(project, "graphiti-mcp", "b", {"B": "b"}, fp)
-    before = (project / relation_filename("graphiti-mcp", "a")).read_text()
-    written = generation_jobs._fill_relations(
-        project, source="graphiti-mcp", entries=[_dep("a"), _dep("b")],
-        mapping={"a": ["A"], "b": ["B"]}, fingerprint=fp, force=True)
-    assert sorted(written) == ["a", "b"]
-    assert (project / relation_filename("graphiti-mcp", "a")).read_text() != before
+def test_the_1to1_projection_names_missing_and_extra_variables(project):
+    from app.services.dependency_model import relation_projection_errors
+    name = write_relation(project, "s", "t", {"A": "t", "B": "t"},
+                          {"compose": [], "profiles": [], "env_bases": []}).name
+    data = read_relation_variant(project, "s", "t", name)
+    assert relation_projection_errors(data, ["A", "B"]) == ([], [])
+    assert relation_projection_errors(data, ["A"]) == ([], ["B"])
+    assert relation_projection_errors(data, ["A", "B", "C"]) == (["C"], [])
 
 
-def test_a_stale_relation_refuses_a_selected_env(project, monkeypatch):
-    fp = _fingerprint(project)
-    write_relation(project, "graphiti-mcp", "graphiti-local", {"A": "graphiti-local"},
-                   _fingerprint(project, compose=()))
-    monkeypatch.setattr(deploy_workflow, "_entries_for_ids",
-                        lambda ids: [_dep("graphiti-local")])
-    with pytest.raises(WorkflowError) as exc:
-        deploy_workflow._dependency_precheck(
-            _intent(dependency_service_ids=["a"]),
-            {"env": ["x.env"]}, fp)
-    assert exc.value.code == "dependency_relations_missing"
+def test_the_coverage_fill_names_every_selected_env_key():
+    artifact = {"version": 1, "fingerprint": {}, "variables": {
+        "KEEP": {"category": "defaulted", "source": {"kind": "file"},
+                 "value": "1"}}}
+    filled = generation_jobs.ensure_classification_coverage(
+        artifact, ["KEEP", "NEW"], {"KEEP": "1", "NEW": "2"})
+    assert set(filled["variables"]) == {"KEEP", "NEW"}
+    assert filled["variables"]["NEW"]["value"] == "2"
+    assert filled["variables"]["NEW"]["category"] == "defaulted"
+    # An already-covered classification is returned unchanged.
+    same = generation_jobs.ensure_classification_coverage(
+        artifact, ["KEEP"], {"KEEP": "1"})
+    assert same is artifact
+
+
+def test_generation_needed_for_a_classified_selected_env(monkeypatch, project):
+    from app.services.generation_jobs import generation_jobs as gm
+    monkeypatch.setattr(gm, "_recipe_missing", lambda req: [])
+    selection = {"compose": ["docker-compose.yml"], "nginx": "n.conf",
+                 "serving_ports": "p.yml", "env": [".env"], "env_none": False}
+    intent = {"service_name": "graphiti-mcp", "recipe_path": "",
+              "classification": "none", "selection": selection}
+    assert deploy_workflow.generation_needed(intent) is False
+    intent["classification"] = "generate_new"
+    assert deploy_workflow.generation_needed(intent) is True
+    intent["classification"] = "env.classification.0123456789abcdef.yaml"
+    assert deploy_workflow.generation_needed(intent) is True
+    intent["selection"] = {**selection, "env": [], "env_none": True}
+    assert deploy_workflow.generation_needed(intent) is False
 
 
 # ---------------------------------------------------------------------------
@@ -283,12 +356,12 @@ def test_snapshot_matrix(tmp_path, monkeypatch):
     rdir = tmp_path / "s" / "recipe"
     rdir.mkdir(parents=True)
     (rdir / "serving_ports.yml").write_text("rows: []\n")
-    write_relation(rdir, "s", "dep", {"A": "dep"},
-                   {"compose": [], "profiles": [], "env_bases": []})
-    write_artifact(rdir, source_service="s", recipe_path="",
-                   fingerprint={"compose": [], "profiles": [], "env_bases": []},
-                   variables={"A": {"category": "defaulted",
-                                    "source": {"kind": "file"}}})
+    fp = {"compose": [], "profiles": [], "env_bases": []}
+    rel_name = write_relation(rdir, "s", "dep", {"A": "dep"}, fp).name
+    cls_name = write_artifact(
+        rdir, source_service="s", recipe_path="", fingerprint=fp,
+        variables={"A": {"category": "defaulted",
+                         "source": {"kind": "file"}}}).name
     monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
     monkeypatch.setattr(deploy_workflow, "_dependency_entries",
                         lambda sid: [{"service_name": "dep"}])
@@ -306,39 +379,43 @@ def test_snapshot_matrix(tmp_path, monkeypatch):
                   {"env_none": True, "serving_ports_none": True})
     assert created == set()
 
-    # Row 4 — a relation read (sent env + deps): dep snapshot only.
+    # A relation read (sent env + deps): dep snapshot only, exact source.
     created = run("31", {"relations": {"dep": "read"}, "classification_read": False,
-                         "classification_written": False},
+                         "classification_written": False,
+                         "relation_variants": {"dep": rel_name}},
                   {"env": ["e.env"], "serving_ports_none": True})
     assert created == {"dependency.s.dep.user-alice.31.json",
                        "dependency.s.dep.user-alice.31.json.generated"}
 
-    # Row 6 — artefact read: env-class snapshot only.
+    # The artefact read: env-class snapshot only, copied from the used variant.
     created = run("32", {"relations": {}, "classification_read": True,
-                         "classification_written": False},
+                         "classification_written": False,
+                         "classification_name": cls_name},
                   {"env_none": True, "serving_ports_none": True})
-    assert created == {"env.classification.user-alice.32.json",
-                       "env.classification.user-alice.32.json.generated"}
+    assert created == {"env.classification.user-alice.32.yaml",
+                       "env.classification.user-alice.32.yaml.generated"}
 
-    # Row 8 — no artefact and no relation: nothing.
+    # No artefact and no relation: nothing.
     created = run("33", {"relations": {}, "classification_read": False,
                          "classification_written": False},
                   {"env_none": True, "serving_ports_none": True})
     assert created == set()
 
-    # Row 10 — a relation written: both snapshots.
+    # A relation written: both snapshots.
     created = run("34", {"relations": {"dep": "written"}, "classification_read": True,
-                         "classification_written": True},
+                         "classification_written": True,
+                         "relation_variants": {"dep": rel_name},
+                         "classification_name": cls_name},
                   {"env_none": True, "serving_ports_none": True})
     assert "dependency.s.dep.user-alice.34.json" in created
-    assert "env.classification.user-alice.34.json" in created
+    assert "env.classification.user-alice.34.yaml" in created
 
     # The card rows read the same files, exact names only.
     rows = deploy_workflow._snapshot_rows({
         "service_name": "s", "user_name": "alice", "label": "34",
         "service_id": "sid", "recipe_path": "recipe"})
     assert rows["env_classification_snapshot"] == \
-        "env.classification.user-alice.34.json"
+        "env.classification.user-alice.34.yaml"
     assert rows["dependency_snapshots"] == [
         {"target_service": "dep",
          "path": "dependency.s.dep.user-alice.34.json"}]
