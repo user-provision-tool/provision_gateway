@@ -1,0 +1,216 @@
+"""T0/T8/T9 — the env classification contract, artefact, renderer and check."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from app.services import env_classification as ec
+
+
+def _classification(**variables):
+    return {"variables": {
+        name: {"category": "defaulted", "source": {"kind": "file"}, "reason": "r"}
+        for name in variables
+    }, "dependencies": {}}
+
+
+def test_the_six_categories_are_the_contract():
+    assert set(ec.CATEGORIES) == {
+        "required", "external", "secret", "deploy_value", "dependency", "defaulted"}
+    assert set(ec.SOURCE_KINDS) == {
+        "file", "compose_default", "metadata_key", "dependency_target",
+        "operator", "minted"}
+
+
+def test_a_classification_normalizes_and_derives_the_dependency_map():
+    raw = {"variables": {
+        "API_URL": {"category": "deploy_value", "source": {"kind": "metadata_key", "key": "serving_url"},
+                    "template": "http://{{ hostname }}:{{ http_port }}", "reason": "URL"},
+        "DEP_URL": {"category": "dependency", "source": {"kind": "dependency_target",
+                                                         "target": "graphiti-local"}, "reason": "dep"},
+        "EXT": {"category": "external", "source": {"kind": "operator"}},
+        "S": {"category": "secret", "source": {"kind": "minted"}},
+        "D": {"category": "defaulted", "source": {"kind": "compose_default"}, "value": "8000"},
+        "R": {"category": "required", "source": {"kind": "file"}},
+    }}
+    out = ec.normalize_classification(raw)
+    assert set(out["variables"]) == {"API_URL", "DEP_URL", "EXT", "S", "D", "R"}
+    assert out["dependencies"] == {"graphiti-local": ["DEP_URL"]}
+
+
+def test_an_unknown_category_is_rejected():
+    with pytest.raises(ec.ClassificationError):
+        ec.normalize_classification({"variables": {
+            "X": {"category": "deploy_url", "source": {"kind": "file"}}}})
+
+
+def test_an_unknown_source_kind_is_rejected_but_a_missing_one_is_derived():
+    with pytest.raises(ec.ClassificationError):
+        ec.normalize_classification({"variables": {
+            "X": {"category": "secret", "source": {"kind": "nonsense"}}}})
+    out = ec.normalize_classification({"variables": {
+        "X": {"category": "secret", "source": {}}}})
+    assert out["variables"]["X"]["source"]["kind"] == "minted"
+
+
+def test_the_defaulted_variable_is_never_dropped_and_external_is_null():
+    variables = {"D": {"category": "defaulted"}, "E": {"category": "external"}}
+    out = ec.validate_values({"D": {"value": "1", "source": "file"},
+                              "E": {"value": None, "source": "operator"}}, variables)
+    assert out["D"]["value"] == "1"
+    assert out["E"]["value"] is None
+
+
+def _write(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_the_fingerprint_is_order_insensitive_and_empty_profiles_is_a_list(tmp_path):
+    _write(tmp_path / "a.yml", "services: {}\n")
+    _write(tmp_path / "b.yml", "services: {x: {}}\n")
+    _write(tmp_path / ".env", "A=1\n")
+    left = ec.structural_fingerprint(
+        tmp_path, compose_names=["a.yml", "b.yml"], profiles=["b", "a"],
+        env_base_names=[".env"])
+    right = ec.structural_fingerprint(
+        tmp_path, compose_names=["b.yml", "a.yml"], profiles=["a", "b"],
+        env_base_names=[".env"])
+    assert left == right
+    assert left["profiles"] == ["a", "b"]
+    empty = ec.structural_fingerprint(
+        tmp_path, compose_names=[], profiles=[], env_base_names=[])
+    assert empty["profiles"] == []
+    assert ec.fingerprint_matches(left, right)
+    assert not ec.fingerprint_matches(left, empty)
+
+
+def test_the_artefact_round_trips_with_its_marker(tmp_path):
+    path = ec.write_artifact(
+        tmp_path, source_service="graphiti-mcp", recipe_path="",
+        fingerprint={"compose": [], "profiles": [], "env_bases": []},
+        variables={"A": {"category": "defaulted", "source": {"kind": "file"}}},
+        dependencies={"graphiti-local": ["A"]})
+    assert path.name == ec.ARTIFACT_NAME
+    assert Path(str(path) + ".generated").is_file()
+    data = ec.read_artifact(tmp_path)
+    assert data["version"] == 1
+    assert data["dependencies"] == {"graphiti-local": ["A"]}
+    _write(tmp_path / ec.ARTIFACT_NAME, "{not json")
+    assert ec.read_artifact(tmp_path) is None
+
+
+def test_a_template_renders_metadata_and_a_missing_key_is_an_error():
+    meta = {"hostname": "svc-a-1.localhost", "http_port": 8767}
+    assert ec.render_template("http://{{ hostname }}:{{ http_port }}", meta) == \
+        "http://svc-a-1.localhost:8767"
+    with pytest.raises(ec.MissingMetadataKey):
+        ec.render_template("http://{{ hostname }}:{{ nope }}", meta)
+
+
+def test_injection_covers_every_category():
+    artifact = {"variables": {
+        "REQ": {"category": "required", "source": {"kind": "file"}},
+        "EXT": {"category": "external", "source": {"kind": "operator"}},
+        "SEC": {"category": "secret", "source": {"kind": "minted"}},
+        "URL": {"category": "deploy_value", "source": {"kind": "metadata_key"},
+                "template": "http://{{ hostname }}:{{ http_port }}"},
+        "DEP": {"category": "dependency", "source": {"kind": "dependency_target"}},
+        "DEF": {"category": "defaulted", "source": {"kind": "compose_default"},
+                "value": "8000"},
+    }}
+    values, missing, externals = ec.inject_values(
+        artifact,
+        base_values={"REQ": "present", "SEC": "", "DEF": ""},
+        metadata={"hostname": "h", "http_port": 8767},
+        relation_values={"DEP": "http://target:8767"},
+        external_values={"EXT": "secret-from-operator"},
+    )
+    assert values["URL"] == "http://h:8767"
+    assert values["DEP"] == "http://target:8767"
+    assert values["EXT"] == "secret-from-operator"
+    assert values["DEF"] == "8000"
+    assert values["SEC"] and values["SEC"] != ""
+    assert missing == [] and externals == []
+
+
+def test_an_unsupplied_external_routes_to_the_pause_and_an_unmapped_dependency_is_missing():
+    artifact = {"variables": {
+        "EXT": {"category": "external", "source": {"kind": "operator"}},
+        "DEP": {"category": "dependency", "source": {"kind": "dependency_target"}},
+    }}
+    values, missing, externals = ec.inject_values(
+        artifact, base_values={}, metadata={}, relation_values={},
+        external_values={})
+    assert externals == ["EXT"]
+    assert missing == ["DEP"]
+    assert values == {}
+
+
+def test_a_dependency_blocked_by_no_relation_is_missing_even_with_a_stale_base_value():
+    artifact = {"variables": {
+        "DEP": {"category": "dependency", "source": {"kind": "dependency_target"}},
+    }}
+    missing, externals = ec.check_assembled(
+        artifact, {"DEP": "http://old:8767"}, relation_values={},
+        external_values={})
+    assert missing == ["DEP"]
+    assert externals == []
+
+
+def test_the_template_copy_is_verbatim_apart_from_the_essential_values(tmp_path):
+    template = (
+        "# keep me\n"
+        "TEMPLATE_ONLY=untouched\n"
+        "EMPTY=\"\"\n"
+        "\n"
+        "API_URL=http://placeholder\n"
+        "KEEP=1\n")
+    _write(tmp_path / ".env", template)
+    defaults, required = {"EMPTY": "fallback"}, ["API_URL"]
+    text = ec.apply_compose_defaults(template, defaults)
+    text = ec.apply_env_values(text, {"API_URL": "http://new"})
+    assert "# keep me" in text
+    assert "TEMPLATE_ONLY=untouched" in text
+    assert "EMPTY=fallback" in text
+    assert "API_URL=http://new" in text
+    assert "KEEP=1" in text
+    # The base file itself is untouched.
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == template
+    assert required == ["API_URL"]
+
+
+def test_identical_template_files_contribute_one_copy(tmp_path):
+    same = "KEEP=1\n# comment\n"
+    _write(tmp_path / ".env", same)
+    _write(tmp_path / ".env.example", same)
+    text = ec.read_env_template(tmp_path, [".env", ".env.example"])
+    assert text.count("KEEP=1") == 1
+    assert text.count("# comment") == 1
+
+
+def test_a_variable_only_in_a_reference_is_not_copied(tmp_path):
+    _write(tmp_path / ".env", "TEMPLATE=1\n")
+    _write(tmp_path / ".env.fix", "ONLY_IN_FIX=2\n")
+    template_names, reference_names, text = (
+        [".env"], [".env.fix"], (tmp_path / ".env").read_text())
+    assert reference_names == [".env.fix"]
+    assert "ONLY_IN_FIX" not in text
+    assert "TEMPLATE=1" in text
+
+
+def test_the_classification_snapshot_is_an_exact_copy_with_a_marker(tmp_path):
+    ec.write_artifact(
+        tmp_path, source_service="s", recipe_path="",
+        fingerprint={"compose": [], "profiles": [], "env_bases": []},
+        variables={"A": {"category": "defaulted", "source": {"kind": "file"}}})
+    name = ec.snapshot_classification(tmp_path, user="alice", label="30")
+    assert name == "env.classification.user-alice.30.json"
+    assert (tmp_path / name).is_file()
+    assert (tmp_path / f"{name}.generated").is_file()
+    assert ec.snapshot_exists(tmp_path, user="alice", label="30")
+    assert ec.classification_snapshot_name("alice", "30") == name

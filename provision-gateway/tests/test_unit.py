@@ -6067,56 +6067,63 @@ class TestSelectedFileFork:
 
 
 class TestEnvReferencePicker:
-    """§5: the env REFERENCE is generation context, never a handoff."""
+    """R1/R2/R3/R9 — the env base moved into the per-slot popup."""
 
-    def test_gateway_uses_the_reference_only_when_env_is_generate_new(self):
+    def test_gateway_still_accepts_the_legacy_reference_as_a_base(self):
         import inspect
         from app.services.generation_jobs import GenerationJobManager
         src = inspect.getsource(GenerationJobManager._build_context)
         assert "env_reference" in src
-        # sel_env (the handoff) wins when present.
         assert "list(sel_env) or [" in src
 
-    def test_dashboard_renders_the_picker_only_for_generate_new(self):
+    def test_the_old_env_only_reference_control_is_gone(self):
         src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
-        # 2026-11-19 / O3 — the reference is the BASE of the generated env, not
-        # mere context; the heading says so.
-        assert "Env reference (generation base)" in src
-        assert "eff.env.length === 0" in src, "shown only when env is `generate new`"
-        assert "env_reference: envRefs" in src
+        assert "Env reference (generation base)" not in src
+        assert "env_reference: envRefs" not in src
+        # R4 — the toolbar and the ONE alert.
+        assert "⚙ base files" in src
+        assert "+ context" in src
+        assert "select a base to put hard constraint on how a file should be like" in src
 
-    def test_reference_is_not_part_of_the_handoff(self):
-        """It must not ride the deploy payload — only the generation request."""
-        src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
-        assert "payload.env_reference" not in src
+    def test_the_deploy_popup_mirrors_the_four_sent_pickers(self):
+        from pathlib import Path
+        src = (_DASH / "src" / "components" / "services" / "BaseFilesPopup.tsx").read_text()
+        assert "DEPLOY_REF_SLOTS" in src
+        for label in ("Compose files", "Serving ports", "Nginx config", "Env files"):
+            assert label in src
+        assert "refSlotEnabled" in src
+        assert "activeBaseRefs" in src
+        deploy = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert "base_refs: effectiveBaseRefs" in deploy
+        assert "context: additionalContext" in deploy
+        assert "force: forceAvailable && forceReclassify" in deploy
 
-    def test_standalone_panel_uses_the_reference_picker_and_no_interpolation_slot(self):
+    def test_the_source_projects_modal_has_three_slots_and_no_env_slot(self):
         src = (_DASH / "src" / "components" / "services" / "GenerateMissingPanel.tsx").read_text()
         assert "showEnv={false}" in src
-        assert "Env reference (generation context)" in src
-        assert "env_reference: envRefs" in src
+        assert "Env reference (generation context)" not in src
+        assert "env_reference: envRefs" not in src
+        assert "SOURCE_PROJECT_REF_SLOTS" in src
+        assert "env: []," in src, "the three-slot popup carries no env ref"
         assert "Generate Base Files" in src
         assert "Generate Missing Files" not in src
-        assert "env: []," in src, "selection.env stays empty; the reference travels separately"
         # Selected recipe files stay openable/editable; saving forks to .fix.
         assert "onOpenFile={openSelectedFile}" in src
         assert "fixVariantFor" in src
         assert "Save as .fix and use it" in src
-        # The reference picker sits below the prompt input.
-        assert src.index("Generation prompt") < src.index("Env reference (generation context)")
-        # Recipe-level generation is profile-blind; the standalone panel has
-        # no profile picker and sends no profiles.
+        # The toolbar sits below the prompt input and the standalone panel has
+        # no profile picker.
+        assert src.index("Generation prompt") < src.index("⚙ base files")
         assert "showProfiles={false}" in src
-        assert "profiles: []," in src
 
-    def test_deploy_generation_is_profile_blind_but_the_deploy_is_not(self):
+    def test_profiles_are_generation_context_and_a_deploy_option(self):
         import inspect
         from app.services import deploy_workflow
-        # The generation request drops profiles (they are deploy-time options).
-        assert 'gen_selection.pop("profiles"' in inspect.getsource(
-            deploy_workflow._generation_request)
-        # The -api payload carries them.
-        assert 'payload["profiles"]' in inspect.getsource(deploy_workflow._api_payload)
+        src = inspect.getsource(deploy_workflow._generation_request)
+        assert '"profiles": list(selection.get("profiles") or [])' in src
+        assert 'gen_selection.pop("profiles"' not in src
+        assert 'payload["profiles"]' in inspect.getsource(
+            deploy_workflow._api_payload)
         src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
         assert "selection: { ...sel" in src
 
@@ -7165,14 +7172,16 @@ class TestEnvPhaseEmptySurface:
     with UnboundLocalError instead of writing the empty `.raw` §4 asks for.
     """
 
-    def test_content_is_bound_before_the_kvs_branch(self):
+    def test_content_is_bound_on_every_env_path(self):
         import inspect
         from app.services.generation_jobs import GenerationJobManager
         src = inspect.getsource(GenerationJobManager._run_job)
-        i = src.index("content = \"\"")
-        j = src.index("if kvs:", i)
-        k = src.index("if not content:", j)
-        assert i < j < k, "`content` must be bound before both arms"
+        # The classification path assembles the copy; the mechanical path is
+        # the template plus its compose defaults. Both bind `content` before
+        # the write, and the resume path binds it too.
+        assert "content, _assembled, _missing, _externals = _assemble_classified_env(" in src
+        assert "content = _ec.apply_compose_defaults(template_text, defaults)" in src
+        assert "content = (_apply_env_kvs(_template, _kvs, external_values=_vals)" in src
 
     def test_mechanical_env_returns_empty_string_not_none(self, tmp_path, monkeypatch):
         from app.config import settings
@@ -7523,7 +7532,10 @@ class TestASelectedEnvIsTheHandoffNotGenerated:
         # S11 — a selected list and the explicit `env_none` both suppress it.
         assert 'if not (selection.get("env") or []) and not selection.get("env_none"):' in src
         form = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
-        assert "env_reference: envRefs" in form
+        # R1/R2 — the reference control became the Env slot of the base popup;
+        # the request carries the per-slot refs, never the old field.
+        assert "base_refs: effectiveBaseRefs" in form
+        assert "env_reference: envRefs" not in form
 
 
 class TestPinnedLabelIsReassertedAtSubmit:
@@ -8463,6 +8475,54 @@ class TestAPauseIsALegAndTheAnswerIsANewJob:
             return await pump_gateway_queue(m, jid, ("completed", "failed"))
 
         assert asyncio.run(scenario()) == "completed"
+        written = (tmp_path / "myapp" / ".env.raw.alice.0").read_text()
+        assert "OPENAI_API_KEY=sk-from-the-operator" in written
+
+    def test_the_answer_survives_a_different_worker(self, tmp_path, monkeypatch):
+        """The gateway runs four workers; the in-memory handoff is not enough.
+
+        Measured live 2026-11-20: the pause answer was lost between workers and
+        the resumed env failed its category check. The encrypted carry in the
+        row is the durable path, and it is deleted once consumed.
+        """
+        import asyncio
+        from pathlib import Path
+        from app.config import settings
+        from app.database import SessionLocal
+        from app.models.generation_job import GenerationJob
+        from app.services import generation_jobs as gj
+        from app.services.generation_jobs import GenerationJobManager
+
+        monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", Path(tmp_path))
+        (tmp_path / "myapp").mkdir()
+        carried = {
+            "service_name": "myapp",
+            "selection": {"compose": [], "nginx": None, "env": []},
+            "user_name": "alice", "label": "0",
+            "resume_env": {"env_name": ".env.raw.alice.0", "vars": ["OPENAI_API_KEY"],
+                           "mech": "OPENAI_API_KEY=\n",
+                           "kvs": {"OPENAI_API_KEY": {"env_type": "external"}},
+                           "compose_paths": []},
+        }
+
+        async def scenario():
+            m = GenerationJobManager()
+            db = SessionLocal()
+            job = m.create_job(
+                db, "myapp", "", "generate_missing", carried,
+                resume_values={"OPENAI_API_KEY": "sk-from-the-operator"})
+            jid = job.id
+            enc_before = "resume_values_enc" in (job.request or {})
+            gj._RESUME_HANDOFF.clear()      # the answer landed on another worker
+            status = await pump_gateway_queue(m, jid, ("completed", "failed"))
+            db.expire_all()
+            row = db.query(GenerationJob).filter(GenerationJob.id == jid).first()
+            return status, enc_before, (row.request or {}).get("resume_values_enc")
+
+        status, enc_before, enc_after = asyncio.run(scenario())
+        assert status == "completed"
+        assert enc_before is True
+        assert enc_after is None, "the encrypted carry must be deleted once used"
         written = (tmp_path / "myapp" / ".env.raw.alice.0").read_text()
         assert "OPENAI_API_KEY=sk-from-the-operator" in written
 

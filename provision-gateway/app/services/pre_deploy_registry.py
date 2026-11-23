@@ -365,6 +365,30 @@ def set_selection(service_id: str, selection: dict | None,
         db.close()
 
 
+def set_env_meta(service_id: str, env_meta: dict | None) -> bool:
+    """Record what the generation's env build used or wrote (C12).
+
+    The deploy that later claims a reviewed session must snapshot exactly the
+    artefact/relations the env build touched, so that set travels with the
+    session under ``options["env_meta"]``.
+    """
+    if not isinstance(env_meta, dict):
+        return False
+    db = _sessions()
+    try:
+        row = db.query(PreDeploySession).filter_by(service_id=service_id).first()
+        if row is None:
+            return False
+        options = dict(row.options or {})
+        options["env_meta"] = env_meta
+        row.options = options
+        row.updated_at = _now()
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
 def set_label(service_id: str, label: str) -> bool:
     """Rebind the session to a newly reserved label (external-race repair)."""
     db = _sessions()

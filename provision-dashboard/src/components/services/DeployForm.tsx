@@ -1,12 +1,22 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Modal, Form, Input, Select, Button, Switch, Space, Divider, message, Checkbox, Alert, Spin, Tag, Typography, Collapse } from 'antd'
-import { PlusOutlined, MinusCircleOutlined, GlobalOutlined, RobotOutlined } from '@ant-design/icons'
+import { PlusOutlined, MinusCircleOutlined, GlobalOutlined, RobotOutlined, DownloadOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import client from '../../api/client'
 import { deriveProfiles, getComposePreview } from '../../api/services'
 import { useGenerationJob, isPaused } from '../../hooks/useGenerationJob'
 import PausePrompt from './PausePrompt'
+import BaseFilesPopup, {
+  BaseRefs,
+  DEPLOY_REF_SLOTS,
+  EMPTY_BASE_REFS,
+  activeBaseRefs,
+} from './BaseFilesPopup'
+import AdditionalContextPopup, {
+  AdditionalContext,
+  EMPTY_CONTEXT,
+} from './AdditionalContextPopup'
 import FileSetSelection, {
   SelectedFileRow,
   confCategory,
@@ -188,12 +198,14 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   const [selection, setSelection] = useState<FileSetSelectionData>(EMPTY_SELECTION)
   const [needsEnv, setNeedsEnv] = useState(true)
   const [prompt, setPrompt] = useState('')
-  // §5: the env REFERENCE picker — the generation CONTEXT for the `.raw`
-  // (base/example env files), used only while env is `generate new`. The
-  // "Interpolation env files" picker above is strictly the HANDOFF now: it is
-  // what gets passed to the -api when env is selected, and is no longer used as
-  // generation context. Optional; defaults to nothing.
-  const [envRefs, setEnvRefs] = useState<string[]>([])
+  // R1/R3/R23 — the per-slot base refs, the arbitrary context and the
+  // per-deploy force control. The refs and context are operator state; the
+  // force is never stored and resets after every deploy.
+  const [baseRefs, setBaseRefs] = useState<BaseRefs>(EMPTY_BASE_REFS)
+  const [additionalContext, setAdditionalContext] = useState<AdditionalContext>(EMPTY_CONTEXT)
+  const [forceReclassify, setForceReclassify] = useState(false)
+  const [basePopupOpen, setBasePopupOpen] = useState(false)
+  const [contextPopupOpen, setContextPopupOpen] = useState(false)
   // Deploy-time per-user env generation (GAP-19): fresh SECRET_KEY per instance.
   const [perUserEnv, setPerUserEnv] = useState<string | null>(null)
   // S13 — the LLM env guard. Enabled + checked by default when the LLM is
@@ -396,6 +408,11 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         setFileSetStale({})
         setNeedsEnv(true)
         setPrompt('')
+        setBaseRefs(EMPTY_BASE_REFS)
+        setAdditionalContext(EMPTY_CONTEXT)
+        setForceReclassify(false)
+        setBasePopupOpen(false)
+        setContextPopupOpen(false)
         setPerUserEnv(null)
         setAtCapacity(null)
         // `check` on an LLM-fix pause (G26 row 5): the analysis's guide IS the
@@ -677,11 +694,18 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
     if (!open || !watchedService) return
     const { baseName, recipePath } = parseServiceValue(watchedService)
     let cancelled = false
-    if (selection.compose.length === 0) {
+    // R9 — with Compose on `generate new`, the Compose BASE REFS are the
+    // compose whose profiles gate the optional services; otherwise the sent
+    // selection is. A profile cannot be chosen without a compose to derive it
+    // from.
+    const composeForProfiles = selection.compose.length > 0
+      ? selection.compose
+      : baseRefs.compose
+    if (composeForProfiles.length === 0) {
       setFileSetCandidates(prev => ({ ...prev, profiles: [] }))
       return
     }
-    deriveProfiles(baseName, selection.compose, recipePath)
+    deriveProfiles(baseName, composeForProfiles, recipePath)
       .then(({ data }) => {
         if (cancelled) return
         const profiles: string[] = (data.candidates && data.candidates.profiles) || []
@@ -697,7 +721,7 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         if (!cancelled) setFileSetCandidates(prev => ({ ...prev, profiles: [] }))
       })
     return () => { cancelled = true }
-  }, [open, watchedService, selection.compose])
+  }, [open, watchedService, selection.compose, baseRefs.compose])
 
   // Check for missing essential files when service selection changes
   const checkMissingFiles = async (serviceName: string) => {
@@ -722,13 +746,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
     } finally { setCheckingMissing(false) }
   }
 
-  // Generation is recipe-level and profile-BLIND: every service/block is
-  // generated and the -api filters blocks at render for the profiles this
-  // deployment activates. The deploy payload still carries `sel.profiles`.
-  const generationSelection = (): FileSetSelectionData => ({
-    ...effectiveSelection(),
-    profiles: [],
-  })
+  // R9 — the selected profiles are GENERATION context (the classifier may pick
+  // a profile-matching example) as well as deploy options. The register
+  // payload still carries them only as the deploy option.
+  const generationSelection = (): FileSetSelectionData => effectiveSelection()
 
   const effectiveSelection = (): FileSetSelectionData => {
     const st = fileSetStale || {}
@@ -777,6 +798,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   // `needs_env:false` is only a hint (it pre-selects `None`); it does not enter
   // this predicate.
   const envSatisfied = eff.env.length > 0 || !!eff.env_none || !!perUserEnv
+  // R23 table 1 — the force control exists only on `generate new` with an
+  // active LLM. Everywhere else it is disabled, unticked and not sent.
+  const forceAvailable = llmActive && eff.env.length === 0 && !eff.env_none
+  const effectiveBaseRefs = activeBaseRefs(baseRefs, eff)
   // G56 — with TLS on (and a serving-ports artifact in play), the stream conf is
   // a SLOT like the http one: a fully-configured deploy names both. `None` is
   // the deliberate no-stream state and demands nothing.
@@ -858,6 +883,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   // Async generation job (ordered phases compose → nginx → env, one job).
   const genJob = useGenerationJob()
   const [genValidations, setGenValidations] = useState<Record<string, any>>({})
+  // The manual Generate path resets `genJob` when it moves into the review
+  // gate, so the export must keep the last non-null job snapshot (id, status,
+  // result) instead of reading an already-cleared hook state.
+  const [lastGeneration, setLastGeneration] = useState<any>(null)
   // Deploy progress popup (design §8.3) — shows generation steps + deploy step.
   const [genPopupOpen, setGenPopupOpen] = useState(false)
 
@@ -934,11 +963,19 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         use_global_proxy: effectiveUseGlobalProxy(),
         selection: generationSelection(),
         prompt,
-        env_reference: envRefs,
+        base_refs: effectiveBaseRefs,
+        context: additionalContext,
+        // The Generate preview must carry the selected dependencies too: the
+        // env classifier needs the identities/relation files, and the deploy
+        // path already sends them. Without this a dependency-only run fails the
+        // category check with an unmapped variable.
+        dependency_service_ids: form.getFieldValue('dependency_service_ids') || [],
+        force: forceAvailable && forceReclassify,
         // G25 — the NAMING follows the TRIGGER: on a guided restart the
         // generation emits `.fix` files, not `.base`.
         ...(fixingGuide ? { fix: true } : {}),
       })
+      setForceReclassify(false)
       if (data.generation_task_id) {
         genJob.resumeJob(data.generation_task_id)
       }
@@ -978,6 +1015,20 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   // Deploy auto-run path (popup open) the completed events are KEPT so the popup
   // freezes on the final frame; the manual Generate path resets into the review
   // gate with the "review, then deploy" toast (feature 4).
+  useEffect(() => {
+    const st = genJob.jobState
+    if (!st) return
+    setLastGeneration({
+      job_id: genJob.jobId,
+      status: st.status,
+      phase: st.phase,
+      phase_index: st.phase_index,
+      phase_total: st.phase_total,
+      progress: st.progress,
+      result: st.result || null,
+    })
+  }, [genJob.jobState, genJob.jobId])
+
   useEffect(() => {
     const st = genJob.jobState
     if (!st || st.status !== 'completed') return
@@ -1238,7 +1289,9 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         // for a real selected env (never under `None`/`generate new`).
         selection: { ...sel, stream_conf: snap.https ? sel.stream_conf : null },
         prompt,
-        env_reference: envRefs,
+        base_refs: effectiveBaseRefs,
+        context: additionalContext,
+        force: forceAvailable && forceReclassify,
         // S13 — the LLM env guard flag, top-level on the deploy payload. It
         // applies only when a selected env list is actually being sent.
         llm_validate_env: !!(llmActive && llmValidateEnv && sel.env.length > 0 && !sel.env_none),
@@ -1269,6 +1322,8 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
       }
 
       const { data } = await client.post('/services/deploy', payload)
+      // R23/B7 — the force is per-deploy: it is not stored and never survives.
+      setForceReclassify(false)
       const workflowId = data.workflow_id || data.service_id
       if (!workflowId) throw new Error('the gateway did not return a workflow handle')
 
@@ -1509,91 +1564,162 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
     )
   }
 
-  // T9/R10 — the Generation prompt and the Env reference live INSIDE the same
-  // box as the `Generate Missing Files via LLM` button (the warning Alert; the
-  // success variant of the same container is green and carries them too).
-  const renderGenerationPrompt = () => (
-    <>
-      <Divider plain style={{ margin: '8px 0' }}>Generation prompt</Divider>
-      <Input.TextArea
-        rows={2}
-        disabled={!llmActive}
-        value={prompt}
-        onChange={(e) => setPrompt(e.target.value)}
-        placeholder="Prompt for the generation agent (missing-files generation + deploy-time per-user env). You may include doc URLs — the agent fetches them."
-      />
-      {/* §5/S21 — shown ONLY under `generate new` (empty env slot, not the
-          deliberate `None`). The per-user env is generated automatically, so
-          that note sits ABOVE the reference picker; the references are
-          generation CONTEXT only — never sent to the -api, never validated. */}
-      {eff.env.length === 0 && !eff.env_none && (
-        <div style={{ marginTop: 8 }}>
-          <Alert
-            type="info"
-            showIcon
-            style={{ marginBottom: 8 }}
-            message="The per-user env is generated automatically as the last step of the missing-files pipeline when you Deploy (or click Generate)."
-          />
-          {(fileSetCandidates.env || []).length > 0 && (
-            <div>
-              <Text strong>Env reference (generation base)</Text>
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                {' '}— base/example env files the model reads. The generated
-                per-user env PRESERVES every variable and value from them and
-                fills only the essential ones; the reference files themselves
-                are never sent to the deployment.
-              </Text>
-              {/* F6/S21 — selected references as rows ABOVE the picker, each
-                  clickable to edit (saving forks to `.fix`) and removable. */}
-              {envRefs.map(ref => (
-                <SelectedFileRow
-                  key={ref}
-                  name={ref}
-                  onOpen={openSelectedFile}
-                  onRemove={() => setEnvRefs(prev => prev.filter(x => x !== ref))}
-                />
-              ))}
-              <Select
-                mode="multiple"
-                allowClear
-                style={{ width: '100%', marginTop: 4 }}
-                placeholder={envRefs.length
-                  ? 'Add another reference file…'
-                  : 'None — the model works from the compose alone'}
-                // F6 — the selected references are the rows above; the control
-                // is the CHOOSER, so they are not rendered twice. New picks are
-                // merged into the ordered list.
-                value={[]}
-                onChange={(v) => {
-                  const picked = (v as string[]).filter(Boolean)
-                  if (picked.length === 0) return
-                  setEnvRefs(prev => [...new Set([...prev, ...picked])])
-                }}
-                options={(fileSetCandidates.env || [])
-                  .filter(c => !envRefs.includes(c))
-                  .map(c => ({ value: c, label: c }))}
+  // Export the panel's selected options and the generation path's output.
+  // The generated files' CONTENT is read from the recipe (the job result is
+  // metadata only); an edited generated file that is already held in state is
+  // exported as-is. The deploy password is redacted and build-arg VALUES are
+  // not exported (they can carry proxy credentials); their keys are.
+  const exportGenerationJson = async () => {
+    const svcVal = form.getFieldValue('service_name') || ''
+    const { baseName, recipePath } = parseServiceValue(svcVal)
+    const fields = form.getFieldsValue()
+    const heldFiles = generatedFiles as Record<string, any>
+    const names = Object.keys(heldFiles || {})
+    const files: Record<string, any> = {}
+    await Promise.all(names.map(async (name) => {
+      const held = heldFiles[name]
+      if (typeof held === 'string') {
+        files[name] = { content: held }
+        return
+      }
+      let content: string | null = null
+      try {
+        const path = recipePath ? `${recipePath}/${name}` : name
+        const { data } = await client.get(`/projects/${baseName}/files/${path}`)
+        content = typeof data?.content === 'string' ? data.content : null
+      } catch {
+        // The metadata still exports; the file may have been removed.
+      }
+      files[name] = { ...(held && typeof held === 'object' ? held : {}), content }
+    }))
+    const js = genJob.jobState || lastGeneration || {}
+    const payload = {
+      exported_at: new Date().toISOString(),
+      selected_options: {
+        service_value: fields.service_name || '',
+        user_name: fields.user_name || '',
+        label: fields.label || '',
+        domain: fields.domain || '',
+        https: !!fields.https,
+        ssl_domain: fields.ssl_domain || '',
+        use_global_proxy: effectiveUseGlobalProxy(),
+        dependencies: fields.dependency_service_ids || [],
+        selection: effectiveSelection(),
+        base_refs: effectiveBaseRefs,
+        context: additionalContext,
+        prompt,
+        force: forceAvailable && forceReclassify,
+        llm_active: llmActive,
+        llm_validate_env: !!llmValidateEnv,
+        volumes: Array.isArray(fields.volumes) ? fields.volumes : [],
+        build_arg_keys: Array.isArray(fields.build_args)
+          ? fields.build_args.map((a: any) => a?.key).filter(Boolean)
+          : [],
+        passwd: fields.passwd ? '<redacted>' : '',
+      },
+      generation: {
+        job_id: genJob.jobId ?? lastGeneration?.job_id ?? null,
+        status: js.status || null,
+        phase: js.phase || null,
+        phase_index: js.phase_index ?? null,
+        phase_total: js.phase_total ?? null,
+        progress: js.progress || '',
+        env_name: perUserEnv,
+        validations: genValidations,
+        result: js.result || null,
+        files,
+      },
+    }
+    const text = JSON.stringify(payload, null, 2)
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const win = window.open(url, '_blank')
+    if (!win) {
+      URL.revokeObjectURL(url)
+      message.error('The browser blocked the export window — allow pop-ups for this page')
+      return
+    }
+    // Keep the URL alive while the new tab reads it, then release it.
+    setTimeout(() => URL.revokeObjectURL(url), 60000)
+  }
+
+  // R2/R4 — the prompt box owns the toolbar, the summary lines and exactly
+  // ONE compact alert. The old env-only reference control is gone; its role is
+  // the Env slot of the base-files popup (R1).
+  const renderGenerationPrompt = () => {
+    const refRows: { name: string; slot: 'compose' | 'serving_ports' | 'nginx' | 'env' }[] = []
+    effectiveBaseRefs.compose.forEach(name => refRows.push({ name, slot: 'compose' }))
+    if (effectiveBaseRefs.serving_ports) {
+      refRows.push({ name: effectiveBaseRefs.serving_ports, slot: 'serving_ports' })
+    }
+    if (effectiveBaseRefs.nginx) refRows.push({ name: effectiveBaseRefs.nginx, slot: 'nginx' })
+    effectiveBaseRefs.env.forEach(name => refRows.push({ name, slot: 'env' }))
+    const removeRef = (name: string, slot: 'compose' | 'serving_ports' | 'nginx' | 'env') => {
+      if (slot === 'compose') {
+        setBaseRefs({ ...baseRefs, compose: baseRefs.compose.filter(x => x !== name) })
+      } else if (slot === 'env') {
+        setBaseRefs({ ...baseRefs, env: baseRefs.env.filter(x => x !== name) })
+      } else {
+        setBaseRefs({ ...baseRefs, [slot]: null })
+      }
+    }
+    return (
+      <>
+        <Divider plain style={{ margin: '8px 0' }}>Generation prompt</Divider>
+        <Input.TextArea
+          rows={2}
+          disabled={!llmActive}
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          placeholder="Prompt for the generation agent (missing-files generation + deploy-time per-user env). You may include doc URLs — the agent fetches them."
+        />
+        <Space size="small" style={{ marginTop: 8 }} wrap>
+          <Button size="small" onClick={() => setBasePopupOpen(true)}>⚙ base files</Button>
+          <Button size="small" onClick={() => setContextPopupOpen(true)}>+ context</Button>
+        </Space>
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginTop: 8 }}
+          message="select a base to put hard constraint on how a file should be like"
+        />
+        {(refRows.length > 0 || additionalContext.files.length > 0
+          || additionalContext.links.length > 0) && (
+          <div style={{ marginTop: 8 }}>
+            {refRows.map(row => (
+              <SelectedFileRow
+                key={`ref:${row.slot}:${row.name}`}
+                name={row.name}
+                onOpen={openSelectedFile}
+                onRemove={() => removeRef(row.name, row.slot)}
               />
-              {/* 2026-11-19/T8 — `None` is a deliberate, valid state: the
-                  model works from the compose alone. It must read as a CHOICE,
-                  not as an empty grey placeholder; Deploy/Generate stay
-                  enabled. */}
-              {envRefs.length === 0 && (
-                <div style={{ marginTop: 6 }}>
-                  <Tag color="orange" style={{ fontWeight: 600 }}>
-                    None — the model works from the compose alone
-                  </Tag>
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    No reference is used; generation reads only the compose's
-                    {' '}<Text code>$&#123;VAR&#125;</Text> surface.
-                  </Text>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      )}
-    </>
-  )
+            ))}
+            {additionalContext.files.map(name => (
+              <SelectedFileRow
+                key={`ctx:${name}`}
+                name={name}
+                onOpen={openSelectedFile}
+                onRemove={() => setAdditionalContext({
+                  files: additionalContext.files.filter(x => x !== name),
+                  links: additionalContext.links,
+                })}
+              />
+            ))}
+            {additionalContext.links.map(url => (
+              <div key={`link:${url}`} style={{ marginTop: 4 }}>
+                <Tag closable onClose={() => setAdditionalContext({
+                  files: additionalContext.files,
+                  links: additionalContext.links.filter(x => x !== url),
+                })}>
+                  {url}
+                </Tag>
+              </div>
+            ))}
+          </div>
+        )}
+      </>
+    )
+  }
 
   return (
     <>
@@ -1603,6 +1729,28 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         returned 503 while no alert appeared. Root-level cannot be hidden by
         whichever modal happens to be open. */}
     {renderAtCapacity()}
+    {/* R1 — the deploy popup mirrors the panel's FOUR sent-file pickers. */}
+    <BaseFilesPopup
+      open={basePopupOpen}
+      onClose={() => setBasePopupOpen(false)}
+      slots={DEPLOY_REF_SLOTS}
+      candidates={fileSetCandidates}
+      selection={eff}
+      refs={baseRefs}
+      onChange={setBaseRefs}
+      onOpenFile={openSelectedFile}
+    />
+    {/* R3 — the existing project browser plus a URL input; context only. */}
+    <AdditionalContextPopup
+      open={contextPopupOpen}
+      onClose={() => setContextPopupOpen(false)}
+      serviceName={parseServiceValue(watchedService || '').baseName}
+      recipePath={parseServiceValue(watchedService || '').recipePath}
+      files={additionalContext.files}
+      links={additionalContext.links}
+      onChange={setAdditionalContext}
+      onOpenFile={openSelectedFile}
+    />
     <Modal
       title={`Deploy${selectedServiceName ? `: ${selectedServiceName}` : ''}`}
       open={open}
@@ -1873,6 +2021,23 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                     : eff.env.length === 0
                     ? 'Available when a selected env file is chosen; under generate new the generation path guards the .raw.'
                     : 'Validates the selected env list before deploy; a finding blocks the deploy until it is fixed. Mechanical validation always runs.'}
+                </div>
+              </div>
+              {/* R23 — the per-deploy force control. Available ONLY on the
+                  generate-new env path with an active LLM; unticked by default,
+                  never stored, reset after every deploy. */}
+              <div style={{ marginTop: 8 }}>
+                <Checkbox
+                  checked={forceAvailable && forceReclassify}
+                  disabled={!forceAvailable}
+                  onChange={(e) => setForceReclassify(e.target.checked)}
+                >
+                  Force env re-classification for this deploy
+                </Checkbox>
+                <div style={{ fontSize: 12, color: '#999' }}>
+                  {forceAvailable
+                    ? 'Re-runs the classification and rewrites the shared artefact and every relation in the env context. Existing instances keep their snapshots.'
+                    : 'Available only under generate new with an active LLM.'}
                 </div>
               </div>
             </>
@@ -2163,6 +2328,11 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                 Select an SSL certificate to enable Deploy.
               </Text>
             )}
+            {/* Debug export: the selected options plus the generation path's
+                output, opened as raw JSON text in a new browser tab. */}
+            <Button htmlType="button" icon={<DownloadOutlined />} onClick={exportGenerationJson}>
+              Export JSON
+            </Button>
             <Button type="primary" htmlType="submit" loading={loading} icon={<span>🚀</span>}
               // `computingLabel` gates the submit too: the next-label call resolves through the
               // -api's status computation and was measured taking ~3–6s, during which the

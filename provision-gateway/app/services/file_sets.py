@@ -42,11 +42,15 @@ from .project_state import (
 # `.env.1.bob.3` from 2026-09-29 was selectable; a deploy picked it, skipped
 # env generation (the slot looked satisfied) and started the graph with an
 # empty OPENAI_API_KEY — it crash-looped.
+# The label is normally numeric, but a legacy/generated file can carry a
+# non-numeric label (`.env.raw.s2sshared.None`, measured live 2026-11-20). The
+# per-user forms are identified by their SHAPE, never by a numeric label: a
+# leaked `.env.raw.*` is an empty deploy handoff masquerading as a base.
 _PER_USER_ENV_RES = (
-    re.compile(r"^\.env\.[^./]+\.[0-9]+$"),
-    re.compile(r"^\.env\.\d+\.[^./]+\.[0-9]+$"),
-    re.compile(r"^\.env\.raw\.[^./]+\.[0-9]+$"),
-    re.compile(r"^\.env\.fix\.[^./]+\.[0-9]+$"),
+    re.compile(r"^\.env\.[^./]+\.(?:[0-9]+|None)$"),
+    re.compile(r"^\.env\.\d+\.[^./]+\.[^./]+$"),
+    re.compile(r"^\.env\.raw\.[^./]+\.[^./]+$"),
+    re.compile(r"^\.env\.fix\.[^./]+\.[^./]+$"),
 )
 
 

@@ -50,6 +50,9 @@ _GATEWAY_ONLY = {
     "dependency_service_ids",
     "use_global_proxy", "fix", "job_type", "owner_username",
     "skip_env", "category", "service_value", "_actor_user_id",
+    # R5 — generation-only context and the per-deploy force control travel on
+    # the gateway request but are never part of the -api register contract.
+    "base_refs", "context", "force", "classification_fingerprint",
     # §14.3 — the LLM env guard flag travels with the deploy request/session
     # but is never part of the -api register contract.
     "llm_validate_env", "env_none",
@@ -60,6 +63,7 @@ _GATEWAY_ONLY = {
 _RECORD_STRIP = {
     "selection", "prompt", "env_reference", "fix", "job_type", "owner_username",
     "skip_env", "category", "service_value",
+    "base_refs", "context", "force", "classification_fingerprint",
 }
 
 LIVE_JOB_STATUSES = ("queued", "running", "unknown")
@@ -109,6 +113,164 @@ def _selection(intent: dict) -> dict:
 def _recipe_dir(service_name: str, recipe_path: str) -> Path:
     from .file_sets import _recipe_dir as resolve
     return resolve(Path(settings.SOURCE_PROJECTS_DIR) / service_name, recipe_path)
+
+
+def _base_refs(intent: dict) -> dict:
+    refs = intent.get("base_refs")
+    return refs if isinstance(refs, dict) else {}
+
+
+def _force_effective(intent: dict, selection: dict) -> bool:
+    """R23 table 1 — force exists only on the generate-new env path.
+
+    A sent env, the deliberate None, or a fix job makes the control
+    unavailable; the gateway never honours a stale tick.
+    """
+    return (bool(intent.get("force")) and not intent.get("fix")
+            and not selection.get("env") and not selection.get("env_none"))
+
+
+def _context(intent: dict) -> dict:
+    ctx = intent.get("context")
+    if not isinstance(ctx, dict):
+        return {"files": [], "links": []}
+    return {
+        "files": [str(p) for p in (ctx.get("files") or []) if isinstance(p, str)],
+        "links": [str(u) for u in (ctx.get("links") or []) if isinstance(u, str)],
+    }
+
+
+def _validate_base_refs(intent: dict, selection: dict) -> None:
+    """R6 — every base ref exists, is that slot's candidate, and its slot is
+    on ``generate new``. A ref on a filled slot is refused, never ignored.
+    """
+    from .file_sets import (
+        FileSetError, _is_compose_candidate, _is_env_candidate,
+        _is_mail_conf_candidate, _is_nginx_candidate,
+        _is_serving_ports_candidate, _is_stream_conf_candidate,
+        _validate_paths,
+    )
+
+    refs = _base_refs(intent)
+    if not refs:
+        return
+    service_name = intent.get("service_name") or ""
+    recipe_path = intent.get("recipe_path") or ""
+    project_dir = Path(settings.SOURCE_PROJECTS_DIR) / service_name
+    try:
+        recipe_dir = _recipe_dir(service_name, recipe_path)
+    except FileSetError as exc:
+        raise WorkflowError("invalid_recipe_path", str(exc)) from exc
+
+    def _check(names: list[str], *, slot: str, filled: bool, label: str, pred) -> None:
+        names = [n for n in names if isinstance(n, str) and n]
+        if not names:
+            return
+        if filled:
+            raise WorkflowError(
+                "base_ref_on_selected_slot",
+                f"the {label} slot is filled — a base ref applies only to "
+                f"`generate new`",
+            )
+        try:
+            rel = _validate_paths(project_dir, recipe_path, names)
+        except FileSetError as exc:
+            raise WorkflowError("invalid_base_ref", str(exc)) from exc
+        missing = [n for n in rel if not (recipe_dir / n).is_file()]
+        if missing:
+            raise WorkflowError(
+                "base_ref_missing",
+                f"base ref file(s) do not exist: {', '.join(missing)}",
+            )
+        not_candidates = [n for n in rel if not pred(Path(n).name)]
+        if not_candidates:
+            raise WorkflowError(
+                "base_ref_not_a_candidate",
+                f"not a {label} candidate: {', '.join(not_candidates)}",
+            )
+
+    _check(
+        refs.get("compose") or [], slot="compose",
+        filled=bool(selection.get("compose")), label="compose",
+        pred=_is_compose_candidate,
+    )
+    _check(
+        [refs.get("serving_ports")] if refs.get("serving_ports") else [],
+        slot="serving_ports",
+        filled=bool(selection.get("serving_ports") or selection.get("serving_ports_none")),
+        label="serving-ports", pred=_is_serving_ports_candidate,
+    )
+    _check(
+        [refs.get("nginx")] if refs.get("nginx") else [],
+        slot="nginx",
+        filled=bool(selection.get("nginx") or selection.get("stream_conf")
+                    or selection.get("mail_conf")),
+        label="nginx",
+        pred=lambda n: (_is_nginx_candidate(n) or _is_stream_conf_candidate(n)
+                        or _is_mail_conf_candidate(n)),
+    )
+    _check(
+        refs.get("env") or [], slot="env",
+        filled=bool(selection.get("env") or selection.get("env_none")),
+        label="env", pred=_is_env_candidate,
+    )
+
+
+def _validate_context(intent: dict) -> None:
+    """R6 — context files stay inside the project root; links are http(s)."""
+    ctx = _context(intent)
+    service_name = intent.get("service_name") or ""
+    project_root = (Path(settings.SOURCE_PROJECTS_DIR) / service_name).resolve()
+    for name in ctx["files"]:
+        raw = str(name).strip()
+        if (not raw or raw.startswith("/") or "\\" in raw
+                or ".." in raw.split("/")):
+            raise WorkflowError(
+                "context_file_invalid",
+                f"context file must be project-root-relative: {name!r}",
+            )
+        path = (project_root / raw).resolve()
+        if not str(path).startswith(str(project_root) + "/"):
+            raise WorkflowError(
+                "context_file_invalid", f"context file is outside the project root: {name!r}")
+        if not path.is_file():
+            raise WorkflowError(
+                "context_file_missing", f"context file does not exist: {name!r}")
+    for url in ctx["links"]:
+        if not url.lower().startswith(("http://", "https://")):
+            raise WorkflowError(
+                "context_link_invalid", f"context link must be http(s): {url!r}")
+
+
+def _classification_fingerprint(intent: dict, selection: dict) -> dict:
+    """R17 — hash the structural inputs once, at intake.
+
+    The Env base used by the classifier: the explicit Env refs, or the recipe's
+    own env files when the slot is `generate new` with no refs. Deploy-varying
+    values and the selected dependency identities are deliberately excluded.
+    """
+    from .env_classification import implicit_env_names, structural_fingerprint
+
+    service_name = intent.get("service_name") or ""
+    try:
+        recipe_dir = _recipe_dir(service_name, intent.get("recipe_path") or "")
+    except Exception:  # noqa: BLE001 — the caller's own validation names this
+        return {}
+    refs = _base_refs(intent)
+    env_bases = [p for p in (refs.get("env") or []) if isinstance(p, str)]
+    if not env_bases:
+        env_bases = [p for p in (intent.get("env_reference") or []) if isinstance(p, str)]
+    if not env_bases:
+        env_bases = implicit_env_names(recipe_dir)
+    compose = [p for p in (selection.get("compose") or []) if isinstance(p, str)]
+    if not compose:
+        compose = [p for p in (refs.get("compose") or []) if isinstance(p, str)]
+    return structural_fingerprint(
+        recipe_dir,
+        compose_names=compose,
+        profiles=list(selection.get("profiles") or []),
+        env_base_names=env_bases,
+    )
 
 
 def _validate_selected_files(intent: dict, selection: dict) -> None:
@@ -245,17 +407,25 @@ def generation_needed(intent: dict) -> bool:
 
 
 def _generation_request(intent: dict, selection: dict) -> dict:
-    # Generation is profile-BLIND: profiles are deploy-time options, not
-    # generation context. They travel on the intent and are merged back into
-    # the final selection before the register payload is built.
+    # R9 — profiles are GENERATION context (the classifier may choose a
+    # profile-matching example) AND deploy-time options. They ride the request
+    # and the final selection; the register payload still carries them only as
+    # the deploy option.
     gen_selection = dict(selection)
-    gen_selection.pop("profiles", None)
     return {
         "service_name": intent.get("service_name"),
         "recipe_path": intent.get("recipe_path") or "",
         "job_type": "generate_missing",
         "prompt": intent.get("prompt") or "",
         "env_reference": intent.get("env_reference") or [],
+        # R5/R6 — the per-slot refs and the arbitrary context are generation
+        # only; they never reach the -api.
+        "base_refs": _base_refs(intent),
+        "context": _context(intent),
+        "profiles": list(selection.get("profiles") or []),
+        "force": _force_effective(intent, selection),
+        # R17 — computed once at intake so reuse and regeneration agree.
+        "classification_fingerprint": intent.get("classification_fingerprint") or {},
         "selection": gen_selection,
         "user_name": intent.get("user_name") or intent.get("owner_username") or "",
         "label": str(intent.get("label") or "0"),
@@ -366,19 +536,22 @@ def _selected_env_values(recipe_dir: Path, selection: dict) -> dict[str, str]:
     return vals
 
 
-def _dependency_precheck(intent: dict, selection: dict) -> str:
+def _dependency_precheck(intent: dict, selection: dict,
+                         fingerprint: dict | None = None) -> str:
     """G103/T15 — decide the env-picker mode at intake.
 
     The modes (T15):
       * no deps → normal;
-      * any missing relation + env file/generate new → forced generate-new
+      * any missing/stale relation + env file/generate new → forced generate-new
         (a selected env is refused here — the modal disables it);
-      * distinct, all relations present + selected env → every classified var
+      * distinct, all relations current + selected env → every classified var
         must be present and non-empty (else the deploy is BLOCKED); all
         present → substitution is marked for `_claim_and_register`;
       * `None` and duplicate target service names → dependencies removed from
         the env context (grants only, normal env pickers).
     """
+    from .dependency_model import relation_is_current
+
     ids = [str(x) for x in (intent.get("dependency_service_ids")
                             or intent.get("allowed_target_service_ids") or []) if x]
     if not ids:
@@ -395,15 +568,21 @@ def _dependency_precheck(intent: dict, selection: dict) -> str:
     if selection.get("env_none"):
         intent["_dependency_env_disabled"] = True
         return "none"
-    missing = sorted({
-        str(e.get("service_name") or "") for e in entries
-        if read_relation(recipe_dir, source, str(e.get("service_name") or "")) is None
-    } - {""})
+    missing: list[str] = []
+    for e in entries:
+        target = str(e.get("service_name") or "")
+        if not target:
+            continue
+        rel = read_relation(recipe_dir, source, target)
+        if rel is None or (fingerprint is not None
+                           and not relation_is_current(rel, fingerprint)):
+            missing.append(target)
+    missing = sorted(set(missing))
     if missing:
         if selection.get("env"):
             raise WorkflowError(
                 "dependency_relations_missing",
-                "missing dependency relation file(s): " + ", ".join(missing)
+                "missing or stale dependency relation file(s): " + ", ".join(missing)
                 + " — choose generate new (or None) and deploy again",
                 409,
             )
@@ -443,6 +622,11 @@ def _snapshot_rows(entry: dict) -> dict:
     sp_name = serving_ports_snapshot_name(user, label)
     if (recipe_dir / sp_name).is_file():
         out["serving_ports_snapshot"] = sp_name
+    # R22 — the card's `Env classification:` row, only when the snapshot exists.
+    from .env_classification import classification_snapshot_name
+    env_name = classification_snapshot_name(user, label)
+    if (recipe_dir / env_name).is_file():
+        out["env_classification_snapshot"] = env_name
     deps: list[dict] = []
     if entry.get("service_id"):
         for target_entry in _dependency_entries(str(entry["service_id"])):
@@ -457,23 +641,44 @@ def _snapshot_rows(entry: dict) -> dict:
     return out
 
 
-def _snapshot_for_deploy(intent: dict, selection: dict, label: str) -> None:
-    """T9 — per-instance copies of the used serving-ports / relation files."""
+def _env_meta_for_substitution(intent: dict) -> dict:
+    """The used set for a sent-env+dependencies deploy (matrix rows 3–4)."""
+    targets: list[str] = []
+    if intent.get("_dependency_substitute") and not intent.get("_dependency_env_disabled"):
+        ids = [str(x) for x in (intent.get("dependency_service_ids")
+                                or intent.get("allowed_target_service_ids") or []) if x]
+        targets = sorted({str(e.get("service_name") or "")
+                          for e in _entries_for_ids(ids)} - {""})
+    return {
+        "classification_read": False,
+        "classification_written": False,
+        "relations": {t: "read" for t in targets},
+    }
+
+
+def _snapshot_for_deploy(intent: dict, selection: dict, label: str,
+                         env_meta: dict | None = None) -> None:
+    """C12 — copy exactly what the env build read or wrote.
+
+    Serving ports keep their independent rule. The classification and the
+    relations are copied only when the env build touched them: a selected env
+    with no dependencies takes no relationship snapshot, and a mechanical env
+    (no LLM) takes no classification snapshot.
+    """
     service = intent.get("service_name") or ""
     user = str(intent.get("user_name") or intent.get("owner_username") or "user")
     try:
         recipe_dir = _recipe_dir(service, intent.get("recipe_path") or "")
         sp = None if selection.get("serving_ports_none") else selection.get("serving_ports")
-        targets: list[str] = []
-        if not intent.get("_dependency_env_disabled"):
-            ids = [str(x) for x in (intent.get("dependency_service_ids")
-                                    or intent.get("allowed_target_service_ids") or []) if x]
-            entries = _entries_for_ids(ids)
-            targets = sorted({str(e.get("service_name") or "") for e in entries} - {""})
+        meta = env_meta if isinstance(env_meta, dict) else _env_meta_for_substitution(intent)
+        targets = sorted(meta.get("relations") or {})
+        classification_used = bool(
+            meta.get("classification_read") or meta.get("classification_written"))
         snapshot_used_artifacts(
             recipe_dir, source_service=service, user=user, label=str(label),
             serving_ports=sp if isinstance(sp, str) else None,
             target_services=targets,
+            include_classification=classification_used,
         )
     except Exception:  # noqa: BLE001 — a snapshot failure never blocks the deploy
         _log.exception("dependency snapshot failed for %s/%s", service, label)
@@ -544,9 +749,20 @@ async def _start(intent: dict, *, operation: str, actor_user_id=None) -> dict:
     selection = _selection(intent)
     _validate_selected_files(intent, selection)
     _validate_policy(intent, selection, require_ready=False)
+    # R6 — every per-slot base ref exists, is that slot's candidate, and its
+    # slot is on `generate new`; arbitrary context stays inside the project.
+    _validate_base_refs(intent, selection)
+    _validate_context(intent)
+    # R17 — the structural fingerprint is computed ONCE, before any reuse
+    # decision, so "reuse" and "regenerate" cannot disagree.
+    intent["classification_fingerprint"] = _classification_fingerprint(intent, selection)
+    # The force control exists only on the generate-new env path (R23); a stale
+    # tick on another path is never honoured.
+    intent["force"] = _force_effective(intent, selection)
     # G103/T15 — the dependency-aware env mode is decided once, here; a selected
-    # env missing a classified variable (or a relation) is a structured refusal.
-    _dependency_precheck(intent, selection)
+    # env missing a classified variable (or a missing/stale relation) is a
+    # structured refusal.
+    _dependency_precheck(intent, selection, intent.get("classification_fingerprint"))
 
     owner_id = intent.get("owner_api_user_id")
     if not owner_id:
@@ -616,8 +832,11 @@ async def _start(intent: dict, *, operation: str, actor_user_id=None) -> dict:
             deploy_request=deploy_request, deploy_secret_values=deploy_secrets,
             selection=seeded,
         )
+        stored_env_meta = (existing.get("options") or {}).get("env_meta") \
+            if isinstance(existing.get("options"), dict) else None
         return await _claim_and_register(
-            service_id, intent, seeded, existing.get("env_name"))
+            service_id, intent, seeded, existing.get("env_name"),
+            env_meta=stored_env_meta)
 
     # Reserve the identity under the tuple lock (R5).
     label = _reserve(
@@ -950,7 +1169,8 @@ def _handle(service_id: str, intent: dict, label: str, stage: str,
 
 async def _claim_and_register(service_id: str, intent: dict,
                               selection: dict,
-                              env_name: str | None) -> dict:
+                              env_name: str | None,
+                              env_meta: dict | None = None) -> dict:
     """Claim `generated -> deploying` and call the existing -api register."""
     record = pdr.session_record(service_id)
     if record is None:
@@ -975,10 +1195,10 @@ async def _claim_and_register(service_id: str, intent: dict,
         env_name = _substitute_dependency_env(
             resolved, selection, str(record["label"]))
 
-    # G103/T9 — snapshot the USED serving-ports artifact and relation files
-    # per (user, service, label) on every deploy. A later edit of the shared
-    # recipe artifact cannot change what the instance records.
-    _snapshot_for_deploy(resolved, selection, str(record["label"]))
+    # C12 — snapshot exactly what the env build used or wrote: the artefact
+    # iff read/written, each relation iff read/written, and the serving-ports
+    # artifact by its own independent rule.
+    _snapshot_for_deploy(resolved, selection, str(record["label"]), env_meta)
 
     # S13 — the opt-in LLM env guard runs BEFORE the claim/register. A
     # finding or an LLM-call failure blocks the deploy; the record fails
@@ -1187,6 +1407,10 @@ async def on_generation_completed(*, service_id: str, request: dict,
 
     final_selection = finalized["selection"] or selection
     pdr.set_selection(service_id, final_selection, env_name)
+    # C12 — carry the used-or-written set to the deploy that claims a reviewed
+    # session, so its snapshot matrix is the generation's, not a guess.
+    if isinstance(result.get("env_meta"), dict):
+        pdr.set_env_meta(service_id, result.get("env_meta"))
 
     if record.get("operation") != pdr.OPERATION_DEPLOY:
         # The review gate: the operator decides whether to deploy later.
@@ -1194,7 +1418,8 @@ async def on_generation_completed(*, service_id: str, request: dict,
 
     try:
         _validate_policy(intent, final_selection, require_ready=True)
-        await _claim_and_register(service_id, intent, final_selection, env_name)
+        await _claim_and_register(service_id, intent, final_selection, env_name,
+                                  env_meta=result.get("env_meta"))
     except WorkflowError as exc:
         # _claim_and_register already recorded a capacity refusal / failure;
         # a policy failure here is a fail-closed deploy failure. A guard pause

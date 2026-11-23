@@ -70,6 +70,7 @@ interface ServiceInstance {
   // G103/T9/T10 — the gateway's per-instance snapshot names, present only when
   // the file exists. Exact paths, never guessed.
   serving_ports_snapshot?: string
+  env_classification_snapshot?: string
   dependency_snapshots?: { target_service: string; path: string }[]
   healthy_containers?: Record<string,string>
   unhealthy_containers?: Record<string,string>
@@ -2097,6 +2098,17 @@ export default function UsersPage() {
                                   onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label,
                                     'serving_ports', svc.serving_ports_snapshot as string, recipePath)}>
                                   {svc.serving_ports_snapshot}
+                                </Text>
+                                <Text type="secondary" style={{fontSize:11}}> (snapshot)</Text>
+                              </div>
+                            )}
+                            {svc.env_classification_snapshot && (
+                              <div style={{marginBottom:4}}>
+                                <Text>Env classification: </Text>
+                                <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
+                                  onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label,
+                                    'env', svc.env_classification_snapshot as string, recipePath)}>
+                                  {svc.env_classification_snapshot}
                                 </Text>
                                 <Text type="secondary" style={{fontSize:11}}> (snapshot)</Text>
                               </div>

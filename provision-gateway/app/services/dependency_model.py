@@ -166,23 +166,40 @@ def relation_env(data: dict | None) -> dict[str, str]:
 
 
 def write_relation(recipe_dir: str | Path, source_service: str,
-                   target_service: str, env_map: dict[str, str]) -> Path:
+                   target_service: str, env_map: dict[str, str],
+                   fingerprint: dict | None = None) -> Path:
     """Write one relation file mechanically (and its marker).
 
-    Existing files are NOT overwritten by generation — the caller checks
-    :func:`read_relation` first. This writer is for the missing relation only.
+    The caller owns the staleness decision (C11): a missing or stale relation
+    is re-filled, a current one is reused. ``fingerprint`` is the same
+    structural fingerprint the classification records, so a later deploy can
+    tell whether the map still matches the inputs it was derived from.
     """
     path = Path(recipe_dir) / relation_filename(source_service, target_service)
     payload = {
         "version": 1,
         "source_service": source_service,
         "target_service": target_service,
+        "fingerprint": fingerprint or {},
         "env": {var: {"depends_on": target_service} for var in sorted(env_map)},
         "generated_at": _stamp(),
     }
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     Path(str(path) + ".generated").write_text("")
     return path
+
+
+def relation_is_current(data: dict | None, fingerprint: dict | None) -> bool:
+    """True when the relation's recorded fingerprint matches the current one."""
+    if not isinstance(data, dict) or not isinstance(fingerprint, dict):
+        return False
+    recorded = data.get("fingerprint")
+    if not isinstance(recorded, dict):
+        return False
+    for key in ("compose", "profiles", "env_bases"):
+        if list(recorded.get(key) or []) != list(fingerprint.get(key) or []):
+            return False
+    return True
 
 
 def duplicate_target_services(entries: list[dict]) -> bool:
@@ -206,14 +223,20 @@ def copy_snapshot(src: Path, dest: Path) -> Path:
 def snapshot_used_artifacts(recipe_dir: str | Path, *, source_service: str,
                             user: str, label: str,
                             serving_ports: str | None,
-                            target_services: list[str]) -> dict:
-    """T9 — snapshot the used serving-ports artifact and relation files.
+                            target_services: list[str],
+                            include_classification: bool = False,
+                            classification_used: bool = False) -> dict:
+    """Snapshot what the env build actually used or wrote.
 
-    Called on EVERY deploy. A missing source is skipped (the card shows only
-    rows whose snapshot exists). Returns the exact snapshot names.
+    Serving ports keep their independent rule (copied whenever the selected or
+    generated artifact is sent). A dependency relation is copied only when the
+    env build read or wrote it — ``target_services`` is the caller's used-or-
+    written set, never "every selected target" (C12). The classification is
+    copied iff the artefact was read or written.
     """
     rdir = Path(recipe_dir)
-    out: dict[str, Any] = {"serving_ports": None, "dependencies": []}
+    out: dict[str, Any] = {"serving_ports": None, "dependencies": [],
+                           "env_classification": None}
     if serving_ports:
         src = rdir / serving_ports
         if src.is_file():
@@ -227,4 +250,8 @@ def snapshot_used_artifacts(recipe_dir: str | Path, *, source_service: str,
         name = relation_snapshot_filename(source_service, target, user, label)
         copy_snapshot(src, rdir / name)
         out["dependencies"].append({"target_service": target, "path": name})
+    if include_classification or classification_used:
+        from .env_classification import snapshot_classification
+        out["env_classification"] = snapshot_classification(
+            rdir, user=user, label=label)
     return out

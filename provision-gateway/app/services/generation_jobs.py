@@ -282,6 +282,152 @@ def _write_relation_files(
     return written
 
 
+def _env_template_inputs(recipe_dir, request: dict) -> tuple[list[str], list[str], str]:
+    """The Env base = the explicit refs, or the recipe env files when absent.
+
+    Returns ``(template_names, reference_names, template_text)``. With an
+    explicit Env base the implicit recipe env files become REFERENCES (read by
+    the classifier, never copied); with no explicit base they ARE the template.
+    """
+    from .env_classification import implicit_env_names, read_env_template
+
+    base_refs = request.get("base_refs") or {}
+    explicit = [p for p in (base_refs.get("env") or []) if isinstance(p, str)]
+    implicit = implicit_env_names(recipe_dir)
+    template_names = explicit or implicit
+    reference_names = [n for n in implicit if n not in template_names] if explicit else []
+    return template_names, reference_names, read_env_template(recipe_dir, template_names)
+
+
+def _env_compose_paths(recipe_dir, request: dict) -> list:
+    """The compose files this env build reads (selection first, then recipe)."""
+    from .file_sets import _is_compose_candidate
+
+    selection = request.get("selection") or {}
+    names = [p for p in (selection.get("compose") or []) if isinstance(p, str)]
+    if not names:
+        try:
+            names = [f.name for f in sorted(recipe_dir.iterdir())
+                     if f.is_file() and _is_compose_candidate(f.name)]
+        except OSError:
+            names = []
+    return [recipe_dir / n for n in names if (recipe_dir / n).is_file()]
+
+
+def _compose_defaults(compose_paths) -> tuple[dict[str, str], list[str]]:
+    from ..utils.var_scan import scan_compose_files
+
+    if not compose_paths:
+        return {}, []
+    scan = scan_compose_files(compose_paths)
+    defaults = {r.name: (r.default_raw or "") for r in scan.refs if r.has_default}
+    required = sorted({r.name for r in scan.refs if not r.has_default})
+    return defaults, required
+
+
+def _ec_unfilled(variables: list[str], supplied: dict[str, str]) -> list[str]:
+    return sorted(v for v in (variables or []) if not str((supplied or {}).get(v) or "").strip())
+
+
+def _target_service(entry: dict) -> str:
+    return str(entry.get("service_name") or entry.get("service") or "")
+
+
+def _normalize_target_service(key: str) -> str:
+    key = str(key or "")
+    return key.split("/")[1] if key.count("/") == 2 else key
+
+
+def _fill_relations(
+    recipe_dir, *, source: str, entries: list[dict],
+    mapping: dict[str, list[str]], fingerprint: dict, force: bool,
+) -> list[str]:
+    """Re-fill the stale/missing relations in the env context (C11).
+
+    A current relation is reused; with ``force`` every relation in the context
+    is rewritten from the new map. The written file records the same structural
+    fingerprint as the classification.
+    """
+    from .dependency_model import read_relation, relation_is_current, write_relation
+
+    written: list[str] = []
+    for entry in entries:
+        target = _target_service(entry)
+        if not target:
+            continue
+        current = read_relation(recipe_dir, source, target)
+        if not force and relation_is_current(current, fingerprint):
+            continue
+        env_map = {str(var): target for var in (mapping.get(target) or [])}
+        write_relation(recipe_dir, source, target, env_map, fingerprint)
+        written.append(target)
+    return sorted(set(written))
+
+
+def _relation_values(recipe_dir, *, source: str, entries: list[dict]) -> tuple[dict[str, str], list[str]]:
+    """Resolve the current relation maps to var -> target serving URL.
+
+    A relation file is the pointing authority; the target's own serving URL is
+    what the variable receives. Returns ``(values, used_targets)``.
+    """
+    from .dependency_model import read_relation, relation_env
+
+    by_service = {_target_service(e): e for e in entries if _target_service(e)}
+    values: dict[str, str] = {}
+    used: list[str] = []
+    for entry in entries:
+        target = _target_service(entry)
+        relation = read_relation(recipe_dir, source, target)
+        if relation is None:
+            continue
+        used.append(target)
+        for var, mapped in relation_env(relation).items():
+            pointed = by_service.get(str(mapped)) or by_service.get(target)
+            if pointed is not None:
+                from .dependency_model import serving_url
+                values[var] = serving_url(pointed)
+    return values, sorted(set(used))
+
+
+def _assemble_classified_env(
+    template_text: str, *, values: dict, artifact: dict,
+    base_metadata: dict, relation_values: dict[str, str],
+    external_values: dict[str, str] | None,
+    defaults: dict[str, str],
+) -> tuple[str, dict[str, str], list[str], list[str]]:
+    """Copy the template, apply only essential values, then check categories."""
+    from .env_classification import (
+        apply_compose_defaults, apply_env_values, check_assembled, inject_values,
+        parse_env_text,
+    )
+
+    base_values = parse_env_text(template_text)
+    injected, missing, externals = inject_values(
+        artifact, base_values=base_values, metadata=base_metadata,
+        relation_values=relation_values, external_values=external_values,
+    )
+    apply: dict[str, str] = {}
+    for name, spec in (values or {}).items():
+        value = spec.get("value") if isinstance(spec, dict) else spec
+        if value is None:
+            continue
+        value = str(value)
+        if not value.strip() and str(base_values.get(name, "")).strip():
+            continue
+        apply[name] = value
+    apply.update(injected)
+    text = apply_compose_defaults(template_text, defaults)
+    text = apply_env_values(text, apply)
+    assembled = parse_env_text(text)
+    missing_after, externals_after = check_assembled(
+        artifact, assembled, relation_values=relation_values,
+        external_values=external_values,
+    )
+    return (text, assembled,
+            sorted(set(missing) | set(missing_after)),
+            sorted(set(externals) | set(externals_after)))
+
+
 def _apply_env_kvs(
     mech: str, kvs: dict[str, Any], external_values: dict[str, str] | None = None
 ) -> str:
@@ -480,6 +626,14 @@ class GenerationJobManager:
             "user_name": request.get("user_name"),
             "label": request.get("label"),
         }
+        # The durable credential carry (four uvicorn workers, so the in-memory
+        # handoff cannot be the only source). Encrypted at rest; the runner
+        # deletes it after decrypting.
+        if resume_values:
+            from ..utils.crypto import encrypt_api_key
+            request = dict(request)
+            request["resume_values_enc"] = encrypt_api_key(
+                json.dumps(dict(resume_values), ensure_ascii=False))
         job = GenerationJob(
             task_id=task_id,
             collision_token=uuid.uuid4().hex[:12],
@@ -772,6 +926,25 @@ class GenerationJobManager:
     # deploy). The gateway owns the record now, so it owns the log — and the log
     # is deleted WITH the record (G30's cleanup contract).
 
+    def _clear_encrypted_resume(self, job_id) -> None:
+        """Remove the encrypted credential carry once it has been consumed."""
+        from ..database import SessionLocal
+        db = SessionLocal()
+        try:
+            row = db.query(GenerationJob).filter_by(task_id=str(job_id)).first()
+            if row is None or not isinstance(row.request, dict):
+                return
+            if "resume_values_enc" not in row.request:
+                return
+            cleaned = dict(row.request)
+            cleaned.pop("resume_values_enc", None)
+            row.request = cleaned
+            db.commit()
+        except Exception:  # noqa: BLE001 — best effort; the blob is encrypted
+            pass
+        finally:
+            db.close()
+
     def _log_dir(self) -> Path:
         d = Path(settings.GATEWAY_DATA_DIR) / "task_logs"
         try:
@@ -1060,9 +1233,18 @@ class GenerationJobManager:
             if kind in ("compose_fix", "validate_ports_fix", "validate_conf_fix") and values.get("guidance"):
                 carried["prompt"] = values["guidance"]
             if kind == "input" and values:
-                # Handed in memory only; never persisted (`_redact_request`
-                # strips it from the row).
+                # The in-memory handoff is the fast path, but the gateway runs
+                # four uvicorn workers: the answer may be received by one and
+                # the resumed leg executed by another (measured live
+                # 2026-11-20 — the external value vanished, the category check
+                # failed). Persist the values AES-GCM-encrypted so the resume
+                # is worker-independent; the runner decrypts and DELETES the
+                # blob before the phase runs.
+                import json as _json
+                from ..utils.crypto import encrypt_api_key
                 carried["resume_values"] = values
+                carried["resume_values_enc"] = encrypt_api_key(
+                    _json.dumps(values, ensure_ascii=False))
             carried.setdefault("service_name", job.service_name)
             carried.setdefault("recipe_path", job.recipe_path)
             carried["_answer_parent"] = job.task_id
@@ -1346,6 +1528,19 @@ class GenerationJobManager:
             db.close()
 
         handoff = _RESUME_HANDOFF.pop(str(job_id), None)
+        if not handoff:
+            # Four uvicorn workers: the answer may have been received by a
+            # different worker. The encrypted carry is the durable fallback;
+            # decrypt it, then remove the blob from the row.
+            enc = request.pop("resume_values_enc", None)
+            if enc:
+                try:
+                    import json as _json
+                    from ..utils.crypto import decrypt_api_key
+                    handoff = _json.loads(decrypt_api_key(str(enc))) or {}
+                except Exception:  # noqa: BLE001 — a lost carry fails closed
+                    handoff = None
+                self._clear_encrypted_resume(job_id)
         if handoff:
             request["resume_values"] = handoff
 
@@ -1364,6 +1559,13 @@ class GenerationJobManager:
                     usage_total: dict[str, int] = {"prompt": 0, "completion": 0, "reasoning": 0}
                     events: list[dict[str, Any]] = []
                     env_name: str | None = None
+                    # What the env build actually used or wrote (C12): the
+                    # deploy snapshots exactly this set, nothing selected.
+                    env_meta: dict[str, Any] = {
+                        "classification_read": False,
+                        "classification_written": False,
+                        "relations": {},
+                    }
                     # The `analyze` phase's output (G26). Empty on every other
                     # job type — the guide belongs to the fix analysis alone.
                     fix_guide: str = ""
@@ -1684,15 +1886,36 @@ class GenerationJobManager:
                         # ---- ENV phase: mechanical-first (design §2) ----
                         if phase == "env" and request.get("resume_env"):
                             # G27: finish the env from the CARRY. No LLM call,
-                            # no re-scan — the paused leg already did both, and
-                            # the operator's answer is the only missing input.
-                            _re = request.get("resume_env") or {}
-                            _vals = request.get("resume_values") or {}
-                            _content = _apply_env_kvs(
-                                _re.get("mech") or "", _re.get("kvs") or {},
-                                external_values=_vals,
-                            )
+                            # no re-scan — the paused leg already classified,
+                            # assembled and filled the relations; the operator's
+                            # external values are the only missing input.
                             from ..services.config_validation import validate_env
+                            _re = request.get("resume_env") or {}
+                            _vals = {str(k): str(v) for k, v in (request.get("resume_values") or {}).items()}
+                            _template = _re.get("template_text")
+                            if _template is None:
+                                _template = _re.get("mech") or ""
+                            _artifact = _re.get("artifact")
+                            if _artifact:
+                                _content, _assembled, _missing, _externals = _assemble_classified_env(
+                                    _template,
+                                    values=_re.get("values") or {},
+                                    artifact=_artifact,
+                                    base_metadata=_re.get("metadata") or {},
+                                    relation_values=_re.get("relation_values") or {},
+                                    external_values=_vals,
+                                    defaults=_re.get("defaults") or {},
+                                )
+                                if _missing or _externals:
+                                    raise GenerationJobError(
+                                        "phase 'env' failed its category check: "
+                                        + ", ".join(sorted(set(_missing) | set(_externals))))
+                            else:
+                                # Back-compat for a carry written by the old
+                                # two-turn path (mechanical base + kvs).
+                                _kvs = _re.get("kvs") or {}
+                                _content = (_apply_env_kvs(_template, _kvs, external_values=_vals)
+                                            if _kvs else _template)
                             validations[phase] = validate_env(
                                 _content, _re.get("compose_paths") or []
                             )
@@ -1701,23 +1924,13 @@ class GenerationJobManager:
                             _name = _re.get("env_name") or ".env"
                             (_rd / _name).write_text(_content, encoding="utf-8")
                             (_rd / f"{_name}.generated").write_text("")
-                            _ru = (request.get("user_name")
-                                   or (request.get("deploy_metadata") or {}).get("user_name")
-                                   or "user")
-                            _rl = str(request.get("label")
-                                      or (request.get("deploy_metadata") or {}).get("label")
-                                      or "0")
-                            if not _recipe_level_env:
-                                _write_relation_files(
-                                    _rd, service=service_name,
-                                    deps=_re.get("dependencies") or [],
-                                    refs=_re.get("dependency_refs") or {},
-                                )
                             result_files[_name] = _content
                             env_name = _name
+                            env_meta = dict(_re.get("env_meta") or env_meta)
+                            env_meta["classification_read"] = bool(_artifact)
                             warnings.extend(
                                 f"external variable '{n}' had no supplied value — kept the base value"
-                                for n in _unfilled_externals(_re.get("kvs") or {}, _vals)
+                                for n in _ec_unfilled(_re.get("external_vars") or [], _vals)
                             )
                             await _event(_name, "done", {
                                 "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
@@ -1726,13 +1939,85 @@ class GenerationJobManager:
                             })
                             continue
                         if phase == "env":
-                            # Always produces content — an empty string when the
-                            # compose references no ${VAR}s (§4), so the
-                            # "skipped (no ${VAR} interpolation)" outcome is gone.
-                            mech = self._mechanical_env(service_name, recipe_path, request) or ""
-                            # Serving-URL contract: ask the -api for the hostname
-                            # this instance will be served on (pre-deploy). The
-                            # gateway then appends the real external port below.
+                            # The env build (C1/C9/C11/C12): the Env base is
+                            # the ROOT TEMPLATE; `.env.raw` is a copy with only
+                            # essential values changed; the artefact drives a
+                            # model-free re-deploy; relations carry the
+                            # fingerprint and are re-filled only when stale.
+                            from . import env_classification as _ec
+                            from ..services.config_validation import validate_env
+
+                            recipe_dir = self._recipe_dir_for(service_name, recipe_path)
+                            recipe_dir.mkdir(parents=True, exist_ok=True)
+                            _uname = (
+                                request.get("user_name")
+                                or (request.get("deploy_metadata") or {}).get("user_name")
+                                or "user"
+                            )
+                            _ulabel = str(
+                                request.get("label")
+                                or (request.get("deploy_metadata") or {}).get("label")
+                                or "0"
+                            )
+                            composition_paths = _env_compose_paths(recipe_dir, request)
+                            defaults, required = _compose_defaults(composition_paths)
+                            _llm_on = self._llm_active(db)
+
+                            # `LLM based fix`: the `.env.fix` repair keeps its
+                            # old, dependency-blind conversation and never reads
+                            # or writes the classification artefact (R20).
+                            if _recipe_level_env:
+                                mech = self._mechanical_env(service_name, recipe_path, request) or ""
+                                try:
+                                    from ..services.provision_service import provision_service as _ps
+                                    dm = request.get("deploy_metadata") or {}
+                                    _base = await _ps.get_service_url_base(
+                                        service_name,
+                                        dm.get("user_name") or request.get("user_name") or "",
+                                        dm.get("label") or request.get("label") or "0",
+                                        dm.get("domain") or request.get("domain") or "localhost",
+                                    )
+                                    if _base.get("hostname"):
+                                        request.setdefault("deploy_metadata", {})["hostname"] = _base["hostname"]
+                                except Exception:
+                                    pass
+                                context = self._build_context(service_name, recipe_path, phase, request)
+                                context["base_files"]["__mechanical_env__.txt"] = mech
+                                context["dependencies"] = []
+                                gen = None
+                                if _llm_on:
+                                    gen = await llm_service.generate_env_two_turn(
+                                        db, context, progress=progress,
+                                        session_log=session_log, usage_cb=_usage_sync,
+                                        on_delta=_live_est,
+                                    )
+                                if gen:
+                                    warnings.extend(gen.get("warnings") or [])
+                                kvs = (gen or {}).get("kvs") or {}
+                                content = _apply_env_kvs(mech, kvs) if kvs else mech
+                                validations[phase] = validate_env(
+                                    content, [str(p) for p in composition_paths])
+                                if not validations[phase].get("valid"):
+                                    errs = validations[phase].get("errors") or []
+                                    raise GenerationJobError(
+                                        f"phase 'env' produced no valid output: {'; '.join(errs)}")
+                                env_name = ".env.fix"
+                                fpath = recipe_dir / env_name
+                                fpath.write_text(content, encoding="utf-8")
+                                (recipe_dir / f"{fpath.name}.generated").write_text("")
+                                result_files[env_name] = content
+                                await _event(env_name, "done", {
+                                    "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
+                                    "step": f"{phase}#final",
+                                    "validation": validations[phase],
+                                })
+                                continue
+
+                            template_names, reference_names, template_text = _env_template_inputs(
+                                recipe_dir, request)
+
+                            # Serving-URL contract: the -api reports the
+                            # hostname this instance will be served on.
                             try:
                                 from ..services.provision_service import provision_service as _ps
                                 dm = request.get("deploy_metadata") or {}
@@ -1742,242 +2027,244 @@ class GenerationJobManager:
                                     dm.get("label") or request.get("label") or "0",
                                     dm.get("domain") or request.get("domain") or "localhost",
                                 )
-                                if _base.get("hostname"):
-                                    request.setdefault("deploy_metadata", {})["hostname"] = _base["hostname"]
+                                if _base.get("hostname") and request.get("deploy_metadata") is not None:
+                                    request["deploy_metadata"]["hostname"] = _base["hostname"]
                             except Exception:
-                                pass  # fall back to the local hostname derivation
+                                pass
 
                             context = self._build_context(service_name, recipe_path, phase, request)
-                            context["base_files"]["__mechanical_env__.txt"] = mech
-                            # G102 — resolve the selected dependency identities
-                            # for the classifier.  The registry is the
-                            # gateway's read-only view of the same services.
+                            context["compose_paths"] = [str(p) for p in composition_paths]
+                            metadata = dict(context.get("deploy_metadata") or {})
+
+                            def _read_block(names):
+                                out: dict[str, str] = {}
+                                for name in names:
+                                    path = recipe_dir / name
+                                    if not path.is_file():
+                                        continue
+                                    try:
+                                        raw = path.read_text(encoding="utf-8", errors="replace")
+                                    except OSError:
+                                        continue
+                                    out[name] = "\n".join(
+                                        ln for ln in raw.splitlines() if ln.strip())
+                                return out
+
+                            context["env_template_files"] = _read_block(template_names)
+                            context["env_reference_files"] = _read_block(reference_names)
+
+                            project_dir = (Path(settings.SOURCE_PROJECTS_DIR) / service_name).resolve()
+                            ctx_files: dict[str, str] = {}
+                            for _name in ((request.get("context") or {}).get("files") or []):
+                                _p = (project_dir / str(_name)).resolve()
+                                if str(_p).startswith(str(project_dir) + "/") and _p.is_file():
+                                    try:
+                                        ctx_files[str(_name)] = _p.read_text(
+                                            encoding="utf-8", errors="replace")[:128 * 1024]
+                                    except OSError:
+                                        pass
+                            context["context_files"] = ctx_files
+
+                            proxy_url = ""
+                            if request.get("use_global_proxy"):
+                                try:
+                                    from . import proxy_service as _proxy
+                                    proxy_url = _proxy.get_proxy_env(db).get("HTTP_PROXY", "")
+                                except Exception:
+                                    proxy_url = ""
+                            context["proxy_url"] = proxy_url
+                            _links = []
+                            for _url in ((request.get("context") or {}).get("links") or []):
+                                _url = str(_url)
+                                _res = await llm_service._tool_web_fetch({"url": _url}, context)
+                                if str(_res).startswith("ERROR"):
+                                    _links.append({"url": _url, "unreachable": True, "text": ""})
+                                else:
+                                    _links.append({"url": _url, "unreachable": False, "text": _res})
+                            context["context_links"] = _links
+
                             _deps: list[dict] = []
                             try:
                                 from .registry import Registry as _Registry
+                                from .dependency_model import serving_url as _serving_url
                                 _reg = _Registry()
                                 for _dep_id in (request.get("dependency_service_ids") or []):
                                     _e = _reg.get_by_id(str(_dep_id))
                                     if not _e:
                                         continue
-                                    # The dependency is addressed by its
-                                    # SERVED endpoint (the hostname index and
-                                    # the cross nginx's server_name use the
-                                    # `--<service>` name), falling back to the
-                                    # instance hostname for a single-service
-                                    # recipe with no endpoint row.
-                                    _served = ((_e.get("http_endpoints") or [])
-                                               or [_e.get("hostname") or ""])[0]
+                                    _svc = str(_e.get("service_name") or "")
                                     _deps.append({
-                                        "key": f"{_e.get('user_name')}/"
-                                               f"{_e.get('service_name')}/"
-                                               f"{_e.get('label')}",
+                                        "key": f"{_e.get('user_name')}/{_svc}/{_e.get('label')}",
                                         "user": _e.get("user_name"),
-                                        "service": _e.get("service_name"),
+                                        "service": _svc,
+                                        "service_name": _svc,
                                         "label": str(_e.get("label")),
-                                        "hostname": _served,
-                                        "serving_url": (
-                                            ("https://" if _e.get("tls") else "http://")
-                                            + str(_served)
-                                            + f":{settings.NGINX_HTTPS_PORT if _e.get('tls') else settings.NGINX_HTTP_PORT}"),
+                                        "hostname": ((_e.get("http_endpoints") or [])
+                                                     or [_e.get("hostname") or ""])[0],
+                                        "serving_url": _serving_url(_e),
                                     })
                             except Exception:  # noqa: BLE001 — context is best-effort
                                 _deps = []
-                            # G103/T18 — the `.env.fix` repair is
-                            # dependency-BLIND: a genuine `fix` job gets no
-                            # structured dependency context, so its output is
-                            # identical with or without dep ids in the intent.
+                            # G103/T18 — the `.env.fix` repair is dependency-
+                            # BLIND; a genuine fix job gets no dependency context.
                             if request.get("fix") and job.job_type == "fix":
                                 _deps = []
                             context["dependencies"] = _deps
-                            # LLM fill = two-turn conversation (design §2 env
-                            # redesign): turn 1 identifies the vars needing
-                            # values, turn 2 (same conversation) maps them to
-                            # values from deployment_meta; the gateway then
-                            # assembles the .env programmatically from the
-                            # returned map over the mechanical merge. Mechanical
-                            # output stands when the LLM is off/empty.
-                            llm_on = self._llm_active(db)
-                            gen = None
-                            kvs: dict[str, str] = {}
-                            if llm_on:
-                                for attempt in (1, 2):
-                                    self._check_cancelled(job_id)
-                                    gen = await llm_service.generate_env_two_turn(
-                                        db, context,
-                                        progress=progress, session_log=session_log,
-                                        usage_cb=_usage_sync,
-                                        on_delta=_live_est,
+
+                            from .dependency_model import (
+                                read_relation as _read_relation,
+                                relation_env as _relation_env,
+                            )
+                            _relations: dict[str, list[str]] = {}
+                            for _e in _deps:
+                                _t = _target_service(_e)
+                                _rel = _read_relation(recipe_dir, service_name, _t)
+                                if _rel is not None:
+                                    _relations[_t] = sorted(_relation_env(_rel))
+                            context["dependency_relations"] = _relations
+
+                            _fingerprint = request.get("classification_fingerprint")
+                            if not isinstance(_fingerprint, dict):
+                                _fingerprint = _ec.structural_fingerprint(
+                                    recipe_dir,
+                                    compose_names=[p.name for p in composition_paths],
+                                    profiles=list((request.get("selection") or {}).get("profiles") or []),
+                                    env_base_names=template_names,
+                                )
+                            _force = bool(request.get("force")) and not request.get("fix")
+                            _artifact = None if _force else _ec.read_artifact(recipe_dir)
+                            _reuse = bool(_artifact) and _ec.fingerprint_matches(
+                                (_artifact or {}).get("fingerprint"), _fingerprint)
+                            _values: dict[str, Any] = {}
+
+                            if _reuse:
+                                # Model-free reuse: inject the current metadata
+                                # and re-fill only the stale/missing relations.
+                                env_meta["classification_read"] = True
+                                _mapping = {
+                                    _normalize_target_service(k): list(v or [])
+                                    for k, v in ((_artifact or {}).get("dependencies") or {}).items()
+                                }
+                                _written = _fill_relations(
+                                    recipe_dir, source=service_name, entries=_deps,
+                                    mapping=_mapping, fingerprint=_fingerprint, force=_force,
+                                )
+                                for _t in _written:
+                                    env_meta["relations"][_t] = "written"
+                            elif _llm_on:
+                                def _persist_classification(cls):
+                                    _ec.write_artifact(
+                                        recipe_dir,
+                                        source_service=service_name,
+                                        recipe_path=recipe_path,
+                                        fingerprint=_fingerprint,
+                                        variables=cls["variables"],
+                                        dependencies=cls["dependencies"],
                                     )
-                                    if gen and gen.get("kvs"):
-                                        break
-                            # 2026-11-19/T12 — the two-turn result's warnings are
-                            # ALWAYS surfaced, including the zero-variable
-                            # fallback. They used to be extended only when kvs
-                            # was non-empty, which swallowed exactly the warning
-                            # that explains the mechanical fallback.
-                            if gen:
-                                warnings.extend(gen.get("warnings") or [])
-                            if gen and gen.get("kvs"):
-                                kvs = gen["kvs"]
-                                u = gen.get("usage") or {}
-                                # (_usage_sync already folded these into the totals)
+                                    env_meta["classification_written"] = True
 
-                            # T14 — mechanical cross-check: a value that IS a
-                            # selected dependency's serving URL is that
-                            # dependency's variable, even when the model left it
-                            # out of `_depends_on`. Without this the relation
-                            # file misses the variable, and the selected-env
-                            # substitution cannot replace a stale URL.
-                            dep_refs = dict((gen or {}).get("dependency_refs") or {})
-                            if kvs and _deps:
-                                for _var, _v in kvs.items():
-                                    if _var in dep_refs:
-                                        continue
-                                    _val = _v.get("value") if isinstance(_v, dict) else _v
-                                    if not _val:
-                                        continue
-                                    for _d in _deps:
-                                        _url = str(_d.get("serving_url") or "").rstrip("/")
-                                        if _url and str(_val).rstrip("/") == _url:
-                                            dep_refs[_var] = str(_d.get("key"))
-                                            break
+                                _gen = await llm_service.generate_env_classified(
+                                    db, context,
+                                    classification_cb=_persist_classification,
+                                    progress=progress, session_log=session_log,
+                                    usage_cb=_usage_sync, on_delta=_live_est,
+                                )
+                                warnings.extend(_gen.get("warnings") or [])
+                                if _gen.get("classification"):
+                                    _values = _gen.get("values") or {}
+                                    _artifact = _ec.read_artifact(recipe_dir)
+                                    if _artifact:
+                                        _mapping = {
+                                            _normalize_target_service(k): list(v or [])
+                                            for k, v in (_artifact.get("dependencies") or {}).items()
+                                        }
+                                        _written = _fill_relations(
+                                            recipe_dir, source=service_name, entries=_deps,
+                                            mapping=_mapping, fingerprint=_fingerprint,
+                                            force=_force,
+                                        )
+                                        for _t in _written:
+                                            env_meta["relations"][_t] = "written"
+                                else:
+                                    _artifact = None
+                            else:
+                                warnings.append(
+                                    "no active LLM — mechanical env from the template (no artefact)")
 
-                            # ---- PAUSE for operator-supplied credentials -------
-                            # Turn 1 classified these as third-party credentials:
-                            # values the platform cannot invent (a random string
-                            # for an externally-issued key looks configured and
-                            # fails at first use). Generation stops HERE — before
-                            # the env file is written — and the job parks in
-                            # `awaiting_input` until the operator supplies them
-                            # through POST /jobs/{id}/input.
-                            #
-                            # `resume` carries the mechanical base and the final
-                            # kvs so the write can be completed WITHOUT re-running
-                            # the LLM: that is what makes the pause restart-safe —
-                            # a gateway restart must not throw away work already
-                            # paid for.
-                            _ext_vars = list(gen.get("external") or []) if gen else []
-                            if kvs and _ext_vars:
-                                _pu_name = (
-                                    request.get("user_name")
-                                    or (request.get("deploy_metadata") or {}).get("user_name")
-                                    or "user"
+                            _rel_values, _used = _relation_values(
+                                recipe_dir, source=service_name, entries=_deps)
+                            for _t in _used:
+                                env_meta["relations"].setdefault(_t, "read")
+
+                            if _artifact:
+                                env_meta["classification_read"] = True
+                                content, _assembled, _missing, _externals = _assemble_classified_env(
+                                    template_text, values=_values, artifact=_artifact,
+                                    base_metadata=metadata,
+                                    relation_values=_rel_values,
+                                    external_values=None, defaults=defaults,
                                 )
-                                _pu_label = str(
-                                    request.get("label")
-                                    or (request.get("deploy_metadata") or {}).get("label")
-                                    or "0"
-                                )
-                                _pu_env = f".env.raw.{_pu_name}.{_pu_label}"
-                                # ORDER MATTERS: `_event` persists the job with a
-                                # hardcoded RUNNING status (it is the generic
-                                # progress reporter). Emitting the event FIRST and
-                                # setting the parked status LAST is what actually
-                                # leaves the job in `awaiting_input` — the other
-                                # order was silently overwritten back to `running`,
-                                # so the job never paused and the popup never
-                                # appeared (found live: job 83 stuck "running").
-                                await _event(_pu_env, "paused", {
-                                    "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
-                                    "step": f"{phase}#input",
-                                    "vars": _ext_vars,
-                                })
-                                # G27 — the leg ends. The carry is the WHOLE
-                                # previous request plus the env-phase resume data
-                                # (mechanical text + the LLM's key map), so the
-                                # answering job can finish the env WITHOUT a
-                                # second LLM call: `_compute_phases` returns
-                                # `["env"]` and the env branch writes the file
-                                # from the carried `resume_env`.
-                                self._set_status(
-                                    job_id, JOB_STATUS_PAUSED,
-                                    progress=(
-                                        f"waiting for {len(_ext_vars)} external credential(s): "
-                                        + ", ".join(_ext_vars)
-                                    ),
-                                    result={
-                                      "pause": {
-                                        "kind": "input",
-                                        "ask": {"vars": _ext_vars},
-                                        "request": {
-                                            **request,
-                                            "resume_env": {
-                                                "env_name": (".env.fix" if _recipe_level_env else _pu_env),
-                                                "vars": _ext_vars,
-                                                "mech": mech,
-                                                "kvs": kvs,
-                                                "compose_paths": context.get("compose_paths") or [],
-                                                "dependencies": context.get("dependencies") or [],
-                                                "dependency_refs": dep_refs,
-                                            },
+                                if _missing:
+                                    raise GenerationJobError(
+                                        "phase 'env' failed its category check — missing "
+                                        "value(s): " + ", ".join(_missing))
+                                if _externals:
+                                    # The ONE pause: an external credential the
+                                    # operator must supply. Everything already
+                                    # written (artefact, relations) stands.
+                                    _pu_env = f".env.raw.{_uname}.{_ulabel}"
+                                    await _event(_pu_env, "paused", {
+                                        "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
+                                        "step": f"{phase}#input",
+                                        "vars": _externals,
+                                    })
+                                    self._set_status(
+                                        job_id, JOB_STATUS_PAUSED,
+                                        progress=(
+                                            f"waiting for {len(_externals)} external credential(s): "
+                                            + ", ".join(_externals)),
+                                        result={
+                                            "pause": {
+                                                "kind": "input",
+                                                "ask": {"vars": _externals},
+                                                "request": {
+                                                    **request,
+                                                    "resume_env": {
+                                                        "env_name": _pu_env,
+                                                        "template_text": template_text,
+                                                        "artifact": _artifact,
+                                                        "values": _values,
+                                                        "metadata": metadata,
+                                                        "relation_values": _rel_values,
+                                                        "defaults": defaults,
+                                                        "compose_paths": [str(p) for p in composition_paths],
+                                                        "external_vars": _externals,
+                                                        "env_meta": env_meta,
+                                                    },
+                                                },
+                                                "warnings": warnings,
+                                            }
                                         },
-                                        "warnings": warnings,
-                                      }
-                                    },
-                                )
-                                return
-                            # §4: bind `content` BEFORE the branch. When the
-                            # compose has no ${VAR} surface AND the LLM produced
-                            # no kvs, neither arm below used to run and the
-                            # `if not content:` fallback raised UnboundLocalError
-                            # — a regression introduced by making
-                            # `_mechanical_env` return "" instead of None (the
-                            # old `is None` guard `continue`d past this point).
-                            content = ""
-                            if kvs:
-                                content = _apply_env_kvs(mech, kvs)
-                                # Normally every `external` variable pauses before we reach
-                                # this write; if one arrives here with no value, report it and
-                                # keep the base value rather than blanking it silently.
-                                for _name in _unfilled_externals(kvs, None):
-                                    warnings.append(
-                                        f"external variable '{_name}' has no value — kept the base value"
                                     )
-                                from ..services.config_validation import validate_env
-                                compose_paths = context.get("compose_paths") or []
-                                validations[phase] = validate_env(content, compose_paths)
-                                if not validations[phase].get("valid", True):
-                                    # LLM map produced an incomplete env → fall
-                                    # back to the mechanical output.
-                                    content = ""
-                            if not content:
-                                content = mech
-                                from ..services.config_validation import validate_env
-                                compose_paths = context.get("compose_paths") or []
-                                validations[phase] = validate_env(content, compose_paths)
-                            # Write the per-user RAW env file (+ marker).
-                            recipe_dir = self._recipe_dir_for(service_name, recipe_path)
-                            recipe_dir.mkdir(parents=True, exist_ok=True)
-                            uname = (
-                                request.get("user_name")
-                                or (request.get("deploy_metadata") or {}).get("user_name")
-                                or "user"
-                            )
-                            ulabel = str(
-                                request.get("label")
-                                or (request.get("deploy_metadata") or {}).get("label")
-                                or "0"
-                            )
-                            # The recipe-level `.env.fix` belongs to a genuine
-                            # `fix` JOB only (llm-based-fix-todo.md §2) — see the
-                            # `_recipe_level_env` note above. A guided deploy
-                            # restart keeps the per-user `.env.raw.*` artifact;
-                            # it is a deploy, and the -api needs a per-user env.
+                                    return
+                                validations[phase] = validate_env(
+                                    content, [str(p) for p in composition_paths])
+                            else:
+                                content = _ec.apply_compose_defaults(template_text, defaults)
+                                _present = _ec.parse_env_text(content)
+                                content = _ec.apply_env_values(
+                                    content, {n: "" for n in required if n not in _present})
+                                validations[phase] = validate_env(
+                                    content, [str(p) for p in composition_paths])
+
                             env_name = (
                                 ".env.fix" if _recipe_level_env
-                                else f".env.raw.{uname}.{ulabel}"
+                                else f".env.raw.{_uname}.{_ulabel}"
                             )
                             if validations[phase].get("valid"):
                                 fpath = recipe_dir / env_name
                                 fpath.write_text(content, encoding="utf-8")
                                 (recipe_dir / f"{fpath.name}.generated").write_text("")
-                                if not _recipe_level_env:
-                                    _write_relation_files(
-                                        recipe_dir, service=service_name,
-                                        deps=_deps,
-                                        refs=dep_refs,
-                                    )
                                 result_files[env_name] = content
                                 await _event(env_name, "done", {
                                     "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
@@ -2427,6 +2714,9 @@ class GenerationJobManager:
                         "validations": validations,
                         "warnings": warnings,
                         "env_name": env_name,
+                        # C12 — exactly what the env build read or wrote, so
+                        # the deploy's snapshot matrix copies nothing else.
+                        "env_meta": env_meta,
                         # G26: the analysis step's output. `guide` is what `check`
                         # pre-fills and what the restarted generation receives as
                         # its prompt; `slot` names the slot the restart should

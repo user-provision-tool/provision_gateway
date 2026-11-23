@@ -1,12 +1,23 @@
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button, Divider, Input, Modal, Progress, Select, Space, Spin, Tag, Typography, message } from 'antd'
+import { Alert, Button, Divider, Input, Modal, Progress, Space, Spin, Tag, Typography, message } from 'antd'
 import Editor from '@monaco-editor/react'
 import client from '../../api/client'
 import { deriveProfiles } from '../../api/services'
 import { useGenerationJob, isPaused } from '../../hooks/useGenerationJob'
 import PausePrompt from './PausePrompt'
+import BaseFilesPopup, {
+  BaseRefs,
+  EMPTY_BASE_REFS,
+  SOURCE_PROJECT_REF_SLOTS,
+  activeBaseRefs,
+} from './BaseFilesPopup'
+import AdditionalContextPopup, {
+  AdditionalContext,
+  EMPTY_CONTEXT,
+} from './AdditionalContextPopup'
 import FileSetSelection, {
   phaseOfFile,
+  SelectedFileRow,
   EMPTY_CANDIDATES,
   EMPTY_SELECTION,
   FileSetCandidates,
@@ -47,8 +58,13 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
   const [stale, setStale] = useState<FileSetStale>({})
   const [selection, setSelection] = useState<FileSetSelectionData>(EMPTY_SELECTION)
   const [needsEnv, setNeedsEnv] = useState(true)
-  const [envRefs, setEnvRefs] = useState<string[]>([])
   const [prompt, setPrompt] = useState('')
+  // R1/R3/C5 — the Source Projects modal mirrors its THREE sent-file pickers
+  // and has no Env slot; the arbitrary context is shared with the deploy panel.
+  const [baseRefs, setBaseRefs] = useState<BaseRefs>(EMPTY_BASE_REFS)
+  const [additionalContext, setAdditionalContext] = useState<AdditionalContext>(EMPTY_CONTEXT)
+  const [basePopupOpen, setBasePopupOpen] = useState(false)
+  const [contextPopupOpen, setContextPopupOpen] = useState(false)
   const { jobId, jobState, polling, startJob, cancelJob, submitInput, resumeJob, reset } = useGenerationJob()
 
   // Review/edit gate (design §Generation rules — human gate is final).
@@ -67,7 +83,10 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
     setReviewFiles(null)
     setValidations({})
     setPrompt('')
-    setEnvRefs([])
+    setBaseRefs(EMPTY_BASE_REFS)
+    setAdditionalContext(EMPTY_CONTEXT)
+    setBasePopupOpen(false)
+    setContextPopupOpen(false)
     reset()
     // Re-attach to a paused leg (the row's `Check`). The job runs in the GATEWAY,
     // not the browser, so it outlives the panel that started it — without this
@@ -255,7 +274,9 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
         job_type: 'generate_missing',
         skip_env: true,  // env is generated per-user at deploy time (§8.7)
         prompt,
-        env_reference: envRefs,
+        // C5 — three slots, no Env slot on this surface.
+        base_refs: { ...activeBaseRefs(baseRefs, effectiveSelection()), env: [] },
+        context: additionalContext,
         selection: effectiveSelection(),
         deploy_metadata: { service_name: serviceName, user_name: '', label: '0', domain: 'localhost' },
       })
@@ -295,6 +316,17 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
   const jobProgress = (jobState && jobState.phase_total && jobState.phase_total > 1)
     ? Math.round(((jobState.phase_index || 0) + (jobState.status === 'running' ? 0.5 : 0)) / jobState.phase_total * 100)
     : jobState && (jobState.status === 'running' || jobState.status === 'queued') ? 10 : 0
+
+  const eff = effectiveSelection()
+  const activeRefs = activeBaseRefs(baseRefs, eff)
+  const refRows: { name: string; slot: 'compose' | 'serving_ports' | 'nginx' }[] = []
+  activeRefs.compose.forEach(name => refRows.push({ name, slot: 'compose' }))
+  if (activeRefs.serving_ports) refRows.push({ name: activeRefs.serving_ports, slot: 'serving_ports' })
+  if (activeRefs.nginx) refRows.push({ name: activeRefs.nginx, slot: 'nginx' })
+  const removeRef = (name: string, slot: 'compose' | 'serving_ports' | 'nginx') => {
+    if (slot === 'compose') setBaseRefs({ ...baseRefs, compose: baseRefs.compose.filter(x => x !== name) })
+    else setBaseRefs({ ...baseRefs, [slot]: null })
+  }
 
   return (
     <Modal
@@ -342,21 +374,47 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
             placeholder="Describe the deployment — REQUIRED when the recipe has no base files at all (empty recipe). You may include doc URLs; the agent fetches them."
           />
 
-          {(candidates.env || []).length > 0 && (
+          <Space size="small" style={{ marginTop: 8 }} wrap>
+            <Button size="small" onClick={() => setBasePopupOpen(true)}>⚙ base files</Button>
+            <Button size="small" onClick={() => setContextPopupOpen(true)}>+ context</Button>
+          </Space>
+          <Alert
+            type="info"
+            showIcon
+            message="select a base to put hard constraint on how a file should be like"
+          />
+          {(refRows.length > 0 || additionalContext.files.length > 0
+            || additionalContext.links.length > 0) && (
             <div>
-              <Text strong>Env reference (generation context)</Text>
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                {' '}— base/example env files the model reads as reference. Not passed to the deployment.
-              </Text>
-              <Select
-                mode="multiple"
-                allowClear
-                style={{ width: '100%', marginTop: 4 }}
-                placeholder="None — the model works from the compose alone"
-                value={envRefs}
-                onChange={(v) => setEnvRefs(v as string[])}
-                options={(candidates.env || []).map(c => ({ value: c, label: c }))}
-              />
+              {refRows.map(row => (
+                <SelectedFileRow
+                  key={`ref:${row.slot}:${row.name}`}
+                  name={row.name}
+                  onOpen={openSelectedFile}
+                  onRemove={() => removeRef(row.name, row.slot)}
+                />
+              ))}
+              {additionalContext.files.map(name => (
+                <SelectedFileRow
+                  key={`ctx:${name}`}
+                  name={name}
+                  onOpen={openSelectedFile}
+                  onRemove={() => setAdditionalContext({
+                    files: additionalContext.files.filter(x => x !== name),
+                    links: additionalContext.links,
+                  })}
+                />
+              ))}
+              {additionalContext.links.map(url => (
+                <div key={`link:${url}`} style={{ marginTop: 4 }}>
+                  <Tag closable onClose={() => setAdditionalContext({
+                    files: additionalContext.files,
+                    links: additionalContext.links.filter(x => x !== url),
+                  })}>
+                    {url}
+                  </Tag>
+                </div>
+              ))}
             </div>
           )}
 
@@ -436,6 +494,28 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
           </Space>
         </>)}
       </Space>
+
+      {/* R1/C5 — THREE ref sets on this surface; no Env slot. */}
+      <BaseFilesPopup
+        open={basePopupOpen}
+        onClose={() => setBasePopupOpen(false)}
+        slots={SOURCE_PROJECT_REF_SLOTS}
+        candidates={candidates}
+        selection={eff}
+        refs={baseRefs}
+        onChange={setBaseRefs}
+        onOpenFile={openSelectedFile}
+      />
+      <AdditionalContextPopup
+        open={contextPopupOpen}
+        onClose={() => setContextPopupOpen(false)}
+        serviceName={serviceName}
+        recipePath={recipePath}
+        files={additionalContext.files}
+        links={additionalContext.links}
+        onChange={setAdditionalContext}
+        onOpenFile={openSelectedFile}
+      />
 
       {/* Review editor modal */}
       <Modal

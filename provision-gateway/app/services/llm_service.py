@@ -332,19 +332,28 @@ class LLMService:
     async def _exec_tool(self, name: str, arguments: dict, context: dict) -> str:
         """Execute one allowlisted tool; returns a text result for the model."""
         if name == "web_fetch":
-            return await self._tool_web_fetch(arguments)
+            return await self._tool_web_fetch(arguments, context)
         if name == "read_file":
             return self._tool_read_file(arguments, context)
         if name == "list_files":
             return self._tool_list_files(context)
         return f"ERROR: unknown tool: {name}"
 
-    async def _tool_web_fetch(self, arguments: dict) -> str:
+    async def _tool_web_fetch(self, arguments: dict, context: dict | None = None) -> str:
         url = str(arguments.get("url") or "").strip()
         if not url.lower().startswith(("http://", "https://")):
             return "ERROR: web_fetch only supports http/https URLs"
+        # C2 — the deploy's global proxy rides on the context; a fetch without
+        # it is direct. A proxy that is unreachable is reported as a fetch
+        # failure, never silently retried without the proxy.
+        proxy = str((context or {}).get("proxy_url") or "").strip() or None
         try:
-            async with httpx.AsyncClient(timeout=FETCH_TIMEOUT, follow_redirects=True) as client:
+            client_kwargs: dict[str, Any] = {
+                "timeout": FETCH_TIMEOUT, "follow_redirects": True,
+            }
+            if proxy:
+                client_kwargs["proxy"] = proxy
+            async with httpx.AsyncClient(**client_kwargs) as client:
                 resp = await client.get(url)
                 if resp.status_code >= 400:
                     return f"ERROR: HTTP {resp.status_code} fetching {url}"
@@ -1464,6 +1473,402 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             "warnings": warnings, "usage": dict(usage_total),
         }
 
+    # ------------------------------------------------------------------
+    # Env classification (T6/T7 — six categories, bounded tool loop)
+    # ------------------------------------------------------------------
+
+    def _env_manifest(self, context: dict) -> str:
+        """The provenance-labelled manifest: every part says what it is."""
+        dm = context.get("deploy_metadata") or {}
+        parts: list[str] = []
+        parts.append(
+            "You are classifying the environment of ONE deployed instance, so "
+            "the gateway can assemble its env from the classification without "
+            "asking a model again. You do NOT write any file. You may read "
+            "project files and fetch documentation with the tools before you "
+            "answer; the answer must end with the classification JSON.\n"
+        )
+        parts.append(
+            "Deployment facts (authoritative; values derived from them are "
+            "`deploy_value`):\n"
+            f"- service: {dm.get('service_name') or context.get('service_name') or '?'}\n"
+            f"- user: {dm.get('user_name') or ''}   label: {dm.get('label') or '0'}\n"
+            f"- domain: {dm.get('domain') or 'localhost'}\n"
+            f"- scheme: {dm.get('scheme') or ('https' if dm.get('https') else 'http')}\n"
+            f"- hostname: {dm.get('hostname') or ''}\n"
+            f"- http_port: {dm.get('http_port') or ''}   https_port: {dm.get('https_port') or ''}\n"
+            f"- serving_url: {dm.get('serving_url') or ''}\n"
+            "Templates may use {{ hostname }}, {{ scheme }}, {{ http_port }}, "
+            "{{ https_port }}, {{ serving_url }}, {{ service_name }}, "
+            "{{ user_name }}, {{ label }} and {{ domain }}."
+        )
+        profiles = context.get("profiles") or []
+        parts.append(
+            "Profiles selected for this deploy (a profile-matching example is "
+            "the strongest reference): " + (", ".join(profiles) if profiles else "(none)")
+        )
+        template = context.get("env_template_files") or {}
+        if template:
+            parts.append(
+                "TEMPLATE files — the ROOT TEMPLATE. `.env.raw` is a copy of "
+                "these files (later file wins); only essential values change. "
+                "Every variable here must be classified.\n\n"
+                + "\n\n".join(
+                    f"--- TEMPLATE: {name} ---\n{body}"
+                    for name, body in template.items())
+            )
+        refs = context.get("env_reference_files") or {}
+        if refs:
+            parts.append(
+                "REFERENCE env files — advisory only, never copied. When the "
+                "template lacks or leaves an essential variable empty, a value "
+                "here may be chosen; name the file in the reason.\n\n"
+                + "\n\n".join(
+                    f"--- REFERENCE: {name} ---\n{body}"
+                    for name, body in refs.items())
+            )
+        compose_surface = (context.get("base_files") or {}).get(
+            "__compose_variables__.txt")
+        if compose_surface:
+            parts.append(
+                "COMPOSE SURFACE — the ${VAR} references of the selected "
+                "compose files. A variable in REQUIRED must be present.\n\n"
+                + compose_surface)
+        files = context.get("context_files") or {}
+        if files:
+            parts.append(
+                "ARBITRARY CONTEXT FILES — operator-selected, generation "
+                "context only, never deployed:\n\n"
+                + "\n\n".join(
+                    f"--- CONTEXT FILE: {name} ---\n{body}"
+                    for name, body in files.items())
+            )
+        links = context.get("context_links") or []
+        if links:
+            blocks = []
+            for link in links:
+                text = link.get("text") or "(unreachable)"
+                blocks.append(f"--- CONTEXT LINK: {link.get('url')} ---\n{text}")
+            parts.append(
+                "ARBITRARY CONTEXT LINKS — operator-selected, generation "
+                "context only, never deployed (a link marked unreachable was "
+                "not fetched):\n\n" + "\n\n".join(blocks))
+        deps = context.get("dependencies") or []
+        if deps:
+            parts.append(
+                "SELECTED DEPENDENCIES — a variable whose meaning is a call to "
+                "one of these is `dependency` (the relation file supplies the "
+                "URL at deploy; never bake the URL in):\n"
+                + "\n".join(
+                    f"- {d.get('key')}: {d.get('service_name') or d.get('service')}"
+                    f":{d.get('label')} served at {d.get('serving_url') or '(not live)'}"
+                    for d in deps))
+        relations = context.get("dependency_relations") or {}
+        if relations:
+            parts.append(
+                "CURRENT DEPENDENCY RELATION FILES — the deploy-time pointing "
+                "authority (variable -> target service):\n"
+                + "\n".join(
+                    f"- {target}: " + ", ".join(sorted(vars_ or []))
+                    for target, vars_ in relations.items()))
+        prompt = (context.get("prompt") or "").strip()
+        if prompt:
+            parts.append(
+                "OPERATOR PROMPT (authoritative when it states exact rules; "
+                "doc URLs in it may be fetched with web_fetch):\n" + prompt)
+        return "\n\n".join(parts)
+
+    def _env_classification_contract(self) -> str:
+        return (
+            "Classify EVERY variable the template carries, and every compose "
+            "REQUIRED variable the template lacks. One entry per variable:\n"
+            "  category — exactly one of:\n"
+            "   · required    — the instance cannot boot without it and the "
+            "platform cannot derive it (it must already be supplied).\n"
+            "   · external    — a credential issued by a third party the "
+            "instance merely consumes; the OPERATOR supplies it.\n"
+            "   · secret      — a secret the instance generates for itself; "
+            "the gateway mints it (never invent one here).\n"
+            "   · deploy_value— a value derived from THIS deployment's facts "
+            "(URL, host, scheme, port, label); give a template.\n"
+            "   · dependency  — a value that points at a selected dependency; "
+            "name the target service.\n"
+            "   · defaulted   — a safe compose/reference default is kept as-is.\n"
+            "  source — {kind: file|compose_default|metadata_key|"
+            "dependency_target|operator|minted, plus the file name, metadata "
+            "key or target service where applicable}.\n"
+            "  template — for deploy_value ONLY.\n"
+            "  reason — ONE line naming the authoritative file/decision. When "
+            "references disagree, the TEMPLATE wins (later file wins; a "
+            "non-empty value beats an empty one); for an essential variable "
+            "the template lacks or leaves empty, prefer the selected profile's "
+            "matching example, then the reference files, then the compose "
+            "default — and name the winner.\n\n"
+            "Return ONE JSON object, no markdown, no prose:\n"
+            '{"variables": {"VAR": {"category": "deploy_value", "source": '
+            '{"kind": "metadata_key", "key": "serving_url"}, "template": '
+            '"http://{{ hostname }}:{{ http_port }}", "reason": "..."}}, '
+            '"dependencies": {"<target-service>": ["VAR"]}}'
+        )
+
+    def _env_values_prompt(self, context: dict, classification: dict) -> str:
+        dm = context.get("deploy_metadata") or {}
+        entries = classification.get("variables") or {}
+        lines = []
+        for name, entry in entries.items():
+            line = f"- {name} [{entry.get('category')}]"
+            if entry.get("template"):
+                line += f" template={entry.get('template')}"
+            if entry.get("reason"):
+                line += f" — {entry.get('reason')}"
+            lines.append(line)
+        return (
+            "deployment_meta (authoritative):\n"
+            f"  hostname={dm.get('hostname') or ''} scheme={dm.get('scheme') or 'http'} "
+            f"http_port={dm.get('http_port') or ''} https_port={dm.get('https_port') or ''} "
+            f"serving_url={dm.get('serving_url') or ''} "
+            f"service_name={dm.get('service_name') or ''} "
+            f"user_name={dm.get('user_name') or ''} label={dm.get('label') or '0'}\n\n"
+            "You classified these variables (do not re-litigate the categories):\n"
+            + "\n".join(lines)
+            + "\n\nThe template's current values are authoritative for "
+            "`defaulted` and `required` entries unless the variable is empty. "
+            "Return ONE JSON object with one entry per variable:\n"
+            '{"VAR": {"value": <string|null>, "source": "file|compose_default|'
+            'metadata_key|dependency_target|operator|minted"}}\n'
+            "Rules:\n"
+            "- deploy_value, dependency, secret and external: value is null — "
+            "the gateway renders/mints/resolves or asks the operator. NEVER "
+            "invent a third-party credential.\n"
+            "- defaulted: echo the template's value (never drop the entry).\n"
+            "- required: the template's non-empty value, else the best value "
+            "from the references; if none exists, null.\n"
+            "- An empty reference value counts as unset.\n"
+            "No markdown, no prose."
+        )
+
+    async def generate_env_classified(
+        self,
+        db: Session,
+        context: dict,
+        *,
+        classification_cb=None,
+        progress=None,
+        session_log=None,
+        usage_cb=None,
+        on_delta=None,
+    ) -> dict:
+        """Turn 1 classification (bounded tools) then turn 2 values.
+
+        Returns ``{"classification", "values", "warnings", "usage",
+        "tool_rounds", "tool_logs"}``. ``classification_cb`` is called with the
+        normalized classification IMMEDIATELY after turn 1, before turn 2 runs
+        — that is what makes the artefact survive a turn-2 failure (T9).
+        """
+        from . import env_classification as ec  # local: no import cycle at module load
+
+        base_url, model, headers = self._resolve_endpoint(db)
+        cfg = db.query(LLMConfig).filter(LLMConfig.is_active == True).first()
+        sysp = (cfg.system_prompt if cfg and cfg.system_prompt else "") or ""
+        usage_total: dict[str, int] = {"prompt": 0, "completion": 0, "reasoning": 0}
+        warnings: list[str] = []
+        tool_logs: list[dict] = []
+
+        def _add(resp: dict) -> None:
+            u = (resp or {}).get("usage") or {}
+            usage_total["prompt"] += int(u.get("prompt_tokens") or 0)
+            usage_total["completion"] += int(u.get("completion_tokens") or 0)
+            det = u.get("completion_tokens_details") or {}
+            usage_total["reasoning"] += int(det.get("reasoning_tokens") or 0)
+            if usage_cb:
+                try:
+                    usage_cb(dict(usage_total))
+                except Exception:
+                    pass
+
+        def _log(entry: dict) -> None:
+            if session_log:
+                entry.setdefault("usage", dict(usage_total))
+                session_log(entry)
+
+        user1 = self._env_manifest(context) + "\n\n" + self._env_classification_contract()
+        messages: list[dict] = []
+        if sysp:
+            messages.append({"role": "system", "content": sysp})
+        messages.append({"role": "user", "content": user1})
+        if progress:
+            await progress("env: classifying every variable (turn 1/2, tools available)")
+
+        classification = None
+        tool_rounds = 0
+        content = ""
+        tools_rejected = False
+        while tool_rounds < TOOL_ROUNDS_MAX:
+            tool_rounds += 1
+            try:
+                resp = await self._chat(
+                    base_url, model, headers, messages,
+                    tools=TOOL_DEFINITIONS, on_delta=on_delta,
+                )
+            except Exception as exc:  # noqa: BLE001 — fall back, never fail the job
+                warnings.append(f"env turn 1 call failed: {exc}")
+                resp = {}
+            if not resp or resp.get("_error"):
+                err = str((resp or {}).get("_error") or "")
+                warnings.append(err or "env turn 1 returned no response")
+                if "tool" in err.lower() or "400" in err:
+                    tools_rejected = True
+                break
+            _add(resp)
+            choice = (resp.get("choices") or [{}])[0] or {}
+            msg = choice.get("message") or {}
+            content = msg.get("content") or ""
+            calls = msg.get("tool_calls") or []
+            _log({"stage": "env.turn1", "round": tool_rounds,
+                  "finish_reason": choice.get("finish_reason"),
+                  "content_head": content[:3000],
+                  "tool_calls": [c.get("function", {}).get("name") for c in calls],
+                  "reasoning": (msg.get("reasoning_content") or "")[:3000]})
+            parsed = self._json_first(content, want_object=True)
+            if parsed is not None and not calls:
+                try:
+                    classification = ec.normalize_classification(parsed)
+                except ec.ClassificationError as exc:
+                    warnings.append(f"env classification rejected: {exc}")
+                    classification = None
+                if classification is not None:
+                    break
+            if not calls:
+                break
+            messages.append({"role": "assistant", "content": content or None,
+                             "tool_calls": calls})
+            for call in calls:
+                fn = call.get("function") or {}
+                name = fn.get("name") or ""
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except (ValueError, TypeError):
+                    args = {}
+                result = await self._exec_tool(name, args, context)
+                tool_logs.append({"name": name, "args": args,
+                                  "result_head": result[:1500]})
+                messages.append({"role": "tool",
+                                 "tool_call_id": call.get("id") or "",
+                                 "content": result})
+            _log({"stage": "tool-results", "round": tool_rounds, "tools": tool_logs})
+            if progress:
+                await progress(f"env: classification tool round {tool_rounds}/{TOOL_ROUNDS_MAX}")
+
+        if classification is None:
+            # One strict-JSON nudge, then a no-tools single shot with the
+            # gateway prefetch (a provider that rejects tools still completes).
+            if content:
+                messages.append({"role": "assistant", "content": content[:4000]})
+            nudge = (
+                "Your reply was not the required JSON object. Reply with ONLY "
+                "the classification JSON — no prose, no markdown."
+            )
+            messages.append({"role": "user", "content": nudge})
+            try:
+                resp = await self._chat(base_url, model, headers, messages,
+                                        on_delta=on_delta)
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"env classification nudge failed: {exc}")
+                resp = {}
+            if resp and not resp.get("_error"):
+                _add(resp)
+                content = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                parsed = self._json_first(content, want_object=True)
+                if parsed is not None:
+                    try:
+                        classification = ec.normalize_classification(parsed)
+                    except ec.ClassificationError as exc:
+                        warnings.append(f"env classification rejected: {exc}")
+            else:
+                warnings.append(str((resp or {}).get("_error") or "no nudge response"))
+        if classification is None and (tools_rejected or tool_logs):
+            prefetched = await self._prefetch_prompt_urls(user1, context)
+            fallback_messages = []
+            if sysp:
+                fallback_messages.append({"role": "system", "content": sysp})
+            fallback_messages.append({"role": "user", "content": prefetched})
+            try:
+                resp = await self._chat(base_url, model, headers, fallback_messages,
+                                        on_delta=on_delta)
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"env classification fallback failed: {exc}")
+                resp = {}
+            if resp and not resp.get("_error"):
+                _add(resp)
+                content = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                parsed = self._json_first(content, want_object=True)
+                if parsed is not None:
+                    try:
+                        classification = ec.normalize_classification(parsed)
+                    except ec.ClassificationError as exc:
+                        warnings.append(f"env classification rejected: {exc}")
+            _log({"stage": "env.turn1.fallback", "ok": classification is not None})
+
+        if classification is None:
+            warnings.append("env turn 1 produced no valid classification — mechanical env stands")
+            return {"classification": None, "values": {}, "warnings": warnings,
+                    "usage": dict(usage_total), "tool_rounds": tool_rounds,
+                    "tool_logs": tool_logs}
+
+        # Persist the classification BEFORE turn 2 (T9): a turn-2 failure must
+        # leave a real artefact behind.
+        if classification_cb is not None:
+            classification_cb(classification)
+        if progress:
+            await progress(
+                f"env: classification done — {len(classification.get('variables') or {})} variable(s)")
+
+        # ---- Turn 2: values and provenance, same conversation ----
+        messages.append({"role": "assistant", "content": content[:4000]})
+        user2 = self._env_values_prompt(context, classification)
+        messages.append({"role": "user", "content": user2})
+        try:
+            resp2 = await self._chat(base_url, model, headers, messages,
+                                     on_delta=on_delta)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"env turn 2 failed: {exc}")
+            resp2 = {}
+        values: dict[str, Any] = {}
+        if resp2 and not resp2.get("_error"):
+            _add(resp2)
+            c2 = ((resp2.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            _log({"stage": "env.turn2", "finish_reason": ((resp2.get("choices") or [{}])[0]).get("finish_reason"),
+                  "content_head": c2[:3000]})
+            raw_values = self._json_first(c2, want_object=True)
+            if raw_values is None:
+                # one strict-JSON nudge for turn 2
+                messages.append({"role": "assistant", "content": c2[:2000]})
+                messages.append({"role": "user", "content":
+                                 "Reply with ONLY the JSON object mapping each variable to "
+                                 '{"value": <string|null>, "source": "..."}.'})
+                try:
+                    resp2b = await self._chat(base_url, model, headers, messages,
+                                              on_delta=on_delta)
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"env turn 2 nudge failed: {exc}")
+                    resp2b = {}
+                if resp2b and not resp2b.get("_error"):
+                    _add(resp2b)
+                    c2 = ((resp2b.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                    raw_values = self._json_first(c2, want_object=True)
+            if raw_values is None:
+                warnings.append("env turn 2 returned no JSON map — the artefact stands")
+            else:
+                try:
+                    values = ec.validate_values(raw_values, classification.get("variables") or {})
+                except ec.ClassificationError as exc:
+                    warnings.append(f"env values rejected: {exc}")
+        else:
+            warnings.append(str((resp2 or {}).get("_error") or "env turn 2 returned no response"))
+        return {"classification": classification, "values": values,
+                "warnings": warnings, "usage": dict(usage_total),
+                "tool_rounds": tool_rounds, "tool_logs": tool_logs}
+
     def _build_repair_prompt(self, validation_errors: list[str]) -> str:
         return (
             "The previous attempt FAILED mechanical validation with these errors:\n"
@@ -1689,11 +2094,12 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
     # Single-shot fallback (gateway URL prefetch)
     # ------------------------------------------------------------------
 
-    async def _prefetch_prompt_urls(self, prompt: str) -> str:
+    async def _prefetch_prompt_urls(self, prompt: str, context: dict | None = None) -> str:
         """Fetch any http(s) URLs in the prompt and inline their content.
 
         Used by the single-shot fallback so docs URLs are honored even when
-        the BYOK model rejects tool calls.
+        the BYOK model rejects tool calls. The deploy's global proxy rides on
+        the same context the tools use (C2).
         """
         urls = re.findall(r"https?://[^\s)\]\"']+", prompt)
         if not urls:
@@ -1704,7 +2110,7 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             if url in seen:
                 continue
             seen.add(url)
-            result = await self._tool_web_fetch({"url": url})
+            result = await self._tool_web_fetch({"url": url}, context)
             injected.append(result)
         if not injected:
             return prompt
