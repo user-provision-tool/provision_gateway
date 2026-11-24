@@ -704,6 +704,7 @@ def classification_state(
     compose: str = Query("", description="comma-separated selected compose names"),
     profiles: str = Query("", description="comma-separated selected profiles"),
     dependency_service_ids: str = Query("", description="comma-separated target ids"),
+    classify_only: bool = Query(False, description="the Source Projects classify-only surface"),
     current: str = Query("", description="the panel's current classification mode"),
     current_relations: str = Query("", description="target=mode pairs, comma-separated"),
     current_admin: dict = Depends(require_admin),
@@ -732,7 +733,7 @@ def classification_state(
     entries = entries_for_ids(ids) if ids else []
     duplicate = bool(entries) and duplicate_target_services(entries)
     targets = sorted({str(e.get("service_name") or "") for e in entries} - {""}) \
-        if not duplicate else []
+        if (not duplicate and not classify_only) else []
     try:
         rdir = _recipe_dir(settings.SOURCE_PROJECTS_DIR / name, recipe_path)
     except Exception as exc:  # noqa: BLE001
@@ -769,7 +770,8 @@ def classification_state(
             continue
         errors = ec.artifact_errors(data)
         missing = ec.coverage_missing(data, env_keys) if env_names else []
-        violations = ec.target_allowlist_violations(data, targets)
+        violations = ([] if classify_only
+                      else ec.target_allowlist_violations(data, targets))
         variants.append({
             "value": item["name"],
             "legacy": bool(item["legacy"]),
@@ -856,8 +858,10 @@ def classification_state(
             "env_keys": env_keys,
             "coverage_missing": (ec.coverage_missing(chosen_data, env_keys)
                                  if chosen_data and env_names else []),
-            "target_violations": (ec.target_allowlist_violations(
-                chosen_data, targets) if chosen_data else []),
+            "target_violations": ([] if classify_only else
+                                  (ec.target_allowlist_violations(
+                                      chosen_data, targets)
+                                   if chosen_data else [])),
             "overwrite": sorted(set(overwrite)),
             "duplicate_targets": duplicate,
         },

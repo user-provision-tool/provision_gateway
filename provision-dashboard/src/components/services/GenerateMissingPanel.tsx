@@ -65,9 +65,26 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
   // later deploy.
   const [classificationChoice, setClassificationChoice] = useState('')
   const [classificationState, setClassificationState] = useState<any>(null)
+  // Bumped after a variant edit/save so the schema/coverage checks re-run.
+  const [classificationRefresh, setClassificationRefresh] = useState(0)
   const clsVariants: any[] = classificationState?.classification?.variants || []
+  const clsVariantKeys = clsVariants.map((v: any) => v.value).join('|')
   const clsDefault: string = classificationState?.classification?.default || 'generate_new'
-  const effectiveClassification = classificationChoice || clsDefault
+  const clsDefaultSafe = clsVariants.find((v: any) => v.value === clsDefault)?.red
+    ? 'generate_new'
+    : clsDefault
+  // C20 — a selection from another fingerprint is not a valid state.
+  useEffect(() => {
+    if (!classificationChoice || classificationChoice === 'none'
+        || classificationChoice === 'generate_new') return
+    if (classificationState && !clsVariants.some((v: any) => v.value === classificationChoice)) {
+      setClassificationChoice('')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [classificationChoice, clsVariantKeys, classificationState])
+  const effectiveClassification = classificationChoice || clsDefaultSafe
+  const clsSelected = clsVariants.find((v: any) => v.value === effectiveClassification)
+  const clsIsExisting = effectiveClassification.startsWith('env.classification.')
   // R1/R3/C5 — the Source Projects modal mirrors its THREE sent-file pickers
   // and has no Env slot; the arbitrary context is shared with the deploy panel.
   const [baseRefs, setBaseRefs] = useState<BaseRefs>(EMPTY_BASE_REFS)
@@ -177,13 +194,17 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
         compose: selection.compose.join(','),
         env: '',
         env_none: false,
+        // R26/R29 — the target allowlist is a deploy-time constraint; this
+        // panel has no deploy identity, so only schema/coverage red applies.
+        classify_only: true,
         current: classificationChoice,
       },
     }).then(({ data }) => {
       if (!cancelled) setClassificationState(data)
     }).catch(() => { if (!cancelled) setClassificationState(null) })
     return () => { cancelled = true }
-  }, [open, serviceName, recipePath, selection.compose.join(','), classificationChoice])
+  }, [open, serviceName, recipePath, selection.compose.join(','), classificationChoice,
+      classificationRefresh])
 
   // Job completed → open the review gate with the result + per-phase validation.
   useEffect(() => {
@@ -290,6 +311,22 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
       setReviewFiles({ ...reviewFiles, [editorFile]: editorContent })
       setEditorFile(null)
       setEditorContent('')
+      return
+    }
+    // A generated classification/relation variant opened from the picker:
+    // it carries its `.generated` marker, so save in place (never fork).
+    try {
+      await client.post('/projects/save-generated', {
+        service_name: serviceName,
+        recipe_path: recipePath,
+        files: { [editorFile]: editorContent },
+      })
+      message.success(`${editorFile} saved`)
+      setEditorFile(null)
+      setEditorContent('')
+      setClassificationRefresh(n => n + 1)
+    } catch (err: any) {
+      message.error(err.response?.data?.detail || 'Failed to save file')
     }
   }
 
@@ -403,6 +440,14 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
               selected variant. */}
           <div>
             <div style={{ fontSize: 13, marginBottom: 4 }}>Env classification (classify only)</div>
+            {clsIsExisting && (
+              <SelectedFileRow
+                name={effectiveClassification}
+                onOpen={(n) => openReviewFile(n)}
+                onRemove={() => setClassificationChoice('')}
+                stale={!!clsSelected?.red}
+              />
+            )}
             <Select
               style={{ width: '100%' }}
               value={effectiveClassification}
@@ -421,6 +466,17 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
               per-user `.env.raw` is written here. An existing variant is
               selectable and editable; Generate regenerates only red ones.
             </div>
+            {(clsSelected?.errors?.length > 0 || clsSelected?.missing_env_keys?.length > 0) && (
+              <Alert type="error" showIcon style={{ marginTop: 8 }}
+                message="The selected classification is invalid"
+                description={[
+                  ...(clsSelected?.errors || []),
+                  ...((clsSelected?.missing_env_keys || []).length
+                    ? [`missing env key(s): ${(clsSelected?.missing_env_keys || []).join(', ')}`]
+                    : []),
+                ].join('; ')}
+                action={<Button size="small" onClick={() => setClassificationChoice('generate_new')}>Use generate new</Button>} />
+            )}
           </div>
 
           <Divider plain style={{ margin: '8px 0' }}>Generation prompt</Divider>

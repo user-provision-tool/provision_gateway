@@ -209,6 +209,9 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   const [classificationChoice, setClassificationChoice] = useState('')
   const [relationChoices, setRelationChoices] = useState<Record<string, string>>({})
   const [classificationState, setClassificationState] = useState<any>(null)
+  // Bumped after a variant edit/save so the coverage/1:1 checks re-run
+  // immediately (R26/R28: "the check re-runs on save").
+  const [classificationRefresh, setClassificationRefresh] = useState(0)
   const [basePopupOpen, setBasePopupOpen] = useState(false)
   const [contextPopupOpen, setContextPopupOpen] = useState(false)
   // Deploy-time per-user env generation (GAP-19): fresh SECRET_KEY per instance.
@@ -871,18 +874,37 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, watchedService, depKey, envKey, eff.env_none, composeKey, profileKey,
-      classificationChoice])
+      classificationChoice, classificationRefresh])
   const clsState = classificationState
   const clsVariants: any[] = clsState?.classification?.variants || []
+  const clsVariantKeys = clsVariants.map((v: any) => v.value).join('|')
   const clsDefault: string = clsState?.classification?.default || 'generate_new'
+  // A red variant is never the automatic default (R26: "matched valid
+  // variant, else generate new"); the endpoint already applies this, and this
+  // is the defensive twin so a future state change cannot select one silently.
+  const clsDefaultSafe = clsVariants.find((v: any) => v.value === clsDefault)?.red
+    ? 'generate_new'
+    : clsDefault
+  // C20 — no stale selection state: a variant chosen under another
+  // fingerprint is not in the matched list, so the explicit choice is dropped
+  // and the picker falls back to the current default.
+  useEffect(() => {
+    if (!classificationChoice || classificationChoice === 'none'
+        || classificationChoice === 'generate_new') return
+    if (clsState && !clsVariants.some((v: any) => v.value === classificationChoice)) {
+      setClassificationChoice('')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [classificationChoice, clsVariantKeys, clsState])
   const envIsNone = !!eff.env_none
   // The picker's effective value: the operator's choice, else the default the
   // gateway computed (a matched valid variant, else generate new). Under the
   // deliberate env `None` there is no classification at all.
   const effectiveClassification = envIsNone
     ? 'none'
-    : (classificationChoice || clsDefault)
+    : (classificationChoice || clsDefaultSafe)
   const clsIsExisting = effectiveClassification.startsWith('env.classification.')
+  const clsSelectedVariant = clsVariants.find((v: any) => v.value === effectiveClassification)
   const relationStates: any[] = clsState?.relations || []
   const relationModeFor = (target: string) =>
     relationChoices[target] || relationStates.find(r => r.target === target)?.default
@@ -1202,6 +1224,8 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
       }
       setEditorModalOpen(false)
       setEditorFork(false)
+      // Re-run the classification/relation checks against the saved bytes.
+      setClassificationRefresh(n => n + 1)
     } catch (err: any) {
       message.error(err.response?.data?.detail || 'Failed to save file')
     } finally {
@@ -2021,6 +2045,17 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                   regenerates it. */}
               <div style={{ marginTop: 10 }}>
                 <div style={{ fontSize: 13, marginBottom: 4 }}>Env classification</div>
+                {/* The selected variant is listed above the picker like the
+                    base-file pickers: click it to inspect/edit, × to drop the
+                    explicit choice and return to the default. */}
+                {clsIsExisting && (
+                  <SelectedFileRow
+                    name={effectiveClassification}
+                    onOpen={(n) => openSelectedFile(n, false)}
+                    onRemove={() => setClassificationChoice('')}
+                    stale={!!clsSelectedVariant?.red}
+                  />
+                )}
                 <Select
                   style={{ width: '100%' }}
                   value={effectiveClassification}
@@ -2049,12 +2084,19 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                 {clsCoverageMissing.length > 0 && (
                   <Alert type="error" showIcon style={{ marginTop: 8 }}
                     message={`The selected env has key(s) the classification does not name: ${clsCoverageMissing.join(', ')}`}
-                    description="Generate/Deploy regenerates the classification over the selected env's keys." />
+                    description="Generate/Deploy regenerates the classification over the selected env's keys, or open the variant above and add them."
+                    action={<Button size="small" onClick={() => setClassificationChoice('generate_new')}>Use generate new</Button>} />
                 )}
                 {clsTargetViolations.length > 0 && (
                   <Alert type="error" showIcon style={{ marginTop: 8 }}
                     message="The classification points at target(s) that are not selected"
-                    description={clsTargetViolations.map(v => `${v.variable} → ${v.target}`).join(', ')} />
+                    description={<>
+                      {clsTargetViolations.map(v => `${v.variable} → ${v.target}`).join(', ')}
+                      {' — the variant claims a deployed dependency this deploy has not selected. '}
+                      Generate/Deploy reclassifies it when an LLM is active, or open the variant above
+                      and change that entry's category/source, or select the target under Dependencies.
+                    </>}
+                    action={<Button size="small" onClick={() => setClassificationChoice('generate_new')}>Use generate new</Button>} />
                 )}
                 {overwritePreview.length > 0 && (
                   <Alert type="info" showIcon style={{ marginTop: 8 }}
@@ -2092,6 +2134,15 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                         <div style={{ fontSize: 12, marginBottom: 3 }}>{r.target}
                           {r.projection?.length ? ` — 1:1: ${r.projection.join(', ')}` : ' — empty projection'}
                         </div>
+                        {clsIsExisting && String(mode).startsWith('dependency.') && (
+                          <SelectedFileRow
+                            name={mode}
+                            onOpen={(n) => openSelectedFile(n, false)}
+                            onRemove={() => setRelationChoices(prev => ({
+                              ...prev, [r.target]: 'generate_new' }))}
+                            stale={!!chosen?.red}
+                          />
+                        )}
                         <Select
                           style={{ width: '100%' }}
                           value={mode}
