@@ -320,15 +320,24 @@ def _env_compose_paths(recipe_dir, request: dict) -> list:
     return [recipe_dir / n for n in names if (recipe_dir / n).is_file()]
 
 
-def _compose_defaults(compose_paths) -> tuple[dict[str, str], list[str]]:
-    from ..utils.var_scan import scan_compose_files
+def _compose_defaults(
+    compose_paths, active_profiles: list[str] | None = None,
+) -> tuple[dict[str, str], list[str], set[str]]:
+    """Defaults, required names and the ACTIVE variable set (F7).
+
+    With ``active_profiles`` only services that will run are scanned, so a
+    variable that belongs solely to an unselected profile is neither required
+    nor part of the active set.
+    """
+    from ..utils.var_scan import scan_compose_files, scan_compose_files_active
 
     if not compose_paths:
-        return {}, []
-    scan = scan_compose_files(compose_paths)
+        return {}, [], set()
+    scan = (scan_compose_files_active(compose_paths, active_profiles)
+            if active_profiles is not None else scan_compose_files(compose_paths))
     defaults = {r.name: (r.default_raw or "") for r in scan.refs if r.has_default}
     required = sorted({r.name for r in scan.refs if not r.has_default})
-    return defaults, required
+    return defaults, required, {r.name for r in scan.refs}
 
 
 def _ec_unfilled(variables: list[str], supplied: dict[str, str]) -> list[str]:
@@ -437,6 +446,7 @@ def _assemble_classified_env(
     base_metadata: dict, relation_values: dict[str, str],
     external_values: dict[str, str] | None,
     defaults: dict[str, str],
+    active_vars: set[str] | None = None,
 ) -> tuple[str, dict[str, str], list[str], list[str]]:
     """Copy the template, apply only essential values, then check categories."""
     from .env_classification import (
@@ -448,6 +458,7 @@ def _assemble_classified_env(
     injected, missing, externals = inject_values(
         artifact, base_values=base_values, metadata=base_metadata,
         relation_values=relation_values, external_values=external_values,
+        active_vars=active_vars,
     )
     apply: dict[str, str] = {}
     for name, spec in (values or {}).items():
@@ -460,11 +471,25 @@ def _assemble_classified_env(
         apply[name] = value
     apply.update(injected)
     text = apply_compose_defaults(template_text, defaults)
+    # A compose-referenced variable that the template lacks but whose compose
+    # reference carries a default must still be written (the renderer would
+    # otherwise substitute an empty value) — F7 follow-up.
+    _present = parse_env_text(text)
+    _absent_defaults = {
+        str(n): str(d) for n, d in (defaults or {}).items()
+        if n not in _present and str(d or "").strip()
+    }
+    if _absent_defaults:
+        text = apply_env_values(text, _absent_defaults)
     text = apply_env_values(text, apply)
     assembled = parse_env_text(text)
+    # The compose defaults are applied AFTER inject_values, so a variable that
+    # was "missing" there may now be satisfied (F7 follow-up). Re-check the
+    # names against the assembled env before reporting them.
+    missing = [n for n in missing if not str(assembled.get(n) or "").strip()]
     missing_after, externals_after = check_assembled(
         artifact, assembled, relation_values=relation_values,
-        external_values=external_values,
+        external_values=external_values, active_vars=active_vars,
     )
     return (text, assembled,
             sorted(set(missing) | set(missing_after)),
@@ -893,15 +918,16 @@ class GenerationJobManager:
         selected, fill from the compose ``${VAR}`` surface defaults. Returns
         None when the compose references no vars (no generation at all).
         """
-        from ..utils.var_scan import scan_compose_files
+        from ..utils.var_scan import scan_compose_files_active
 
         recipe_dir = self._recipe_dir_for(service_name, recipe_path)
         selection = request.get("selection") or {}
         sel_env = [p for p in selection.get("env", []) if isinstance(p, str)]
         sel_compose = [p for p in selection.get("compose", []) if isinstance(p, str)]
         compose_paths = [recipe_dir / p for p in sel_compose if (recipe_dir / p).is_file()]
+        _profiles = list(selection.get("profiles") or request.get("profiles") or [])
 
-        scan = scan_compose_files(compose_paths) if compose_paths else None
+        scan = scan_compose_files_active(compose_paths, _profiles) if compose_paths else None
 
         def _merge_env_file(path: str) -> None:
             fp = recipe_dir / path
@@ -1949,6 +1975,9 @@ class GenerationJobManager:
                                     relation_values=_re.get("relation_values") or {},
                                     external_values=_vals,
                                     defaults=_re.get("defaults") or {},
+                                    active_vars=(set(_re.get("active_vars") or [])
+                                                 if _re.get("active_vars") is not None
+                                                 else None),
                                 )
                                 if _missing or _externals:
                                     raise GenerationJobError(
@@ -1961,7 +1990,8 @@ class GenerationJobManager:
                                 _content = (_apply_env_kvs(_template, _kvs, external_values=_vals)
                                             if _kvs else _template)
                             validations[phase] = validate_env(
-                                _content, _re.get("compose_paths") or []
+                                _content, _re.get("compose_paths") or [],
+                                _re.get("profiles"),
                             )
                             _rd = self._recipe_dir_for(service_name, recipe_path)
                             _rd.mkdir(parents=True, exist_ok=True)
@@ -2004,7 +2034,11 @@ class GenerationJobManager:
                                 or "0"
                             )
                             composition_paths = _env_compose_paths(recipe_dir, request)
-                            defaults, required = _compose_defaults(composition_paths)
+                            _env_profiles = list(
+                                (request.get("selection") or {}).get("profiles")
+                                or request.get("profiles") or [])
+                            defaults, required, active_vars = _compose_defaults(
+                                composition_paths, _env_profiles)
                             _llm_on = self._llm_active(db)
 
                             # `LLM based fix`: the `.env.fix` repair keeps its
@@ -2040,7 +2074,8 @@ class GenerationJobManager:
                                 kvs = (gen or {}).get("kvs") or {}
                                 content = _apply_env_kvs(mech, kvs) if kvs else mech
                                 validations[phase] = validate_env(
-                                    content, [str(p) for p in composition_paths])
+                                    content, [str(p) for p in composition_paths],
+                                    _env_profiles)
                                 if not validations[phase].get("valid"):
                                     errs = validations[phase].get("errors") or []
                                     raise GenerationJobError(
@@ -2197,12 +2232,42 @@ class GenerationJobManager:
                                 _target_service(_e) for _e in _deps
                                 if _target_service(_e)})
                             _values: dict[str, Any] = {}
+                            # C22 — services defined in the selected compose are
+                            # INTERNAL: a variable pointing at one is never a
+                            # dependency, even if a selected dependency has the
+                            # same name. The internal match wins.
+                            from .file_sets import compose_service_names as _compose_service_names
+                            _internal_services = set(_compose_service_names(composition_paths))
 
                             # R26/R29 — resolve the classification selection:
                             # `none`, `generate new`, or a matched variant.
                             _cls_mode = classification_mode(request)
                             _artifact: dict | None = None
                             _variant_name: str | None = None
+
+                            def _apply_internal_rule(data: dict | None) -> dict | None:
+                                """Demote same-compose targets and rewrite the variant."""
+                                if not isinstance(data, dict):
+                                    return data
+                                fixed, rewrites = _ec.enforce_internal_targets(
+                                    data, _internal_services, _base_values)
+                                if not rewrites:
+                                    return data
+                                warnings.append(
+                                    "internal service target(s) are never dependencies — "
+                                    "demoted: "
+                                    + ", ".join(f"{v['variable']}->{v['target']}"
+                                                for v in rewrites))
+                                _name = _ec.variant_filename(_fingerprint)
+                                _ec.write_artifact(
+                                    recipe_dir, source_service=service_name,
+                                    recipe_path=recipe_path,
+                                    fingerprint=_fingerprint,
+                                    variables=fixed["variables"],
+                                    dependencies=fixed.get("dependencies") or {},
+                                )
+                                env_meta["classification_written"] = True
+                                return (_ec.read_variant(recipe_dir, _name) or fixed)
 
                             def _write_classification(cls: dict) -> dict:
                                 _ec.write_artifact(
@@ -2253,7 +2318,7 @@ class GenerationJobManager:
                                             dependencies=filled.get("dependencies") or {},
                                         )
                                         data = _ec.read_variant(recipe_dir, _name)
-                                return data
+                                return _apply_internal_rule(data)
 
                             if _cls_mode == CLASSIFICATION_NONE:
                                 _artifact = None
@@ -2269,6 +2334,9 @@ class GenerationJobManager:
                             else:
                                 _variant_name = _cls_mode
                                 _artifact = _ec.read_variant(recipe_dir, _variant_name)
+                                # C22 — repair same-compose targets mechanically
+                                # before the red check; the internal match wins.
+                                _artifact = _apply_internal_rule(_artifact)
                                 if _classification_red(_artifact):
                                     if _llm_on:
                                         warnings.append(
@@ -2418,6 +2486,7 @@ class GenerationJobManager:
                                     base_metadata=metadata,
                                     relation_values=_rel_values,
                                     external_values=None, defaults=defaults,
+                                    active_vars=active_vars,
                                 )
                                 if _missing:
                                     raise GenerationJobError(
@@ -2452,6 +2521,8 @@ class GenerationJobManager:
                                                         "metadata": metadata,
                                                         "relation_values": _rel_values,
                                                         "defaults": defaults,
+                                                        "active_vars": sorted(active_vars),
+                                                        "profiles": _env_profiles,
                                                         "compose_paths": [str(p) for p in composition_paths],
                                                         "external_vars": _externals,
                                                         "env_meta": env_meta,
@@ -2463,7 +2534,8 @@ class GenerationJobManager:
                                     )
                                     return
                                 validations[phase] = validate_env(
-                                    content, [str(p) for p in composition_paths])
+                                    content, [str(p) for p in composition_paths],
+                                    _env_profiles)
                             elif _selected_env:
                                 # `generate new` with no LLM: the selected env
                                 # is the handoff, as-is (M-A18).
@@ -2479,7 +2551,8 @@ class GenerationJobManager:
                                 content = _ec.apply_env_values(
                                     content, {n: "" for n in required if n not in _present})
                                 validations[phase] = validate_env(
-                                    content, [str(p) for p in composition_paths])
+                                    content, [str(p) for p in composition_paths],
+                                    _env_profiles)
 
                             env_name = (
                                 ".env.fix" if _recipe_level_env
@@ -3176,11 +3249,12 @@ class GenerationJobManager:
                     except OSError:
                         continue
         elif phase == "env":
-            from ..utils.var_scan import scan_compose_files
+            from ..utils.var_scan import scan_compose_files_active
 
             compose_paths = [recipe_dir / p for p in eff_compose if (recipe_dir / p).is_file()]
             if compose_paths:
-                scan = scan_compose_files(compose_paths)
+                # F7 — only services that will run contribute to the surface.
+                scan = scan_compose_files_active(compose_paths, profiles)
                 if scan.refs:
                     required = sorted({r.name for r in scan.refs if not r.has_default})
                     optional = sorted({r.name for r in scan.refs if r.has_default})
@@ -3191,6 +3265,32 @@ class GenerationJobManager:
                         + "\n\nOPTIONAL (have defaults; include only when relevant):\n"
                         + ("\n".join(optional) or "(none)")
                     )
+        # R6/F1 — every per-slot base ref reaches its OWN phase, never another.
+        # Compose and serving-ports were validated but never routed; they are
+        # hard constraints on the file that phase produces, so their contents
+        # enter that phase's base files.
+        _base_refs = request.get("base_refs") or {}
+        if phase == "compose":
+            for _name in (_base_refs.get("compose") or []):
+                if not isinstance(_name, str) or not _name:
+                    continue
+                _fp = recipe_dir / _name
+                if _fp.is_file():
+                    try:
+                        base_files[_name] = _fp.read_text(
+                            encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+        if phase == "serving_ports":
+            _name = _base_refs.get("serving_ports")
+            if isinstance(_name, str) and _name:
+                _fp = recipe_dir / _name
+                if _fp.is_file():
+                    try:
+                        base_files[_name] = _fp.read_text(
+                            encoding="utf-8", errors="replace")
+                    except OSError:
+                        pass
         if phase == "nginx" and sel_nginx:
             fp = recipe_dir / sel_nginx
             if fp.is_file():
@@ -3198,6 +3298,26 @@ class GenerationJobManager:
                     base_files[sel_nginx] = fp.read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     pass
+        if phase == "nginx":
+            # C15 — the Nginx phase receives every selected base ref WITH its
+            # category (http/stream/mail); the key carries the category so the
+            # model cannot confuse the slot it constrains.
+            nginx_refs = (request.get("base_refs") or {}).get("nginx")
+            if isinstance(nginx_refs, str):
+                nginx_refs = {"http": nginx_refs} if nginx_refs else {}
+            if isinstance(nginx_refs, dict):
+                for cat in ("http", "stream", "mail"):
+                    name = nginx_refs.get(cat)
+                    if not isinstance(name, str) or not name:
+                        continue
+                    fp = recipe_dir / name
+                    if not fp.is_file():
+                        continue
+                    try:
+                        base_files[f"{cat}:{name}"] = fp.read_text(
+                            encoding="utf-8", errors="replace")
+                    except OSError:
+                        pass
         if phase == "env":
             # §5: when env is `generate new` the operator may supply REFERENCE
             # files — base/example envs the model reads to produce the `.raw`.

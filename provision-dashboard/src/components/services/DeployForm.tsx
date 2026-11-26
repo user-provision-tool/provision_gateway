@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Modal, Form, Input, Select, Button, Switch, Space, Divider, message, Checkbox, Alert, Spin, Tag, Typography, Collapse } from 'antd'
-import { PlusOutlined, MinusCircleOutlined, GlobalOutlined, RobotOutlined, DownloadOutlined } from '@ant-design/icons'
+import { PlusOutlined, MinusCircleOutlined, GlobalOutlined, RobotOutlined, DownloadOutlined, WarningOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import client from '../../api/client'
 import { deriveProfiles, getComposePreview } from '../../api/services'
@@ -15,8 +15,8 @@ import BaseFilesPopup, {
 } from './BaseFilesPopup'
 import AdditionalContextPopup, {
   AdditionalContext,
-  EMPTY_CONTEXT,
 } from './AdditionalContextPopup'
+import { setServiceContext, useServiceContext } from '../../stores/additionalContext'
 import FileSetSelection, {
   SelectedFileRow,
   confCategory,
@@ -203,7 +203,6 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   // the classification picker's `generate new` and the per-target relation
   // pickers are the explicit controls.
   const [baseRefs, setBaseRefs] = useState<BaseRefs>(EMPTY_BASE_REFS)
-  const [additionalContext, setAdditionalContext] = useState<AdditionalContext>(EMPTY_CONTEXT)
   // '' means "the picker's default" (a matched valid variant, else generate
   // new). Resets with the panel, like the other per-deploy controls.
   const [classificationChoice, setClassificationChoice] = useState('')
@@ -417,7 +416,6 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
         setNeedsEnv(true)
         setPrompt('')
         setBaseRefs(EMPTY_BASE_REFS)
-        setAdditionalContext(EMPTY_CONTEXT)
         setClassificationChoice('')
         setRelationChoices({})
         setClassificationState(null)
@@ -700,6 +698,14 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   // so the profiles section follows the selection (design §Selection & UI
   // L59-62) instead of staying stale from the stored file set.
   const watchedService = Form.useWatch('service_name', form)
+  // C16 — the additional context is a shared per-service store: the project
+  // page's `add to context` button writes the same value this panel sends.
+  const deployContextService = watchedService
+    ? parseServiceValue(watchedService).baseName : ''
+  const additionalContext = useServiceContext(deployContextService)
+  const setAdditionalContext = (ctx: AdditionalContext) => {
+    if (deployContextService) setServiceContext(deployContextService, ctx)
+  }
   useEffect(() => {
     if (!open || !watchedService) return
     const { baseName, recipePath } = parseServiceValue(watchedService)
@@ -915,6 +921,8 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
     clsIsExisting ? (clsState?.classification?.coverage_missing || []) : []
   const clsTargetViolations: any[] =
     clsIsExisting ? (clsState?.classification?.target_violations || []) : []
+  const clsInternalViolations: any[] =
+    clsIsExisting ? (clsState?.classification?.internal_violations || []) : []
   const overwritePreview: string[] =
     clsIsExisting && eff.env.length > 0
       ? (clsState?.classification?.overwrite || []) : []
@@ -1703,20 +1711,26 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
   // ONE compact alert. The old env-only reference control is gone; its role is
   // the Env slot of the base-files popup (R1).
   const renderGenerationPrompt = () => {
-    const refRows: { name: string; slot: 'compose' | 'serving_ports' | 'nginx' | 'env' }[] = []
+    const refRows: { name: string; slot: 'compose' | 'serving_ports' | 'nginx' | 'env'; cat?: 'http' | 'stream' | 'mail' }[] = []
     effectiveBaseRefs.compose.forEach(name => refRows.push({ name, slot: 'compose' }))
     if (effectiveBaseRefs.serving_ports) {
       refRows.push({ name: effectiveBaseRefs.serving_ports, slot: 'serving_ports' })
     }
-    if (effectiveBaseRefs.nginx) refRows.push({ name: effectiveBaseRefs.nginx, slot: 'nginx' })
+    ;(['http', 'stream', 'mail'] as const).forEach(cat => {
+      const n = effectiveBaseRefs.nginx[cat]
+      if (n) refRows.push({ name: n, slot: 'nginx', cat })
+    })
     effectiveBaseRefs.env.forEach(name => refRows.push({ name, slot: 'env' }))
-    const removeRef = (name: string, slot: 'compose' | 'serving_ports' | 'nginx' | 'env') => {
+    const removeRef = (name: string, slot: 'compose' | 'serving_ports' | 'nginx' | 'env',
+                        cat?: 'http' | 'stream' | 'mail') => {
       if (slot === 'compose') {
         setBaseRefs({ ...baseRefs, compose: baseRefs.compose.filter(x => x !== name) })
       } else if (slot === 'env') {
         setBaseRefs({ ...baseRefs, env: baseRefs.env.filter(x => x !== name) })
+      } else if (slot === 'nginx') {
+        setBaseRefs({ ...baseRefs, nginx: { ...baseRefs.nginx, [cat || 'http']: null } })
       } else {
-        setBaseRefs({ ...baseRefs, [slot]: null })
+        setBaseRefs({ ...baseRefs, serving_ports: null })
       }
     }
     return (
@@ -1747,7 +1761,7 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                 key={`ref:${row.slot}:${row.name}`}
                 name={row.name}
                 onOpen={openSelectedFile}
-                onRemove={() => removeRef(row.name, row.slot)}
+                onRemove={() => removeRef(row.name, row.slot, row.cat)}
               />
             ))}
             {additionalContext.files.map(name => (
@@ -2068,7 +2082,17 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                         { value: 'generate_new', label: 'generate new' },
                         ...clsVariants.map((v) => ({
                           value: v.value,
-                          label: `${v.value}${v.red ? ' — red (regenerate)' : ''}`,
+                          title: v.value,
+                          label: (
+                            <span>
+                              {v.value}
+                              {v.red && (
+                                <WarningOutlined
+                                  style={{ color: '#cf1322', marginLeft: 6 }}
+                                  title="invalid — will be regenerated" />
+                              )}
+                            </span>
+                          ),
                         })),
                       ]}
                 />
@@ -2083,20 +2107,18 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                 </div>
                 {clsCoverageMissing.length > 0 && (
                   <Alert type="error" showIcon style={{ marginTop: 8 }}
-                    message={`The selected env has key(s) the classification does not name: ${clsCoverageMissing.join(', ')}`}
-                    description="Generate/Deploy regenerates the classification over the selected env's keys, or open the variant above and add them."
-                    action={<Button size="small" onClick={() => setClassificationChoice('generate_new')}>Use generate new</Button>} />
+                    message="This classification cannot be used"
+                    description={`According to the classification, ${clsCoverageMissing.join(', ')} ${clsCoverageMissing.length === 1 ? 'is' : 'are'} missing. The env classification will be regenerated because the currently selected one is invalid.`} />
                 )}
                 {clsTargetViolations.length > 0 && (
                   <Alert type="error" showIcon style={{ marginTop: 8 }}
-                    message="The classification points at target(s) that are not selected"
-                    description={<>
-                      {clsTargetViolations.map(v => `${v.variable} → ${v.target}`).join(', ')}
-                      {' — the variant claims a deployed dependency this deploy has not selected. '}
-                      Generate/Deploy reclassifies it when an LLM is active, or open the variant above
-                      and change that entry's category/source, or select the target under Dependencies.
-                    </>}
-                    action={<Button size="small" onClick={() => setClassificationChoice('generate_new')}>Use generate new</Button>} />
+                    message="This classification cannot be used"
+                    description={`According to the classification, ${clsTargetViolations.map(v => `${v.variable} should point to "${v.target}"`).join('; ')}, but ${clsTargetViolations.length === 1 ? 'that service is' : 'those services are'} not selected as a dependency. The env classification will be regenerated because the currently selected one is invalid.`} />
+                )}
+                {clsInternalViolations.length > 0 && (
+                  <Alert type="error" showIcon style={{ marginTop: 8 }}
+                    message="This classification cannot be used"
+                    description={`According to the classification, ${clsInternalViolations.map(v => `${v.variable} should point to "${v.target}"`).join('; ')}, but ${clsInternalViolations.length === 1 ? 'that service is' : 'those services are'} inside the same compose — an internal service is never a dependency. The env classification will be regenerated because the currently selected one is invalid.`} />
                 )}
                 {overwritePreview.length > 0 && (
                   <Alert type="info" showIcon style={{ marginTop: 8 }}
@@ -2125,7 +2147,17 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                           { value: 'generate_new', label: 'generate new' },
                           ...(r.options || []).map((o: any) => ({
                             value: o.value,
-                            label: `${o.value}${o.red ? ' — red (regenerate)' : ''}`,
+                            title: o.value,
+                            label: (
+                              <span>
+                                {o.value}
+                                {o.red && (
+                                  <WarningOutlined
+                                    style={{ color: '#cf1322', marginLeft: 6 }}
+                                    title="invalid — will be regenerated" />
+                                )}
+                              </span>
+                            ),
                           })),
                         ]
                     const chosen = (r.options || []).find((o: any) => o.value === mode)
@@ -2153,8 +2185,8 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                         />
                         {chosen?.red && (
                           <Alert type="warning" showIcon style={{ marginTop: 6 }}
-                            message="This relation is not 1:1 with the classification"
-                            description={`missing: ${(chosen.missing || []).join(', ') || 'none'}; extra: ${(chosen.extra || []).join(', ') || 'none'}. Generate/Deploy regenerates it.`} />
+                            message="This relation cannot be used"
+                            description="According to the classification, this relation lists the wrong variables for the target. The dependency relation will be regenerated because the currently selected one is invalid." />
                         )}
                         {clsIsExisting && !r.allowed_none && (
                           <div style={{ fontSize: 12, color: '#999' }}>

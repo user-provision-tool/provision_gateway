@@ -91,6 +91,34 @@ def test_a_base_ref_on_a_filled_slot_is_refused(project):
     assert exc.value.code == "base_ref_on_selected_slot"
 
 
+def test_the_nginx_base_ref_is_per_category(project):
+    """C15 — one file per category, each validated against its own predicate."""
+    (project / "nginx.conf").write_text("server {}\n")
+    (project / "app.stream.conf").write_text("stream {}\n")
+    (project / "app.mail.conf").write_text("mail {}\n")
+    deploy_workflow._validate_base_refs(
+        _intent(base_refs={"nginx": {"http": "nginx.conf",
+                                     "stream": "app.stream.conf",
+                                     "mail": "app.mail.conf"}}),
+        _selection(),
+    )
+    with pytest.raises(WorkflowError) as exc:
+        deploy_workflow._validate_base_refs(
+            _intent(base_refs={"nginx": {"http": "app.stream.conf"}}),
+            _selection())
+    assert exc.value.code == "base_ref_not_a_candidate"
+    with pytest.raises(WorkflowError) as exc:
+        deploy_workflow._validate_base_refs(
+            _intent(base_refs={"nginx": {"smtp": "nginx.conf"}}),
+            _selection())
+    assert exc.value.code == "invalid_base_ref"
+    with pytest.raises(WorkflowError) as exc:
+        deploy_workflow._validate_base_refs(
+            _intent(base_refs={"nginx": {"http": "nginx.conf"}}),
+            _selection(nginx="n.conf"))
+    assert exc.value.code == "base_ref_on_selected_slot"
+
+
 def test_a_context_file_outside_the_project_root_is_refused(project):
     with pytest.raises(WorkflowError) as exc:
         deploy_workflow._validate_context(_intent(context={"files": ["../x"], "links": []}))
@@ -337,6 +365,22 @@ def test_assembly_missing_required_blocks_by_name(project):
     assert externals == []
 
 
+def test_compose_defaults_fill_absent_and_empty_template_variables(project):
+    """F7 follow-up — the defaults are applied after inject_values."""
+    artifact = _artifact(**{
+        "REQ": {"category": "required", "source": {"kind": "file"}},
+        "DEF": {"category": "defaulted", "source": {"kind": "file"}},
+    })
+    text, assembled, missing, externals = generation_jobs._assemble_classified_env(
+        "KEEP=1\n", values={}, artifact=artifact, base_metadata={},
+        relation_values={}, external_values=None,
+        defaults={"REQ": "req-default", "DEF": "def-default"},
+        active_vars={"REQ", "DEF"})
+    assert missing == [] and externals == []
+    assert assembled["REQ"] == "req-default"
+    assert assembled["DEF"] == "def-default"
+
+
 def test_assembly_unsupplied_external_routes_to_the_pause(project):
     artifact = _artifact(**{
         "API_KEY": {"category": "external", "source": {"kind": "operator"}},
@@ -419,3 +463,60 @@ def test_snapshot_matrix(tmp_path, monkeypatch):
     assert rows["dependency_snapshots"] == [
         {"target_service": "dep",
          "path": "dependency.s.dep.user-alice.34.json"}]
+
+
+def test_snapshot_matrix_rev7_rows(tmp_path, monkeypatch):
+    """Rows 18–22 of the snapshot matrix: the used-or-written set decides."""
+    rdir = tmp_path / "s" / "recipe"
+    rdir.mkdir(parents=True)
+    fp = {"compose": [], "profiles": [], "env_bases": []}
+    rel_name = write_relation(rdir, "s", "dep", {"A": "dep"}, fp).name
+    cls_name = write_artifact(
+        rdir, source_service="s", recipe_path="", fingerprint=fp,
+        variables={"A": {"category": "defaulted",
+                         "source": {"kind": "file"}}}).name
+    monkeypatch.setattr(settings, "SOURCE_PROJECTS_DIR", tmp_path)
+    monkeypatch.setattr(deploy_workflow, "_dependency_entries",
+                        lambda sid: [{"service_name": "dep"}])
+
+    def run(label, env_meta, selection):
+        before = {p.name for p in rdir.iterdir()}
+        deploy_workflow._snapshot_for_deploy(
+            {"service_name": "s", "user_name": "alice", "recipe_path": "recipe"},
+            selection, label, env_meta)
+        return {p.name for p in rdir.iterdir()} - before
+
+    # Row 18 — sent env + cls existing + relation read: both snapshots.
+    created = run("40", {"relations": {"dep": "read"},
+                         "classification_read": True,
+                         "classification_name": cls_name,
+                         "relation_variants": {"dep": rel_name}},
+                  {"env": ["e.env"], "serving_ports_none": True})
+    assert "env.classification.user-alice.40.yaml" in created
+    assert "dependency.s.dep.user-alice.40.json" in created
+
+    # Row 19 — sent env + cls None: nothing.
+    created = run("41", {"relations": {}, "classification_read": False,
+                         "classification_written": False},
+                  {"env": ["e.env"], "serving_ports_none": True})
+    assert created == set()
+
+    # Row 20 — generate new + cls None: nothing.
+    created = run("42", {"relations": {}, "classification_read": False,
+                         "classification_written": False},
+                  {"env": [], "env_none": False, "serving_ports_none": True})
+    assert created == set()
+
+    # Rows 21/22 — cls generate new + relation written: both snapshots, for a
+    # sent env and for generate new.
+    for label, selection in (("43", {"env": ["e.env"], "serving_ports_none": True}),
+                             ("44", {"env": [], "env_none": False,
+                                     "serving_ports_none": True})):
+        created = run(label, {"relations": {"dep": "written"},
+                              "classification_read": True,
+                              "classification_written": True,
+                              "classification_name": cls_name,
+                              "relation_variants": {"dep": rel_name}},
+                      selection)
+        assert f"env.classification.user-alice.{label}.yaml" in created
+        assert f"dependency.s.dep.user-alice.{label}.json" in created

@@ -6093,6 +6093,11 @@ class TestEnvReferencePicker:
             assert label in src
         assert "refSlotEnabled" in src
         assert "activeBaseRefs" in src
+        # C14 — the sent pickers reused exactly: the black in-field None, the
+        # Nginx per-category ref set, no Clear control beside the picker.
+        assert "None - no base constraint" in src
+        assert "NginxBaseRefs" in src
+        assert "Clear</Button>" not in src
         deploy = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
         assert "base_refs: effectiveBaseRefs" in deploy
         assert "context: additionalContext" in deploy
@@ -6102,6 +6107,26 @@ class TestEnvReferencePicker:
         assert "relations: relationsPayload" in deploy
         assert "forceReclassify" not in deploy
         assert "Force env re-classification" not in deploy
+
+    def test_the_additional_context_popup_is_the_project_tree_browser(self):
+        """C16 — no dropdown picker; the shared tree/editor, add-to-context left
+        of Edit, and a height-filling layout."""
+        from pathlib import Path
+        popup = (_DASH / "src" / "components" / "services" / "AdditionalContextPopup.tsx").read_text()
+        assert "ProjectBrowser" in popup
+        assert 'mode="multiple"' not in popup
+        page = (_DASH / "src" / "pages" / "ServicesPage.tsx").read_text()
+        assert "ProjectBrowser" in page
+        browser = (_DASH / "src" / "components" / "projects" / "ProjectBrowser.tsx").read_text()
+        assert "add to context" in browser
+        assert browser.index("add to context") < browser.index(">Edit<")
+        assert 'height="500px"' not in browser
+        assert 'height="100%"' in browser
+        assert "overflow: 'auto'" in browser
+        deploy = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
+        assert "useServiceContext" in deploy
+        panel = (_DASH / "src" / "components" / "services" / "GenerateMissingPanel.tsx").read_text()
+        assert "useServiceContext" in panel
 
     def test_the_source_projects_modal_has_three_slots_and_no_env_slot(self):
         src = (_DASH / "src" / "components" / "services" / "GenerateMissingPanel.tsx").read_text()

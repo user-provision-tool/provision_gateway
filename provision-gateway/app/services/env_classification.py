@@ -522,16 +522,22 @@ def matched_variant(recipe_dir: str | Path,
     if not isinstance(fingerprint, dict):
         return None
     expected = variant_filename(fingerprint)
+    matches: list[tuple[dict, dict]] = []
     for item in list_variants(recipe_dir):
         data = read_variant(recipe_dir, item["name"])
         if data is None:
             continue
         if not fingerprint_matches(data.get("fingerprint"), fingerprint):
             continue
-        if item["legacy"]:
+        if item["legacy"] or item["name"] == expected:
+            matches.append((item, data))
+    # M-A22 — a legacy JSON and the canonical YAML can both match; the YAML is
+    # the canonical variant and the duplicate is ignored.
+    for item, data in matches:
+        if not item["legacy"]:
             return item["name"], data
-        if item["name"] == expected:
-            return item["name"], data
+    if matches:
+        return matches[0][0]["name"], matches[0][1]
     return None
 
 
@@ -629,6 +635,67 @@ def projection(data: dict | None, target: str) -> list[str]:
     )
 
 
+def internal_target_violations(
+    data: dict | None, internal_services: list[str] | set[str] | None,
+) -> list[dict[str, str]]:
+    """Dependency entries whose target is a service defined in the SAME compose.
+
+    C22 — a container inside the service is an internal reference, never a
+    dependency, even when a deployed dependency shares its name.
+    """
+    internal = {str(s) for s in (internal_services or []) if s}
+    out: list[dict[str, str]] = []
+    for name, entry in ((data or {}).get("variables") or {}).items():
+        if not isinstance(entry, dict) or entry.get("category") != "dependency":
+            continue
+        target = dependency_target(entry)
+        if target and target in internal:
+            out.append({"variable": str(name), "target": target})
+    return sorted(out, key=lambda v: v["variable"])
+
+
+def enforce_internal_targets(
+    data: dict | None,
+    internal_services: list[str] | set[str] | None,
+    base_values: dict[str, str] | None = None,
+) -> tuple[dict, list[dict[str, str]]]:
+    """Mechanically demote same-compose dependency targets (C22).
+
+    The internal match wins over any selected dependency of the same name. A
+    non-empty template value becomes `defaulted`; an empty one becomes
+    `required` (the category check then names it instead of inventing a URL).
+    The target is dropped from `dependencies`.
+    """
+    import copy
+
+    violations = internal_target_violations(data, internal_services)
+    if not violations or not isinstance(data, dict):
+        return data or {}, []
+    out = copy.deepcopy(data)
+    variables = out.setdefault("variables", {})
+    values = base_values or {}
+    for item in violations:
+        name, target = item["variable"], item["target"]
+        entry = variables.get(name)
+        if not isinstance(entry, dict):
+            continue
+        value = str(values.get(name) or entry.get("value") or "")
+        empty = is_empty_value(value)
+        entry["category"] = "required" if empty else "defaulted"
+        entry["source"] = {"kind": "file"}
+        if empty:
+            entry.pop("value", None)
+        else:
+            entry["value"] = value
+        reason = str(entry.get("reason") or "").strip()
+        note = (f"internal service '{target}' (C22): "
+                + ("kept the template value" if not empty
+                   else "the template has no value"))
+        entry["reason"] = (reason + "; " + note) if reason else note
+    out["dependencies"] = dependencies_map(variables)
+    return out, violations
+
+
 def write_artifact(
     recipe_dir: str | Path,
     *,
@@ -695,6 +762,7 @@ def inject_values(
     relation_values: dict[str, str],
     external_values: dict[str, str] | None = None,
     mint: bool = True,
+    active_vars: set[str] | None = None,
 ) -> tuple[dict[str, str], list[str], list[str]]:
     """Compute the values the assembler applies, category by category.
 
@@ -743,6 +811,10 @@ def inject_values(
             val = ("" if is_empty_value(current) else current.strip()) or str(
                 entry.get("value") or "").strip()
             if not val:
+                # F7 — a variable that belongs only to an inactive-profile
+                # service is not required; an empty value is harmless.
+                if active_vars is not None and name not in active_vars:
+                    continue
                 missing.append(name)
             elif val != current:
                 values[name] = val
@@ -755,6 +827,7 @@ def check_assembled(
     *,
     relation_values: dict[str, str],
     external_values: dict[str, str] | None = None,
+    active_vars: set[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """The one post-assembly category check (C9).
 
@@ -780,6 +853,11 @@ def check_assembled(
                 missing.append(name)
             continue
         if is_empty_value(value):
+            # F7 — only an active compose service makes a required/defaulted
+            # variable necessary; an inactive-profile variable may stay empty.
+            if (active_vars is not None and category in ("required", "defaulted")
+                    and name not in active_vars):
+                continue
             missing.append(name)
     return sorted(missing), sorted(externals)
 

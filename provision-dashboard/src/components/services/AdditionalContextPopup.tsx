@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
-import { Button, Input, Modal, Select, Space, Tag, Typography, message } from 'antd'
-import client from '../../api/client'
+import { useState } from 'react'
+import { Button, Input, Modal, Space, Tag, Typography, message } from 'antd'
+import ProjectBrowser from '../projects/ProjectBrowser'
 import { SelectedFileRow } from './FileSetSelection'
 
 const { Text } = Typography
@@ -20,36 +20,17 @@ interface Props {
   files: string[]
   links: string[]
   onChange: (context: AdditionalContext) => void
-  onOpenFile: (name: string) => void
+  onOpenFile?: (name: string) => void
 }
 
-/** R3 — the existing project browser (the tree endpoint) plus a URL input.
- *  Both are generation context only: never sent to the deployment. */
+/** C16 — the Additional context popup IS the project tree browser: the same
+ *  tree + preview/editor used when a project is opened on Source Projects,
+ *  with the `add to context` button left of `Edit`, plus the URL input.
+ *  Both kinds are generation context only: never sent to the deployment. */
 export default function AdditionalContextPopup({
-  open, onClose, serviceName, recipePath, files, links, onChange, onOpenFile,
+  open, onClose, serviceName, files, links, onChange, onOpenFile,
 }: Props) {
-  const [candidates, setCandidates] = useState<string[]>([])
   const [url, setUrl] = useState('')
-
-  useEffect(() => {
-    if (!open || !serviceName) return
-    let cancelled = false
-    const dir = recipePath || ''
-    client.get(`/projects/${serviceName}/tree`, { params: { dir } })
-      .then(({ data }) => {
-        if (cancelled) return
-        const children = (data.children || []) as { name: string; path?: string; type?: string }[]
-        const prefix = dir ? `${dir}/` : ''
-        setCandidates(
-          children
-            .filter(c => c.type !== 'dir' && !String(c.name || '').startsWith('.'))
-            .map(c => String(c.path || `${prefix}${c.name}`))
-            .filter(Boolean),
-        )
-      })
-      .catch(() => { if (!cancelled) setCandidates([]) })
-    return () => { cancelled = true }
-  }, [open, serviceName, recipePath])
 
   const addUrl = () => {
     const value = url.trim()
@@ -69,14 +50,14 @@ export default function AdditionalContextPopup({
       onCancel={onClose}
       onOk={onClose}
       okText="Done"
-      width={680}
+      width={960}
       destroyOnClose
     >
       <Space direction="vertical" size="middle" style={{ width: '100%' }}>
         <div>
           <Text strong>Project files</Text>
           <Text type="secondary" style={{ fontSize: 12 }}>
-            {' '}— generation context only; never sent to the deployment
+            {' '}— click a file to preview it, then “add to context”; generation context only
           </Text>
           {files.map(name => (
             <SelectedFileRow
@@ -86,21 +67,18 @@ export default function AdditionalContextPopup({
               onRemove={() => onChange({ files: files.filter(x => x !== name), links })}
             />
           ))}
-          <Select
-            mode="multiple"
-            allowClear
-            style={{ width: '100%', marginTop: 4 }}
-            value={[]}
-            placeholder={files.length ? 'Add another project file…' : 'None'}
-            onChange={(picked) => {
-              const next = (picked as string[]).filter(Boolean)
-              if (next.length === 0) return
-              onChange({ files: [...new Set([...files, ...next])], links })
-            }}
-            options={candidates
-              .filter(c => !files.includes(c))
-              .map(c => ({ value: c, label: c }))}
-          />
+          {serviceName ? (
+            <div style={{ marginTop: 8 }}>
+              <ProjectBrowser
+                serviceName={serviceName}
+                height="52vh"
+                contextFiles={files}
+                onAddToContext={(path) => {
+                  if (!files.includes(path)) onChange({ files: [...files, path], links })
+                }}
+              />
+            </div>
+          ) : null}
         </div>
         <div>
           <Text strong>Links</Text>

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Alert, Button, Divider, Input, Modal, Progress, Select, Space, Spin, Tag, Typography, message } from 'antd'
+import { WarningOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import client from '../../api/client'
 import { deriveProfiles } from '../../api/services'
@@ -13,8 +14,8 @@ import BaseFilesPopup, {
 } from './BaseFilesPopup'
 import AdditionalContextPopup, {
   AdditionalContext,
-  EMPTY_CONTEXT,
 } from './AdditionalContextPopup'
+import { setServiceContext, useServiceContext } from '../../stores/additionalContext'
 import FileSetSelection, {
   phaseOfFile,
   SelectedFileRow,
@@ -88,7 +89,9 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
   // R1/R3/C5 — the Source Projects modal mirrors its THREE sent-file pickers
   // and has no Env slot; the arbitrary context is shared with the deploy panel.
   const [baseRefs, setBaseRefs] = useState<BaseRefs>(EMPTY_BASE_REFS)
-  const [additionalContext, setAdditionalContext] = useState<AdditionalContext>(EMPTY_CONTEXT)
+  // C16 — shared per-service context store (the project page writes it too).
+  const additionalContext = useServiceContext(serviceName)
+  const setAdditionalContext = (ctx: AdditionalContext) => setServiceContext(serviceName, ctx)
   const [basePopupOpen, setBasePopupOpen] = useState(false)
   const [contextPopupOpen, setContextPopupOpen] = useState(false)
   const { jobId, jobState, polling, startJob, cancelJob, submitInput, resumeJob, reset } = useGenerationJob()
@@ -110,7 +113,6 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
     setValidations({})
     setPrompt('')
     setBaseRefs(EMPTY_BASE_REFS)
-    setAdditionalContext(EMPTY_CONTEXT)
     setBasePopupOpen(false)
     setContextPopupOpen(false)
     reset()
@@ -389,13 +391,18 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
 
   const eff = effectiveSelection()
   const activeRefs = activeBaseRefs(baseRefs, eff)
-  const refRows: { name: string; slot: 'compose' | 'serving_ports' | 'nginx' }[] = []
+  const refRows: { name: string; slot: 'compose' | 'serving_ports' | 'nginx'; cat?: 'http' | 'stream' | 'mail' }[] = []
   activeRefs.compose.forEach(name => refRows.push({ name, slot: 'compose' }))
   if (activeRefs.serving_ports) refRows.push({ name: activeRefs.serving_ports, slot: 'serving_ports' })
-  if (activeRefs.nginx) refRows.push({ name: activeRefs.nginx, slot: 'nginx' })
-  const removeRef = (name: string, slot: 'compose' | 'serving_ports' | 'nginx') => {
+  ;(['http', 'stream', 'mail'] as const).forEach(cat => {
+    const n = activeRefs.nginx[cat]
+    if (n) refRows.push({ name: n, slot: 'nginx', cat })
+  })
+  const removeRef = (name: string, slot: 'compose' | 'serving_ports' | 'nginx',
+                     cat?: 'http' | 'stream' | 'mail') => {
     if (slot === 'compose') setBaseRefs({ ...baseRefs, compose: baseRefs.compose.filter(x => x !== name) })
-    else setBaseRefs({ ...baseRefs, [slot]: null })
+    else if (slot === 'nginx') setBaseRefs({ ...baseRefs, nginx: { ...baseRefs.nginx, [cat || 'http']: null } })
+    else setBaseRefs({ ...baseRefs, serving_ports: null })
   }
 
   return (
@@ -457,7 +464,17 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
                 { value: 'generate_new', label: 'generate new' },
                 ...clsVariants.map((v) => ({
                   value: v.value,
-                  label: `${v.value}${v.red ? ' — red' : ''}`,
+                  title: v.value,
+                  label: (
+                    <span>
+                      {v.value}
+                      {v.red && (
+                        <WarningOutlined
+                          style={{ color: '#cf1322', marginLeft: 6 }}
+                          title="invalid — will be regenerated" />
+                      )}
+                    </span>
+                  ),
                 })),
               ]}
             />
@@ -468,14 +485,13 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
             </div>
             {(clsSelected?.errors?.length > 0 || clsSelected?.missing_env_keys?.length > 0) && (
               <Alert type="error" showIcon style={{ marginTop: 8 }}
-                message="The selected classification is invalid"
-                description={[
+                message="This classification cannot be used"
+                description={`According to the classification, ${[
                   ...(clsSelected?.errors || []),
                   ...((clsSelected?.missing_env_keys || []).length
-                    ? [`missing env key(s): ${(clsSelected?.missing_env_keys || []).join(', ')}`]
+                    ? [`${(clsSelected?.missing_env_keys || []).join(', ')} ${(clsSelected?.missing_env_keys || []).length === 1 ? 'is' : 'are'} missing`]
                     : []),
-                ].join('; ')}
-                action={<Button size="small" onClick={() => setClassificationChoice('generate_new')}>Use generate new</Button>} />
+                ].join('; ')}. The env classification will be regenerated because the currently selected one is invalid.`} />
             )}
           </div>
 
@@ -505,7 +521,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
                   key={`ref:${row.slot}:${row.name}`}
                   name={row.name}
                   onOpen={openSelectedFile}
-                  onRemove={() => removeRef(row.name, row.slot)}
+                  onRemove={() => removeRef(row.name, row.slot, row.cat)}
                 />
               ))}
               {additionalContext.files.map(name => (

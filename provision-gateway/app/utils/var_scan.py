@@ -218,6 +218,51 @@ def scan_compose_files(paths: Iterable[str | Path]) -> ScanResult:
     return result
 
 
+def scan_compose_files_active(
+    paths: Iterable[str | Path], active_profiles: Iterable[str] | None = None,
+) -> ScanResult:
+    """Union scan over the compose services that are ACTIVE for this deploy.
+
+    Compose semantics: a service with no ``profiles`` is always active; a
+    service with profiles runs only when at least one of them is selected. A
+    variable that appears only in an inactive-profile service is not required
+    (F7): the service is not started, so an empty value is harmless. The scan
+    walks each active service's YAML subtree, so profile-gated variables are
+    excluded instead of being reported as REQUIRED.
+    """
+    import yaml
+
+    active = {str(p) for p in (active_profiles or []) if p}
+    result = ScanResult()
+    seen: set[str] = set()
+    for p in paths:
+        path = Path(p)
+        if not path.is_file():
+            continue
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        services = data.get("services") if isinstance(data, dict) else None
+        if not isinstance(services, dict):
+            continue
+        for name, svc in services.items():
+            if not isinstance(svc, dict):
+                continue
+            profiles = [x for x in (svc.get("profiles") or []) if isinstance(x, str) and x]
+            if profiles and not (set(profiles) & active):
+                continue
+            try:
+                body = yaml.safe_dump({str(name): svc}, sort_keys=False)
+            except Exception:
+                continue
+            for ref in scan_text(body).refs:
+                if ref.name not in seen:
+                    seen.add(ref.name)
+                    result.refs.append(ref)
+    return result
+
+
 def needs_env(paths: Iterable[str | Path]) -> bool:
     """True when any selected compose file contains a ${VAR} interpolation."""
     return len(scan_compose_files(paths).refs) > 0
@@ -247,14 +292,17 @@ def parse_env_file(path: str | Path) -> dict[str, str]:
 
 
 def env_completeness(
-    compose_paths: Iterable[str | Path], env_paths: Iterable[str | Path]
+    compose_paths: Iterable[str | Path], env_paths: Iterable[str | Path],
+    active_profiles: Iterable[str] | None = None,
 ) -> list[str]:
     """Vars required by compose but absent from the merged env files (sorted).
 
     'Required' = no ``:-``/``-`` default. Later env files win, so the union of
-    all provided keys is checked.
+    all provided keys is checked. With ``active_profiles`` the scan considers
+    only services that will run (F7).
     """
-    scan = scan_compose_files(compose_paths)
+    scan = (scan_compose_files_active(compose_paths, active_profiles)
+            if active_profiles is not None else scan_compose_files(compose_paths))
     if not scan.refs:
         return []
     provided: set[str] = set()

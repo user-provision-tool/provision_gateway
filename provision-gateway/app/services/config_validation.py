@@ -123,7 +123,8 @@ async def validate_nginx(
 
 
 def validate_env(
-    env_content: str, compose_paths: list[str | Path]
+    env_content: str, compose_paths: list[str | Path],
+    active_profiles: list[str] | None = None,
 ) -> dict[str, Any]:
     """Completeness + line-sanity check for the generated env output.
 
@@ -145,14 +146,19 @@ def validate_env(
         if "=" not in line:
             errors.append(f"invalid env line (not KEY=VALUE): {line[:80]}")
 
+    from ..utils.var_scan import scan_compose_files_active
+
     paths = [_Path(p) for p in compose_paths]
-    scan = scan_compose_files(paths)
+    # F7 — a service behind an unselected profile does not run, so its
+    # variables are not required.
+    scan = (scan_compose_files_active(paths, active_profiles)
+            if active_profiles is not None else scan_compose_files(paths))
     missing: list[str] = []
     if scan.refs:
         with tempfile.TemporaryDirectory() as tmp:
             env_file = _Path(tmp) / ".env"
             env_file.write_text(env_content or "", encoding="utf-8")
-            missing = env_completeness(paths, [env_file])
+            missing = env_completeness(paths, [env_file], active_profiles)
         if missing:
             errors.append(f"missing env var(s) without defaults: {', '.join(missing)}")
 

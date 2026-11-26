@@ -754,6 +754,11 @@ def classification_state(
         rdir, compose_names=compose_names, profiles=profile_names,
         env_base_names=env_bases)
     fp_id = ec.fingerprint_id(fingerprint)
+    # C22 — services defined in the selected compose are internal; a dependency
+    # entry targeting one is red (it is never a dependency).
+    from ..services.file_sets import compose_service_names
+    internal_services = set(compose_service_names(
+        [rdir / n for n in compose_names if (rdir / n).is_file()]))
 
     def _selected_values() -> dict[str, str]:
         text = ec.read_env_template(rdir, env_names) if env_names else ""
@@ -772,14 +777,28 @@ def classification_state(
         missing = ec.coverage_missing(data, env_keys) if env_names else []
         violations = ([] if classify_only
                       else ec.target_allowlist_violations(data, targets))
+        internal = ec.internal_target_violations(data, internal_services)
         variants.append({
             "value": item["name"],
             "legacy": bool(item["legacy"]),
-            "red": bool(errors or missing or violations),
+            "red": bool(errors or missing or violations or internal),
             "errors": errors,
             "missing_env_keys": missing,
             "target_violations": violations,
+            "internal_violations": internal,
         })
+    # M-A22 — one variant per fingerprint; the YAML is canonical over a legacy
+    # JSON that records the same fingerprint.
+    deduped: dict[str, dict] = {}
+    for v in variants:
+        raw = ec.read_variant_any(rdir, v["value"])
+        key = (ec.fingerprint_id(raw.get("fingerprint"))
+               if isinstance(raw, dict) and isinstance(raw.get("fingerprint"), dict)
+               else v["value"])
+        prev = deduped.get(key)
+        if prev is None or (prev["legacy"] and not v["legacy"]):
+            deduped[key] = v
+    variants = list(deduped.values())
     matched = ec.matched_variant(rdir, fingerprint)
     default = matched[0] if matched and not any(
         v["value"] == matched[0] and v["red"] for v in variants) else "generate_new"
@@ -862,6 +881,8 @@ def classification_state(
                                   (ec.target_allowlist_violations(
                                       chosen_data, targets)
                                    if chosen_data else [])),
+            "internal_violations": (ec.internal_target_violations(
+                chosen_data, internal_services) if chosen_data else []),
             "overwrite": sorted(set(overwrite)),
             "duplicate_targets": duplicate,
         },

@@ -1562,7 +1562,12 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
                 + "\n".join(
                     f"- {d.get('key')}: {d.get('service_name') or d.get('service')}"
                     f":{d.get('label')} served at {d.get('serving_url') or '(not live)'}"
-                    for d in deps))
+                    for d in deps)
+                + "\n\nOnly these exact target services may be `dependency`. A "
+                "variable that points at a service defined in the SAME compose "
+                "(an internal container) is NOT a dependency — classify it "
+                "`defaulted`/`required`, or `deploy_value` when it renders this "
+                "instance's own external URL.")
         else:
             # R26/R28 — the target allowlist rejects a `dependency` variable
             # whose target is not selected. With no dependency selected the
@@ -1572,7 +1577,9 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
                 "any variable as `dependency` — the target allowlist would "
                 "reject it. A value that would point at another service is "
                 "`defaulted` (keep the template value) or `external` "
-                "(operator-supplied), per its own meaning. Any `dependency.*.json` "
+                "(operator-supplied), per its own meaning. A variable pointing "
+                "at a container INSIDE the same compose is not a dependency "
+                "either — keep it `defaulted`/`required`. Any `dependency.*.json` "
                 "file in the project is a STALE record of another deploy, never "
                 "a selected dependency.")
         relations = context.get("dependency_relations") or {}
@@ -1603,8 +1610,13 @@ localhost/example placeholder. Follow these rules EXACTLY, then output NOW:
             "the gateway mints it (never invent one here).\n"
             "   · deploy_value— a value derived from THIS deployment's facts "
             "(URL, host, scheme, port, label); give a template.\n"
-            "   · dependency  — a value that points at a selected dependency; "
-            "name the target service.\n"
+            "   · dependency  — a value that points at ANOTHER DEPLOYED SERVICE "
+            "chosen in this deploy's Dependencies picker; name that target "
+            "service. A service defined in the SAME compose (an internal "
+            "container such as a database sidecar) is NOT a dependency: a "
+            "variable pointing at it is `defaulted`/`required` (or "
+            "`deploy_value` only when it renders THIS instance's own external "
+            "URL).\n"
             "   · defaulted   — a safe compose/reference default is kept as-is.\n"
             "  source — {kind: file|compose_default|metadata_key|"
             "dependency_target|operator|minted, plus the file name, metadata "

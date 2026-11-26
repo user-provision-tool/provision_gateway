@@ -199,15 +199,44 @@ def _validate_base_refs(intent: dict, selection: dict) -> None:
         filled=bool(selection.get("serving_ports") or selection.get("serving_ports_none")),
         label="serving-ports", pred=_is_serving_ports_candidate,
     )
-    _check(
-        [refs.get("nginx")] if refs.get("nginx") else [],
-        slot="nginx",
-        filled=bool(selection.get("nginx") or selection.get("stream_conf")
-                    or selection.get("mail_conf")),
-        label="nginx",
-        pred=lambda n: (_is_nginx_candidate(n) or _is_stream_conf_candidate(n)
-                        or _is_mail_conf_candidate(n)),
-    )
+    # C15 — `base_refs.nginx` is a per-category set: one file per category,
+    # each validated against its own candidate predicate. A legacy string is
+    # read as the http category.
+    nginx_refs = refs.get("nginx")
+    if isinstance(nginx_refs, str):
+        nginx_refs = {"http": nginx_refs} if nginx_refs else {}
+    if nginx_refs not in (None, {}):
+        if not isinstance(nginx_refs, dict):
+            raise WorkflowError(
+                "invalid_base_ref",
+                "base_refs.nginx must be a mapping of http/stream/mail to a file",
+            )
+        unknown = sorted(set(nginx_refs) - {"http", "stream", "mail"})
+        if unknown:
+            raise WorkflowError(
+                "invalid_base_ref",
+                "unknown nginx base-ref category: " + ", ".join(unknown),
+            )
+        categories = (
+            ("http", _is_nginx_candidate, "http nginx"),
+            ("stream", _is_stream_conf_candidate, "stream nginx"),
+            ("mail", _is_mail_conf_candidate, "mail nginx"),
+        )
+        for cat, pred, label in categories:
+            name = nginx_refs.get(cat)
+            if not name:
+                continue
+            if not isinstance(name, str):
+                raise WorkflowError(
+                    "invalid_base_ref",
+                    f"base_refs.nginx.{cat} must be a file name",
+                )
+            _check(
+                [name], slot="nginx",
+                filled=bool(selection.get("nginx") or selection.get("stream_conf")
+                            or selection.get("mail_conf")),
+                label=label, pred=pred,
+            )
     _check(
         refs.get("env") or [], slot="env",
         filled=bool(selection.get("env") or selection.get("env_none")),

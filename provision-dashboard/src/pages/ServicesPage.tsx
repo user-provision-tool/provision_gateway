@@ -11,7 +11,9 @@ import {
   GithubOutlined, UploadOutlined, InboxOutlined, FileAddOutlined,
   RobotOutlined, SettingOutlined, CheckOutlined, StopOutlined
 } from '@ant-design/icons'
-import Editor, { DiffEditor } from '@monaco-editor/react'
+import Editor from '@monaco-editor/react'
+import ProjectBrowser from '../components/projects/ProjectBrowser'
+import { addContextFile, useServiceContext } from '../stores/additionalContext'
 import { useAuth } from '../hooks/useAuth'
 import client from '../api/client'
 import GenerateMissingPanel from '../components/services/GenerateMissingPanel'
@@ -594,20 +596,27 @@ function UploadZipForm({ form, recipeForm, addLoading, setAddLoading, onSuccess 
 function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void }) {
   const [searchParams] = useSearchParams()
   const [service, setService] = useState<ServiceInfo | null>(null)
-  const [fileContent, setFileContent] = useState('')
-  const [headContent, setHeadContent] = useState('')
-  const [selectedFile, setSelectedFile] = useState('')
-  const [editing, setEditing] = useState(false)
-  const [saving, setSaving] = useState(false)
-  const [gitModifiedFiles, setGitModifiedFiles] = useState<Set<string>>(new Set())
-  const [gitNewFiles, setGitNewFiles] = useState<Set<string>>(new Set())
   const [selectedRecipe, setSelectedRecipe] = useState('')
-  // Lazy tree: one /tree request per expanded directory (never a full walk)
-  type TreeNode = { name: string; path: string; type: 'file' | 'dir'; is_generated: boolean; is_template: boolean }
-  const [treeNodes, setTreeNodes] = useState<Record<string, TreeNode[]>>({})  // dir-rel-path → children
-  const [loadingDirs, setLoadingDirs] = useState<Set<string>>(new Set())
-  const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set())
-  const openedFileRef = useRef(false)
+  const pageContext = useServiceContext(name)
+
+  // C16 — this page owns the viewport: the shell footer is hidden while it is
+  // mounted, so the Files card can end at the bottom of the browser viewport
+  // (not above the footer) without the page scrolling.
+  useEffect(() => {
+    const footer = document.querySelector('footer.ant-layout-footer') as HTMLElement | null
+    const main = document.querySelector('main.ant-layout-content') as HTMLElement | null
+    if (!footer && !main) return
+    const previousFooter = footer?.style.display ?? ''
+    const previousMainMargin = main?.style.marginBottom ?? ''
+    if (footer) footer.style.display = 'none'
+    // The shell's 24 px bottom margin is the gap before the (hidden) footer;
+    // it would be the last 24 px of page scroll.
+    if (main) main.style.marginBottom = '0px'
+    return () => {
+      if (footer) footer.style.display = previousFooter
+      if (main) main.style.marginBottom = previousMainMargin
+    }
+  }, [])
 
   // Add file modal
   const [addFileOpen, setAddFileOpen] = useState(false)
@@ -617,97 +626,9 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
 
   useEffect(() => {
     client.get(`/projects/${name}`).then(r=>setService(r.data)).catch(()=>message.error('Failed'))
-    refreshGitStatus()
-    loadDir('')
   }, [name])
 
-  // When recipe selection changes, collapse all then expand the recipe path
-  useEffect(() => {
-    if (!selectedRecipe) {
-      setExpandedDirs(new Set())
-      return
-    }
-    const parts = selectedRecipe.split('/')
-    const toExpand = new Set<string>()
-    for (let i = 0; i < parts.length; i++) {
-      const d = parts.slice(0, i + 1).join('/')
-      toExpand.add(d)
-      loadDir(d)
-    }
-    setExpandedDirs(toExpand)
-  }, [selectedRecipe])
-
-  // Auto-load file from URL query param ?file=...
   const fileParam = searchParams.get('file')
-  useEffect(() => {
-    if (!fileParam || !service || openedFileRef.current) return
-    openedFileRef.current = true
-    loadFile(fileParam)
-    // Auto-expand parent directories (loading them from the lazy tree)
-    const parts = fileParam.split('/')
-    const dirsToExpand = new Set<string>()
-    for (let i = 0; i < parts.length - 1; i++) {
-      const d = parts.slice(0, i + 1).join('/')
-      dirsToExpand.add(d)
-      loadDir(d)
-    }
-    if (dirsToExpand.size > 0) {
-      setExpandedDirs(prev => {
-        const next = new Set(prev)
-        dirsToExpand.forEach(d => next.add(d))
-        return next
-      })
-    }
-  }, [fileParam, service])
-
-  const refreshGitStatus = async () => {
-    try {
-      const { data } = await client.get(`/projects/${name}/git/status`)
-      const modified = new Set<string>()
-      const untracked = new Set<string>()
-      for (const m of (data.modified || [])) { modified.add(m.file) }
-      for (const u of (data.untracked || [])) { untracked.add(u.file) }
-      setGitModifiedFiles(modified)
-      setGitNewFiles(untracked)
-    } catch { /* git not available */ }
-  }
-
-  const loadHeadContent = async (file: string): Promise<string> => {
-    try {
-      const { data } = await client.get(`/projects/${name}/git/head-file`, { params: { file } })
-      return (data.content || '').replace(/\r\n/g, '\n')
-    } catch { return '' }
-  }
-
-  const loadFile = async (f: string) => {
-    try {
-      const [{ data: fileData }, headText] = await Promise.all([
-        client.get(`/projects/${name}/files/${f}`),
-        loadHeadContent(f),
-      ])
-      setFileContent((fileData.content || '').replace(/\r\n/g, '\n'))
-      setHeadContent(headText)
-      setSelectedFile(f)
-      setEditing(false)
-    } catch { message.error('Failed to load file') }
-  }
-
-  const saveFile = async () => {
-    setSaving(true)
-    try {
-      await client.put(`/projects/${name}/files/${selectedFile}`, { content: fileContent })
-      message.success('Saved')
-      setHeadContent(fileContent)
-      setEditing(false)
-      await refreshGitStatus()
-    } catch { message.error('Failed') }
-    finally { setSaving(false) }
-  }
-
-  const handleCancel = () => {
-    setEditing(false)
-    loadFile(selectedFile)
-  }
 
   const handleConvert = async () => {
     try {
@@ -733,88 +654,6 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
     finally { setAddFileLoading(false) }
   }
 
-  // Delete file
-  const handleDeleteFile = () => {
-    Modal.confirm({
-      title: 'Delete File',
-      content: `Permanently delete "${selectedFile}"?`,
-      okText: 'Delete', okType: 'danger',
-      onOk: async () => {
-        try {
-          await client.delete(`/projects/${name}/files/${selectedFile}`)
-          message.success(`Deleted ${selectedFile}`)
-          setSelectedFile('')
-          setFileContent('')
-          client.get(`/projects/${name}`).then(r => setService(r.data))
-        } catch (err: any) { message.error(err.response?.data?.detail || 'Failed') }
-      },
-    })
-  }
-
-  const headLoaded = selectedFile && headContent !== undefined
-  const hasDiff = headLoaded && fileContent !== headContent
-
-  // ---- Lazy directory tree (one /tree request per expanded dir) ----
-  const loadDir = async (dir: string) => {
-    setLoadingDirs(prev => { const n = new Set(prev); n.add(dir); return n })
-    try {
-      const { data } = await client.get(`/projects/${name}/tree`, { params: dir ? { dir } : {} })
-      setTreeNodes(prev => ({ ...prev, [dir]: data.children || [] }))
-    } catch (err: any) {
-      message.error(err.response?.data?.detail || 'Failed to load directory')
-    } finally {
-      setLoadingDirs(prev => { const n = new Set(prev); n.delete(dir); return n })
-    }
-  }
-
-  const toggleDir = (node: TreeNode) => {
-    setExpandedDirs(prev => {
-      const next = new Set(prev)
-      if (next.has(node.path)) next.delete(node.path)
-      else next.add(node.path)
-      return next
-    })
-    if (!treeNodes[node.path]) loadDir(node.path)
-  }
-
-  const renderDirChildren = (dir: string, depth: number): React.ReactNode => {
-    const nodes = treeNodes[dir] || []
-    return <div key={dir || '__root__'}>
-      {nodes.map(n => {
-        const fullPath = n.path
-        const isSelected = selectedFile === fullPath
-        const isNew = gitNewFiles.has(fullPath) && !gitModifiedFiles.has(fullPath)
-        const isModified = gitModifiedFiles.has(fullPath)
-        const isGenerated = n.is_generated
-        const statusColor = isSelected ? '#e6f4ff' : isGenerated ? '#f6ffed' : isNew ? '#f6ffed' : isModified ? '#fff7e6' : 'transparent'
-        if (n.type === 'dir') {
-          const expanded = expandedDirs.has(fullPath)
-          return <div key={fullPath}>
-            <div onClick={() => toggleDir(n)}
-              style={{padding:'6px 12px',cursor:'pointer',borderRadius:4,background:statusColor,marginBottom:2,fontFamily:'monospace',fontSize:13,display:'flex',alignItems:'center',gap:6,paddingLeft:12+depth*16}}
-            >
-              <span>{expanded ? '📂' : '📁'}</span>
-              <span style={{fontWeight:'bold'}}>{n.name}/</span>
-              {isNew && <Tag color="green" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>N</Tag>}
-              {isModified && <Tag color="orange" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>M</Tag>}
-            </div>
-            {expanded && renderDirChildren(fullPath, depth + 1)}
-          </div>
-        }
-        return <div key={fullPath} onClick={() => loadFile(fullPath)}
-          style={{padding:'6px 12px',cursor:'pointer',borderRadius:4,background:statusColor,marginBottom:2,fontFamily:'monospace',fontSize:13,display:'flex',alignItems:'center',gap:6,paddingLeft:12+depth*16}}
-        >
-          <span>{isGenerated?'✨':isNew?'●':'📄'}</span>
-          <span style={{color:isGenerated?'#52c41a':isNew?'#52c41a':isModified?'#faad14':undefined,fontWeight:isGenerated||isNew?'bold':undefined}}>{n.name}</span>
-          {isGenerated && <Tag color="green" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>gen</Tag>}
-          {isNew && <Tag color="green" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>N</Tag>}
-          {isModified && !isNew && <Tag color="orange" style={{fontSize:10,lineHeight:'16px',marginLeft:'auto'}}>M</Tag>}
-        </div>
-      })}
-      {loadingDirs.has(dir) && <div style={{padding:'8px 12px'}}><Spin size="small"/></div>}
-    </div>
-  }
-
   if (!service) return <Spin/>
 
   // Compute per-recipe status from files
@@ -824,8 +663,10 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
   const hasTemplate = hasComposeTemplate || hasNginxTemplate
 
   return (
-    <div>
-      <Button onClick={onBack} style={{marginBottom:16}}>← Back to Source Projects</Button>
+    // C16 — fill the shell without scrolling: header 64 + its 24 gap are the
+    // only chrome above this page (the footer is hidden while it is mounted).
+    <div style={{display:'flex', flexDirection:'column', height:'calc(100vh - 88px)', minHeight:0}}>
+      <Button onClick={onBack} style={{marginBottom:16, alignSelf:'flex-start'}}>← Back to Source Projects</Button>
       <Title level={3}>{name}</Title>
       <Card style={{marginBottom:16}}>
         <Space direction="vertical"><div><strong>Path:</strong> {service.path}</div>
@@ -843,74 +684,17 @@ function ServiceDetailPage({ name, onBack }: { name: string; onBack: () => void 
           {hasTemplate && <Button size="small" onClick={handleConvert}>Re-Convert</Button>}
         </div></Space>
       </Card>
-      <Card title={<Space>Files <Button size="small" icon={<FileAddOutlined/>} onClick={() => setAddFileOpen(true)}>Add File</Button></Space>}>
-        <div style={{display:'flex',gap:16}}>
-          <div style={{width:280,borderRight:'1px solid #f0f0f0',paddingRight:16,overflow:'auto',maxHeight:'calc(100vh - 300px)'}}>
-            <div style={{marginBottom:8,display:'flex',gap:8,alignItems:'center'}}>
-              <Tag color="green">N</Tag><Text type="secondary" style={{fontSize:11}}>new</Text>
-              <Tag color="orange">M</Tag><Text type="secondary" style={{fontSize:11}}>modified</Text>
-            </div>
-            {renderDirChildren('', 0)}
-          </div>
-          <div style={{flex:1}}>
-            {selectedFile ? <div>
-              <div style={{marginBottom:8,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-                <Space>
-                  <strong>{selectedFile}</strong>
-                  {hasDiff && !editing && <Tag color="orange">Modified</Tag>}
-                </Space>
-                <Space>
-                  {editing ? <>
-                    <Button onClick={handleCancel}>Cancel</Button>
-                    <Button type="primary" onClick={saveFile} loading={saving}>Save</Button>
-                  </> : <>
-                    <Button onClick={()=>setEditing(true)}>Edit</Button>
-                    <Button danger icon={<DeleteOutlined/>} onClick={handleDeleteFile}>Delete</Button>
-                  </>}
-                </Space>
-              </div>
-              {editing ? (
-                <Editor
-                  height="500px"
-                  width="100%"
-                  defaultLanguage="yaml"
-                  value={fileContent}
-                  onChange={(v)=>setFileContent((v||'').replace(/\r\n/g, '\n'))}
-                  theme="vs-dark"
-                  options={{ minimap:{enabled:false}, fontSize:13, lineNumbers:'on', glyphMargin:true, automaticLayout:true, scrollBeyondLastLine:false, wordWrap:'on' }}
-                />
-              ) : hasDiff ? (
-                <DiffEditor
-                  height="500px"
-                  width="100%"
-                  language="yaml"
-                  original={headContent}
-                  modified={fileContent}
-                  theme="vs-dark"
-                  options={{
-                    minimap: { enabled: false },
-                    fontSize: 13,
-                    lineNumbers: 'on',
-                    automaticLayout: true,
-                    scrollBeyondLastLine: false,
-                    wordWrap: 'on',
-                    readOnly: true,
-                    renderSideBySide: false,
-                  }}
-                />
-              ) : (
-                <Editor
-                  height="500px"
-                  width="100%"
-                  defaultLanguage="yaml"
-                  value={fileContent}
-                  theme="vs-dark"
-                  options={{ minimap:{enabled:false}, fontSize:13, lineNumbers:'on', readOnly:true, automaticLayout:true, scrollBeyondLastLine:false, wordWrap:'on' }}
-                />
-              )}
-            </div> : <Empty description="Select a file"/>}
-          </div>
-        </div>
+      <Card
+        title={<Space>Files <Button size="small" icon={<FileAddOutlined/>} onClick={() => setAddFileOpen(true)}>Add File</Button></Space>}
+        style={{flex:1, minHeight:0, display:'flex', flexDirection:'column'}}
+        styles={{ body: { flex:1, minHeight:0, padding:16 } }}
+      >
+        <ProjectBrowser
+          serviceName={name}
+          initialFile={fileParam || undefined}
+          onAddToContext={(path) => addContextFile(name, path)}
+          contextFiles={pageContext.files}
+        />
       </Card>
 
       {/* Add File Modal */}

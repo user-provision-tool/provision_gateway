@@ -254,6 +254,40 @@ def test_a_variable_only_in_a_reference_is_not_copied(tmp_path):
     assert "TEMPLATE=1" in text
 
 
+def test_an_internal_service_target_is_demoted_and_wins_over_a_selected_dependency():
+    """C22 — same-compose services are internal; never dependencies."""
+    artifact = {"version": 1, "fingerprint": {}, "variables": {
+        "NEO4J_URI": {"category": "dependency",
+                      "source": {"kind": "dependency_target", "target": "neo4j"},
+                      "reason": "looks like a dependency"},
+        "OTHER": {"category": "dependency",
+                  "source": {"kind": "dependency_target", "target": "graphiti-local"}},
+    }}
+    fixed, rewrites = ec.enforce_internal_targets(
+        artifact, {"neo4j"}, {"NEO4J_URI": "http://neo4j:7687", "OTHER": "x"})
+    assert rewrites == [{"variable": "NEO4J_URI", "target": "neo4j"}]
+    assert fixed["variables"]["NEO4J_URI"]["category"] == "defaulted"
+    assert fixed["variables"]["NEO4J_URI"]["value"] == "http://neo4j:7687"
+    assert fixed["variables"]["NEO4J_URI"]["source"] == {"kind": "file"}
+    assert fixed["dependencies"] == {"graphiti-local": ["OTHER"]}
+    # A selected dependency with the same name does not override the internal
+    # match: the caller passes only the compose services here.
+    assert ec.internal_target_violations(fixed, {"neo4j"}) == []
+    assert ec.internal_target_violations(artifact, {"neo4j"}) == [
+        {"variable": "NEO4J_URI", "target": "neo4j"}]
+
+
+def test_an_empty_internal_service_value_becomes_required():
+    artifact = {"version": 1, "fingerprint": {}, "variables": {
+        "NEO4J_URI": {"category": "dependency",
+                      "source": {"kind": "dependency_target", "target": "neo4j"}},
+    }}
+    fixed, _ = ec.enforce_internal_targets(artifact, {"neo4j"}, {})
+    assert fixed["variables"]["NEO4J_URI"]["category"] == "required"
+    assert "value" not in fixed["variables"]["NEO4J_URI"]
+    assert fixed["dependencies"] == {}
+
+
 def test_the_classification_snapshot_copies_the_used_variant_with_a_marker(tmp_path):
     fingerprint = {"compose": [], "profiles": [], "env_bases": []}
     source = ec.write_artifact(
