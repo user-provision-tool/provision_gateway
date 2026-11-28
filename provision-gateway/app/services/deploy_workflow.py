@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -569,6 +571,46 @@ def _api_payload(intent: dict, selection: dict, env_name: str | None) -> dict:
     return payload
 
 
+def _ensure_env_raw(intent: dict, selection: dict) -> str | None:
+    """R7.2 — the deploy always sends a per-user `.env.raw`, never a recipe file.
+
+    When the env build produced one, ``env_name`` already names it. When the
+    operator selected an existing env file and nothing needed tuning, the
+    selected content is copied into the raw here; the payload then has the
+    same one-path shape as a generated env.
+    """
+    if selection.get("env_none"):
+        return None
+    names = [n for n in (selection.get("env") or []) if isinstance(n, str)]
+    if not names:
+        return None
+    service = intent.get("service_name") or ""
+    user = str(intent.get("user_name") or intent.get("owner_username") or "user")
+    label = str(intent.get("label") or "0")
+    try:
+        rdir = _recipe_dir(service, intent.get("recipe_path") or "")
+    except Exception:  # noqa: BLE001
+        return None
+    parts: list[str] = []
+    for name in names:
+        path = rdir / name.rsplit("/", 1)[-1]
+        if path.is_file():
+            parts.append(path.read_text(encoding="utf-8", errors="replace").rstrip("\n"))
+    if not parts:
+        return None
+    text = "\n".join(parts) + "\n"
+    raw_name = f".env.raw.{user}.{label}"
+    from .generated_marker import write_marker_pair
+    try:
+        write_marker_pair(rdir / raw_name, text, cls="ins",
+                          description=f"per-user env raw ({raw_name})",
+                          validation="selected env, no tuning")
+    except Exception:  # noqa: BLE001 — a copy failure never blocks the deploy
+        _log.exception("env raw write failed for %s/%s", service, label)
+        return None
+    return raw_name
+
+
 def _validate_env_selection(intent: dict, selection: dict) -> None:
     """R26–R28 — validate the classification/relation selections at intake.
 
@@ -713,8 +755,147 @@ def _validate_env_selection(intent: dict, selection: dict) -> None:
     intent["relations"] = out
 
 
+DEPLOY_RECORD_VERSION = 1
+
+
+def deploy_record_filename(user: str, label: str) -> str:
+    return f"deploy.user-{user}.{label}.json"
+
+
+def write_deploy_record(recipe_dir: Path, user: str, label: str,
+                        copies: list[dict]) -> Path:
+    """R11.6 — one gateway-private record naming this deployment's copies."""
+    import json
+    path = Path(recipe_dir) / deploy_record_filename(user, str(label))
+    payload = {
+        "version": DEPLOY_RECORD_VERSION,
+        "deployed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "copies": copies or [],
+    }
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def read_deploy_record(recipe_dir: Path, user: str, label: str) -> dict | None:
+    import json
+    path = Path(recipe_dir) / deploy_record_filename(user, str(label))
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _fix_copy_name(name: str, user: str, label: str, job: str) -> str | None:
+    """`<stem>.fix.<job>.<ext>` -> `<stem>.fix.user-<u>.<l>.<ext>` (R11.3)."""
+    token = f".fix.{job}"
+    if job and token in name:
+        return name.replace(token, f".fix.user-{user}.{label}", 1)
+    return None
+
+
+_FIX_TOKEN_RE = re.compile(r"\.fix\.([^.]+)(?:\.|$)")
+
+
+def _selection_fix_job(recipe_dir: Path, selection: dict) -> str | None:
+    """The fix run a reviewed selection belongs to, when no job record exists.
+
+    The reviewed deploy's selection names the `.fix.<job>` files the run
+    produced. When the deploy carries no ``env_meta.job_id`` (a direct deploy
+    of a reviewed fix), the NEWEST selected fix file's token is that run.
+    """
+    newest: tuple[float, str] | None = None
+    names: list[str] = []
+    for key in ("compose", "env"):
+        names.extend(p for p in (selection.get(key) or []) if isinstance(p, str))
+    for key in ("nginx", "stream_conf", "mail_conf", "serving_ports"):
+        if isinstance(selection.get(key), str):
+            names.append(selection[key])
+    for name in names:
+        base = name.rsplit("/", 1)[-1]
+        match = _FIX_TOKEN_RE.search(base)
+        if not match:
+            continue
+        path = Path(recipe_dir) / base
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if newest is None or mtime > newest[0]:
+            newest = (mtime, match.group(1))
+    return newest[1] if newest else None
+
+
+def copy_run_fixes(recipe_dir: Path, selection: dict, user: str, label: str,
+                   job: str | None) -> list[dict]:
+    """Copy only the CURRENT run's `.fix` files to per-instance `ins` copies."""
+    if not job:
+        return []
+    from .generated_marker import write_marker_pair
+    names: list[str] = []
+    for key in ("compose", "env"):
+        names.extend(p for p in (selection.get(key) or []) if isinstance(p, str))
+    for key in ("nginx", "stream_conf", "mail_conf", "serving_ports"):
+        if isinstance(selection.get(key), str):
+            names.append(selection[key])
+    out: list[dict] = []
+    for name in dict.fromkeys(names):
+        dest_name = _fix_copy_name(name.rsplit("/", 1)[-1], user, label, str(job))
+        if not dest_name:
+            continue
+        src = Path(recipe_dir) / name.rsplit("/", 1)[-1]
+        if not src.is_file():
+            continue
+        try:
+            write_marker_pair(
+                Path(recipe_dir) / dest_name,
+                src.read_text(encoding="utf-8", errors="replace"),
+                cls="ins",
+                description=f"fix copy for this deploy ({dest_name})",
+                job=job, source=src.name)
+        except Exception:  # noqa: BLE001 — a copy never blocks the deploy
+            _log.exception("fix copy failed for %s", src.name)
+            continue
+        out.append({"kind": "fix", "path": dest_name})
+    return out
+
+
+def teardown_deploy_copies(entry: dict) -> int:
+    """R11.6 — delete a deployment's copies and its record (explicit teardown)."""
+    from .generated_marker import remove_pair
+    service = str(entry.get("service_name") or "")
+    user = str(entry.get("user_name") or "")
+    label = str(entry.get("label") or "")
+    if not service or not user:
+        return 0
+    try:
+        rdir = _recipe_dir(service, entry.get("recipe_path") or "")
+    except Exception:  # noqa: BLE001
+        return 0
+    record = read_deploy_record(rdir, user, label)
+    removed = 0
+    for copy in (record or {}).get("copies") or []:
+        if not isinstance(copy, dict) or not isinstance(copy.get("path"), str):
+            continue
+        path = rdir / copy["path"].rsplit("/", 1)[-1]
+        try:
+            remove_pair(path)
+            removed += 1
+        except OSError:
+            pass
+    try:
+        (rdir / deploy_record_filename(user, label)).unlink(missing_ok=True)
+    except OSError:
+        pass
+    return removed
+
+
 def _snapshot_rows(entry: dict) -> dict:
-    """T10 — the card's snapshot rows: exact names, only when the file exists."""
+    """R11.2/R11.3 — the card's rows read the deployment record, never existence."""
     service = str(entry.get("service_name") or "")
     user = str(entry.get("user_name") or "")
     label = str(entry.get("label") or "")
@@ -725,25 +906,30 @@ def _snapshot_rows(entry: dict) -> dict:
     except Exception:  # noqa: BLE001
         return {}
     out: dict[str, Any] = {}
-    sp_name = serving_ports_snapshot_name(user, label)
-    if (recipe_dir / sp_name).is_file():
-        out["serving_ports_snapshot"] = sp_name
-    # R22 — the card's `Env classification:` row, only when the snapshot exists.
-    from .env_classification import classification_snapshot_name
-    env_name = classification_snapshot_name(user, label)
-    if (recipe_dir / env_name).is_file():
-        out["env_classification_snapshot"] = env_name
+    record = read_deploy_record(recipe_dir, user, label)
+    copies = (record or {}).get("copies") or []
     deps: list[dict] = []
-    if entry.get("service_id"):
-        for target_entry in _dependency_entries(str(entry["service_id"])):
-            target = str(target_entry.get("service_name") or "")
-            if not target:
-                continue
-            name = relation_snapshot_filename(service, target, user, label)
-            if (recipe_dir / name).is_file():
-                deps.append({"target_service": target, "path": name})
+    fixes: list[str] = []
+    for copy in copies:
+        if not isinstance(copy, dict):
+            continue
+        path = copy.get("path")
+        kind = copy.get("kind")
+        if not isinstance(path, str) or not path:
+            continue
+        if kind == "serving_ports":
+            out["serving_ports_snapshot"] = path
+        elif kind == "env_classification":
+            out["env_classification_snapshot"] = path
+        elif kind == "dependency":
+            deps.append({"target_service": copy.get("target_service") or "",
+                         "path": path})
+        elif kind == "fix":
+            fixes.append(path)
     if deps:
         out["dependency_snapshots"] = deps
+    if fixes:
+        out["fix_copies"] = fixes
     return out
 
 
@@ -762,33 +948,55 @@ def _env_meta_for_substitution(intent: dict) -> dict:
 
 def _snapshot_for_deploy(intent: dict, selection: dict, label: str,
                          env_meta: dict | None = None) -> None:
-    """C12 — copy exactly what the env build read or wrote.
+    """C12/R11 — copy exactly what the env build used, then record the copies.
 
     Serving ports keep their independent rule. The classification and the
     relations are copied only when the env build touched them: a selected env
     with no dependencies takes no relationship snapshot, and a mechanical env
-    (no LLM) takes no classification snapshot.
+    (no LLM) takes no classification snapshot. The current run's ``.fix`` files
+    are copied by their job token. The record is written even when there are no
+    copies, so the card never falls back to an older deployment's file.
     """
     service = intent.get("service_name") or ""
     user = str(intent.get("user_name") or intent.get("owner_username") or "user")
     try:
         recipe_dir = _recipe_dir(service, intent.get("recipe_path") or "")
-        sp = None if selection.get("serving_ports_none") else selection.get("serving_ports")
-        meta = env_meta if isinstance(env_meta, dict) else _env_meta_for_substitution(intent)
-        targets = sorted(t for t, status in (meta.get("relations") or {}).items()
-                         if status in ("read", "written"))
-        classification_used = bool(
-            meta.get("classification_read") or meta.get("classification_written"))
-        snapshot_used_artifacts(
+    except Exception:  # noqa: BLE001 — a snapshot failure never blocks the deploy
+        _log.exception("dependency snapshot dir failed for %s/%s", service, label)
+        return
+    sp = None if selection.get("serving_ports_none") else selection.get("serving_ports")
+    meta = env_meta if isinstance(env_meta, dict) else _env_meta_for_substitution(intent)
+    targets = sorted(t for t, status in (meta.get("relations") or {}).items()
+                     if status in ("read", "written"))
+    classification_used = bool(
+        meta.get("classification_read") or meta.get("classification_written"))
+    copies: list[dict] = []
+    try:
+        snap = snapshot_used_artifacts(
             recipe_dir, source_service=service, user=user, label=str(label),
             serving_ports=sp if isinstance(sp, str) else None,
             target_services=targets,
             include_classification=classification_used,
             relation_variants=meta.get("relation_variants") or {},
             classification_name=meta.get("classification_name"),
-        )
-    except Exception:  # noqa: BLE001 — a snapshot failure never blocks the deploy
-        _log.exception("dependency snapshot failed for %s/%s", service, label)
+        ) or {}
+        if snap.get("serving_ports"):
+            copies.append({"kind": "serving_ports",
+                           "path": snap["serving_ports"]})
+        if snap.get("env_classification"):
+            copies.append({"kind": "env_classification",
+                           "path": snap["env_classification"]})
+        for dep in snap.get("dependencies") or []:
+            copies.append({"kind": "dependency", "path": dep.get("path"),
+                           "target_service": dep.get("target_service")})
+        job = str(meta.get("job_id") or "") or _selection_fix_job(recipe_dir, selection)
+        copies.extend(copy_run_fixes(recipe_dir, selection, user, str(label), job))
+    except Exception:  # noqa: BLE001 — the card degrades, the deploy does not
+        _log.exception("deployment copies failed for %s/%s", service, label)
+    try:
+        write_deploy_record(recipe_dir, user, str(label), copies)
+    except OSError:
+        _log.exception("deployment record write failed for %s/%s", service, label)
 
 
 def _record_deploy_intent(intent: dict) -> tuple[dict, dict]:
@@ -1261,6 +1469,12 @@ async def _claim_and_register(service_id: str, intent: dict,
     # writes the injected `.env.raw` from the classification (or the selected
     # env is sent as-is under `cls None`). `env_name` is that handoff when one
     # was built.
+
+    # R7.2 — the deploy always sends the per-user raw. A selected env with
+    # nothing to tune is copied into it here (the env build already wrote one
+    # when it ran).
+    if not env_name:
+        env_name = _ensure_env_raw(resolved, selection)
 
     # C12 — snapshot exactly what the env build used or wrote: the artefact
     # iff read/written, each relation iff read/written, and the serving-ports

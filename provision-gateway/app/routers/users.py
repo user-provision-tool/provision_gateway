@@ -378,7 +378,15 @@ async def _lifecycle(service_id: str, action: str, req: dict | None = None,
                      current_admin: dict | None = None) -> dict:
     try:
         if action == "remove":
+            from ..services.registry import Registry
+            entry = Registry().get_by_id(service_id)
             result = await provision_service.remove_instance(service_id, "service")
+            if entry is not None:
+                try:
+                    from ..services.deploy_workflow import teardown_deploy_copies
+                    teardown_deploy_copies(entry)
+                except Exception:  # noqa: BLE001
+                    _log.exception("deployment copies teardown failed for %s", service_id)
         elif action == "rebuild":
             req = dict(req or {})
             if req.pop("use_global_proxy", False):
@@ -446,6 +454,13 @@ async def delete_instance(service_id: str, scope: str = Query("service", pattern
         result = await provision_service.remove_instance(service_id, scope)
     except Exception as e:  # noqa: BLE001
         raise provision_service.as_http_error(e)
+    # R11.6 — the deployment's per-instance copies and its record go with the
+    # per-user files the -api removed. An explicit recorded deletion.
+    try:
+        from ..services.deploy_workflow import teardown_deploy_copies
+        teardown_deploy_copies(entry)
+    except Exception:  # noqa: BLE001 — teardown metadata never blocks the delete
+        _log.exception("deployment copies teardown failed for %s", service_id)
     if scope == "service":
         _revoke_exposures(service_id, current_admin)
         from ..services import pre_deploy_registry as pdr
@@ -807,14 +822,16 @@ async def _clone_user_impl(source_user: str, target_user: str, req: dict) -> dic
         path = _artifact_path(source_svc, target_user)
         if path is None:
             continue
-        path.write_text(_json.dumps({
+        content = _json.dumps({
             "version": 1,
             "generated_at": __import__("datetime").datetime.now(
                 __import__("datetime").timezone.utc).isoformat().replace("+00:00", "Z"),
             "source": new_key,
             "services": new_services,
-        }, indent=2) + "\n")
-        Path(str(path) + ".generated").write_text("")
+        }, indent=2) + "\n"
+        from ..services.generated_marker import write_marker_pair
+        write_marker_pair(path, content, cls="ins",
+                          description=f"cloned per-user dependency artifact ({path.name})")
     return {"tasks": tasks, "total": len(tasks)}
 
 

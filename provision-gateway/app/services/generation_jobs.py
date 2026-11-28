@@ -171,7 +171,9 @@ PHASE_FILENAME = {
     # into the per-instance `*.stream.conf`. No user/label in the name, because
     # the file is the recipe's, not the deployment's.
     "stream_conf": "nginx.stream.base.{token}.conf",
-    "env": ".env",
+    # R11.5 — the env shape joins the generated family and carries the job
+    # token: `.env.base.<job>`. The per-user `.env.raw` stays token-free.
+    "env": ".env.base.{token}",
 }
 
 # The GUIDED RESTART's names, next to the original they correct, with the `.fix`
@@ -192,8 +194,36 @@ FIX_FILENAME = {
     "serving_ports": "serving_ports.fix.{token}.yml",
     "nginx": "nginx.fix.{token}.conf",
     "stream_conf": "nginx.stream.fix.{token}.conf",
-    "env": ".env.fix",
+    # R11.5 — the fix shape carries the job token too: `.env.fix.<job>`.
+    "env": ".env.fix.{token}",
 }
+
+
+def _artifact_class(name: str, *, fix: bool = False) -> str:
+    """`fix` for a `.fix` family name, otherwise `base` (R2.1)."""
+    return "fix" if fix or ".fix." in name or name.endswith(".fix") else "base"
+
+
+def _env_class(name: str) -> str:
+    """The class of an env-family output: base shape, fix shape, or ins raw."""
+    if ".env.base" in name:
+        return "base"
+    if ".env.fix" in name:
+        return "fix"
+    return "ins"
+
+
+def _write_generated_file(rdir, name: str, content: str, *, cls: str,
+                          description: str, job=None, generator: str = "llm",
+                          fingerprint: dict | None = None,
+                          validation: str | None = None,
+                          guide: str | None = None):
+    """Write one artifact + its validated marker as a pair (R1.4)."""
+    from .generated_marker import write_marker_pair
+    return write_marker_pair(
+        Path(rdir) / name, content, cls=cls, description=description, job=job,
+        generator=generator, fingerprint=fingerprint, validation=validation,
+        guide=guide)
 
 
 def _phase_names(job_id: int, *, fix: bool) -> dict[str, str]:
@@ -202,7 +232,7 @@ def _phase_names(job_id: int, *, fix: bool) -> dict[str, str]:
 
     One place resolves the token, so the writer, the progress lines and the
     "did I produce this file?" test in the validate phase cannot disagree about
-    a name. `env` has no slot and passes through untouched.
+    a name. The env shape carries the token as well (R11.5).
     """
     family = FIX_FILENAME if fix else PHASE_FILENAME
     return {phase: name.format(token=job_id) for phase, name in family.items()}
@@ -1723,7 +1753,8 @@ class GenerationJobManager:
                     # never exist — seen live in T12, whose progress read
                     # `.env.fix: running` while it wrote `.env.raw.alice.1`.
                     if not _recipe_level_env:
-                        _names = {**_names, "env": PHASE_FILENAME["env"]}
+                        _names = {**_names,
+                                  "env": PHASE_FILENAME["env"].format(token=job_id)}
 
                     for idx, phase in enumerate(phases):
                         self._check_cancelled(job_id)
@@ -1995,9 +2026,13 @@ class GenerationJobManager:
                             )
                             _rd = self._recipe_dir_for(service_name, recipe_path)
                             _rd.mkdir(parents=True, exist_ok=True)
-                            _name = _re.get("env_name") or ".env"
-                            (_rd / _name).write_text(_content, encoding="utf-8")
-                            (_rd / f"{_name}.generated").write_text("")
+                            _name = _re.get("env_name") or _names["env"]
+                            _write_generated_file(
+                                _rd, _name, _content, cls=_env_class(_name),
+                                description=f"env build output ({_name})",
+                                job=job_id,
+                                validation=("valid" if validations[phase].get("valid")
+                                            else "invalid"))
                             result_files[_name] = _content
                             env_name = _name
                             env_meta = dict(_re.get("env_meta") or env_meta)
@@ -2080,10 +2115,13 @@ class GenerationJobManager:
                                     errs = validations[phase].get("errors") or []
                                     raise GenerationJobError(
                                         f"phase 'env' produced no valid output: {'; '.join(errs)}")
-                                env_name = ".env.fix"
-                                fpath = recipe_dir / env_name
-                                fpath.write_text(content, encoding="utf-8")
-                                (recipe_dir / f"{fpath.name}.generated").write_text("")
+                                env_name = _names["env"]  # .env.fix.<job> (R11.5)
+                                _write_generated_file(
+                                    recipe_dir, env_name, content, cls="fix",
+                                    description=f"env fix shape ({env_name})",
+                                    job=job_id,
+                                    validation=("valid" if validations[phase].get("valid")
+                                                else "invalid"))
                                 result_files[env_name] = content
                                 await _event(env_name, "done", {
                                     "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
@@ -2105,6 +2143,24 @@ class GenerationJobManager:
 
                             template_names, reference_names, template_text = _env_template_inputs(
                                 recipe_dir, request)
+
+                            # R7.1 — the SHAPE first: every variable with a
+                            # default or empty value, recipe-level, job-token
+                            # named. The values are tuned into the per-user raw
+                            # below; the shape itself is never sent.
+                            if not request.get("classify_only"):
+                                _shape = _ec.apply_compose_defaults(
+                                    template_text, defaults)
+                                _shape_present = _ec.parse_env_text(_shape)
+                                _shape = _ec.apply_env_values(
+                                    _shape,
+                                    {n: "" for n in required
+                                     if n not in _shape_present})
+                                _shape_name = _names["env"]
+                                _write_generated_file(
+                                    recipe_dir, _shape_name, _shape, cls="base",
+                                    description=f"env base shape ({_shape_name})",
+                                    job=job_id)
 
                             # Serving-URL contract: the -api reports the
                             # hostname this instance will be served on.
@@ -2258,29 +2314,29 @@ class GenerationJobManager:
                                     "demoted: "
                                     + ", ".join(f"{v['variable']}->{v['target']}"
                                                 for v in rewrites))
-                                _name = _ec.variant_filename(_fingerprint)
-                                _ec.write_artifact(
+                                _path = _ec.write_artifact(
                                     recipe_dir, source_service=service_name,
                                     recipe_path=recipe_path,
                                     fingerprint=_fingerprint,
                                     variables=fixed["variables"],
                                     dependencies=fixed.get("dependencies") or {},
+                                    job=job_id,
                                 )
                                 env_meta["classification_written"] = True
-                                return (_ec.read_variant(recipe_dir, _name) or fixed)
+                                return (_ec.read_variant(recipe_dir, _path.name) or fixed)
 
                             def _write_classification(cls: dict) -> dict:
-                                _ec.write_artifact(
+                                _path = _ec.write_artifact(
                                     recipe_dir, source_service=service_name,
                                     recipe_path=recipe_path,
                                     fingerprint=_fingerprint,
                                     variables=cls["variables"],
                                     dependencies=cls["dependencies"],
+                                    job=job_id,
                                 )
                                 env_meta["classification_written"] = True
-                                return (_ec.read_variant(
-                                    recipe_dir, _ec.variant_filename(_fingerprint))
-                                    or cls)
+                                return (_ec.read_variant(recipe_dir, _path.name)
+                                        or cls)
 
                             def _classification_red(data: dict | None) -> bool:
                                 if data is None:
@@ -2304,19 +2360,21 @@ class GenerationJobManager:
                                 if not _gen.get("classification"):
                                     return None
                                 _values.update(_gen.get("values") or {})
-                                _name = _ec.variant_filename(_fingerprint)
+                                _name = _ec.variant_filename(_fingerprint, job=job_id)
                                 data = _ec.read_variant(recipe_dir, _name)
                                 if data is not None:
                                     filled = ensure_classification_coverage(
                                         data, _env_keys, _base_values)
                                     if filled is not data:
-                                        _ec.write_artifact(
+                                        _path = _ec.write_artifact(
                                             recipe_dir, source_service=service_name,
                                             recipe_path=recipe_path,
                                             fingerprint=_fingerprint,
                                             variables=filled["variables"],
                                             dependencies=filled.get("dependencies") or {},
+                                            job=job_id,
                                         )
+                                        _name = _path.name
                                         data = _ec.read_variant(recipe_dir, _name)
                                 return _apply_internal_rule(data)
 
@@ -2325,7 +2383,8 @@ class GenerationJobManager:
                             elif _cls_mode == CLASSIFICATION_GENERATE_NEW:
                                 if _llm_on:
                                     _artifact = await _classify()
-                                    _variant_name = (_ec.variant_filename(_fingerprint)
+                                    _variant_name = (_ec.variant_filename(
+                                        _fingerprint, job=job_id)
                                                      if _artifact else None)
                                 else:
                                     warnings.append(
@@ -2343,7 +2402,8 @@ class GenerationJobManager:
                                             f"classification {_variant_name} is not valid for "
                                             "this env — regenerating it over the selected env's keys")
                                         _artifact = await _classify()
-                                        _variant_name = (_ec.variant_filename(_fingerprint)
+                                        _variant_name = (_ec.variant_filename(
+                                            _fingerprint, job=job_id)
                                                          if _artifact else None)
                                     else:
                                         _viol_off = ([] if _classify_only else
@@ -2415,7 +2475,8 @@ class GenerationJobManager:
                                     if _mode == CLASSIFICATION_GENERATE_NEW:
                                         _name = _write_relation(
                                             recipe_dir, service_name, _t,
-                                            {v: _t for v in _expected}, _fingerprint).name
+                                            {v: _t for v in _expected}, _fingerprint,
+                                            job=job_id).name
                                         env_meta["relations"][_t] = "written"
                                     else:
                                         _name = _mode
@@ -2429,7 +2490,7 @@ class GenerationJobManager:
                                             _name = _write_relation(
                                                 recipe_dir, service_name, _t,
                                                 {v: _t for v in _expected},
-                                                _fingerprint).name
+                                                _fingerprint, job=job_id).name
                                             env_meta["relations"][_t] = "written"
                                         else:
                                             env_meta["relations"][_t] = "read"
@@ -2462,10 +2523,21 @@ class GenerationJobManager:
                             # no injection, no `.env.raw`, nothing substituted.
                             if _artifact is None and _selected_env \
                                     and _cls_mode == CLASSIFICATION_NONE:
-                                await _event("env", "done", {
+                                # R7.2 — the per-user raw is ALWAYS written;
+                                # with nothing to tune it is the shape/selected
+                                # content copied into the raw, and the deploy
+                                # sends that `ins` file.
+                                env_name = f".env.raw.{_uname}.{_ulabel}"
+                                _write_generated_file(
+                                    recipe_dir, env_name, template_text, cls="ins",
+                                    description=f"per-user env raw ({env_name})",
+                                    job=job_id,
+                                    validation="selected env, no tuning")
+                                result_files[env_name] = template_text
+                                await _event(env_name, "done", {
                                     "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
                                     "step": f"{phase}#final",
-                                    "skipped": "selected env sent as-is (cls None)",
+                                    "skipped": "selected env copied to the raw (cls None)",
                                 })
                                 continue
 
@@ -2538,11 +2610,19 @@ class GenerationJobManager:
                                     _env_profiles)
                             elif _selected_env:
                                 # `generate new` with no LLM: the selected env
-                                # is the handoff, as-is (M-A18).
-                                await _event("env", "done", {
+                                # is copied into the per-user raw (R7.2); the
+                                # raw is what the deploy sends.
+                                env_name = f".env.raw.{_uname}.{_ulabel}"
+                                _write_generated_file(
+                                    recipe_dir, env_name, template_text, cls="ins",
+                                    description=f"per-user env raw ({env_name})",
+                                    job=job_id,
+                                    validation="selected env, no LLM")
+                                result_files[env_name] = template_text
+                                await _event(env_name, "done", {
                                     "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
                                     "step": f"{phase}#final",
-                                    "skipped": "selected env sent as-is (no LLM)",
+                                    "skipped": "selected env copied to the raw (no LLM)",
                                 })
                                 continue
                             else:
@@ -2555,13 +2635,16 @@ class GenerationJobManager:
                                     _env_profiles)
 
                             env_name = (
-                                ".env.fix" if _recipe_level_env
+                                _names["env"] if _recipe_level_env
                                 else f".env.raw.{_uname}.{_ulabel}"
                             )
                             if validations[phase].get("valid"):
-                                fpath = recipe_dir / env_name
-                                fpath.write_text(content, encoding="utf-8")
-                                (recipe_dir / f"{fpath.name}.generated").write_text("")
+                                _write_generated_file(
+                                    recipe_dir, env_name, content,
+                                    cls=_env_class(env_name),
+                                    description=f"env build output ({env_name})",
+                                    job=job_id,
+                                    validation="valid")
                                 result_files[env_name] = content
                                 await _event(env_name, "done", {
                                     "purpose": f"phase {idx + 1}/{len(phases)}: {phase}",
@@ -2882,9 +2965,11 @@ class GenerationJobManager:
                             try:
                                 _rd = self._recipe_dir_for(service_name, recipe_path)
                                 _rd.mkdir(parents=True, exist_ok=True)
-                                _fp = _rd / sc_name
-                                _fp.write_text(content, encoding="utf-8")
-                                (_rd / f"{_fp.name}.generated").write_text("")
+                                _write_generated_file(
+                                    _rd, sc_name, content,
+                                    cls=_artifact_class(sc_name, fix=_fix_mode),
+                                    description=f"stream conf template ({sc_name})",
+                                    job=job_id)
                             except OSError:
                                 pass
                             await _event(sc_name, "done", {
@@ -2971,9 +3056,17 @@ class GenerationJobManager:
                             try:
                                 _rd = self._recipe_dir_for(service_name, recipe_path)
                                 _rd.mkdir(parents=True, exist_ok=True)
-                                _fp = _rd / fname
-                                _fp.write_text(content, encoding="utf-8")
-                                (_rd / f"{_fp.name}.generated").write_text("")
+                                _write_generated_file(
+                                    _rd, fname, content,
+                                    cls=_artifact_class(fname, fix=_fix_mode),
+                                    description=f"{phase} artifact ({fname})",
+                                    job=job_id,
+                                    fingerprint=(request.get("classification_fingerprint")
+                                                 if isinstance(request.get("classification_fingerprint"), dict)
+                                                 else None),
+                                    validation=(validations[phase].get("errors")
+                                                and "; ".join(validations[phase].get("errors") or [])
+                                                or "valid"))
                             except OSError:
                                 pass
                             await _event(fname, "done", {
@@ -3006,6 +3099,9 @@ class GenerationJobManager:
                         }
                         for name, content in result_files.items()
                     }
+                    # R11.3 — the deploy copies only THIS run's `.fix` files;
+                    # the job id is what identifies them in the names.
+                    env_meta["job_id"] = str(job_id)
                     result = {
                         "files": files_meta,
                         "validations": validations,

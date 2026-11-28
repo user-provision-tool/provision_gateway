@@ -59,6 +59,7 @@ interface ServiceInstance {
   // nothing that the deployment did not create.
   http_endpoints?: string[]
   nginx_conf_paths?: string[]
+  nginx_conf_paths_by_category?: Record<string, string>
   // G93/C3.1 — the DEPLOY SELECTION recorded by the -api: the plain sources
   // the operator picked, not the converted `.j2`. The card lists the fix
   // artifacts of this selection and shows its nginx source. Absent on a
@@ -72,6 +73,8 @@ interface ServiceInstance {
   serving_ports_snapshot?: string
   env_classification_snapshot?: string
   dependency_snapshots?: { target_service: string; path: string }[]
+  // R11.3 — this deploy's `.fix` copies, named by its deployment record.
+  fix_copies?: string[]
   healthy_containers?: Record<string,string>
   unhealthy_containers?: Record<string,string>
   missing_containers?: Record<string,string>
@@ -394,23 +397,6 @@ export default function UsersPage() {
   // replays it instead of registering `build_args: {}`. Mirrors how the label is
   // carried — it is the session's own value, not a fresh default.
   const [preselectedUseGlobalProxy, setPreselectedUseGlobalProxy] = useState<boolean | null>(null)
-  // G93/C3.2 — the card's LLM-fix line comes from the recorded DEPLOY
-  // SELECTION (the `.fix` sources the operator actually used), never from a
-  // recipe-wide scan: a scan lists historical jobs and conversions that this
-  // deployment did not use. `selectionFixNames` is the single reader.
-  const selectionFixNames = (svc: ServiceInstance): string[] => {
-    const all = [
-      ...(svc.selected_compose_paths || []),
-      ...Object.values(svc.selected_nginx_paths || {}),
-      ...(svc.selected_env_paths || []),
-    ]
-    const names = new Set<string>()
-    for (const p of all) {
-      const name = baseName(String(p))
-      if (name && /\.fix(\.|$)/.test(name)) names.add(name)
-    }
-    return Array.from(names).sort()
-  }
   const [search, setSearch] = useState('')
   const [visiblePwds, setVisiblePwds] = useState<Record<string,boolean>>({})
 
@@ -2051,20 +2037,22 @@ export default function UsersPage() {
                           // (e.g. a compose with no ${VAR} surface) — say so.
                           const envFile = baseName(svc.env_file_path)
                           const composeFile = baseName(svc.compose_file_path) || `docker-compose.user-${svc.user_name}.${svc.label}.yml`
-                          // G93/C3.4 — nginx shows the SELECTED source from
-                          // the deploy selection (the plain conf the operator
-                          // picked). The converted `.j2` is the -api's render
-                          // source and is never presented as the selection; a
-                          // legacy instance with no recorded selection shows
-                          // none rather than the internal `.j2`.
-                          const selNginx = svc.selected_nginx_paths || {}
-                          const selectedNginxPath =
-                            selNginx.http || Object.values(selNginx)[0] || ''
-                          const nginxFile = baseName(selectedNginxPath)
+                          // R11.1 — nginx links the -api's RENDERED per-user
+                          // confs (one per category), never the selected
+                          // recipe source. A legacy instance with no recorded
+                          // render shows none.
+                          const nginxByCat = svc.nginx_conf_paths_by_category || {}
+                          const nginxFiles: { name: string; category: string }[] =
+                            Object.keys(nginxByCat).length > 0
+                              ? Object.entries(nginxByCat).map(([category, path]) => ({
+                                  name: baseName(path), category }))
+                              : (svc.nginx_conf_paths || []).map(path => ({
+                                  name: baseName(path), category: '' }))
                           const recipeHint = `PROVISION/source_projects/${svc.service_name}${recipePath ? '/' + recipePath : ''}`
-                          // C3.2/C3.3 — only the SELECTION's `.fix` artifacts
-                          // (compose, nginx, `.env.fix`). No fix used → no line.
-                          const recipeFixes = selectionFixNames(svc)
+                          // R11.3 — only THIS deploy's fix copies, as named by
+                          // the deployment record. No copy → no line; an older
+                          // `.fix` in the recorded selection is not shown.
+                          const recipeFixes = (svc.fix_copies || []).map(baseName)
                           return <>
                             <div style={{marginBottom:4}}>
                               <Text>.env: </Text>
@@ -2082,11 +2070,16 @@ export default function UsersPage() {
                             </div>
                             <div style={{marginBottom:4}}>
                               <Text>nginx: </Text>
-                              {nginxFile
-                                ? <Text code style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
-                                    onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'nginx', nginxFile, recipePath)}>{nginxFile}</Text>
-                                : <Text type="secondary">none — this deployment recorded no nginx selection</Text>}
-                              {nginxFile && <Text type="secondary" style={{fontSize:11}}> (in {recipeHint} dir)</Text>}
+                              {nginxFiles.length > 0
+                                ? <Space size={6} wrap>{nginxFiles.map(n => (
+                                    <Text key={n.category + n.name} code
+                                      style={{cursor:'pointer',color:'#1677ff',textDecoration:'underline'}}
+                                      onClick={() => openFileEditor(svc.user_name, svc.service_name, svc.label, 'nginx', n.name, recipePath)}>
+                                      {n.category ? `${n.category}: ` : ''}{n.name}
+                                    </Text>
+                                  ))}</Space>
+                                : <Text type="secondary">none — this deployment records no rendered per-user nginx conf</Text>}
+                              {nginxFiles.length > 0 && <Text type="secondary" style={{fontSize:11}}> (in {recipeHint} dir)</Text>}
                             </div>
                             {/* G103/T10 — the per-instance SNAPSHOTS the
                                 gateway took at deploy. One row per relation,

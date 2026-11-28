@@ -221,8 +221,9 @@ def produce_for_deploy(
         return None
     out = Path(recipe_dir) / f"{service_name}.user-{user_name}.{label}.stream.conf"
     try:
-        out.write_text(content, encoding="utf-8")
-        Path(str(out) + ".generated").write_text("")
+        from .generated_marker import write_marker_pair
+        write_marker_pair(out, content, cls="ins",
+                          description=f"per-instance stream conf ({out.name})")
     except OSError:
         return None
     return str(out)

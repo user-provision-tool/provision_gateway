@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Alert, Button, Divider, Input, Modal, Progress, Select, Space, Spin, Tag, Typography, message } from 'antd'
-import { WarningOutlined } from '@ant-design/icons'
+import { CheckCircleTwoTone, WarningOutlined } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import client from '../../api/client'
 import { deriveProfiles } from '../../api/services'
@@ -24,7 +24,7 @@ import FileSetSelection, {
   FileSetCandidates,
   FileSetSelectionData,
   FileSetStale,
-  fixVariantFor,
+  userVariantFor,
 } from './FileSetSelection'
 
 const { Text } = Typography
@@ -139,7 +139,10 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
     ]).then(([fs, cfg, check]: any[]) => {
       const rp = recipePath || '.'
       const entry = (fs.file_sets || {})[rp] || {}
-      const cand = (fs.candidates || {})[rp] || EMPTY_CANDIDATES
+      const cand = {
+        ...((fs.candidates || {})[rp] || EMPTY_CANDIDATES),
+        provenance: (fs.provenance || {})[rp] || {},
+      }
       setCandidates(cand)
       setStale((fs.stale || {})[rp] || {})
       setSelection({
@@ -284,7 +287,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
   const saveEditor = async () => {
     if (!editorFile) return
     if (editorFromPicker) {
-      const targetName = fixVariantFor(editorFile)
+      const targetName = userVariantFor(editorFile)
       try {
         await client.post('/projects/save-generated', {
           service_name: serviceName,
@@ -656,7 +659,7 @@ export default function GenerateMissingPanel({ open, serviceName, recipePath, re
           <Space>
             <Button onClick={() => { setEditorFile(null); setEditorFromPicker(false) }}>Close</Button>
             <Button type="primary" onClick={saveEditor}>
-              {editorFromPicker ? 'Save as .fix and use it' : 'Apply edit'}
+              {editorFromPicker ? 'Save as .user and use it' : 'Apply edit'}
             </Button>
           </Space>
         }

@@ -89,7 +89,8 @@ def test_one_variant_per_relation_and_unselected_keys_are_dropped(project):
     rel = read_relation_variant(
         project, "graphiti-mcp", "graphiti-local", names[0])
     assert relation_env(rel) == {"GRAPHITI_API_URL": "graphiti-local"}
-    assert (project / f"{names[0]}.generated").is_file()
+    from app.services.generated_marker import find_marker
+    assert find_marker(project / names[0]) is not None
     # The unselected key appears in neither file.
     assert "NOT_SELECTED" not in relation_env(rel)
     assert "NOT_SELECTED" not in relation_env(read_relation_variant(

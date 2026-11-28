@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react'
+import { Fragment, useState, useEffect, useMemo, useRef } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Typography, Card, Table, Button, Modal, Form, Input,
@@ -26,6 +26,7 @@ interface ServiceInfo {
   has_dockerfile: boolean; active_users: number
   active_instances: string[]; created_at: string
   generated_files?: string[]
+  generated_file_meta?: Record<string, { class?: string | null; description?: string; created_at?: string }>
   template_files?: string[]
   recipes?: { path: string; label: string; is_root: boolean; template_files: string[] }[]
 }
@@ -54,6 +55,106 @@ export function generatedFileScope(name: string): 'recipe' | 'instance' {
   // .env.1.<user>.<label>, .env.raw.<user>.<label>
   if (/^\.env(?:\.raw)?(?:\.\d+)?\.[^./]+\.\d+$/.test(base)) return 'instance'
   return 'recipe'
+}
+
+/** R6 — the source table's Generated Files column: category groups (alphabetical),
+ * newest first inside a group, `ins` folded under a collapsed count, and the
+ * marker description on hover. */
+function GeneratedFilesCell({ names, meta, onOpen }: {
+  names: string[]
+  meta: Record<string, { class?: string | null; description?: string; created_at?: string }>
+  onOpen: (name: string) => void
+}) {
+  const [insOpen, setInsOpen] = useState(false)
+  const groups = useMemo(() => {
+    const out: Record<string, string[]> = {}
+    for (const n of names) {
+      const cls = meta[n]?.class || null
+      if (cls === 'ins') continue
+      const cat = generatedCategory(n, cls)
+      ;(out[cat] ||= []).push(n)
+    }
+    for (const cat of Object.keys(out)) {
+      out[cat].sort((a, b) => (meta[b]?.created_at || '').localeCompare(meta[a]?.created_at || ''))
+    }
+    return Object.keys(out).sort().map(cat => [cat, out[cat]] as const)
+  }, [names, meta])
+  const ins = useMemo(
+    () => names.filter(n => meta[n]?.class === 'ins')
+      .sort((a, b) => (meta[b]?.created_at || '').localeCompare(meta[a]?.created_at || '')),
+    [names, meta])
+  // C27 — the colour is the marker CLASS, never the name shape, so the fold
+  // and the colour agree: ins is purple, every recipe-level class is gold.
+  const colorFor = (f: string) => (meta[f]?.class === 'ins' ? 'purple' : 'gold')
+  // C28 — inside a category, inline `subclass` tags split the files by class,
+  // alphabetically, on the same wrapped line; inside the ins fold the same
+  // inline style splits them by artifact type.
+  const bucketBy = (files: string[], keyOf: (f: string) => string) => {
+    const buckets = new Map<string, string[]>()
+    for (const f of files) {
+      const key = keyOf(f)
+      if (!buckets.has(key)) buckets.set(key, [])
+      buckets.get(key)!.push(f)
+    }
+    return Array.from(buckets.entries()).sort(([a], [b]) => a.localeCompare(b))
+  }
+  const subclassOf = (f: string) => meta[f]?.class || 'unknown'
+  const insTypeOf = (f: string) => {
+    const stem = f.endsWith('.j2') ? f.slice(0, -3) : f
+    const cat = generatedCategory(stem, 'ins')
+    if (cat === 'classification') return 'env cls'
+    if (cat === 'relation') return 'dependency'
+    return cat
+  }
+  const separator = (key: string) => <Tag key={`sep-${key}`}>{key}</Tag>
+  const tag = (f: string, color: string) => (
+    <Tooltip key={f} title={meta[f]?.description || f}>
+      <Tag color={color} style={{ cursor: 'pointer', maxWidth: 260, overflow: 'hidden',
+        textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} onClick={() => onOpen(f)}>{f}</Tag>
+    </Tooltip>
+  )
+  if (names.length === 0) return <Tag>none</Tag>
+  return (
+    <Space direction="vertical" size={2} style={{ width: '100%' }}>
+      {groups.map(([cat, files]) => (
+        <Space key={cat} size={4} wrap>
+          <Text type="secondary" style={{ fontSize: 11, minWidth: 86 }}>{cat}</Text>
+          {bucketBy(files, subclassOf).map(([cls, fs]) => (
+            <Fragment key={`${cat}-${cls}`}>
+              {separator(cls)}
+              {fs.map(f => tag(f, colorFor(f)))}
+            </Fragment>
+          ))}
+        </Space>
+      ))}
+      {ins.length > 0 && (
+        <Space size={4} wrap>
+          <Tag color="blue" style={{ cursor: 'pointer' }} onClick={() => setInsOpen(v => !v)}>
+            ins ({ins.length}) {insOpen ? '▾' : '▸'}
+          </Tag>
+          {insOpen && bucketBy(ins, insTypeOf).map(([kind, fs]) => (
+            <Fragment key={`ins-${kind}`}>
+              {separator(kind)}
+              {fs.map(f => tag(f, colorFor(f)))}
+            </Fragment>
+          ))}
+        </Space>
+      )}
+      {groups.length === 0 && ins.length > 0 && <Text type="secondary" style={{ fontSize: 11 }}>per-instance files folded under ins</Text>}
+    </Space>
+  )
+}
+
+export function generatedCategory(name: string, cls?: string | null): string {
+  if (cls === 'cls' || name.startsWith('env.classification.')) return 'classification'
+  if (cls === 'rel' || name.startsWith('dependency.')) return 'relation'
+  if (name.startsWith('docker-compose') || name.startsWith('compose')) return 'compose'
+  if (name.includes('.stream.') || name.endsWith('.stream.conf')) return 'nginx stream'
+  if (name.endsWith('.mail.conf')) return 'mail'
+  if (name.endsWith('.conf')) return 'nginx http'
+  if (name.startsWith('serving_ports') || name.startsWith('serving-ports')) return 'serving ports'
+  if (name.startsWith('.env')) return 'env'
+  return 'other'
 }
 
 export default function ServicesPage() {
@@ -342,19 +443,14 @@ export default function ServicesPage() {
         return <Space size={4} wrap>{temps.length>0 ? temps.map(f=><Tag key={f} color="green" style={{cursor:'pointer'}} onClick={()=>navigate(`/projects/${r.name}?file=${f}`)}>{f}</Tag>) : <Tag>none</Tag>}</Space>
       }
     },
-    { title: <Space size={4}>Generated Files <Tag color="gold">recipe</Tag><Tag color="purple">per-user</Tag></Space>, key: 'generated',
+    { title: <Space size={4}>Generated Files <Tag color="gold">base/fix/cls/rel</Tag><Tag color="purple">ins</Tag><Tag>subclass</Tag></Space>, key: 'generated',
       render: (_:any, r: TableRow) => {
         const gens = r.recipeGeneratedFiles || r.generated_files || []
-        return <Space size={4} wrap>{gens.length>0 ? gens.map(f=>{
-          const scope = generatedFileScope(f)
-          return <Tag
-            key={f}
-            color={scope === 'recipe' ? 'gold' : 'purple'}
-            title={scope === 'recipe' ? 'Recipe-level generated artifact' : 'Per-user, per-service generated file'}
-            style={{cursor:'pointer'}}
-            onClick={()=>navigate(`/projects/${r.name}?file=${f}`)}
-          >{f}</Tag>
-        }) : <Tag>none</Tag>}</Space>
+        return <GeneratedFilesCell
+          names={gens}
+          meta={r.generated_file_meta || {}}
+          onOpen={(f) => navigate(`/projects/${r.name}?file=${f}`)}
+        />
       }
     },
     { title: 'AI Generate', key: 'actions',

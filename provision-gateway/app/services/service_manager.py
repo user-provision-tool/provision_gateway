@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import settings
+from .generated_marker import read_marker, build_record, find_marker, remove_marker, write_marker_pair
 from .project_state import (
     PROJECT_STATE_FILENAME,
     compute_dir_fingerprint,
@@ -233,7 +234,7 @@ class ServiceManager:
         project-root-relative paths, or ``None`` if the dir is missing.
 
         Classification is marker-only: a file is "generated" iff a sibling
-        ``{file}.generated`` marker exists. No git anywhere.
+        marker exists (bare or subclass, one reader). No git anywhere.
         """
         if recipe_path in ("", "."):
             dir_path = project_dir
@@ -274,7 +275,7 @@ class ServiceManager:
             if not is_file:
                 continue  # dirs/symlinks are not part of the files union
             files.append(rel)
-            has_marker = (dir_path / f"{name}.generated").is_file()
+            has_marker = find_marker(dir_path / name) is not None
             if has_marker:
                 generated.append(rel)
             elif self._is_template_file(rel):
@@ -400,11 +401,27 @@ class ServiceManager:
             active_users += 1
             active_instances.append(f"{entry.get('user_name')}/{entry.get('label', '0')}")
 
+        # R6.2 — the description each generated file's marker carries, for the
+        # source table's hover. Read-time and advisory: a missing or corrupt
+        # marker degrades to an empty description, never an error.
+        generated_file_meta: dict[str, dict[str, Any]] = {}
+        for rel in generated_files:
+            try:
+                info = read_marker(project_dir / rel)
+            except Exception:  # noqa: BLE001
+                continue
+            generated_file_meta[rel] = {
+                "class": info.cls,
+                "description": info.description,
+                "created_at": info.created_at,
+            }
+
         return {
             "name": name,
             "path": str(project_dir),
             "files": files,
             "generated_files": generated_files,
+            "generated_file_meta": generated_file_meta,
             "template_files": template_files,
             "recipes": recipes,
             "has_compose_template": has_compose_template,
@@ -478,7 +495,7 @@ class ServiceManager:
                 "name": name_e,
                 "path": rel,
                 "type": "dir" if is_dir else "file",
-                "is_generated": (not is_dir) and (target / f"{name_e}.generated").is_file(),
+                "is_generated": (not is_dir) and find_marker(target / name_e) is not None,
                 "is_template": (not is_dir) and self._is_template_file(rel),
             })
         return children
@@ -620,14 +637,12 @@ class ServiceManager:
         return True
 
     def create_file(self, service_name: str, filename: str, content: str) -> bool:
-        """Create a new file in a service project with .generated marker."""
+        """Create a repo-shipped file: a tree add carries NO marker (R8.2)."""
         filepath = self._source_dir / service_name / filename
         if filepath.exists():
             return False  # already exists
         filepath.parent.mkdir(parents=True, exist_ok=True)
         filepath.write_text(content)
-        # Track as generated
-        (self._source_dir / service_name / f"{filename}.generated").write_text("")
         self.invalidate_state(service_name)
         return True
 
@@ -637,10 +652,8 @@ class ServiceManager:
         if not filepath.is_file():
             return False
         filepath.unlink()
-        # Also remove .generated marker if present
-        marker = self._source_dir / service_name / f"{filename}.generated"
-        if marker.is_file():
-            marker.unlink()
+        # Also remove its marker, whatever the class
+        remove_marker(filepath)
         self.invalidate_state(service_name)
         return True
 
@@ -675,8 +688,12 @@ class ServiceManager:
         content = src.read_text()
         header = f"# Jinja2 compose template — conversion handled by provision-api at deploy time\n# Service: {service_name}\n\n"
         template_out.write_text(header + content)
-        # Mark as generated
-        (template_out.parent / f"{template_out.name}.generated").write_text("")
+        write_marker_pair(
+            template_out, header + content,
+            build_record(cls="ins",
+                         description=f"converted compose template ({template_out.name})",
+                         content=header + content),
+        )
         self.invalidate_state(service_name)
         return {
             "compose_template": str(template_out.name),
@@ -699,8 +716,12 @@ class ServiceManager:
         content = src.read_text()
         header = f"# Jinja2 nginx template — conversion handled by provision-api at deploy time\n# Service: {service_name}\n\n"
         template_out.write_text(header + content)
-        # Mark as generated
-        (template_out.parent / f"{template_out.name}.generated").write_text("")
+        write_marker_pair(
+            template_out, header + content,
+            build_record(cls="ins",
+                         description=f"converted nginx template ({template_out.name})",
+                         content=header + content),
+        )
         self.invalidate_state(service_name)
         return {
             "nginx_template": str(template_out.name),

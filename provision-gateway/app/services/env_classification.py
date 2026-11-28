@@ -28,7 +28,9 @@ ARTIFACT_NAME = "env.classification.json"  # legacy, read but never written
 ARTIFACT_SUFFIX = ".yaml"
 MARKER_SUFFIX = ".generated"
 ARTIFACT_PREFIX = "env.classification."
-_VARIANT_RE = re.compile(r"^env\.classification\.([0-9a-f]{16})\.yaml$")
+# R9.1 — the token is the job id; legacy fingerprint ids (16 hex) and any
+# job token share the shape. The class comes from the marker, not the name.
+_VARIANT_RE = re.compile(r"^env\.classification\.([0-9A-Za-z_-]+)\.yaml$")
 
 CATEGORIES = (
     "required", "external", "secret", "deploy_value", "dependency", "defaulted",
@@ -142,8 +144,14 @@ def fingerprint_id(fingerprint: dict | None) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
-def variant_filename(fingerprint: dict | None) -> str:
-    return f"{ARTIFACT_PREFIX}{fingerprint_id(fingerprint)}{ARTIFACT_SUFFIX}"
+def variant_filename(fingerprint: dict | None = None, job: str | int | None = None) -> str:
+    """The artefact's name. R9.1: the generation JOB token when one is given.
+
+    The legacy fingerprint-named shape stays readable (and is still written by
+    callers that pass no job, e.g. a migration or a test).
+    """
+    token = str(job) if job is not None else fingerprint_id(fingerprint)
+    return f"{ARTIFACT_PREFIX}{token}{ARTIFACT_SUFFIX}"
 
 
 # ---------------------------------------------------------------------------
@@ -414,8 +422,9 @@ def artifact_path(recipe_dir: str | Path) -> Path:
     return Path(recipe_dir) / ARTIFACT_NAME
 
 
-def variant_path(recipe_dir: str | Path, fingerprint: dict | None) -> Path:
-    return Path(recipe_dir) / variant_filename(fingerprint)
+def variant_path(recipe_dir: str | Path, fingerprint: dict | None = None,
+                 job: str | int | None = None) -> Path:
+    return Path(recipe_dir) / variant_filename(fingerprint, job=job)
 
 
 def _load_yaml(path: Path) -> Any:
@@ -506,7 +515,10 @@ def list_variants(recipe_dir: str | Path) -> list[dict[str, Any]]:
             continue
         match = _VARIANT_RE.match(name)
         if match:
-            out.append({"name": name, "fingerprint_id": match.group(1),
+            token = match.group(1)
+            out.append({"name": name,
+                        "fingerprint_id": token if re.fullmatch(r"[0-9a-f]{16}", token) else "",
+                        "token": token,
                         "legacy": False})
     return out
 
@@ -521,18 +533,18 @@ def matched_variant(recipe_dir: str | Path,
     """
     if not isinstance(fingerprint, dict):
         return None
-    expected = variant_filename(fingerprint)
     matches: list[tuple[dict, dict]] = []
+    # R9.1 — the exact match is the STORED fingerprint, never the file name:
+    # a job-token variant is as exact as a legacy fingerprint-named one.
     for item in list_variants(recipe_dir):
         data = read_variant(recipe_dir, item["name"])
         if data is None:
             continue
         if not fingerprint_matches(data.get("fingerprint"), fingerprint):
             continue
-        if item["legacy"] or item["name"] == expected:
-            matches.append((item, data))
-    # M-A22 — a legacy JSON and the canonical YAML can both match; the YAML is
-    # the canonical variant and the duplicate is ignored.
+        matches.append((item, data))
+    # M-A22 — a legacy artefact and a canonical YAML can both match; the
+    # non-legacy variant wins.
     for item, data in matches:
         if not item["legacy"]:
             return item["name"], data
@@ -704,15 +716,16 @@ def write_artifact(
     fingerprint: dict[str, Any],
     variables: dict[str, Any],
     dependencies: dict[str, list[str]] | None = None,
+    job: str | int | None = None,
 ) -> Path:
-    """Write the current fingerprint's YAML variant (+ marker).
+    """Write a job-token YAML variant (+ ``cls`` marker) — R9.1.
 
-    Only the matched variant is overwritten — never another fingerprint's file
-    (R29). ``generate new`` calls this for the current structural inputs.
+    Each run writes its own file; nothing is overwritten. The fingerprint stays
+    in the body and the marker. ``job`` is the generation job id.
     """
     import yaml
 
-    path = variant_path(recipe_dir, fingerprint)
+    path = variant_path(recipe_dir, fingerprint, job=job)
     payload = {
         "version": 1,
         "source_service": source_service,
@@ -724,11 +737,14 @@ def write_artifact(
         "generated_at": _stamp(),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
-    )
-    Path(str(path) + MARKER_SUFFIX).write_text("", encoding="utf-8")
+    text = yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
+    from .generated_marker import write_marker_pair
+    write_marker_pair(
+        path, text, cls="cls",
+        description=f"env classification ({path.name})",
+        job=job, generator="llm",
+        fingerprint=_canonical_fingerprint(fingerprint),
+        source=source_service)
     return path
 
 
@@ -891,8 +907,12 @@ def snapshot_classification(
     if src is None:
         return None
     dest = Path(recipe_dir) / name
-    dest.write_text(src.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-    Path(str(dest) + MARKER_SUFFIX).write_text("", encoding="utf-8")
+    text = src.read_text(encoding="utf-8", errors="replace")
+    from .generated_marker import write_marker_pair
+    write_marker_pair(
+        dest, text, cls="ins",
+        description=f"per-instance env classification copy ({name})",
+        source=str(src.name))
     return name
 
 

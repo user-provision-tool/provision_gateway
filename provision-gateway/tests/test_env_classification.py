@@ -99,7 +99,8 @@ def test_the_artefact_round_trips_as_a_yaml_fingerprint_variant(tmp_path):
     assert path.name == ec.variant_filename(fingerprint)
     assert path.name.startswith("env.classification.")
     assert path.name.endswith(".yaml")
-    assert Path(str(path) + ".generated").is_file()
+    from app.services.generated_marker import find_marker
+    assert find_marker(path) is not None
     data = ec.read_variant(tmp_path, path.name)
     assert data["version"] == 1
     assert data["dependencies"] == {"graphiti-local": ["A"]}
@@ -297,7 +298,8 @@ def test_the_classification_snapshot_copies_the_used_variant_with_a_marker(tmp_p
         tmp_path, user="alice", label="30", source_name=source.name)
     assert name == "env.classification.user-alice.30.yaml"
     assert (tmp_path / name).is_file()
-    assert (tmp_path / f"{name}.generated").is_file()
+    from app.services.generated_marker import find_marker
+    assert find_marker(tmp_path / name) is not None
     assert ec.snapshot_exists(tmp_path, user="alice", label="30")
     assert ec.classification_snapshot_name("alice", "30") == name
     # Nothing to copy ⇒ no snapshot, never a stale one.

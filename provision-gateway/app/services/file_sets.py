@@ -307,15 +307,33 @@ def list_file_sets(service_name: str) -> dict[str, Any]:
             ]
     candidates: dict[str, dict[str, Any]] = {}
     stale: dict[str, dict[str, list[str]]] = {}
+    provenance: dict[str, dict[str, dict]] = {}
+
+    from .artifact_provenance import build_provenance, deploy_counts
+    from .generated_marker import read_marker
+
+    def _selectable(names: list[str], rdir: Path, pred) -> list[str]:
+        """Candidates minus the `ins` class (R3.1): only ins is filtered."""
+        out: list[str] = []
+        for n in names:
+            if not pred(n):
+                continue
+            if read_marker(rdir / n).cls == "ins":
+                continue
+            out.append(n)
+        return sorted(out)
+
+    counts = deploy_counts(service_name)
 
     for rp in recipe_paths:
+        rdir = _recipe_dir(project_dir, rp)
         names = _scan_recipe_files(project_dir, rp)
-        compose_cands = sorted(n for n in names if _is_compose_candidate(n))
-        nginx_cands = sorted(n for n in names if _is_nginx_candidate(n))
-        env_cands = sorted(n for n in names if _is_env_candidate(n))
-        sp_cands = sorted(n for n in names if _is_serving_ports_candidate(n))
-        sc_cands = sorted(n for n in names if _is_stream_conf_candidate(n))
-        mc_cands = sorted(n for n in names if _is_mail_conf_candidate(n))
+        compose_cands = _selectable(names, rdir, _is_compose_candidate)
+        nginx_cands = _selectable(names, rdir, _is_nginx_candidate)
+        env_cands = _selectable(names, rdir, _is_env_candidate)
+        sp_cands = _selectable(names, rdir, _is_serving_ports_candidate)
+        sc_cands = _selectable(names, rdir, _is_stream_conf_candidate)
+        mc_cands = _selectable(names, rdir, _is_mail_conf_candidate)
 
         # Profile candidates derive from the SELECTED compose (the merged set);
         # when nothing is selected the section stays disabled (dependency on
@@ -334,6 +352,29 @@ def list_file_sets(service_name: str) -> dict[str, Any]:
             "env": env_cands,
             "profiles": prof_cands,
         }
+
+        # R4 — the derived evidence for every candidate (and every stored
+        # selection, so a stale row still renders its hint). The structural
+        # inputs mirror `classification-state`: the selected compose/env, or
+        # the recipe's own when nothing is selected.
+        try:
+            from . import env_classification as _ec
+            fp_compose = [p.rsplit("/", 1)[-1] for p in sel_compose] or compose_cands
+            fp_env = ([] if selected.get("env_none") else
+                      [p.rsplit("/", 1)[-1] for p in (selected.get("env") or [])])
+            fp_env = fp_env or _ec.implicit_env_names(rdir)
+            current_fp = _ec.structural_fingerprint(
+                rdir, compose_names=fp_compose,
+                profiles=[p for p in (selected.get("profiles") or [])
+                          if isinstance(p, str)],
+                env_base_names=fp_env)
+        except Exception:  # noqa: BLE001 — evidence is advisory
+            current_fp = None
+        all_names = sorted(set(
+            compose_cands + nginx_cands + env_cands + sp_cands + sc_cands
+            + mc_cands + [p for p in (sel_compose or []) if isinstance(p, str)]))
+        provenance[rp] = build_provenance(
+            rdir, all_names, fingerprint=current_fp, deploys=counts)
 
         # Stale detection: stored entry whose file vanished / profile gone.
         #
@@ -388,6 +429,7 @@ def list_file_sets(service_name: str) -> dict[str, Any]:
         "file_sets": file_sets,
         "candidates": candidates,
         "stale": stale,
+        "provenance": provenance,
     }
 
 

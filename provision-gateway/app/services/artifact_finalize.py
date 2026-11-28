@@ -1,31 +1,51 @@
-"""Artifact finalization — the overwrite matrix, server-side (R3, T4).
+"""Artifact finalization — the validated write matrix, server-side (R1.4).
 
 The generation pipeline produces file *metadata* in the task result and leaves
 the content on disk. Finalization applies the platform's overwrite matrix:
 
-* file MISSING -> write as a new file + ``.generated`` marker;
-* file exists with a ``.generated`` marker -> re-generate IN PLACE;
-* file exists as an ORIGINAL (unmarked) -> originals are NEVER touched; the
-  output is written to a fresh marked name and the selection is renamed.
+* file MISSING -> write the artifact and its validated marker as one pair;
+* file exists with a marker -> regenerate both IN PLACE as a pair;
+* file exists as an ORIGINAL (unmarked) -> repo-shipped, whatever its name:
+  NEVER overwritten, marked or renamed. The write is refused; there is no
+  ``generated-<time>`` alias.
 
-The result also carries the selection mapped through the renames, so the deploy
-payload names the files that actually exist. The standalone Generate panel's
-explicit Save and the workflow's automatic finalization share this function.
+The result carries the selection mapped through the renames (identity on every
+non-refusal path), so the deploy payload names the files that actually exist.
+The standalone Generate panel's explicit Save and the workflow's automatic
+finalization share this function.
 """
 
 from __future__ import annotations
 
-import time
+import re
 from pathlib import Path
 from typing import Any
 
 from ..config import settings
 from .file_sets import FileSetError, _recipe_dir, _validate_paths, put_file_set
+from .generated_marker import (CLASSES, UnmarkedTargetError, marker_for,
+                               read_marker, write_marker_pair)
+
+_FIX_NAME_RE = re.compile(r"\.fix(\.|$)")
+_TOKEN_RE = re.compile(r"\.(?:base|fix)\.([^./]+)\.")
 
 
-def _fresh_generated_name(filepath: Path) -> str:
-    """Distinct marked name for an original (unmarked) file."""
-    return f"{filepath.stem}.generated-{int(time.time())}{filepath.suffix}"
+def _class_for(filename: str) -> str:
+    """The class of a NEW artifact, from its name family (R2.1)."""
+    if ".user." in filename or filename.endswith(".user"):
+        return "user"
+    if filename.startswith("env.classification."):
+        return "cls"
+    if filename.startswith("dependency."):
+        return "rel"
+    if filename.startswith(".env.raw.") or re.search(r"\.user-[^./]+\.", filename):
+        return "ins"
+    return "fix" if _FIX_NAME_RE.search(filename) else "base"
+
+
+def _job_for(filename: str) -> str | None:
+    match = _TOKEN_RE.search(filename)
+    return match.group(1) if match else None
 
 
 def map_selection(selection: dict | None, rename_map: dict[str, str]) -> dict[str, Any]:
@@ -86,18 +106,28 @@ def finalize_files(service_name: str, recipe_path: str,
         if not isinstance(content, str):
             raise ValueError("files must map filename -> string content")
         filepath = target / filename
-        marker = target / f"{filename}.generated"
-        if filepath.exists() and not marker.is_file():
-            new_name = _fresh_generated_name(filepath)
-            (target / new_name).write_text(content)
-            (target / f"{new_name}.generated").write_text("")
-            saved.append(new_name)
-            rename_map[filename] = new_name
-        else:
-            filepath.write_text(content)
-            marker.write_text("")
-            saved.append(filename)
-            rename_map[filename] = filename
+        # R1.1 — one artifact carries one class. An already-marked file keeps
+        # ITS class (a `.cls`/`.ins` artifact re-saved by the finalizer is not
+        # reclassified as `base`); a new file takes the name family.
+        existing = read_marker(filepath)
+        cls = (existing.cls if existing.cls in CLASSES
+               else _class_for(filename))
+        try:
+            write_marker_pair(
+                filepath, content,
+                cls=cls,
+                description=f"{cls} artifact: {filename}",
+                job=_job_for(filename), generator="mechanical",
+            )
+            for other in CLASSES:
+                if other != cls:
+                    stray = marker_for(filepath, other)
+                    if stray.is_file():
+                        stray.unlink(missing_ok=True)
+        except UnmarkedTargetError as exc:
+            raise ValueError(str(exc)) from exc
+        saved.append(filename)
+        rename_map[filename] = filename
 
     mapped = map_selection(selection, rename_map) if isinstance(selection, dict) else {}
     if persist_selection and isinstance(selection, dict):

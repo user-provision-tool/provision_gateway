@@ -795,7 +795,8 @@ class TestRecipePathMultiRecipe:
 
         written = tmp_path / "multisvc" / "recipes" / "web" / "docker-compose.yml"
         assert written.read_text() == "services: {}"
-        assert (tmp_path / "multisvc" / "recipes" / "web" / "docker-compose.yml.generated").exists()
+        assert (tmp_path / "multisvc" / "recipes" / "web" /
+            "docker-compose.yml.base.generated").exists()
         assert result["saved"] == ["docker-compose.yml"]
 
     def test_save_generated_rejects_recipe_path_traversal(self, tmp_path, monkeypatch):
@@ -5812,7 +5813,7 @@ class TestLLMBasedFix:
         from app.services.generation_jobs import FIX_FILENAME, PHASE_FILENAME
         assert FIX_FILENAME["compose"] == "docker-compose.fix.{token}.yml"
         assert FIX_FILENAME["nginx"] == "nginx.fix.{token}.conf"
-        assert FIX_FILENAME["env"] == ".env.fix"
+        assert FIX_FILENAME["env"] == ".env.fix.{token}"
         # ...and never collide with the originals they correct.
         for phase, name in FIX_FILENAME.items():
             assert name.format(token=7) != PHASE_FILENAME[phase].format(token=7)
@@ -5933,8 +5934,8 @@ class TestDeployPanelSemantics:
 
         The token is what makes a parallel generation for the same recipe — a
         pair whose reservation keys differ only by user or label — unable to
-        address the same path. `env` has none on purpose: it is per-user
-        (`.env.raw.{user}.{label}`) and already collision-free.
+        address the same path. The env SHAPE carries it too (R11.5); the
+        per-user `.env.raw.{user}.{label}` stays token-free.
         """
         from app.services.generation_jobs import PHASE_FILENAME, _phase_names
         assert PHASE_FILENAME["compose"] == "docker-compose.base.{token}.yml"
@@ -5942,13 +5943,13 @@ class TestDeployPanelSemantics:
         assert PHASE_FILENAME["nginx"] == "nginx.base.{token}.conf"
         # G56 — the stream conf is recipe-level too.
         assert PHASE_FILENAME["stream_conf"] == "nginx.stream.base.{token}.conf"
-        assert PHASE_FILENAME["env"] == ".env"
+        assert PHASE_FILENAME["env"] == ".env.base.{token}"
         assert _phase_names(337, fix=False) == {
             "compose": "docker-compose.base.337.yml",
             "serving_ports": "serving_ports.base.337.yml",
             "nginx": "nginx.base.337.conf",
             "stream_conf": "nginx.stream.base.337.conf",
-            "env": ".env",
+            "env": ".env.base.337",
         }
         # The token goes BEFORE the extension, so the candidate predicates still
         # match and the file stays selectable everywhere it was.
@@ -6042,21 +6043,18 @@ class TestComposeValidationPause:
         assert "awaiting_input" in src
 
 class TestSelectedFileFork:
-    """§5b: editing a SELECTED file forks into its `.fix` variant."""
+    """R8.1: editing a SELECTED file forks into its `.user` variant."""
 
-    def test_fork_name_follows_the_fix_convention(self):
+    def test_fork_name_follows_the_user_convention(self):
         """The tag goes before the extension and is single-slotted."""
         src = (_DASH / "src" / "components" / "services" / "FileSetSelection.tsx").read_text()
-        assert "export function fixVariantFor" in src
-        assert "fix1" not in src and "fix2" not in src
-        from app.services.generation_jobs import FIX_FILENAME
-        for name in FIX_FILENAME.values():
-            assert ".fix" in name
+        assert "export function userVariantFor" in src
+        assert "user1" not in src and "user2" not in src
 
     def test_save_forks_instead_of_overwriting_the_selection(self):
         src = (_DASH / "src" / "components" / "services" / "DeployForm.tsx").read_text()
         assert "editorFork" in src
-        assert "fixVariantFor(editorFileName)" in src
+        assert "userVariantFor(editorFileName)" in src
         assert "the selection now uses it" in src
 
     def test_picker_names_are_clickable(self):
@@ -6137,10 +6135,10 @@ class TestEnvReferencePicker:
         assert "env: []," in src, "the three-slot popup carries no env ref"
         assert "Generate Base Files" in src
         assert "Generate Missing Files" not in src
-        # Selected recipe files stay openable/editable; saving forks to .fix.
+        # Selected recipe files stay openable/editable; saving forks to .user.
         assert "onOpenFile={openSelectedFile}" in src
-        assert "fixVariantFor" in src
-        assert "Save as .fix and use it" in src
+        assert "userVariantFor" in src
+        assert "Save as .user and use it" in src
         # The toolbar sits below the prompt input and the standalone panel has
         # no profile picker.
         assert src.index("Generation prompt") < src.index("⚙ base files")
@@ -6160,10 +6158,19 @@ class TestEnvReferencePicker:
     def test_generated_files_distinguish_recipe_from_per_user(self):
         src = (_DASH / "src" / "pages" / "ServicesPage.tsx").read_text()
         assert "export function generatedFileScope" in src
-        assert "color={scope === 'recipe' ? 'gold' : 'purple'}" in src
-        assert "Recipe-level generated artifact" in src
-        assert "Per-user, per-service generated file" in src
-        assert '<Tag color="gold">recipe</Tag><Tag color="purple">per-user</Tag>' in src
+        assert "function GeneratedFilesCell" in src
+        assert "generatedCategory" in src
+        assert "description" in src
+        assert "ins (" in src
+        # C27 — the colour is the marker class, not the name shape.
+        assert "const colorFor = (f: string)" in src
+        assert "cls === 'ins'" in src and "'purple'" in src
+        # C28 — inline class/type separators in the `subclass` style.
+        assert "const bucketBy = (files: string[]" in src
+        assert "const subclassOf = (f: string)" in src
+        assert "const insTypeOf = (f: string)" in src
+        assert "const separator = (key: string) => <Tag" in src
+        assert '<Tag color="gold">base/fix/cls/rel</Tag><Tag color="purple">ins</Tag><Tag>subclass</Tag>' in src
 
     def test_every_picker_offers_generate_new_inside_the_control(self):
         """T0/R8 — the sentinel is a picker OPTION, not a tag beside it."""
@@ -6930,11 +6937,9 @@ class TestServiceCardsAndTaskLifecycle:
         src = self._page("pages/UsersPage.tsx")
         assert "recipeFixes" in src
         assert "recipeFixes.length > 0 &&" in src
-        # G93 — the list is the selection's, never a recipe-wide scan.
-        assert "selectionFixNames" in src
-        assert "selected_compose_paths" in src
-        assert "selected_nginx_paths" in src
-        assert "selected_env_paths" in src
+        # R11.3 — the list is the deployment RECORD's copies, never a scan.
+        assert "fix_copies" in src
+        assert "selectionFixNames" not in src
         assert "loadFixFiles" not in src
         assert "LLM fix" in src
 

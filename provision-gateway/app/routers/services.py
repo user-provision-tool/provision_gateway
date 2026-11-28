@@ -771,8 +771,8 @@ def classification_state(
         data = ec.read_variant_any(rdir, item["name"])
         if data is None:
             continue
-        if not ec.fingerprint_matches(data.get("fingerprint"), fingerprint):
-            continue
+        # R4.1/R10 — every variant is listed; the exact match is a HINT.
+        exact = ec.fingerprint_matches(data.get("fingerprint"), fingerprint)
         errors = ec.artifact_errors(data)
         missing = ec.coverage_missing(data, env_keys) if env_names else []
         violations = ([] if classify_only
@@ -781,22 +781,27 @@ def classification_state(
         variants.append({
             "value": item["name"],
             "legacy": bool(item["legacy"]),
+            "exact": exact,
             "red": bool(errors or missing or violations or internal),
             "errors": errors,
             "missing_env_keys": missing,
             "target_violations": violations,
             "internal_violations": internal,
         })
-    # M-A22 — one variant per fingerprint; the YAML is canonical over a legacy
-    # JSON that records the same fingerprint.
+    # M-A22 — collapse only a legacy JSON beside a canonical variant with the
+    # same fingerprint. R9.1 — two JOB-named variants are both listed, even
+    # when they share structural inputs.
     deduped: dict[str, dict] = {}
     for v in variants:
         raw = ec.read_variant_any(rdir, v["value"])
         key = (ec.fingerprint_id(raw.get("fingerprint"))
                if isinstance(raw, dict) and isinstance(raw.get("fingerprint"), dict)
                else v["value"])
+        if not v["legacy"]:
+            deduped[v["value"]] = v
+            continue
         prev = deduped.get(key)
-        if prev is None or (prev["legacy"] and not v["legacy"]):
+        if prev is None:
             deduped[key] = v
     variants = list(deduped.values())
     matched = ec.matched_variant(rdir, fingerprint)
@@ -848,11 +853,14 @@ def classification_state(
         options: list[dict] = []
         for item in list_relation_variants(rdir, name, target):
             data = read_relation_variant(rdir, name, target, item["name"])
-            if data is None or not relation_is_current(data, fingerprint):
+            if data is None:
                 continue
+            # R4.1/R10 — all variants; the stored fingerprint is the hint.
+            exact = relation_is_current(data, fingerprint)
             missing, extra = relation_projection_errors(data, expected)
             options.append({
                 "value": item["name"], "legacy": bool(item["legacy"]),
+                "exact": exact,
                 "red": bool(missing or extra),
                 "missing": missing, "extra": extra,
             })

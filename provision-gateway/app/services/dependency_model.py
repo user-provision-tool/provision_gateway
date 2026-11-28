@@ -26,9 +26,10 @@ from typing import Any
 
 RELATION_RE = re.compile(
     r"^dependency\.(?P<source>[^.]+)\.(?P<target>[^.]+)\.json$")
-# R28/R29 — `dependency.<source>.<target>.<fingerprint-id>.json`.
+# R9.1 — the token is the generation job id; legacy fingerprint ids (16 hex)
+# share the shape. The class comes from the marker, not the name.
 RELATION_VARIANT_RE = re.compile(
-    r"^dependency\.(?P<source>[^.]+)\.(?P<target>[^.]+)\.(?P<fpid>[0-9a-f]{16})\.json$")
+    r"^dependency\.(?P<source>[^.]+)\.(?P<target>[^.]+)\.(?P<fpid>[0-9A-Za-z_-]+)\.json$")
 
 
 def _stamp() -> str:
@@ -41,10 +42,12 @@ def relation_filename(source_service: str, target_service: str) -> str:
 
 
 def relation_variant_filename(source_service: str, target_service: str,
-                              fingerprint: dict | None) -> str:
+                              fingerprint: dict | None = None,
+                              job: str | int | None = None) -> str:
+    """R9.1 — the job token when one is given, else the legacy fingerprint id."""
     from .env_classification import fingerprint_id
-    return (f"dependency.{source_service}.{target_service}."
-            f"{fingerprint_id(fingerprint)}.json")
+    token = str(job) if job is not None else fingerprint_id(fingerprint)
+    return f"dependency.{source_service}.{target_service}.{token}.json"
 
 
 def relation_snapshot_filename(source_service: str, target_service: str,
@@ -187,8 +190,10 @@ def list_relation_variants(recipe_dir: str | Path, source_service: str,
         match = RELATION_VARIANT_RE.match(name)
         if match and match.group("source") == source_service \
                 and match.group("target") == target_service:
-            out.append({"name": name, "fingerprint_id": match.group("fpid"),
-                        "legacy": False})
+            token = match.group("fpid")
+            out.append({"name": name,
+                        "fingerprint_id": token if re.fullmatch(r"[0-9a-f]{16}", token) else "",
+                        "token": token, "legacy": False})
     return out
 
 
@@ -198,13 +203,14 @@ def matched_relation_variant(recipe_dir: str | Path, source_service: str,
     """The relation variant whose stored fingerprint matches, or None."""
     if not isinstance(fingerprint, dict):
         return None
-    expected = relation_variant_filename(source_service, target_service, fingerprint)
+    # R9.1 — the exact match is the STORED fingerprint, never the file name.
     for item in list_relation_variants(recipe_dir, source_service, target_service):
         data = read_relation_variant(recipe_dir, source_service, target_service,
                                      item["name"])
         if data is None or not relation_is_current(data, fingerprint):
             continue
-        if item["legacy"] or item["name"] == expected:
+        if item["legacy"] or item["name"] == relation_variant_filename(
+                source_service, target_service, fingerprint):
             return item["name"], data
     return None
 
@@ -246,15 +252,16 @@ def relation_env(data: dict | None) -> dict[str, str]:
 
 def write_relation(recipe_dir: str | Path, source_service: str,
                    target_service: str, env_map: dict[str, str],
-                   fingerprint: dict | None = None) -> Path:
-    """Write the current fingerprint's relation variant (+ marker) mechanically.
+                   fingerprint: dict | None = None,
+                   job: str | int | None = None) -> Path:
+    """Write a job-token relation variant (+ ``rel`` marker) — R9.1.
 
-    Only the matched variant is overwritten — never another fingerprint's file
-    (R29). The caller owns the selection decision: `generate new`, a red
-    variant's regeneration, or a missing 1:1 relation all land here.
+    Each run writes its own file; nothing is overwritten. The caller owns the
+    selection decision: `generate new`, a red variant's regeneration, or a
+    missing 1:1 relation all land here.
     """
     path = Path(recipe_dir) / relation_variant_filename(
-        source_service, target_service, fingerprint)
+        source_service, target_service, fingerprint, job=job)
     payload = {
         "version": 1,
         "source_service": source_service,
@@ -263,8 +270,15 @@ def write_relation(recipe_dir: str | Path, source_service: str,
         "env": {var: {"depends_on": target_service} for var in sorted(env_map)},
         "generated_at": _stamp(),
     }
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    Path(str(path) + ".generated").write_text("")
+    text = json.dumps(payload, indent=2) + "\n"
+    from .generated_marker import write_marker_pair
+    write_marker_pair(
+        path, text, cls="rel",
+        description=f"dependency relation {source_service} -> {target_service} "
+                    f"({path.name})",
+        job=job, generator="llm",
+        fingerprint=fingerprint or {},
+        source=source_service)
     return path
 
 
@@ -291,11 +305,15 @@ def duplicate_target_services(entries: list[dict]) -> bool:
     return len(names) != len(set(names))
 
 
-def copy_snapshot(src: Path, dest: Path) -> Path:
-    """Copy a used artifact to its per-instance snapshot name (+ marker)."""
-    dest.write_text(src.read_text(encoding="utf-8", errors="replace"),
-                    encoding="utf-8")
-    Path(str(dest) + ".generated").write_text("")
+def copy_snapshot(src: Path, dest: Path, *, job: str | int | None = None,
+                  description: str | None = None) -> Path:
+    """Copy a used artifact to its per-instance snapshot name (+ ``ins``)."""
+    text = src.read_text(encoding="utf-8", errors="replace")
+    from .generated_marker import write_marker_pair
+    write_marker_pair(
+        dest, text, cls="ins",
+        description=description or f"per-instance copy ({dest.name})",
+        job=job, source=src.name)
     return dest
 
 

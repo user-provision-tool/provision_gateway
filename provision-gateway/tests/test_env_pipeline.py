@@ -250,7 +250,8 @@ def test_a_relation_is_a_fingerprint_variant_with_its_fingerprint(project):
                           {"GRAPHITI_API_URL": "graphiti-local"}, fp)
     assert path.name == relation_variant_filename(
         "graphiti-mcp", "graphiti-local", fp)
-    assert (project / f"{path.name}.generated").is_file()
+    from app.services.generated_marker import find_marker
+    assert find_marker(path) is not None
     data = read_relation_variant(
         project, "graphiti-mcp", "graphiti-local", path.name)
     assert data["fingerprint"] == fp
@@ -421,7 +422,7 @@ def test_snapshot_matrix(tmp_path, monkeypatch):
     created = run("30", {"relations": {}, "classification_read": False,
                          "classification_written": False},
                   {"env_none": True, "serving_ports_none": True})
-    assert created == set()
+    assert created == {"deploy.user-alice.30.json"}
 
     # A relation read (sent env + deps): dep snapshot only, exact source.
     created = run("31", {"relations": {"dep": "read"}, "classification_read": False,
@@ -429,7 +430,8 @@ def test_snapshot_matrix(tmp_path, monkeypatch):
                          "relation_variants": {"dep": rel_name}},
                   {"env": ["e.env"], "serving_ports_none": True})
     assert created == {"dependency.s.dep.user-alice.31.json",
-                       "dependency.s.dep.user-alice.31.json.generated"}
+                       "dependency.s.dep.user-alice.31.json.ins.generated",
+                       "deploy.user-alice.31.json"}
 
     # The artefact read: env-class snapshot only, copied from the used variant.
     created = run("32", {"relations": {}, "classification_read": True,
@@ -437,13 +439,14 @@ def test_snapshot_matrix(tmp_path, monkeypatch):
                          "classification_name": cls_name},
                   {"env_none": True, "serving_ports_none": True})
     assert created == {"env.classification.user-alice.32.yaml",
-                       "env.classification.user-alice.32.yaml.generated"}
+                       "env.classification.user-alice.32.yaml.ins.generated",
+                       "deploy.user-alice.32.json"}
 
     # No artefact and no relation: nothing.
     created = run("33", {"relations": {}, "classification_read": False,
                          "classification_written": False},
                   {"env_none": True, "serving_ports_none": True})
-    assert created == set()
+    assert created == {"deploy.user-alice.33.json"}
 
     # A relation written: both snapshots.
     created = run("34", {"relations": {"dep": "written"}, "classification_read": True,
@@ -499,13 +502,13 @@ def test_snapshot_matrix_rev7_rows(tmp_path, monkeypatch):
     created = run("41", {"relations": {}, "classification_read": False,
                          "classification_written": False},
                   {"env": ["e.env"], "serving_ports_none": True})
-    assert created == set()
+    assert created == {"deploy.user-alice.41.json"}
 
     # Row 20 — generate new + cls None: nothing.
     created = run("42", {"relations": {}, "classification_read": False,
                          "classification_written": False},
                   {"env": [], "env_none": False, "serving_ports_none": True})
-    assert created == set()
+    assert created == {"deploy.user-alice.42.json"}
 
     # Rows 21/22 — cls generate new + relation written: both snapshots, for a
     # sent env and for generate new.

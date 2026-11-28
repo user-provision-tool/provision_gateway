@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Modal, Form, Input, Select, Button, Switch, Space, Divider, message, Checkbox, Alert, Spin, Tag, Typography, Collapse } from 'antd'
-import { PlusOutlined, MinusCircleOutlined, GlobalOutlined, RobotOutlined, DownloadOutlined, WarningOutlined } from '@ant-design/icons'
+import { PlusOutlined, MinusCircleOutlined, GlobalOutlined, RobotOutlined, DownloadOutlined, WarningOutlined, CheckCircleTwoTone } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import client from '../../api/client'
 import { deriveProfiles, getComposePreview } from '../../api/services'
@@ -20,7 +20,7 @@ import { setServiceContext, useServiceContext } from '../../stores/additionalCon
 import FileSetSelection, {
   SelectedFileRow,
   confCategory,
-  fixVariantFor,
+  userVariantFor,
   phaseOfFile,
   EMPTY_CANDIDATES,
   EMPTY_SELECTION,
@@ -612,7 +612,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
     try {
       const { data } = await client.get(`/projects/${baseName}/file-sets`)
       const rp = recipePath || '.'
-      setFileSetCandidates((data.candidates || {})[rp] || EMPTY_CANDIDATES)
+      setFileSetCandidates({
+        ...((data.candidates || {})[rp] || EMPTY_CANDIDATES),
+        provenance: (data.provenance || {})[rp] || {},
+      })
       setFileSetStale((data.stale || {})[rp] || {})
     } catch { /* a stale candidate list must not fail the generation path */ }
   }
@@ -626,7 +629,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
       const { data } = await client.get(`/projects/${baseName}/file-sets`)
       const rp = recipePath || '.'
       const entry = (data.file_sets || {})[rp] || {}
-      setFileSetCandidates((data.candidates || {})[rp] || EMPTY_CANDIDATES)
+      setFileSetCandidates({
+        ...((data.candidates || {})[rp] || EMPTY_CANDIDATES),
+        provenance: (data.provenance || {})[rp] || {},
+      })
       setFileSetStale((data.stale || {})[rp] || {})
       setSelection({
         compose: entry.compose || [],
@@ -1195,7 +1201,7 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
     if (!editorFileName) return
     setEditorSaving(true)
     try {
-      const targetName = editorFork ? fixVariantFor(editorFileName) : editorFileName
+      const targetName = editorFork ? userVariantFor(editorFileName) : editorFileName
       // Merge the edited content into the generated-files state
       setGeneratedFiles(prev => ({ ...prev, [targetName]: editorContent }))
       // Persist to the service project on disk
@@ -2085,6 +2091,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                           title: v.value,
                           label: (
                             <span>
+                              {v.exact && !v.red && (
+                                <CheckCircleTwoTone twoToneColor="#52c41a"
+                                  style={{ marginRight: 6 }} />
+                              )}
                               {v.value}
                               {v.red && (
                                 <WarningOutlined
@@ -2103,7 +2113,7 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                       ? 'The selected env is sent as-is; no classification injection happens.'
                       : eff.env.length > 0
                         ? 'The selected env is the root template; the classification is the overwrite plan. Missing env keys make the variant red; Generate/Deploy regenerates it.'
-                        : 'A generated classification drives the per-user .env.raw. Only variants matched to the current structural inputs are listed.'}
+                        : 'A generated classification drives the per-user .env.raw. Every variant is listed; the exact match is marked and a non-matching one is still selectable.'}
                 </div>
                 {clsCoverageMissing.length > 0 && (
                   <Alert type="error" showIcon style={{ marginTop: 8 }}
@@ -2150,6 +2160,10 @@ export default function DeployForm({ open, onClose, onDeployed, onDeployStarted,
                             title: o.value,
                             label: (
                               <span>
+                                {o.exact && !o.red && (
+                                  <CheckCircleTwoTone twoToneColor="#52c41a"
+                                    style={{ marginRight: 6 }} />
+                                )}
                                 {o.value}
                                 {o.red && (
                                   <WarningOutlined

@@ -1,5 +1,5 @@
-import { Alert, Button, Select, Space, Tag, Typography } from 'antd'
-import { ArrowDownOutlined, ArrowUpOutlined, CloseOutlined } from '@ant-design/icons'
+import { Alert, Button, Select, Space, Tag, Tooltip, Typography } from 'antd'
+import { ArrowDownOutlined, ArrowUpOutlined, CheckCircleTwoTone, CloseOutlined } from '@ant-design/icons'
 
 /**
  * Per-recipe base-file selection UI — shared by the LLM generate-missing
@@ -39,6 +39,18 @@ export interface FileSetSelectionData {
   profiles: string[]
 }
 
+export interface FileSetProvenance {
+  class: string | null
+  legacy?: boolean
+  description?: string
+  created_at?: string
+  sha256?: string | null
+  exact?: boolean | null
+  deploys?: number | null
+  duplicates?: number
+  history_unknown?: boolean
+}
+
 export interface FileSetCandidates {
   compose: string[]
   nginx: string[]
@@ -47,6 +59,8 @@ export interface FileSetCandidates {
   serving_ports?: string[]
   env: string[]
   profiles: string[]
+  // R4/R5 — the derived evidence keyed by candidate name.
+  provenance?: Record<string, FileSetProvenance>
 }
 
 export interface FileSetStale {
@@ -71,23 +85,53 @@ export function confCategory(name: string): 'http' | 'stream' | 'mail' {
   return 'http'
 }
 
-export function fixVariantFor(name: string): string {
-  // Mirrors the gateway's FIX_FILENAME: the tag goes before the extension and
-  // is single-slotted (overwritten each round, never accumulated).
-  //
-  // R4-F66 — and this function did NOT honour its own rule on a name that is
-  // ALREADY a fork: `serving_ports.base.362.fix.yml` became
-  // `serving_ports.base.362.fix.fix.yml`. It bites the moment a fork is opened
-  // and saved again — which is the ordinary second edit of an artifact the
-  // operator has already touched once. Single-slotted means idempotent: a name
-  // that carries the tag is returned as it is.
+/** R5.1 — `[exact icon][deploy count] description`, truncated by the picker's
+ * EXISTING container width (CSS ellipsis; the width is never changed) with
+ * the full text on hover. No provenance degrades to the bare name. */
+export function CandidateLabel({ name, p }: { name: string; p?: FileSetProvenance }) {
+  if (!p) return <span style={{ fontFamily: 'monospace' }}>{name}</span>
+  const deployText = p.deploys == null
+    ? (p.history_unknown ? 'history unknown' : (p.legacy ? 'legacy' : null))
+    : (p.deploys > 0 ? `deployed ${p.deploys}x` : 'never deployed')
+  const full = [
+    p.exact ? 'exact match' : null,
+    deployText,
+    p.duplicates ? `${p.duplicates} duplicate(s)` : null,
+    p.description || null,
+  ].filter(Boolean).join(' · ') || name
+  return (
+    <Tooltip title={full}>
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: '100%', overflow: 'hidden', whiteSpace: 'nowrap', verticalAlign: 'bottom' }}>
+        {p.exact && <CheckCircleTwoTone twoToneColor="#52c41a" style={{ fontSize: 12 }} />}
+        <span style={{ fontFamily: 'monospace', flex: '0 0 auto' }}>{name}</span>
+        {deployText && <span style={{ color: '#888', fontSize: 11, flex: '0 0 auto' }}>{deployText}</span>}
+        {p.description && (
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {p.description}
+          </span>
+        )}
+      </span>
+    </Tooltip>
+  )
+}
+
+export function userVariantFor(name: string): string {
+  // R8.1 — a picker edit forks to `<stem>.user.<ext>` with a `user` marker.
+  // The tag is single-slotted and idempotent: a name that already carries it
+  // is returned as it is. For an env name the family token (base/fix/raw) is
+  // REPLACED, so `.env.fix.42` becomes `.env.user.42` rather than growing a
+  // second token.
   if (/\.env/.test(name) && !name.includes('.raw.')) {
-    const stem = name.split('.').slice(0, -1).join('.') || '.env'
-    return /\.fix$/.test(stem) ? name : `${stem}.fix`
+    const parts = name.split('.')
+    if (parts.length > 2 && ['fix', 'base'].includes(parts[1])) {
+      parts[1] = 'user'
+      return parts.join('.')
+    }
+    return /\.user$/.test(name) ? name : `${name}.user`
   }
   const m = name.match(/^(.*)\.([^.]+)$/)
-  if (!m) return `${name}.fix`
-  return /\.fix$/.test(m[1]) ? name : `${m[1]}.fix.${m[2]}`
+  if (!m) return `${name}.user`
+  return /\.user$/.test(m[1]) ? name : `${m[1]}.user.${m[2]}`
 }
 
 interface Props {
@@ -180,9 +224,10 @@ export function SelectedFileRow({ name, onOpen, onRemove, stale, disabled }: {
   )
 }
 
-function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled, onOpenFile, noneSelected, noneLabel, forceGenerate }: {
+function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled, onOpenFile, noneSelected, noneLabel, forceGenerate, provenance }: {
   values: string[]
   candidates: string[]
+  provenance?: Record<string, FileSetProvenance>
   staleMark: (v: string) => boolean
   // S11 — the second argument carries the deliberate-NO-FILE state with the
   // list, so a caller can apply BOTH in one update (two `set` calls from the
@@ -234,7 +279,10 @@ function OrderedMulti({ values, candidates, staleMark, onOrderChange, disabled, 
         options={[
           { value: GENERATE_NEW, label: GENERATE_NEW_LABEL },
           ...(noneLabel ? [{ value: ENV_NONE, label: noneLabel }] : []),
-          ...(forceGenerate ? [] : remaining.map(c => ({ value: c, label: c }))),
+          ...(forceGenerate ? [] : remaining.map(c => ({
+            value: c,
+            label: <CandidateLabel name={c} p={provenance?.[c]} />,
+          }))),
         ]}
       />
       {/* All options are in the picker; the previous tag beside it is gone. */}
@@ -268,7 +316,9 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
     ...(candidates.mail_conf || []),
   ])].filter(c => !selectedConfs.includes(c)).map(c => ({
     value: c,
-    label: staleConf(c) ? <span style={strike}>{c}</span> : c,
+    label: staleConf(c) ? <span style={strike}>{c}</span> : (
+      <CandidateLabel name={c} p={candidates.provenance?.[c]} />
+    ),
     disabled: selectedCats.has(confCategory(c)),
   }))
   const spOptions = [
@@ -279,7 +329,9 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
     ...[...new Set([...(candidates.serving_ports || []), ...(sel.serving_ports ? [sel.serving_ports] : [])])]
       .map(c => ({
         value: c,
-        label: isStale('serving_ports', c) ? <span style={strike}>{c}</span> : c,
+        label: isStale('serving_ports', c) ? <span style={strike}>{c}</span> : (
+          <CandidateLabel name={c} p={candidates.provenance?.[c]} />
+        ),
       })),
   ]
 
@@ -291,6 +343,7 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
         <OrderedMulti
           values={sel.compose}
           candidates={candidates.compose}
+          provenance={candidates.provenance}
           staleMark={(v) => isStale('compose', v)}
           onOrderChange={(next) => set({ compose: next })}
           disabled={false}
@@ -473,6 +526,7 @@ export default function FileSetSelection({ selection, candidates, stale, needsEn
         <OrderedMulti
           values={sel.env}
           candidates={candidates.env}
+          provenance={candidates.provenance}
           staleMark={(v) => isStale('env', v)}
           // S11 state machine: a real file clears `env_none`; empty + not None is
           // `generate new`; None empties the list and records the flag.
